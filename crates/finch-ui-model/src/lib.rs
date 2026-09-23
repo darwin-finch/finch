@@ -16,15 +16,17 @@ use uuid::Uuid;
 mod component;
 mod markdown;
 mod say_turn;
+mod span;
 mod work_unit;
 
 pub use component::{
-    component_lines, ComponentView, LiveToolView, OperationRowView, OperationView, ProgressView,
-    StaticTextKind, StaticTextView,
+    component_lines, ComponentStylePalette, ComponentView, LiveToolView, OperationRowView,
+    OperationView, ProgressView, StaticTextKind, StaticTextView,
 };
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
 };
+pub use span::{spans_text, Span, SpanColor, SpanStyle};
 pub use work_unit::{
     project_work_unit, AgentActivityView, AgentToolView, MessageStatus, TranscriptNode,
     WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
@@ -85,11 +87,21 @@ pub enum NodeRole {
 }
 
 /// One rendered transcript line: semantic text plus the row metadata the
-/// claiming pass turns into hit rects. Text carries SGR today; the spans
-/// migration (stage 4 of docs/TUI_DESIGN.md) replaces the baked bytes.
+/// claiming pass turns into hit rects.
+///
+/// Stage 4 of docs/TUI_DESIGN.md: the line's semantic content is the span
+/// sequence when one is present — `text` is always the concatenated plain
+/// projection (what measurement, wrapping, and the canonical record read),
+/// and `spans` carries the styling the render modes lower. An empty `spans`
+/// means the plain `text` is the whole story, which keeps the legacy
+/// projection paths byte-identical.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {
     pub text: String,
+    /// The styled segments of the line when it carries styling; empty for
+    /// plain lines. Concatenating the segment texts reproduces `text`
+    /// exactly — the two projections share one content by construction.
+    pub spans: Vec<Span>,
     pub row_id: Option<RowId>,
     /// Expand/collapse for assistive consumers. Set on expandable header
     /// lines; never encoded as a second visible `[expanded]`/`[collapsed]`
@@ -106,6 +118,20 @@ pub struct RenderedTranscriptLine {
     /// state lives on the component's ViewModel, not the renderer's
     /// RowId-keyed maps, and a click routes to the component's handle.
     pub component_owned: bool,
+}
+
+impl RenderedTranscriptLine {
+    /// A rendered line from styled segments: `text` is the concatenation of
+    /// the segment texts, so measurement and the canonical record never see
+    /// content the styled projection disagrees with. All other metadata is
+    /// defaulted and can be set on the returned value.
+    pub fn from_spans(spans: Vec<Span>) -> RenderedTranscriptLine {
+        RenderedTranscriptLine {
+            text: spans_text(&spans),
+            spans,
+            ..RenderedTranscriptLine::default()
+        }
+    }
 }
 
 // ─── Line metrics ─────────────────────────────────────────────────────────────

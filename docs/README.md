@@ -28,6 +28,8 @@ authoritative.
 
 - [Root design index](../DESIGN.md): subsystem map, current dependency cycles, and intended
   direction
+- [UI manifest wire contract](UI_MANIFEST.md): the versioned DOM lowering the Tauri client
+  (#808) will consume — node shape, element types, schema, and generated TS artifacts
 - [finch-providers crate](../crates/finch-providers/AGENTS.md): extracted provider transports,
   OAuth, catalogs, and credential ports
 - [finch-generation crate](../crates/finch-generation/AGENTS.md): generation contract,

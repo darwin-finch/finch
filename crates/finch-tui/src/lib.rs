@@ -50,11 +50,13 @@ mod autocomplete_widget;
 mod command_autocomplete;
 mod dialog;
 mod dialog_widget;
+mod dom_manifest;
 #[cfg(test)]
 mod isolation;
 mod mouse_capture;
 mod scroll_view;
 mod shadow_buffer; // kept – good architecture for future diffing
+mod span_render;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 #[cfg(test)]
@@ -202,12 +204,21 @@ pub fn emergency_restore_terminal() {
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
+// The DOM manifest (#1141 part 2): the versioned wire contract the Tauri
+// client will consume over the daemon IPC (#808). The lowerings are engine
+// render modes; components never write HTML.
+pub use dom_manifest::{
+    component_manifest, component_ui_manifest, manifest_path_id, manifest_row_id, manifest_spans,
+    say_card_manifest, ui_manifest, widget_manifest, widget_ui_manifest, DynamicUiNode,
+    ManifestColor, ManifestSpan, UiManifest, MANIFEST_VERSION,
+};
 // The root setup wizard uses this named widget-host surface; keep the child
 // module private so the crate facade remains the only external path.
 pub use wizard_host::{
-    plan_wizard_frame, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
-    wizard_physical_rows, wizard_plain, wizard_visible_length, wizard_wrap, WizardCard,
-    WizardColor, WizardFrame, WizardHost, WizardRects, WizardSectionContent, WizardView,
+    lower_wizard_line, lower_wizard_span, plan_wizard_frame, wizard_bold, wizard_boxed,
+    wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_physical_rows,
+    wizard_plain, wizard_selected, wizard_visible_length, wizard_wrap, WizardCard, WizardColor,
+    WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
@@ -1093,8 +1104,15 @@ pub(crate) fn plan_live_frame(
 
     // ── 3. Paint in claimed order: transcript, task rows, tracked rows,
     //       completions, hr, input, hr, status ────────────────────────────────
+    // Stage 4 (#1141): component-owned lines carry spans and are lowered to
+    // SGR here, at paint. The plain text stays what every measurement reads;
+    // span-free lines keep their legacy bytes.
     for line in &viewport_content {
-        frame.push(line.text.trim_end_matches('\r'));
+        frame.push(
+            span_render::lower_rendered_line(line)
+                .trim_end_matches('\r')
+                .to_string(),
+        );
     }
     // ── 3a. Furniture: session tasks and tracked child agents claim fixed
     //        rows between the transcript viewport and the composer (#966).
@@ -2772,7 +2790,10 @@ impl TuiRenderer {
         // it. Component state lives on the ViewModel, not the renderer's
         // RowId-keyed maps.
         if let Some(view) = message.component_view() {
-            let lines = finch_ui_model::component_lines(&view);
+            // Stage 4 (#1141): the palette is built from the user's scheme at
+            // the one engine boundary; the component capsule never sees it.
+            let palette = span_render::component_style_palette(&self.colors);
+            let lines = finch_ui_model::component_lines(&view, &palette);
             return self
                 .tool_viewports
                 .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);
@@ -3427,9 +3448,12 @@ impl TuiRenderer {
         // anchors the offset against content growth while scrolled and keeps
         // the quantised offset honest.
         let source = self.scroll_window_committed_source(term_width);
+        // Stage 4 (#1141): the scrolled transcript lowers spans at paint, the
+        // same lowering the live viewport uses, so a scrolled reader sees the
+        // styled rows.
         let transcript = source
             .iter()
-            .map(|line| line.text.clone())
+            .map(span_render::lower_rendered_line)
             .collect::<Vec<_>>();
         let transcript = viewport_tail_lines(&transcript, term_width, transcript_budget);
         let transcript_rows = transcript
@@ -7605,6 +7629,92 @@ mod tests {
             !live_ids.contains(&message.id()),
             "zero-claim furniture: a completed progress row leaves the live viewport; \
              live ids were {live_ids:?}"
+        );
+    }
+
+    /// INVARIANT (stage 4, #1141): component rows carry styled spans, the
+    /// engine lowers them to SGR at the live-frame paint seam, and the plain
+    /// text the canonical record and measurement read stays SGR-free. The
+    /// canonical commit's raw bytes are untouched by the styling.
+    #[test]
+    fn test_component_spans_lower_to_sgr_at_the_live_frame_paint() {
+        use finch_messages::ProgressMessage;
+        let mut renderer = headless_renderer();
+        let progress = Arc::new(ProgressMessage::new("weights.safetensors", 100));
+        let message: MessageRef = Arc::clone(&progress) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        // The projection carries spans built from the scheme palette.
+        let lines = renderer.projected_message_lines(&message, 80);
+        assert_eq!(
+            lines[0].text, "weights.safetensors [░░░░░░░░░░] 0%",
+            "the plain projection stays SGR-free; got {:?}",
+            lines[0].text
+        );
+        assert!(
+            !lines[0].spans.is_empty()
+                && lines[0].spans[0].style.fg == Some(finch_ui_model::SpanColor::DARK_YELLOW),
+            "the running bar wears the scheme's operation colour as a span; got {:#?}",
+            lines[0].spans
+        );
+        // One-tree-two-lowerings: the span texts concatenate to the plain text.
+        assert_eq!(
+            finch_ui_model::spans_text(&lines[0].spans),
+            lines[0].text,
+            "spans and text agree on content; got line={:?}",
+            lines[0]
+        );
+
+        // The live-frame paint seam lowers the spans to SGR bytes.
+        let frame = plan_frame_for_test(80, 24, &lines);
+        let painted = frame
+            .lines
+            .iter()
+            .find(|line| line.contains("weights.safetensors"))
+            .expect("the progress row paints in the live frame");
+        assert_eq!(
+            painted, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
+            "the running bar paints in the scheme's operation colour; got {painted:?}"
+        );
+
+        // A span-free (legacy) line keeps its bytes exactly.
+        let legacy = RenderedTranscriptLine {
+            text: "legacy row".to_string(),
+            ..RenderedTranscriptLine::default()
+        };
+        let frame = plan_frame_for_test(80, 24, &[legacy]);
+        assert!(
+            frame.lines.iter().any(|line| line == "legacy row"),
+            "a span-free row paints its plain bytes; got {:?}",
+            frame.lines
+        );
+    }
+
+    /// INVARIANT (stage 4, #1141): the scrolled transcript region lowers spans
+    /// through the same lowering the live viewport uses, so a scrolled reader
+    /// sees the styled rows.
+    #[test]
+    fn test_scrolled_transcript_lowers_spans_like_the_live_viewport() {
+        use finch_messages::{Message, ProgressMessage};
+        let mut renderer = headless_renderer();
+        let progress = Arc::new(ProgressMessage::new("weights.safetensors", 100));
+        let message: MessageRef = Arc::clone(&progress) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+        let styled = renderer.projected_message_lines(&message, 80);
+        assert!(
+            !styled.is_empty() && !styled[0].spans.is_empty(),
+            "the component line carries spans; got {styled:?}"
+        );
+        // The scroll-window source is the projection itself; the lowering the
+        // full-viewport paint applies renders the same bytes as the seam.
+        let lowered = span_render::lower_rendered_line(&styled[0]);
+        assert_eq!(
+            lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
+            "the scrolled paint shows the styled row; got {lowered:?}"
         );
     }
 

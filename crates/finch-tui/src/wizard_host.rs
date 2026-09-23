@@ -31,9 +31,13 @@ use finch_ui_model::char_display_width;
 
 // ─── Styling ─────────────────────────────────────────────────────────────────
 //
-// Wizard lines carry their own ANSI, exactly like conversation live-frame
-// lines. The shadow buffer strips the codes for measurement, so styling can
-// never change a frame's geometry.
+// Stage 4 (#1141): wizard view props carry **styled spans** — semantic
+// (text, style) segments with no terminal bytes. The spans are built here and
+// by the wizard's view builders from the `WizardColor` vocabulary; the host
+// lowers them to SGR exactly once, in `lower_wizard_line`, when a frame is
+// planned. The shadow buffer strips the codes for measurement, so styling can
+// never change a frame's geometry, and a plain span paints byte-identically
+// to the pre-span text.
 
 /// The wizard view's own colour vocabulary.
 ///
@@ -58,6 +62,119 @@ pub enum WizardColor {
         g: u8,
         b: u8,
     },
+}
+
+/// One styled wizard segment: optional foreground/background colour plus the
+/// bold and dim modifiers. No escape sequences here — the lowering is the
+/// host's job, and a GUI consumer reads the colours directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WizardSpan {
+    pub text: String,
+    pub fg: Option<WizardColor>,
+    pub bg: Option<WizardColor>,
+    pub bold: bool,
+    pub dim: bool,
+}
+
+impl WizardSpan {
+    /// A plain (unstyled) span.
+    pub fn plain(text: impl Into<String>) -> WizardSpan {
+        WizardSpan {
+            text: text.into(),
+            fg: None,
+            bg: None,
+            bold: false,
+            dim: false,
+        }
+    }
+
+    /// A coloured, optionally bold span.
+    pub fn styled(text: impl Into<String>, fg: Option<WizardColor>, bold: bool) -> WizardSpan {
+        WizardSpan {
+            text: text.into(),
+            fg,
+            bg: None,
+            bold,
+            dim: false,
+        }
+    }
+
+    /// A span with a background (the #1140 selection contrast channel).
+    pub fn with_background(
+        text: impl Into<String>,
+        fg: WizardColor,
+        bg: WizardColor,
+    ) -> WizardSpan {
+        WizardSpan {
+            text: text.into(),
+            fg: Some(fg),
+            bg: Some(bg),
+            bold: true,
+            dim: false,
+        }
+    }
+}
+
+/// One logical wizard line: styled segments in paint order. A line's display
+/// width is the sum of its segments' visible widths, so styling can never
+/// shift a frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WizardLine(pub Vec<WizardSpan>);
+
+impl WizardLine {
+    /// A one-span plain line.
+    pub fn plain(text: impl Into<String>) -> WizardLine {
+        WizardLine(vec![WizardSpan::plain(text)])
+    }
+
+    /// The blank line — zero segments, zero columns.
+    pub fn blank() -> WizardLine {
+        WizardLine(Vec::new())
+    }
+
+    /// A coloured, non-bold one-span line.
+    pub fn colored(text: impl Into<String>, fg: WizardColor) -> WizardLine {
+        WizardLine(vec![WizardSpan::styled(text, Some(fg), false)])
+    }
+
+    /// A coloured, bold one-span line.
+    pub fn bold(text: impl Into<String>, fg: WizardColor) -> WizardLine {
+        WizardLine(vec![WizardSpan::styled(text, Some(fg), true)])
+    }
+
+    /// Join lines left to right into one logical line.
+    pub fn concat(lines: &[WizardLine]) -> WizardLine {
+        let mut spans = Vec::new();
+        for line in lines {
+            spans.extend(line.0.iter().cloned());
+        }
+        WizardLine(spans)
+    }
+
+    /// The line's plain text — the concatenation of its segment texts, the
+    /// speakable form a screen reader or a GUI host reads.
+    pub fn plain_text(&self) -> String {
+        let mut text = String::new();
+        for span in &self.0 {
+            text.push_str(&span.text);
+        }
+        text
+    }
+
+    /// Visible display columns the line occupies (ANSI-free by construction).
+    pub fn display_length(&self) -> usize {
+        self.0.iter().map(wizard_span_visible_length).sum()
+    }
+
+    /// Physical terminal rows this logical line occupies at `width`.
+    pub fn physical_rows(&self, width: usize) -> usize {
+        self.display_length().max(1).div_ceil(width.max(1))
+    }
+}
+
+/// Visible display-column width of one span's text.
+fn wizard_span_visible_length(span: &WizardSpan) -> usize {
+    span.text.chars().map(wizard_char_width).sum()
 }
 
 /// SGR reset closing every styled wizard span.
@@ -149,7 +266,7 @@ pub fn wizard_physical_rows(text: &str, width: usize) -> usize {
 /// `┐`, exactly `width` visible columns (#926: the gap count must be glyphs,
 /// not digits, and the run must fill the row — the frame's row-diff depends on
 /// every border row being exactly one terminal row).
-fn wizard_title_border(title: &str, width: usize, accent: WizardColor, bold: bool) -> String {
+fn wizard_title_border(title: &str, width: usize, accent: WizardColor, bold: bool) -> WizardLine {
     if width < 5 {
         // A row too small for a title still closes the box without overflow.
         let dashes = width.saturating_sub(2);
@@ -166,13 +283,13 @@ fn wizard_title_border(title: &str, width: usize, accent: WizardColor, bold: boo
     let title_budget = width - 5;
     let mut fitted = String::new();
     for ch in title.chars() {
-        let next = wizard_visible_length(&format!("{fitted}{ch}"));
+        let next = wizard_word_width(&format!("{fitted}{ch}"));
         if next > title_budget {
             break;
         }
         fitted.push(ch);
     }
-    let dashes = width - 5 - wizard_visible_length(&fitted);
+    let dashes = width - 5 - wizard_word_width(&fitted);
     wizard_paint(
         &format!("┌─ {fitted} {}┐", "─".repeat(dashes)),
         Some(accent),
@@ -216,148 +333,210 @@ fn sgr_fg(color: WizardColor) -> String {
     }
 }
 
-/// One styled wizard span: optional foreground colour plus bold.
-pub fn wizard_paint(text: &str, fg: Option<WizardColor>, bold: bool) -> String {
-    let mut code = String::new();
-    if bold {
-        code.push('1');
+fn sgr_bg(color: WizardColor) -> String {
+    match color {
+        WizardColor::Black => "40".to_string(),
+        WizardColor::Red => "41".to_string(),
+        WizardColor::Green => "42".to_string(),
+        WizardColor::Yellow => "43".to_string(),
+        WizardColor::Blue => "44".to_string(),
+        WizardColor::Magenta => "45".to_string(),
+        WizardColor::Cyan => "46".to_string(),
+        WizardColor::Gray => "47".to_string(),
+        WizardColor::DarkGray => "100".to_string(),
+        WizardColor::White => "107".to_string(),
+        WizardColor::Truecolor { r, g, b } => format!("48;2;{r};{g};{b}"),
     }
-    if let Some(fg) = fg {
-        if !code.is_empty() {
-            code.push(';');
-        }
-        code.push_str(&sgr_fg(fg));
+}
+
+/// The SGR attribute run for one span: bold, dim, foreground, background —
+/// the same attribute order the pre-span helpers emitted (bold first, then
+/// colour), with the background appended.
+fn span_sgr_codes(span: &WizardSpan) -> String {
+    let mut codes: Vec<String> = Vec::new();
+    if span.bold {
+        codes.push("1".to_string());
     }
-    if code.is_empty() {
-        text.to_string()
+    if span.dim {
+        codes.push("2".to_string());
+    }
+    if let Some(fg) = span.fg {
+        codes.push(sgr_fg(fg));
+    }
+    if let Some(bg) = span.bg {
+        codes.push(sgr_bg(bg));
+    }
+    codes.join(";")
+}
+
+/// THE LOWERING (stage 4 #1141): turn one styled wizard span into the bytes a
+/// terminal paints. This is the only place in the wizard surface that names
+/// escape codes; view builders construct spans, never bytes.
+pub fn lower_wizard_span(span: &WizardSpan) -> String {
+    let codes = span_sgr_codes(span);
+    if codes.is_empty() {
+        span.text.clone()
     } else {
-        format!("\x1b[{code}m{text}{WIZ_RESET}")
+        format!("\x1b[{codes}m{}{WIZ_RESET}", span.text)
     }
+}
+
+/// Lower one logical line to its painted bytes.
+pub fn lower_wizard_line(line: &WizardLine) -> String {
+    let mut out = String::new();
+    for span in &line.0 {
+        out.push_str(&lower_wizard_span(span));
+    }
+    out
+}
+
+/// The selection style (#1140): bold bright-white on a black background —
+/// the pre-migration `bg(Black).fg(White)` contrast the widget-host migration
+/// lost, restored through the background channel so a selected row reads on
+/// any terminal background.
+pub fn wizard_selected(text: impl Into<String>) -> WizardLine {
+    WizardLine(vec![WizardSpan::with_background(
+        text,
+        WizardColor::White,
+        WizardColor::Black,
+    )])
+}
+
+/// True when the line marks a wizard selection (the #1140 contrast prop).
+pub fn wizard_line_is_selected(line: &WizardLine) -> bool {
+    line.0.iter().any(|span| span.bg.is_some() && span.bold)
+}
+
+/// One styled wizard line: optional foreground colour plus bold —
+/// pre-migration shape, now as spans instead of baked bytes.
+pub fn wizard_paint(text: &str, fg: Option<WizardColor>, bold: bool) -> WizardLine {
+    WizardLine(vec![WizardSpan::styled(text, fg, bold)])
 }
 
 /// A coloured, non-bold wizard span.
-pub fn wizard_line(text: &str, fg: WizardColor) -> String {
-    wizard_paint(text, Some(fg), false)
+pub fn wizard_line(text: &str, fg: WizardColor) -> WizardLine {
+    WizardLine::colored(text, fg)
 }
 
 /// A coloured, bold wizard span.
-pub fn wizard_bold(text: &str, fg: WizardColor) -> String {
-    wizard_paint(text, Some(fg), true)
+pub fn wizard_bold(text: &str, fg: WizardColor) -> WizardLine {
+    WizardLine::bold(text, fg)
 }
 
 /// A plain wizard span.
-pub fn wizard_plain(text: &str) -> String {
-    wizard_paint(text, None, false)
+pub fn wizard_plain(text: &str) -> WizardLine {
+    WizardLine::plain(text)
 }
 
-/// Centre `text` (ANSI-aware) in `width` display columns.
-pub fn wizard_centered(text: &str, width: usize) -> String {
-    let lead = width.saturating_sub(wizard_visible_length(text)) / 2;
-    format!("{}{}", " ".repeat(lead), text)
+/// Centre a styled line in `width` display columns (a leading plain pad).
+pub fn wizard_centered(line: WizardLine, width: usize) -> WizardLine {
+    let lead = width.saturating_sub(line.display_length()) / 2;
+    let mut spans = Vec::with_capacity(line.0.len() + 1);
+    if lead > 0 {
+        spans.push(WizardSpan::plain(" ".repeat(lead)));
+    }
+    spans.extend(line.0);
+    WizardLine(spans)
 }
 
-/// Word-wrap `text` at `width` display columns, keeping any single leading
-/// SGR span on every fragment so wrapped box rows keep their style. An
-/// embedded `\n` breaks the line hard, so user text (a persona's system
-/// prompt) can never feed the terminal a raw linefeed mid-row.
+/// Word-wrap a styled line at `width` display columns. Each fragment
+/// re-carries the style of the segment it started in, so wrapped box rows
+/// keep their style — the span equivalent of the SGR-prefix behaviour the
+/// string wrapper had. An embedded `\n` breaks the line hard, so user text
+/// (a persona's system prompt) can never feed the terminal a raw linefeed
+/// mid-row.
 ///
 /// A boxed body must wrap like the old painter's `Paragraph`, not truncate —
 /// truncation is exactly how an accessibility string loses its last words.
-pub fn wizard_wrap(text: &str, width: usize) -> Vec<String> {
+pub fn wizard_wrap(line: &WizardLine, width: usize) -> Vec<WizardLine> {
     let width = width.max(1);
-    // Split a single styled span into (leading escapes, inner text, reset).
-    let mut prefix = String::new();
-    let mut rest = text;
-    while rest.starts_with('\x1b') {
-        let Some(end) = rest.find('m').or_else(|| rest.find('\x07')) else {
-            break;
-        };
-        let (escape, remainder) = rest.split_at(end + 1);
-        if escape.ends_with("[0m") {
-            break; // A reset ends the leading style run.
-        }
-        prefix.push_str(escape);
-        rest = remainder;
-    }
-    let inner = rest.strip_suffix(WIZ_RESET).unwrap_or(rest);
+    let mut lines_out: Vec<WizardLine> = Vec::new();
+    let mut current: Vec<WizardSpan> = Vec::new();
+    let mut column = 0usize;
 
-    // Greedy word wrap over display columns. The char walk consumes escape
-    // sequences at zero width (#926): counting their bytes as visible columns
-    // over-wrapped every styled string and, once the help line's claim came
-    // from the same wrap, desynced the claim from the painted extent. An
-    // embedded newline is a hard break: a literal linefeed inside a painted
-    // fragment feeds the terminal real linefeeds and desyncs the row-diff
-    // blit just the same.
-    let mut lines: Vec<String> = Vec::new();
-    for paragraph in inner.split('\n') {
-        let paragraph = paragraph.trim_end_matches('\r');
-        let mut current = String::new();
-        let mut column = 0usize;
-        for word in paragraph.split(' ') {
-            if column > 0 && column + wizard_visible_length(word) > width {
-                lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
-                current.clear();
+    for span in &line.0 {
+        // Hard breaks first: an embedded linefeed must never reach the frame
+        // as a raw byte (#926); it ends the logical row where it stands.
+        for (paragraph_index, paragraph) in span.text.split('\n').enumerate() {
+            if paragraph_index > 0 {
+                close_row(&mut current, &mut lines_out);
                 column = 0;
             }
-            let chars: Vec<char> = word.chars().collect();
-            let mut index = 0usize;
-            while index < chars.len() {
-                let ch = chars[index];
-                if ch == '\x1b' {
-                    // Copy the escape sequence through untouched; it renders
-                    // zero columns.
-                    current.push(ch);
-                    index += 1;
-                    if index < chars.len() && chars[index] == '[' {
-                        current.push('[');
-                        index += 1;
-                        while index < chars.len() {
-                            let terminator = chars[index].is_ascii_alphabetic();
-                            current.push(chars[index]);
-                            index += 1;
-                            if terminator {
-                                break;
-                            }
-                        }
-                    } else if index < chars.len() {
-                        current.push(chars[index]);
-                        index += 1;
-                    }
-                    continue;
-                }
-                let char_width = wizard_char_width(ch);
-                if column + char_width > width {
-                    lines.push(format!("{prefix}{current}{WIZ_RESET}"));
-                    current.clear();
+            let paragraph = paragraph.trim_end_matches('\r');
+            for word in paragraph.split(' ') {
+                if column > 0 && column + wizard_word_width(word) > width {
+                    close_row(&mut current, &mut lines_out);
                     column = 0;
                 }
-                current.push(ch);
-                column += char_width;
-                index += 1;
+                for ch in word.chars() {
+                    let char_width = wizard_char_width(ch);
+                    if column + char_width > width {
+                        close_row(&mut current, &mut lines_out);
+                        column = 0;
+                    }
+                    append_char(&mut current, span, ch);
+                    column += char_width;
+                }
+                // The separator space rides the word's own style; the row
+                // trim removes it when it lands at the end.
+                append_char(&mut current, span, ' ');
+                column += 1;
             }
-            current.push(' ');
-            column += 1;
-        }
-        if current.trim().is_empty() {
-            lines.push(String::new());
-        } else {
-            lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
         }
     }
-    lines
-        .into_iter()
-        .map(|line| line.trim_end().to_string())
-        .collect()
+    if !current.is_empty() {
+        close_row(&mut current, &mut lines_out);
+    } else if lines_out.is_empty() {
+        lines_out.push(WizardLine::blank());
+    }
+    lines_out
+}
+
+fn close_row(current: &mut Vec<WizardSpan>, lines_out: &mut Vec<WizardLine>) {
+    while let Some(last) = current.last_mut() {
+        let trimmed = last.text.trim_end().to_string();
+        if trimmed.is_empty() {
+            current.pop();
+        } else {
+            last.text = trimmed;
+            break;
+        }
+    }
+    lines_out.push(WizardLine(std::mem::take(current)));
+}
+
+/// Greedy word width as a terminal renders it.
+fn wizard_word_width(word: &str) -> usize {
+    word.chars().map(wizard_char_width).sum()
+}
+
+fn same_style(a: &WizardSpan, b: &WizardSpan) -> bool {
+    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.dim == b.dim
+}
+
+/// Append one character to the line, merging with the previous span when the
+/// styles agree so contiguous same-style text stays one segment.
+fn append_char(current: &mut Vec<WizardSpan>, style_of: &WizardSpan, ch: char) {
+    match current.last_mut() {
+        Some(last) if same_style(last, style_of) => last.text.push(ch),
+        _ => current.push(WizardSpan {
+            text: ch.to_string(),
+            fg: style_of.fg,
+            bg: style_of.bg,
+            bold: style_of.bold,
+            dim: style_of.dim,
+        }),
+    }
 }
 
 /// One boxed region of a wizard section: `title` on the top border, every
 /// body line wrapped and padded so the accent border stays on the box.
 pub fn wizard_boxed(
     title: &str,
-    body: &[String],
+    body: &[WizardLine],
     accent: WizardColor,
     width: usize,
-) -> Vec<String> {
+) -> Vec<WizardLine> {
     let width = width.max(4);
     let inner = width - 2;
     let border = "─".repeat(inner);
@@ -366,14 +545,15 @@ pub fn wizard_boxed(
         for fragment in wizard_wrap(line, inner.saturating_sub(2)) {
             let pad = inner
                 .saturating_sub(2)
-                .saturating_sub(wizard_visible_length(&fragment));
-            out.push(format!(
-                "{} {}{} {}",
-                wizard_paint("│", Some(accent), false),
-                fragment,
-                " ".repeat(pad),
-                wizard_paint("│", Some(accent), false)
-            ));
+                .saturating_sub(fragment.display_length());
+            let mut spans = vec![
+                WizardSpan::styled("│", Some(accent), false),
+                WizardSpan::plain(" "),
+            ];
+            spans.extend(fragment.0);
+            spans.push(WizardSpan::plain(format!(" {}", " ".repeat(pad))));
+            spans.push(WizardSpan::styled("│", Some(accent), false));
+            out.push(WizardLine(spans));
         }
     }
     out.push(wizard_paint(&format!("└{border}┘"), Some(accent), false));
@@ -390,14 +570,18 @@ pub fn wizard_boxed(
 /// out of the card.
 pub struct WizardCard {
     pub title: String,
-    pub body: Vec<String>,
-    pub controls: Option<String>,
+    pub body: Vec<WizardLine>,
+    pub controls: Option<WizardLine>,
     pub accent: WizardColor,
 }
 
 impl WizardCard {
     /// A card that announces and instructs: title, body, controls, cyan chrome.
-    pub fn new(title: impl Into<String>, body: Vec<String>, controls: Option<String>) -> Self {
+    pub fn new(
+        title: impl Into<String>,
+        body: Vec<WizardLine>,
+        controls: Option<WizardLine>,
+    ) -> Self {
         Self {
             title: title.into(),
             body,
@@ -406,14 +590,23 @@ impl WizardCard {
         }
     }
 
+    /// The card's controls row as the host paints it: yellow, the way the old
+    /// painter styled every controls row. The props carry the text; the chrome
+    /// style stays the host's.
+    fn controls_line(&self) -> Option<WizardLine> {
+        self.controls
+            .as_ref()
+            .map(|controls| WizardLine::colored(controls.plain_text(), WizardColor::Yellow))
+    }
+
     /// The body (controls pinned last) wrapped to one fragment per row, the
     /// unit the chrome and the pinned rebuild both count.
-    fn wrapped_body(&self, width: usize) -> Vec<String> {
+    fn wrapped_body(&self, width: usize) -> Vec<WizardLine> {
         let width = width.max(4);
         let inner = width - 2;
-        let mut body: Vec<String> = self.body.clone();
-        if let Some(controls) = &self.controls {
-            body.push(wizard_line(controls, WizardColor::Yellow));
+        let mut body: Vec<WizardLine> = self.body.clone();
+        if let Some(controls) = self.controls_line() {
+            body.push(controls);
         }
         let mut fragments = Vec::new();
         for line in &body {
@@ -422,23 +615,24 @@ impl WizardCard {
         fragments
     }
 
-    fn boxed_fragment(&self, width: usize, fragment: &str) -> String {
+    fn boxed_fragment(&self, width: usize, fragment: &WizardLine) -> WizardLine {
         let width = width.max(4);
         let inner = width - 2;
         let pad = inner
             .saturating_sub(2)
-            .saturating_sub(wizard_visible_length(fragment));
-        format!(
-            "{} {}{} {}",
-            wizard_paint("│", Some(self.accent), false),
-            fragment,
-            " ".repeat(pad),
-            wizard_paint("│", Some(self.accent), false)
-        )
+            .saturating_sub(fragment.display_length());
+        let mut spans = vec![
+            WizardSpan::styled("│", Some(self.accent), false),
+            WizardSpan::plain(" "),
+        ];
+        spans.extend(fragment.0.clone());
+        spans.push(WizardSpan::plain(format!(" {}", " ".repeat(pad))));
+        spans.push(WizardSpan::styled("│", Some(self.accent), false));
+        WizardLine(spans)
     }
 
     /// The card's unpinned chrome: title border, wrapped body, bottom border.
-    fn chrome_lines(&self, width: usize) -> Vec<String> {
+    fn chrome_lines(&self, width: usize) -> Vec<WizardLine> {
         let width = width.max(4);
         let inner = width - 2;
         let border = "─".repeat(inner);
@@ -458,7 +652,7 @@ impl WizardCard {
     /// The card re-rendered to exactly `claimed_rows` physical rows, chrome
     /// pinned: title on the top border, controls on the row above the bottom
     /// border, the body windowed between them with a count when it overflows.
-    fn lines_for_claim(&self, width: usize, claimed_rows: usize) -> Vec<String> {
+    fn lines_for_claim(&self, width: usize, claimed_rows: usize) -> Vec<WizardLine> {
         let width = width.max(1);
         if claimed_rows == 0 {
             return Vec::new();
@@ -467,7 +661,7 @@ impl WizardCard {
         if chrome.len() <= claimed_rows {
             let mut lines = chrome;
             while lines.len() < claimed_rows {
-                lines.push(String::new());
+                lines.push(WizardLine::blank());
             }
             return lines;
         }
@@ -482,18 +676,17 @@ impl WizardCard {
             Some(self.accent),
             false,
         );
-        let mut body: Vec<String> = self.body.clone();
-        if let Some(controls) = &self.controls {
-            body.push(wizard_line(controls, WizardColor::Yellow));
+        let mut body: Vec<WizardLine> = self.body.clone();
+        if let Some(controls) = self.controls_line() {
+            body.push(controls);
         }
-        let mut fragments: Vec<String> = Vec::new();
+        let mut fragments: Vec<WizardLine> = Vec::new();
         for line in body.iter().take(body.len().saturating_sub(1)) {
             fragments.extend(wizard_wrap(line, inner.saturating_sub(2)));
         }
         let controls_fragment = body
             .last()
-            .cloned()
-            .map(|controls| wizard_wrap(&controls, inner.saturating_sub(2)))
+            .map(|controls| wizard_wrap(controls, inner.saturating_sub(2)))
             .unwrap_or_default();
 
         let window = claimed_rows.saturating_sub(2);
@@ -521,7 +714,7 @@ impl WizardCard {
             lines.push(self.boxed_fragment(width, fragment));
         }
         while lines.len() < claimed_rows.saturating_sub(1) {
-            lines.push(String::new());
+            lines.push(WizardLine::blank());
         }
         lines.push(bottom_row);
         lines
@@ -543,7 +736,7 @@ pub mod wizard_keys {
 /// them into the claimed leftover.
 #[derive(Default)]
 pub struct WizardSectionContent {
-    pub lines: Vec<String>,
+    pub lines: Vec<WizardLine>,
     /// Wrapped rows to skip from the top (the expanded GUI-status scroll).
     pub scroll_rows: usize,
     /// Line range that must stay visible (the selected feature group). The
@@ -553,8 +746,8 @@ pub struct WizardSectionContent {
 }
 
 impl WizardSectionContent {
-    /// Plain top-anchored content.
-    pub fn plain(lines: Vec<String>) -> Self {
+    /// Top-anchored styled content.
+    pub fn plain(lines: Vec<WizardLine>) -> Self {
         Self {
             lines,
             scroll_rows: 0,
@@ -564,17 +757,20 @@ impl WizardSectionContent {
 }
 
 /// Everything one wizard frame paints. This is the view a GUI host (#808)
-/// would consume: plain text, tab titles, and one overlay card.
+/// would consume: styled spans, tab titles with an active marker, and one
+/// overlay card — the speakable canonical form without any terminal bytes.
 pub struct WizardView {
     /// Header title, e.g. ` Finch Setup `.
     pub title: String,
-    /// Tab names in order; `selected_tab` indexes into it.
+    /// Tab names in order; `selected_tab` indexes into it. The index IS the
+    /// active-tab marker prop: the tab row paints the selected tab in the
+    /// active style and every other tab plainly (#1140).
     pub tab_titles: Vec<String>,
     pub selected_tab: usize,
     pub section: WizardSectionContent,
     /// One help line under the section. Yielded while a card owns the keys,
     /// exactly as the conversation composer yields behind a dialog card.
-    pub help: Option<String>,
+    pub help: Option<WizardLine>,
     pub card: Option<WizardCard>,
 }
 
@@ -582,39 +778,34 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
     let width = width.max(4);
     let inner = width - 2;
     let top = wizard_title_border(&view.title, width, WizardColor::Blue, true);
-    let mut tabs = String::new();
+    let mut tabs: Vec<WizardSpan> = Vec::new();
     for (index, name) in view.tab_titles.iter().enumerate() {
         if index > 0 {
-            tabs.push_str("  ");
+            tabs.push(WizardSpan::plain("  "));
         }
+        // The active tab is bold magenta ON BLACK — visible on any terminal
+        // background (#1140); inactive tabs stay blue.
         let painted = if index == view.selected_tab {
-            wizard_bold(name, WizardColor::Magenta)
+            WizardSpan::with_background(name.clone(), WizardColor::Magenta, WizardColor::Black)
         } else {
-            wizard_line(name, WizardColor::Blue)
+            WizardSpan::styled(name.clone(), Some(WizardColor::Blue), false)
         };
-        tabs.push_str(&painted);
+        tabs.push(painted);
     }
-    let tabs_row = format!(
-        "{}{}{}",
-        wizard_paint("│", Some(WizardColor::Blue), false),
-        tabs,
-        {
-            let used = wizard_visible_length(&tabs);
-            format!(
-                "{}{}",
-                " ".repeat(inner.saturating_sub(used)),
-                wizard_paint("│", Some(WizardColor::Blue), false)
-            )
-        }
-    );
+    let used: usize = tabs.iter().map(wizard_span_visible_length).sum();
+    let mut row_spans = vec![WizardSpan::styled("│", Some(WizardColor::Blue), false)];
+    row_spans.extend(tabs);
+    row_spans.push(WizardSpan::plain(" ".repeat(inner.saturating_sub(used))));
+    row_spans.push(WizardSpan::styled("│", Some(WizardColor::Blue), false));
+    let tabs_row = WizardLine(row_spans);
     vec![
-        top,
-        tabs_row,
-        wizard_paint(
+        lower_wizard_line(&top),
+        lower_wizard_line(&tabs_row),
+        lower_wizard_line(&wizard_paint(
             &format!("└{}┘", "─".repeat(inner)),
             Some(WizardColor::Blue),
             false,
-        ),
+        )),
     ]
 }
 
@@ -623,8 +814,10 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
 /// leftover, and an open card claims its natural extent as an inline
 /// [`Widget::DialogCard`] (#807) — the help yields while the card owns keys.
 /// `card_lines` are the card's chrome lines at the frame width; they decide
-/// the card's natural claim.
+/// the card's natural claim. All lines are lowered here: the claiming tree
+/// and the paint read the same bytes.
 fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<String>>) -> Widget {
+    let lowered_section: Vec<String> = view.section.lines.iter().map(lower_wizard_line).collect();
     let mut children: Vec<(Track, Widget)> = vec![
         (
             Track::Natural,
@@ -640,7 +833,7 @@ fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<S
             Widget::Marked(
                 wizard_keys::SECTION,
                 Box::new(Widget::Text {
-                    lines: view.section.lines.clone(),
+                    lines: lowered_section,
                 }),
             ),
         ),
@@ -655,14 +848,13 @@ fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<S
         // (#812 accessibility contract), so it must never overflow the frame
         // (which scrolls the whole screen) nor be truncated. Its natural
         // claim is its wrapped extent, the same lines the paint emits.
+        let wrapped: Vec<String> = wizard_wrap(help, width)
+            .iter()
+            .map(lower_wizard_line)
+            .collect();
         children.push((
             Track::Natural,
-            Widget::Marked(
-                wizard_keys::HELP,
-                Box::new(Widget::Text {
-                    lines: wizard_wrap(help, width),
-                }),
-            ),
+            Widget::Marked(wizard_keys::HELP, Box::new(Widget::Text { lines: wrapped })),
         ));
     }
     Widget::Stack {
@@ -717,14 +909,14 @@ impl WizardFrame {
 /// The section lines windowed into `budget` wrapped rows: skip the view's
 /// scroll offset, then honour `pin_visible` with the minimum scroll that keeps
 /// the pinned range visible.
-fn section_window(content: &WizardSectionContent, width: usize, budget: usize) -> Vec<String> {
+fn section_window(content: &WizardSectionContent, width: usize, budget: usize) -> Vec<WizardLine> {
     if budget == 0 || content.lines.is_empty() {
         return Vec::new();
     }
     let rows: Vec<usize> = content
         .lines
         .iter()
-        .map(|line| wizard_physical_rows(line, width))
+        .map(|line| line.physical_rows(width))
         .collect();
 
     // Range of line indices currently visible starting at `start`.
@@ -789,7 +981,14 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
         height,
     };
     // Claiming pass: the card claims its natural (unpinned) chrome extent.
-    let card_natural_lines = view.card.as_ref().map(|card| card.chrome_lines(width));
+    // The card chrome lowers here: the claim and the paint read the same
+    // bytes.
+    let card_natural_lines = view.card.as_ref().map(|card| {
+        card.chrome_lines(width)
+            .iter()
+            .map(lower_wizard_line)
+            .collect()
+    });
     let layout = widgets::layout(&project_wizard_root(view, width, card_natural_lines), frame);
     let rects = WizardRects {
         tab_row: layout.keyed(wizard_keys::TAB_ROW).unwrap_or_default(),
@@ -834,32 +1033,33 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
     // pinned-box discipline the conversation card follows).
     if rects.section.height > 0 {
         let mut window = section_window(&view.section, width, rects.section.height);
-        let used: usize = window
-            .iter()
-            .map(|line| wizard_physical_rows(line, width))
-            .sum();
+        let used: usize = window.iter().map(|line| line.physical_rows(width)).sum();
         for _ in used..rects.section.height {
-            window.push(String::new());
+            window.push(WizardLine::blank());
         }
-        push(&mut lines, &mut row_spans, &mut row, window);
+        let lowered: Vec<String> = window.iter().map(lower_wizard_line).collect();
+        push(&mut lines, &mut row_spans, &mut row, lowered);
     }
 
     // Card: pinned to the claimed box; help yielded while it owns the keys.
     if let Some(card) = &view.card {
         if rects.card.height > 0 {
-            let card_lines = card.lines_for_claim(width, rects.card.height);
+            let card_lines: Vec<String> = card
+                .lines_for_claim(width, rects.card.height)
+                .iter()
+                .map(lower_wizard_line)
+                .collect();
             push(&mut lines, &mut row_spans, &mut row, card_lines);
         }
     } else if rects.help.height > 0 {
         if let Some(help) = &view.help {
             // The same wrapped lines the claim was sized from, so the paint
             // and the claiming pass see one help block.
-            push(
-                &mut lines,
-                &mut row_spans,
-                &mut row,
-                wizard_wrap(help, width),
-            );
+            let wrapped: Vec<String> = wizard_wrap(help, width)
+                .iter()
+                .map(lower_wizard_line)
+                .collect();
+            push(&mut lines, &mut row_spans, &mut row, wrapped);
         }
     }
 
@@ -963,13 +1163,15 @@ impl WizardHost {
 mod tests {
     use super::*;
 
-    fn plain_view(section_lines: Vec<String>) -> WizardView {
+    fn plain_view(section_lines: Vec<&str>) -> WizardView {
         WizardView {
             title: " Finch Setup ".to_string(),
             tab_titles: vec!["Alpha ✓".to_string(), "Beta".to_string()],
             selected_tab: 1,
-            section: WizardSectionContent::plain(section_lines),
-            help: Some("help line".to_string()),
+            section: WizardSectionContent::plain(
+                section_lines.into_iter().map(WizardLine::plain).collect(),
+            ),
+            help: Some(WizardLine::plain("help line")),
             card: None,
         }
     }
@@ -980,7 +1182,7 @@ mod tests {
         // widget tree the conversation uses — the 3-row tab block and the
         // 1-row help claim natural extents, the section claims the leftover,
         // and the rects drive the paint.
-        let view = plain_view(vec!["provider one".to_string(), "provider two".to_string()]);
+        let view = plain_view(vec!["provider one", "provider two"]);
         let frame = plan_wizard_frame(&view, 80, 24);
         assert_eq!(
             (frame.rects.tab_row.y, frame.rects.tab_row.height),
@@ -1015,7 +1217,7 @@ mod tests {
     fn test_resize_reclaims_every_wizard_rect_without_stale_sizes() {
         // INVARIANT (#805): resize is another claiming pass; no widget keeps
         // a cell count from the previous frame.
-        let view = plain_view(vec!["content".to_string()]);
+        let view = plain_view(vec!["content"]);
         let narrow = plan_wizard_frame(&view, 40, 18);
         let wide = plan_wizard_frame(&view, 120, 40);
         assert_eq!(narrow.rects.section.width, 40, "narrow section width");
@@ -1041,12 +1243,15 @@ mod tests {
         // the card claims exactly the rows its content needs.
         let card = WizardCard::new(
             "Device sign-in",
-            vec!["Open: https://example/activate".to_string(), String::new()],
-            Some("Esc: Cancel".to_string()),
+            vec![
+                WizardLine::plain("Open: https://example/activate"),
+                WizardLine::blank(),
+            ],
+            Some(WizardLine::plain("Esc: Cancel")),
         );
         let view = WizardView {
             card: Some(card),
-            ..plain_view(vec!["section content".to_string()])
+            ..plain_view(vec!["section content"])
         };
         let frame = plan_wizard_frame(&view, 80, 24);
         let card_rect = frame.rects.card;
@@ -1095,8 +1300,10 @@ mod tests {
         // (#435 discipline applied to the wizard's cards).
         let card = WizardCard::new(
             "Add Cloud Provider",
-            (0..30).map(|i| format!("body line {i}")).collect(),
-            Some("Enter: adds · Esc: back".to_string()),
+            (0..30)
+                .map(|i| WizardLine::plain(format!("body line {i}")))
+                .collect(),
+            Some(WizardLine::plain("Enter: adds · Esc: back")),
         );
         let view = WizardView {
             card: Some(card),
@@ -1123,15 +1330,19 @@ mod tests {
     #[test]
     fn test_help_yields_and_returns_as_the_card_opens_and_closes() {
         let view_open = WizardView {
-            card: Some(WizardCard::new("Cancel setup?", vec![], Some("N".into()))),
-            ..plain_view(vec!["content".to_string()])
+            card: Some(WizardCard::new(
+                "Cancel setup?",
+                vec![],
+                Some(WizardLine::plain("N")),
+            )),
+            ..plain_view(vec!["content"])
         };
         let frame_open = plan_wizard_frame(&view_open, 80, 24);
         assert!(
             frame_open.rects.help.is_empty() && frame_open.rects.card.height > 0,
             "card open: help yields, card claims"
         );
-        let frame_closed = plan_wizard_frame(&plain_view(vec!["content".to_string()]), 80, 24);
+        let frame_closed = plan_wizard_frame(&plain_view(vec!["content"]), 80, 24);
         assert_eq!(
             (
                 frame_closed.rects.help.height,
@@ -1146,30 +1357,38 @@ mod tests {
     fn test_section_window_keeps_the_pinned_range_visible() {
         // The ListState guarantee from the old painter: the selected group
         // stays visible with the minimum scroll.
-        let lines: Vec<String> = (0..10).map(|i| format!("row {i:02}")).collect();
+        let lines: Vec<WizardLine> = (0..10)
+            .map(|i| WizardLine::plain(format!("row {i:02}")))
+            .collect();
         let content = WizardSectionContent {
             lines,
             scroll_rows: 0,
             pin_visible: Some((8, 10)),
         };
         let window = section_window(&content, 80, 4);
+        let texts: Vec<String> = window.iter().map(WizardLine::plain_text).collect();
         assert_eq!(
-            window,
+            texts,
             vec![
                 "row 06".to_string(),
                 "row 07".to_string(),
                 "row 08".to_string(),
                 "row 09".to_string()
             ],
-            "the window must slide so the pinned range is the last thing visible; got {window:?}"
+            "the window must slide so the pinned range is the last thing visible; got {texts:?}"
         );
         let pinned = WizardSectionContent {
-            lines: (0..10).map(|i| format!("row {i:02}")).collect(),
+            lines: (0..10)
+                .map(|i| WizardLine::plain(format!("row {i:02}")))
+                .collect(),
             scroll_rows: 0,
             pin_visible: Some((0, 2)),
         };
         let window = section_window(&pinned, 80, 4);
-        assert_eq!(window.first().map(String::as_str), Some("row 00"));
+        assert_eq!(
+            window.first().map(|line| line.plain_text()),
+            Some("row 00".to_string())
+        );
     }
 
     #[test]
@@ -1177,16 +1396,8 @@ mod tests {
         // The blit contract: the shadow buffer decides what a reader sees;
         // only lines whose visible rows changed are rewritten.
         let mut sink: Vec<u8> = Vec::new();
-        let frame_a = plan_wizard_frame(
-            &plain_view(vec!["A one".to_string(), "A two".to_string()]),
-            40,
-            8,
-        );
-        let frame_b = plan_wizard_frame(
-            &plain_view(vec!["A one".to_string(), "CHANGED two".to_string()]),
-            40,
-            8,
-        );
+        let frame_a = plan_wizard_frame(&plain_view(vec!["A one", "A two"]), 40, 8);
+        let frame_b = plan_wizard_frame(&plain_view(vec!["A one", "CHANGED two"]), 40, 8);
 
         let mut host = WizardHost::new();
         host.paint(&mut sink, &frame_a, 40, 8).unwrap();
@@ -1226,7 +1437,7 @@ mod tests {
 
     #[test]
     fn test_host_full_repaint_on_resize() {
-        let view = plain_view(vec!["content".to_string()]);
+        let view = plain_view(vec!["content"]);
         let frame = plan_wizard_frame(&view, 40, 8);
         let mut host = WizardHost::new();
         let mut sink: Vec<u8> = Vec::new();
@@ -1245,15 +1456,27 @@ mod tests {
     #[test]
     fn test_frame_rects_never_escape_the_frame() {
         // Hostile sizes: nothing may claim outside the offered box.
-        let card = WizardCard::new("T", (0..40).map(|i| format!("line {i}")).collect(), None);
+        let card = WizardCard::new(
+            "T",
+            (0..40)
+                .map(|i| WizardLine::plain(format!("line {i}")))
+                .collect(),
+            None,
+        );
         for (width, height) in [(1, 1), (2, 2), (10, 3), (80, 3), (20, 1)] {
             let view = WizardView {
                 card: Some(WizardCard::new(
                     card.title.clone(),
-                    (0..30).map(|i| format!("line {i}")).collect(),
-                    Some("Esc".into()),
+                    (0..30)
+                        .map(|i| WizardLine::plain(format!("line {i}")))
+                        .collect(),
+                    Some(WizardLine::plain("Esc")),
                 )),
-                ..plain_view((0..20).map(|i| format!("section {i}")).collect())
+                ..plain_view(
+                    (0..20)
+                        .map(|i| Box::leak(format!("section {i}").into_boxed_str()) as &str)
+                        .collect(),
+                )
             };
             let frame = plan_wizard_frame(&view, width, height);
             for (name, rect) in [
@@ -1488,7 +1711,7 @@ mod tests {
         }
     }
 
-    fn emoji_section_view(section_lines: Vec<String>) -> WizardView {
+    fn emoji_section_view(section_lines: Vec<WizardLine>) -> WizardView {
         WizardView {
             title: " Finch Setup ".to_string(),
             tab_titles: vec![
@@ -1500,7 +1723,7 @@ mod tests {
             ],
             selected_tab: 0,
             section: WizardSectionContent::plain(section_lines),
-            help: Some("↑/↓: Choose | Enter: Next | Tab: Next".to_string()),
+            help: Some(WizardLine::plain("↑/↓: Choose | Enter: Next | Tab: Next")),
             card: None,
         }
     }
@@ -1539,7 +1762,7 @@ mod tests {
         let width = 100;
         let height = 24;
         let tall = vec![wizard_centered(
-            &wizard_bold("Theme Selection", WizardColor::Blue),
+            wizard_bold("Theme Selection", WizardColor::Blue),
             width,
         )]
         .into_iter()
@@ -1551,7 +1774,7 @@ mod tests {
                 wizard_plain("Solarized - Solarized Dark color palette"),
                 wizard_plain(
                     "A much longer description line that must wrap inside the box \
-                              because it exceeds the interior width of the box by far",
+                                  because it exceeds the interior width of the box by far",
                 ),
             ],
             WizardColor::Blue,
@@ -1621,6 +1844,7 @@ mod tests {
             ] {
                 for (accent, bold) in [(WizardColor::Blue, false), (WizardColor::Cyan, true)] {
                     let border = wizard_title_border(title, width, accent, bold);
+                    let border = lower_wizard_line(&border);
                     let visible = wizard_visible_length(&border);
                     assert_eq!(
                         visible, width,
@@ -1644,7 +1868,7 @@ mod tests {
         for width in [1, 2, 4] {
             let border = wizard_title_border("Available Themes", width, WizardColor::Blue, false);
             assert!(
-                wizard_visible_length(&border) <= width,
+                border.display_length() <= width,
                 "border at width {width} overflows the frame: {border:?}"
             );
         }
@@ -1677,11 +1901,11 @@ mod tests {
         );
         for line in &boxed {
             assert!(
-                wizard_visible_length(line) <= width,
+                line.display_length() <= width,
                 "box row must fit the frame as a terminal measures it: {line:?}"
             );
             assert_eq!(
-                wizard_physical_rows(line, width),
+                line.physical_rows(width),
                 1,
                 "box row must occupy one terminal row: {line:?}"
             );
@@ -1690,7 +1914,7 @@ mod tests {
         // row past the frame; the widest row pins the two-column accounting.
         let body = &boxed[2];
         assert_eq!(
-            wizard_visible_length(body),
+            body.display_length(),
             width,
             "padded box rows fill the frame exactly; got {body:?}"
         );
@@ -1700,31 +1924,45 @@ mod tests {
     fn test_tab_row_marks_the_active_tab() {
         // INVARIANT (#926): the tab row renders every label and marks the
         // active section (bold + magenta) so navigation is visible.
-        let view = emoji_section_view(vec!["content".to_string()]);
+        let view = emoji_section_view(vec![WizardLine::plain("content")]);
         let selected = &view.tab_titles[view.selected_tab];
         let rows = tab_row_lines(&view, 100);
         let tabs = &rows[1];
         for name in &view.tab_titles {
             assert!(
-                tabs.contains(name.as_str()),
+                strip_ansi(tabs).contains(name.as_str()),
                 "tab label {name:?} must be painted in the tab row; got {tabs:?}"
             );
         }
-        let marked = wizard_bold(selected, WizardColor::Magenta);
+        // #1140: the active tab is bold magenta ON BLACK — visually distinct
+        // on any terminal background, not just a bold weight.
+        let marked = lower_wizard_line(&WizardLine(vec![WizardSpan::with_background(
+            selected.clone(),
+            WizardColor::Magenta,
+            WizardColor::Black,
+        )]));
         assert!(
             tabs.contains(&marked),
-            "the active tab must be the bold magenta span {marked:?}; tab row: {tabs:?}"
+            "the active tab must be the bold-magenta-on-black span {marked:?}; tab row: {tabs:?}"
         );
         let inactive = view
             .tab_titles
             .iter()
             .enumerate()
             .find(|(index, _)| *index != view.selected_tab)
-            .map(|(_, name)| wizard_line(name, WizardColor::Blue))
+            .map(|(_, name)| lower_wizard_line(&wizard_line(name, WizardColor::Blue)))
             .unwrap();
         assert!(
             tabs.contains(&inactive),
             "inactive tabs must not carry the active marking; tab row: {tabs:?}"
+        );
+        assert!(
+            tabs.contains("\x1b[1;35;40m"),
+            "the active tab's SGR carries bold + magenta + black background; got {tabs:?}"
+        );
+        assert!(
+            !tabs.contains("\x1b[1;35;40m\u{1b}[0m\u{1b}[1;35;40m"),
+            "exactly one tab wears the active marking; got {tabs:?}"
         );
     }
 }

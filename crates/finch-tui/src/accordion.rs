@@ -137,6 +137,7 @@ impl AccordionState {
         };
         lines.push(RenderedTranscriptLine {
             text: format!("{focus}{}{}{}", "  ".repeat(depth), marker, row.label),
+            spans: Vec::new(),
             row_id: expandable.then(|| row.id.clone()),
             row_expanded: expandable.then_some(expanded),
             role: Some(row.role),
@@ -157,6 +158,7 @@ impl AccordionState {
         for body in body {
             lines.push(RenderedTranscriptLine {
                 text: format!("{}  {}", "  ".repeat(depth), body),
+                spans: Vec::new(),
                 row_id: None,
                 row_expanded: None,
                 role: Some(row.role),
