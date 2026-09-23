@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,8 @@ const MAX_DISAMBIGUATION_BYTES: usize = 16 * 1024;
 const MAX_DISAMBIGUATION_CALLS: usize = 8;
 const DISAMBIGUATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SELECTED_PER_MENU: usize = 3;
-const MAX_RETURNED_SPANS: usize = 5;
+const DEFAULT_RESULT_LIMIT: usize = 5;
+const MAX_RETURNED_SPANS: usize = 10;
 const MAX_WHY_BYTES: usize = 256;
 const MAX_MECHANICAL_FILES: usize = 2_048;
 const MAX_MECHANICAL_BYTES: usize = 64 * 1024 * 1024;
@@ -78,7 +79,45 @@ struct CodeHopSpan {
     end_byte: usize,
     start_line: usize,
     end_line: usize,
+    symbol: Option<String>,
+    symbol_kind: Option<String>,
+    match_kind: &'static str,
     why: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FindCodeMatch(String, usize, usize, Option<String>, &'static str);
+
+#[derive(Debug, Serialize)]
+struct FindCodeResponse {
+    matches: Vec<FindCodeMatch>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchKind {
+    Function,
+    Type,
+    Module,
+    File,
+}
+
+#[derive(Debug, Clone)]
+struct SearchOptions {
+    path: Option<String>,
+    kind: Option<SearchKind>,
+    limit: usize,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            path: None,
+            kind: None,
+            limit: DEFAULT_RESULT_LIMIT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,7 +157,7 @@ struct RouteAttempt {
 
 /// Routes a question to a bounded set of exact source spans without returning bodies.
 #[derive(Clone)]
-pub struct CodeHopTool {
+pub struct FindCodeTool {
     workspace_root: PathBuf,
     state_directory: PathBuf,
     disambiguator: Option<Arc<dyn CodeHopDisambiguator>>,
@@ -126,7 +165,7 @@ pub struct CodeHopTool {
     disambiguation_timeout: Duration,
 }
 
-impl CodeHopTool {
+impl FindCodeTool {
     pub fn new(workspace_root: impl Into<PathBuf>, state_directory: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         Self {
@@ -158,7 +197,7 @@ impl CodeHopTool {
         });
         tokio::time::timeout(INDEX_WORK_TIMEOUT + Duration::from_secs(1), task)
             .await
-            .context("source-index work exceeded the code_hop deadline")?
+            .context("source-index work exceeded the find_code deadline")?
             .context("source-index worker task failed")?
     }
 
@@ -202,10 +241,17 @@ impl CodeHopTool {
         Ok((SourceResolver::new(&workspace_root)?, snapshot))
     }
 
+    #[cfg(test)]
     async fn execute_query(&self, query: &str) -> Result<CodeHopResult> {
+        self.execute_search(query, SearchOptions::default()).await
+    }
+
+    async fn execute_search(&self, query: &str, options: SearchOptions) -> Result<CodeHopResult> {
         for attempt in 0..2 {
             let (resolver, snapshot) = self.snapshot(attempt == 1).await?;
-            let routed = self.route_off_thread(query.to_string(), snapshot).await?;
+            let routed = self
+                .route_off_thread(query.to_string(), snapshot, options.clone())
+                .await?;
             let mut stale = false;
             for (source, span) in &routed.selected {
                 if resolver.read_span(source, span).is_err() {
@@ -217,23 +263,34 @@ impl CodeHopTool {
                 return Ok(routed.result);
             }
         }
-        bail!("source generation changed during both code_hop routing attempts")
+        bail!("source generation changed during both find_code routing attempts")
     }
 
     async fn route_off_thread(
         &self,
         query: String,
         snapshot: RepositorySnapshot,
+        options: SearchOptions,
     ) -> Result<RouteAttempt> {
         let tool = self.clone();
         let workspace_root = self.workspace_root.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let resolver = SourceResolver::new(workspace_root)?;
-            runtime.block_on(tool.route(&query, &resolver, &snapshot))
+            let snapshot = constrain_snapshot(snapshot, &options)?;
+            let require_structural_match =
+                options.kind.is_some_and(|kind| kind != SearchKind::File);
+            let mut routed = runtime.block_on(tool.route(
+                &query,
+                &resolver,
+                &snapshot,
+                require_structural_match,
+            ))?;
+            apply_result_options(&mut routed, &options)?;
+            Ok(routed)
         })
         .await
-        .context("code_hop routing worker failed")?
+        .context("find_code routing worker failed")?
     }
 
     async fn route(
@@ -241,8 +298,10 @@ impl CodeHopTool {
         query: &str,
         resolver: &SourceResolver,
         snapshot: &RepositorySnapshot,
+        require_structural_match: bool,
     ) -> Result<RouteAttempt> {
-        let (mechanical, partial_warning) = mechanical_route(query, resolver, snapshot)?;
+        let (mechanical, partial_warning) =
+            mechanical_route(query, resolver, snapshot, require_structural_match)?;
         if partial_warning.is_none() {
             if let Some(mechanical) = mechanical {
                 return Ok(mechanical);
@@ -355,7 +414,7 @@ impl CodeHopTool {
         }
 
         if chosen_files.is_empty() {
-            bail!("code_hop could not route the query to an indexed file")
+            bail!("find_code could not route the query to an indexed file")
         }
 
         let mut spans = Vec::new();
@@ -392,7 +451,18 @@ impl CodeHopTool {
                     "{} match for {} ({})",
                     selection.method, record.name, record.kind
                 ));
-                spans.push(span_result(&file.outline.source, &record.span, why));
+                spans.push(span_result(
+                    &file.outline.source,
+                    &record.span,
+                    Some(record.name.clone()),
+                    Some(record.kind.clone()),
+                    if selection.used_model {
+                        "inferred"
+                    } else {
+                        "lexical"
+                    },
+                    why,
+                ));
                 selected.push((file.outline.source.clone(), record.span.clone()));
                 if spans.len() == MAX_RETURNED_SPANS {
                     break;
@@ -406,7 +476,7 @@ impl CodeHopTool {
             .collect::<BTreeSet<_>>()
             .len();
         if spans.is_empty() {
-            bail!("code_hop found indexed files but no routable source spans")
+            bail!("find_code found indexed files but no routable source spans")
         }
         Ok(RouteAttempt {
             result: CodeHopResult {
@@ -477,10 +547,10 @@ impl CodeHopTool {
             };
             let request_bytes = serde_json::to_vec(&request)?;
             if request_bytes.len() > MAX_DISAMBIGUATION_BYTES {
-                bail!("code_hop sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
+                bail!("find_code sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
             }
             if metrics.disambiguation_calls >= MAX_DISAMBIGUATION_CALLS {
-                bail!("code_hop exceeded {MAX_DISAMBIGUATION_CALLS} disambiguation calls")
+                bail!("find_code exceeded {MAX_DISAMBIGUATION_CALLS} disambiguation calls")
             }
             metrics.disambiguation_input_bytes += request_bytes.len();
             metrics.routing_context_bytes += request_bytes.len();
@@ -533,9 +603,9 @@ struct Selection {
 }
 
 #[async_trait]
-impl Tool for CodeHopTool {
+impl Tool for FindCodeTool {
     fn name(&self) -> &str {
-        "code_hop"
+        "find_code"
     }
 
     fn effect(&self) -> ExecutionEffect {
@@ -543,14 +613,35 @@ impl Tool for CodeHopTool {
     }
 
     fn description(&self) -> &str {
-        "Route a code question through bounded repository sibling menus and return exact source spans without source bodies."
+        "Find code locations without returning file bodies. Query with a workspace path, identifier, quoted fixed string, or plain lexical terms; optional path, kind, and limit constrain results. Each match is [path,start_line,end_line,symbol,match_type]; read the returned range."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema::simple(vec![(
-            "query",
-            "Natural-language question, identifier, quoted literal, or workspace path",
-        )])
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: serde_json::json!({
+                "query": {
+                    "type": "string",
+                    "description": "Workspace path, identifier, quoted fixed string, or plain lexical search terms"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative file or directory scope"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["function", "type", "module", "file"],
+                    "description": "Optional structural result filter"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_RETURNED_SPANS,
+                    "description": "Maximum matches; defaults to 5"
+                }
+            }),
+            required: vec!["query".to_string()],
+        }
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
@@ -560,13 +651,15 @@ impl Tool for CodeHopTool {
             .context("Missing query parameter")?
             .trim();
         if query.is_empty() {
-            bail!("code_hop query must not be empty")
+            bail!("find_code query must not be empty")
         }
         if query.len() > MAX_QUERY_BYTES {
-            bail!("code_hop query exceeds {MAX_QUERY_BYTES} UTF-8 bytes")
+            bail!("find_code query exceeds {MAX_QUERY_BYTES} UTF-8 bytes")
         }
-        let result = self.execute_query(query).await?;
-        serde_json::to_string_pretty(&result).context("failed to serialize code_hop result")
+        let options = parse_search_options(&input)?;
+        let result = self.execute_search(query, options).await?;
+        serde_json::to_string(&compact_response(result))
+            .context("failed to serialize find_code result")
     }
 
     fn workspace_root(&self) -> Option<&Path> {
@@ -574,10 +667,212 @@ impl Tool for CodeHopTool {
     }
 }
 
+fn parse_search_options(input: &Value) -> Result<SearchOptions> {
+    let path = input
+        .get("path")
+        .map(|value| {
+            value
+                .as_str()
+                .context("find_code path must be a string")
+                .and_then(normalize_scope)
+        })
+        .transpose()?;
+    let kind = input
+        .get("kind")
+        .map(|value| match value.as_str() {
+            Some("function") => Ok(SearchKind::Function),
+            Some("type") => Ok(SearchKind::Type),
+            Some("module") => Ok(SearchKind::Module),
+            Some("file") => Ok(SearchKind::File),
+            _ => bail!("find_code kind must be function, type, module, or file"),
+        })
+        .transpose()?;
+    let limit = input
+        .get("limit")
+        .map(|value| {
+            let limit = value
+                .as_u64()
+                .context("find_code limit must be an integer")? as usize;
+            if !(1..=MAX_RETURNED_SPANS).contains(&limit) {
+                bail!("find_code limit must be between 1 and {MAX_RETURNED_SPANS}")
+            }
+            Ok(limit)
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
+    Ok(SearchOptions { path, kind, limit })
+}
+
+fn normalize_scope(value: &str) -> Result<String> {
+    let value = value.trim().trim_start_matches("./").trim_end_matches('/');
+    if value.is_empty() || value.len() > 4_096 {
+        bail!("find_code path must be a nonempty workspace-relative path of at most 4096 bytes")
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(part) => parts.push(
+                part.to_str()
+                    .context("find_code path must be valid UTF-8")?
+                    .to_string(),
+            ),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("find_code path must stay within the workspace")
+            }
+        }
+    }
+    if parts.is_empty() {
+        bail!("find_code path must name a workspace file or directory")
+    }
+    Ok(parts.join("/"))
+}
+
+fn constrain_snapshot(
+    mut snapshot: RepositorySnapshot,
+    options: &SearchOptions,
+) -> Result<RepositorySnapshot> {
+    if let Some(scope) = &options.path {
+        let prefix = format!("{scope}/");
+        snapshot.files.retain(|file| {
+            file.outline.source.path == *scope || file.outline.source.path.starts_with(&prefix)
+        });
+        if snapshot.files.is_empty() {
+            bail!("find_code path scope {scope:?} contains no indexed files")
+        }
+    }
+    if let Some(kind) = options.kind.filter(|kind| *kind != SearchKind::File) {
+        for file in &mut snapshot.files {
+            file.outline
+                .records
+                .retain(|record| record_matches_kind(&record.kind, kind));
+        }
+        snapshot
+            .files
+            .retain(|file| !file.outline.records.is_empty());
+        if snapshot.files.is_empty() {
+            bail!("find_code found no indexed records of the requested kind")
+        }
+    }
+
+    let allowed_files = snapshot
+        .files
+        .iter()
+        .map(|file| file.outline.source.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut allowed_directories = BTreeSet::from([String::new()]);
+    for path in &allowed_files {
+        for directory in Path::new(path).ancestors().skip(1) {
+            let directory = directory.to_str().unwrap_or_default().replace('\\', "/");
+            allowed_directories.insert(directory);
+        }
+    }
+    snapshot
+        .directories
+        .retain(|directory| allowed_directories.contains(&directory.path));
+    for directory in &mut snapshot.directories {
+        directory.children.retain(|child| {
+            let target = join_path(&directory.path, &child.name);
+            allowed_files.contains(&target) || allowed_directories.contains(&target)
+        });
+    }
+    Ok(snapshot)
+}
+
+fn record_matches_kind(kind: &str, requested: SearchKind) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    match requested {
+        SearchKind::Function => kind.contains("function") || kind.contains("method"),
+        SearchKind::Type => ["class", "struct", "enum", "interface", "trait", "type"]
+            .iter()
+            .any(|candidate| kind.contains(candidate)),
+        SearchKind::Module => ["module", "namespace", "package"]
+            .iter()
+            .any(|candidate| kind.contains(candidate)),
+        SearchKind::File => true,
+    }
+}
+
+fn apply_result_options(attempt: &mut RouteAttempt, options: &SearchOptions) -> Result<()> {
+    let mut seen_files = BTreeSet::new();
+    let mut kept_spans = Vec::new();
+    let mut kept_selected = Vec::new();
+    for (mut span, selected) in attempt
+        .result
+        .spans
+        .drain(..)
+        .zip(attempt.selected.drain(..))
+    {
+        let keep = match options.kind {
+            Some(SearchKind::File) => seen_files.insert(span.path.clone()),
+            Some(kind) => span
+                .symbol_kind
+                .as_deref()
+                .is_some_and(|actual| record_matches_kind(actual, kind)),
+            None => true,
+        };
+        if keep {
+            if options.kind == Some(SearchKind::File) {
+                span.symbol = None;
+                span.symbol_kind = None;
+                span.match_kind = "file";
+            }
+            kept_spans.push(span);
+            kept_selected.push(selected);
+            if kept_spans.len() == options.limit {
+                break;
+            }
+        }
+    }
+    if kept_spans.is_empty() {
+        bail!("find_code found no matches satisfying the requested constraints")
+    }
+    attempt.result.spans = kept_spans;
+    attempt.selected = kept_selected;
+    attempt.result.metrics.selected_files = attempt
+        .selected
+        .iter()
+        .map(|(source, _)| source.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    Ok(())
+}
+
+fn compact_response(result: CodeHopResult) -> FindCodeResponse {
+    let matches = result
+        .spans
+        .into_iter()
+        .map(|span| {
+            FindCodeMatch(
+                span.path,
+                span.start_line,
+                span.end_line,
+                span.symbol,
+                span.match_kind,
+            )
+        })
+        .collect();
+    let mut warnings = Vec::new();
+    for warning in result.warnings {
+        let compact = if warning.contains("scan bound") || warning.contains("partially routed") {
+            "partial"
+        } else if warning.contains("suffix matched multiple") {
+            "ambiguous path"
+        } else if warning.contains("disambiguator") {
+            "local disambiguation failed"
+        } else {
+            continue;
+        };
+        push_warning_once(&mut warnings, compact);
+    }
+    FindCodeResponse { matches, warnings }
+}
+
 fn mechanical_route(
     query: &str,
     resolver: &SourceResolver,
     snapshot: &RepositorySnapshot,
+    require_structural_match: bool,
 ) -> Result<(Option<RouteAttempt>, Option<String>)> {
     if looks_like_path(query) {
         let normalized = query.trim_matches(['\'', '"']).trim_start_matches("./");
@@ -660,6 +955,9 @@ fn mechanical_route(
                 .records
                 .iter()
                 .find(|record| record.span.start_byte <= start && record.span.end_byte >= end);
+            if require_structural_match && matched_record.is_none() {
+                continue;
+            }
             let span = matched_record
                 .map(|record| record.span.clone())
                 .unwrap_or(SourceSpan {
@@ -676,7 +974,18 @@ fn mechanical_route(
                 exhausted = true;
                 break;
             }
-            spans.push(span_result(&file.outline.source, &span, why));
+            spans.push(span_result(
+                &file.outline.source,
+                &span,
+                matched_record.map(|record| record.name.clone()),
+                matched_record.map(|record| record.kind.clone()),
+                if query.trim().starts_with('\'') || query.trim().starts_with('"') {
+                    "literal"
+                } else {
+                    "identifier"
+                },
+                why,
+            ));
             selected.push((file.outline.source.clone(), span));
         }
         if exhausted {
@@ -802,7 +1111,28 @@ fn mechanical_file_result(
     }
     let spans = selected_records
         .iter()
-        .map(|span| span_result(&file.outline.source, span, why.to_string()))
+        .map(|span| {
+            let symbol = file
+                .outline
+                .records
+                .iter()
+                .find(|record| record.span == *span)
+                .map(|record| record.name.clone());
+            let symbol_kind = file
+                .outline
+                .records
+                .iter()
+                .find(|record| record.span == *span)
+                .map(|record| record.kind.clone());
+            span_result(
+                &file.outline.source,
+                span,
+                symbol,
+                symbol_kind,
+                "path",
+                why.to_string(),
+            )
+        })
         .collect();
     let selected = selected_records
         .iter()
@@ -1040,13 +1370,23 @@ fn line_coordinates(text: &str, start_byte: usize, end_byte: usize) -> (usize, u
     (start_line, end_line)
 }
 
-fn span_result(source: &SourceIdentity, span: &SourceSpan, why: String) -> CodeHopSpan {
+fn span_result(
+    source: &SourceIdentity,
+    span: &SourceSpan,
+    symbol: Option<String>,
+    symbol_kind: Option<String>,
+    match_kind: &'static str,
+    why: String,
+) -> CodeHopSpan {
     CodeHopSpan {
         path: source.path.clone(),
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         start_line: span.start_line,
         end_line: span.end_line,
+        symbol,
+        symbol_kind,
+        match_kind,
         why: bounded_why(why),
     }
 }
@@ -1105,7 +1445,7 @@ mod tests {
         .expect("src agents");
         fs::write(
             root.path().join("src/claim.rs"),
-            "pub fn admit_claim() { let _ = \"TARGET_BODY_PRIVATE\"; }\n",
+            "pub struct Claim;\npub fn admit_claim() { let _ = \"TARGET_BODY_PRIVATE\"; }\n",
         )
         .expect("claim source");
         fs::write(
@@ -1175,7 +1515,7 @@ mod tests {
         snapshot: &RepositorySnapshot,
     ) -> BaselineMetrics {
         let mut files_read = 0;
-        let mut context_bytes = 0;
+        let mut returned = Vec::new();
         let mut task_success = false;
         let mut unsupported_language_success = false;
         for file in &snapshot.files {
@@ -1184,7 +1524,7 @@ mod tests {
                 .expect("baseline read");
             files_read += 1;
             if source.text.contains("admit_claim") {
-                context_bytes += source.text.len();
+                returned.push((file.outline.source.path.clone(), source.text.clone()));
                 task_success = file.outline.source.path == "src/claim.rs"
                     && file
                         .outline
@@ -1193,10 +1533,13 @@ mod tests {
                         .any(|record| record.name == "admit_claim");
             }
             if source.text.contains("unusual widgets") {
-                context_bytes += source.text.len();
+                returned.push((file.outline.source.path.clone(), source.text.clone()));
                 unsupported_language_success = file.outline.source.path == "fallback.txt";
             }
         }
+        let context_bytes = serde_json::to_vec(&returned)
+            .expect("naive grep/read response")
+            .len();
         BaselineMetrics {
             task_success,
             context_bytes,
@@ -1244,7 +1587,7 @@ mod tests {
     async fn test_natural_query_returns_claim_definition_without_body_or_distractor_secret() {
         let root = fixture();
         let state = state_parent();
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .execute_query("where does claim admission live?")
             .await
             .expect("code hop");
@@ -1261,13 +1604,14 @@ mod tests {
     async fn test_exact_headingless_path_returns_a_bounded_span() {
         let root = fixture();
         let state = state_parent();
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .execute_query("headingless.md")
             .await
             .expect("exact path route");
 
         assert_eq!(result.spans.len(), 1);
         assert_eq!(result.spans[0].path, "headingless.md");
+        assert_eq!(result.spans[0].match_kind, "path");
         assert_eq!(result.spans[0].start_byte, 0);
         assert!(result.spans[0].end_byte > 0);
         assert_eq!(result.metrics.body_bytes_disclosed, 0);
@@ -1374,7 +1718,7 @@ mod tests {
             preferred_name: "claim.rs".to_string(),
             invalid: false,
         });
-        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let tool = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .with_disambiguator(recorder.clone());
 
         let mechanical = tool
@@ -1391,6 +1735,14 @@ mod tests {
         assert_eq!(recorder.calls.load(Ordering::SeqCst), 0);
         assert!(
             literal.spans.iter().any(|span| span.path == "src/claim.rs"),
+            "spans: {:?}",
+            literal.spans
+        );
+        assert!(
+            literal
+                .spans
+                .iter()
+                .all(|span| span.match_kind == "literal"),
             "spans: {:?}",
             literal.spans
         );
@@ -1417,7 +1769,7 @@ mod tests {
             source: root.path().join("src/ambiguous.rs"),
             calls: AtomicUsize::new(0),
         });
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .with_disambiguator(disambiguator.clone())
             .execute_query("alpha beta")
             .await
@@ -1445,14 +1797,16 @@ mod tests {
             source: root.path().join("src/ambiguous.rs"),
             calls: AtomicUsize::new(0),
         });
-        let error = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let error = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .with_disambiguator(disambiguator.clone())
             .execute_query("alpha beta")
             .await
             .err()
             .expect("second race must fail closed");
 
-        assert!(error.to_string().contains("both code_hop routing attempts"));
+        assert!(error
+            .to_string()
+            .contains("both find_code routing attempts"));
         assert!(disambiguator.calls.load(Ordering::SeqCst) >= 2);
     }
 
@@ -1460,7 +1814,7 @@ mod tests {
     async fn test_ambiguous_suffix_path_returns_each_bounded_branch_and_trace() {
         let root = fixture();
         let state = state_parent();
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .execute_query("mod.rs")
             .await
             .expect("suffix path route");
@@ -1483,7 +1837,7 @@ mod tests {
     async fn test_ambiguous_natural_route_preserves_every_returned_branch_trace() {
         let root = fixture();
         let state = state_parent();
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .execute_query("left right modules?")
             .await
             .expect("ambiguous natural route");
@@ -1510,7 +1864,7 @@ mod tests {
     async fn test_repeat_route_is_byte_deterministic_and_records_comparative_metrics() {
         let root = fixture();
         let state = state_parent();
-        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"));
+        let tool = FindCodeTool::new(root.path(), state.path().join("source-index"));
         let first = tool
             .execute_query("where does claim admission live?")
             .await
@@ -1531,6 +1885,8 @@ mod tests {
         let snapshot = cache.load().expect("load cache").expect("snapshot");
         let naive = naive_grep_read_baseline(&resolver, &snapshot);
         let file_list = file_list_baseline(&snapshot);
+        let response = serde_json::to_vec(&compact_response(first.clone()))
+            .expect("complete find_code response");
         let unsupported = tool
             .execute_query("where are unusual widgets calibrated?")
             .await
@@ -1544,6 +1900,10 @@ mod tests {
             first.metrics.ranker_input_bytes + first.metrics.disambiguation_input_bytes
         );
         assert!(first.metrics.routing_context_bytes > 0);
+        let response_text = String::from_utf8(response.clone()).expect("UTF-8 response");
+        for internal in ["hop_path", "metrics", "provenance", "why", "cache"] {
+            assert!(!response_text.contains(internal), "{response_text}");
+        }
         assert!(naive.task_success);
         assert!(naive.unsupported_language_success);
         assert_eq!(naive.files_read, snapshot.files.len());
@@ -1559,6 +1919,7 @@ mod tests {
         );
         assert_eq!(file_list.files_read, 0);
         assert!(file_list.context_bytes > 0);
+        assert!(response.len() < naive.context_bytes, "{response_text}");
         assert!(unsupported
             .spans
             .iter()
@@ -1575,7 +1936,7 @@ mod tests {
             preferred_name: String::new(),
             invalid: true,
         });
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .with_disambiguator(recorder)
             .execute_query("alpha beta")
             .await
@@ -1617,7 +1978,7 @@ mod tests {
     async fn test_disambiguator_error_and_timeout_fall_back_with_warnings() {
         let root = fixture();
         let error_state = state_parent();
-        let failed = CodeHopTool::new(root.path(), error_state.path().join("source-index"))
+        let failed = FindCodeTool::new(root.path(), error_state.path().join("source-index"))
             .with_disambiguator(Arc::new(FailingDisambiguator))
             .execute_query("alpha beta")
             .await
@@ -1628,7 +1989,7 @@ mod tests {
             .any(|warning| warning.contains("failed")));
 
         let timeout_state = state_parent();
-        let timed_out = CodeHopTool::new(root.path(), timeout_state.path().join("source-index"))
+        let timed_out = FindCodeTool::new(root.path(), timeout_state.path().join("source-index"))
             .with_disambiguator(Arc::new(PendingDisambiguator))
             .with_disambiguation_timeout(Duration::from_millis(1))
             .execute_query("alpha beta")
@@ -1650,7 +2011,7 @@ mod tests {
             preferred_name: "left".to_string(),
             invalid: false,
         });
-        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let tool = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .with_disambiguator(recorder.clone());
         tool.execute_query("left right modules?")
             .await
@@ -1675,7 +2036,7 @@ mod tests {
     async fn test_unbound_ranker_warns_and_routes_unsupported_language_window() {
         let root = fixture();
         let state = state_parent();
-        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+        let result = FindCodeTool::new(root.path(), state.path().join("source-index"))
             .execute_query("where are unusual widgets calibrated?")
             .await
             .expect("fallback route");
@@ -1701,7 +2062,7 @@ mod tests {
         let root = fixture();
         let state = state_parent();
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(CodeHopTool::new(
+        registry.register(Box::new(FindCodeTool::new(
             root.path(),
             state.path().join("source-index"),
         )));
@@ -1717,7 +2078,7 @@ mod tests {
         let result = executor
             .execute_tool(
                 &ToolUse::new(
-                    "code_hop".to_string(),
+                    "find_code".to_string(),
                     serde_json::json!({"query": "admit_claim"}),
                 ),
                 None::<fn() -> anyhow::Result<()>>,
@@ -1735,7 +2096,103 @@ mod tests {
             "{}",
             result.content
         );
+        let value: Value = serde_json::from_str(&result.content).expect("compact JSON response");
+        let matches = value["matches"].as_array().expect("matches array");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0][0], "src/claim.rs");
+        assert_eq!(matches[0][3], "admit_claim");
+        assert_eq!(matches[0][4], "identifier");
         assert!(!result.content.contains("TARGET_BODY_PRIVATE"));
+        for internal in ["hop_path", "metrics", "provenance", "why", "cache"] {
+            assert!(!result.content.contains(internal), "{}", result.content);
+        }
+        assert!(result.content.len() < 128, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_structured_scope_kind_and_limit_constrain_results() {
+        let root = fixture();
+        let state = state_parent();
+        let tool = FindCodeTool::new(root.path(), state.path().join("source-index"));
+        let scoped = tool
+            .execute_search(
+                "route_left",
+                SearchOptions {
+                    path: Some("left".to_string()),
+                    kind: Some(SearchKind::Function),
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("scoped function search");
+        assert_eq!(scoped.spans.len(), 1);
+        assert_eq!(scoped.spans[0].path, "left/mod.rs");
+        assert_eq!(scoped.spans[0].symbol.as_deref(), Some("route_left"));
+
+        let type_only = tool
+            .execute_search(
+                "claim type",
+                SearchOptions {
+                    path: Some("src".to_string()),
+                    kind: Some(SearchKind::Type),
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("type-only search");
+        assert_eq!(type_only.spans.len(), 1);
+        assert_eq!(type_only.spans[0].symbol.as_deref(), Some("Claim"));
+
+        let exact_identifier_with_type_filter = tool
+            .execute_search(
+                "admit_claim",
+                SearchOptions {
+                    path: Some("src".to_string()),
+                    kind: Some(SearchKind::Type),
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("wrong-kind exact match falls through to structural routing");
+        assert_eq!(exact_identifier_with_type_filter.spans.len(), 1);
+        assert_eq!(
+            exact_identifier_with_type_filter.spans[0].symbol.as_deref(),
+            Some("Claim")
+        );
+
+        let file_only = tool
+            .execute_search(
+                "claim admission",
+                SearchOptions {
+                    path: Some("src".to_string()),
+                    kind: Some(SearchKind::File),
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("file-only search");
+        assert_eq!(file_only.spans.len(), 1);
+        assert_eq!(file_only.spans[0].path, "src/claim.rs");
+        assert!(file_only.spans[0].symbol.is_none());
+        assert_eq!(file_only.spans[0].match_kind, "file");
+    }
+
+    #[test]
+    fn test_find_code_schema_and_option_bounds_are_explicit() {
+        let tool = FindCodeTool::new(".", "state");
+        assert_eq!(tool.name(), "find_code");
+        let schema = tool.input_schema();
+        assert_eq!(schema.required, vec!["query"]);
+        for property in ["query", "path", "kind", "limit"] {
+            assert!(
+                schema.properties.get(property).is_some(),
+                "missing {property}"
+            );
+        }
+        assert!(parse_search_options(&serde_json::json!({"limit": 0})).is_err());
+        assert!(parse_search_options(&serde_json::json!({"limit": 11})).is_err());
+        assert!(parse_search_options(&serde_json::json!({"kind": "class"})).is_err());
+        assert!(parse_search_options(&serde_json::json!({"path": "../secret"})).is_err());
     }
 
     #[test]
@@ -1766,11 +2223,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "reports comparative latency; correctness is covered by deterministic tests"]
-    async fn benchmark_code_hop_routing_latency() {
+    async fn benchmark_find_code_routing_latency() {
         const ITERATIONS: usize = 25;
         let root = fixture();
         let state = state_parent();
-        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"));
+        let tool = FindCodeTool::new(root.path(), state.path().join("source-index"));
         let query = "where does claim admission live?";
         tool.execute_query(query)
             .await
@@ -1778,9 +2235,9 @@ mod tests {
 
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(tool.execute_query(query).await.expect("code_hop route"));
+            std::hint::black_box(tool.execute_query(query).await.expect("find_code route"));
         }
-        let code_hop_elapsed = start.elapsed();
+        let find_code_elapsed = start.elapsed();
 
         let resolver = SourceResolver::new(root.path()).expect("resolver");
         let cache =
@@ -1799,8 +2256,15 @@ mod tests {
         let file_list_elapsed = start.elapsed();
         let naive = naive_grep_read_baseline(&resolver, &snapshot);
         let file_list = file_list_baseline(&snapshot);
+        let response_bytes = serde_json::to_vec(&compact_response(
+            tool.execute_query(query)
+                .await
+                .expect("final find_code route"),
+        ))
+        .expect("complete response")
+        .len();
         eprintln!(
-            "{ITERATIONS} iterations: code_hop={code_hop_elapsed:?}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
+            "{ITERATIONS} iterations: find_code={find_code_elapsed:?} response_bytes={response_bytes}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
         );
     }
 }

@@ -2206,7 +2206,7 @@ async fn build_query_tool_executor(
     Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::{
-        BashTool, CodeHopTool, CodeOutlineTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool,
+        BashTool, CodeOutlineTool, EditTool, FindCodeTool, GlobTool, GrepTool, PatchTool, ReadTool,
         WebFetchTool, WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
@@ -2226,7 +2226,7 @@ async fn build_query_tool_executor(
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
     registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
-    registry.register(Box::new(CodeHopTool::new(
+    registry.register(Box::new(FindCodeTool::new(
         tool_workspace_root.clone(),
         source_index_state,
     )));

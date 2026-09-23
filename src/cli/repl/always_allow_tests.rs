@@ -5,19 +5,19 @@ use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
     invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
     AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BackgroundBashTool,
-    BackgroundPollTool, BackgroundStopTool, BashTool, CodeHopTool, CodeOutlineTool,
-    CreateMemoryTool, EditTool, EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool,
-    GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool,
-    PatchTool, PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool,
-    RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool,
-    Tool, ToolRegistry, WebFetchTool, WriteTool,
+    BackgroundPollTool, BackgroundStopTool, BashTool, CodeOutlineTool, CreateMemoryTool, EditTool,
+    EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
+    HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
+    PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
+    SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
+    ToolRegistry, WebFetchTool, WriteTool,
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
 use std::path::PathBuf;
 
 #[test]
-fn fallback_code_hop_state_is_derived_from_fallback_persistence_root() {
+fn fallback_find_code_state_is_derived_from_fallback_persistence_root() {
     let primary = PathBuf::from("/home/example/.finch/tool_patterns.json");
     let fallback = PathBuf::from("/tmp/finch_patterns_fallback.json");
     assert_eq!(
@@ -97,7 +97,7 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(CodeOutlineTool::new(std::env::current_dir().expect("cwd"))),
-        Box::new(CodeHopTool::new(
+        Box::new(FindCodeTool::new(
             std::env::current_dir().expect("cwd"),
             memory_dir.path().join("source-index"),
         )),
@@ -277,7 +277,7 @@ fn pre_refactor_effect(tool_name: &str) -> ExecutionEffect {
 /// Unclassified just because the legacy arms used stale spellings.
 fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
     match tool_name {
-        "code_outline" | "code_hop" => ExecutionEffect::WorkspaceRead,
+        "code_outline" | "find_code" => ExecutionEffect::WorkspaceRead,
         "todo_read" => ExecutionEffect::VmRead,
         "todo_write" | "present_plan" | "ask_user_question" => ExecutionEffect::VmWrite,
         // Issue #754: the background bash sibling carries bash's worst-case
@@ -540,7 +540,7 @@ fn test_always_allow_list_pre_approves_named_reads_and_agent_control() {
         "glob",
         "grep",
         "code_outline",
-        "code_hop",
+        "find_code",
         "web_fetch",
         "search_memory",
         "inspect_memory",

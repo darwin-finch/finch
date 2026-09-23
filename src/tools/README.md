@@ -21,15 +21,13 @@ Two callers show how those pieces meet:
    for it from the shared executor alone.
 
 The code-retrieval implementations are adapters over `source_index`. `code_outline` supplies one
-path and returns its bounded structural envelope. `code_hop` refreshes the injected derived cache,
-tries bounded fixed-string routing for paths/identifiers/literals, then walks sibling directory and
-symbol menus with deterministic lexical scoring. It returns exact spans for a later `read`, never
-source bodies. Ambiguous hops stay ranker-only with a warning today; a future local `compress`
-adapter may receive only opaque candidate ids, labels, and the documented bounded `AGENTS.md` lead.
-Corpus structure, source generations, parser selection, and cache format do not belong in the
-executor. Result metrics separately count exact serialized ranker-input and disambiguation-input
-bytes; the ignored benchmark compares end-to-end routing with task-scored grep/read and file-list
-baselines rather than treating timing as a correctness assertion.
+path and returns its bounded structural envelope. `find_code` accepts a path, identifier, quoted
+fixed string, or plain lexical terms, with optional path, structural-kind, and result-count
+constraints. It returns a compact list of exact line ranges for a later `read`, never source bodies
+or its internal traversal and cache diagnostics. Plain terms use deterministic string similarity;
+this is not vector or semantic search. Corpus structure, source generations, parser selection, and
+cache format do not belong in the executor. The ignored benchmark compares the complete serialized
+response and end-to-end latency with task-scored grep/read and file-list baselines.
 
 Use the [agent contract](AGENTS.md) for authority and dependency rules, [`mod.rs`](mod.rs) for
 the flat root-package facade, and the [MCP guide](mcp/README.md) for external connections.

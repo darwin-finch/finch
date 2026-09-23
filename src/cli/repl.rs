@@ -33,8 +33,8 @@ use crate::tools::{
     resolve_workspace_root, PermissionManager, PermissionRule, ToolExecutor, ToolRegistry,
 };
 use crate::tools::{
-    AnsibleTool, AskUserQuestionTool, BashTool, CodeHopTool, CodeOutlineTool, EditTool,
-    EnterPlanModeTool, GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool,
+    AnsibleTool, AskUserQuestionTool, BashTool, CodeOutlineTool, EditTool, EnterPlanModeTool,
+    FindCodeTool, GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool,
     RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
@@ -84,7 +84,7 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "code_outline",
-    "code_hop",
+    "find_code",
     "web_fetch",
     "search_memory",
     "inspect_memory",
@@ -1080,7 +1080,7 @@ impl Repl {
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
-        tool_registry.register(Box::new(CodeHopTool::new(
+        tool_registry.register(Box::new(FindCodeTool::new(
             tool_workspace_root.clone(),
             source_index_state.clone(),
         )));
@@ -1248,7 +1248,7 @@ impl Repl {
                     std::env::temp_dir().join("finch_patterns_fallback.json");
                 let fallback_source_index_state =
                     source_index_state_path(&fallback_patterns_path, "finch-source-index-fallback");
-                fallback_registry.register(Box::new(CodeHopTool::new(
+                fallback_registry.register(Box::new(FindCodeTool::new(
                     tool_workspace_root.clone(),
                     fallback_source_index_state,
                 )));

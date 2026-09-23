@@ -28,7 +28,7 @@ pub use implementations::restart::DeferredFrontendRestart;
 pub use implementations::{
     AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool, AnsibleTool,
     AskUserQuestionTool, BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool,
-    CodeHopTool, CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
+    CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool, FindCodeTool,
     GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
     InspectMemoryTool, InspectProgramTool, InspectVmWordTool, InspectWordTool, LLMDelegationTool,
     ListRecentTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool,

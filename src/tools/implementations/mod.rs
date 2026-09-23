@@ -75,7 +75,7 @@ pub mod spawn;
 pub use ask_user_question::AskUserQuestionTool;
 pub use background::{BackgroundBashTool, BackgroundPollTool, BackgroundStopTool};
 pub use bash::BashTool;
-pub use code_hop::CodeHopTool;
+pub use code_hop::FindCodeTool;
 pub use code_outline::CodeOutlineTool;
 pub use edit::EditTool;
 pub use enter_plan_mode::EnterPlanModeTool;

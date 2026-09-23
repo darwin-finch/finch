@@ -38,8 +38,8 @@ may depend on any composition-root subsystem, and each of those may import `tool
 reverse edge is why implementations stay here. The shared surface they implement
 (`finch-tools-api`) depends on nothing in the root crate; add no new dependency from the API
 crate to any `src/` subsystem, and add no new authority surface outside it. `code_outline` and
-`code_hop` form a one-way `tools -> source_index` dependency: source identity, parsing,
-provenance, cache format, and stale-result semantics remain owned by that capsule. Hop ranking and
+`find_code` form a one-way `tools -> source_index` dependency: source identity, parsing,
+provenance, cache format, and stale-result semantics remain owned by that capsule. Lexical ranking and
 the optional application-specific local disambiguation port stay here; they must not enter
 `source_index` or depend on MemTree.
 
@@ -61,8 +61,9 @@ means “any path under the workspace root”, not “any string”. Bash has no
 `code_outline.path` is a discrete path slot and receives the same containment decision as
 `read.file_path`; `ToolExecutor::new` rejects any path-bound tool whose declared execution root
 differs from the permission root, and the implementation capability-opens beneath that same root.
-`code_hop` has no caller-selected path slot: it can inspect only the workspace capability injected
-at construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived
+`find_code.path`, when supplied, is a workspace-contained permission slot and an in-memory scope on
+the already capability-bounded index; omitting it searches only the workspace injected at
+construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived
 index bytes under the separately injected application-state capability; it cannot mutate source,
 conversation, provider, or approval state. Current roots bind no disambiguator, so ambiguity never
 reconstructs or calls a provider. Index freshness/build work runs off the async worker thread and
