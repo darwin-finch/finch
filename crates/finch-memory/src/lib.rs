@@ -2524,6 +2524,16 @@ impl MemorySystem {
         for node in nodes.values_mut() {
             node.children.sort_unstable();
         }
+        // The tree is fully assembled now -- every `children` list is
+        // correct, so `children.is_empty()` reliably means "leaf" -- which is
+        // exactly the condition `find_leaf_by_text`'s dedup index requires.
+        // Rebuilding here, rather than threading updates through the batch
+        // loop above, avoids re-deriving hydration's own partially-linked
+        // intermediate states: a node's `children` field seeded from
+        // `edges` in `hydrate_batches` can look nonempty before its own
+        // children have landed, which would wrongly exclude it here if this
+        // ran mid-load instead of after linking.
+        guard.rebuild_text_index();
     }
 
     /// Every parent's child list, as one compact query.
@@ -2754,6 +2764,12 @@ impl MemorySystem {
 
         // Advance next_id past all loaded IDs
         tree.set_next_id(max_id + 1);
+
+        // Both passes are done, so every `children` list is final and
+        // `find_leaf_by_text`'s dedup index can be rebuilt from it -- the
+        // same "tree is now fully assembled" point `link_loaded_children`
+        // rebuilds it from on the batched hydration path.
+        tree.rebuild_text_index();
 
         Ok(())
     }
@@ -3518,6 +3534,75 @@ mod tests {
         assert_eq!(
             sources, 3,
             "each conversation that produced the memory keeps its own source row"
+        );
+
+        Ok(())
+    }
+
+    /// `find_leaf_by_text`'s O(1) `text_index` is rebuilt once hydration
+    /// finishes (`link_loaded_children` on the background batch path), not
+    /// carried over from the writing process and not built incrementally as
+    /// batches land. A bug that only populated it from
+    /// `attach_child`/`promote_leaf`, and never from a load, would pass every
+    /// in-session dedup test while silently never deduplicating against
+    /// anything the store already had on disk at startup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dedup_matches_a_leaf_hydrated_in_the_background_not_only_a_fresh_one(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+
+        let text = substantive("hydration-dedup");
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            memory
+                .insert_conversation("system", &text, None, None)
+                .await?;
+        }
+
+        // Reopen on a multi-thread runtime: `MemorySystem::new` spawns the
+        // background loader (`hydrate_in_background`) instead of loading
+        // synchronously, so this exercises `hydrate_batches` /
+        // `link_loaded_children` rather than `load_tree_from_db_conn`, which
+        // has its own equivalent rebuild and its own coverage in
+        // `test_every_persisted_column_survives_a_reload`.
+        let reopened = MemorySystem::new(config)?;
+        assert!(
+            reopened.hydration_task.is_some(),
+            "this test exists to cover the backgrounded hydration path; a \
+             synchronous load here would make it redundant with the \
+             `load_tree_from_db_conn` coverage elsewhere"
+        );
+        reopened.ensure_hydrated().await?;
+
+        let node_count_after_hydration = reopened.tree.lock().await.all_nodes().len();
+
+        // The same fact again, never inserted this session -- only ever
+        // hydrated from disk.
+        reopened
+            .insert_conversation("system", &text, None, None)
+            .await?;
+
+        let node_count_after_repeat = reopened.tree.lock().await.all_nodes().len();
+        assert_eq!(
+            node_count_after_repeat, node_count_after_hydration,
+            "re-inserting text that was only ever hydrated (never inserted \
+             this session) must dedup against the hydrated leaf, not attach \
+             a second node; {node_count_after_hydration} nodes after \
+             hydration, {node_count_after_repeat} after the repeat"
+        );
+
+        let results = reopened.query_with_sources(&text, Some(5)).await?;
+        let matching = results.iter().filter(|r| r.text == text).count();
+        assert_eq!(
+            matching, 1,
+            "the hydrated fact must remain one memory after a same-session \
+             repeat, not split into a hydrated leaf plus a freshly-attached \
+             duplicate; got {results:?}"
         );
 
         Ok(())

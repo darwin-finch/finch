@@ -109,6 +109,18 @@ pub struct MemTree {
     root: NodeId,
     nodes: HashMap<NodeId, TreeNode>,
     next_id: NodeId,
+    /// Leaf text to leaf id, kept in sync with `nodes` at every point a leaf's
+    /// identity changes: `attach_child` (new leaf), `promote_leaf` (the
+    /// matched leaf's old id stops being a leaf; its text moves to a new
+    /// node id), and hydration (rebuilt wholesale once the loaded tree is
+    /// fully assembled, via `rebuild_text_index`).
+    ///
+    /// This is what makes `find_leaf_by_text` O(1) instead of an O(node
+    /// count) scan of `nodes` on every insert. It is derived, in-memory-only
+    /// state -- never persisted, never read back from `tree_nodes` -- so it
+    /// carries no format compatibility burden and hydration always rebuilds
+    /// it from the loaded nodes rather than trusting a stored copy.
+    text_index: HashMap<String, NodeId>,
 }
 
 impl MemTree {
@@ -147,6 +159,10 @@ impl MemTree {
             // the table before any child does: `parent_id` is a
             // self-referential foreign key and SQLite enforces it immediately.
             dirty: HashSet::from([root_id]),
+            // The root is never a leaf (it is excluded by id in
+            // `find_leaf_by_text`/`rebuild_text_index`), so it never belongs
+            // in the index.
+            text_index: HashMap::new(),
         }
     }
 
@@ -166,11 +182,46 @@ impl MemTree {
     /// Only leaves are considered. Internal nodes hold aggregated content, so
     /// matching against them would attach new information to a summary rather
     /// than to the memory it summarizes.
+    ///
+    /// O(1) via `text_index`, which every mutator that changes leaf identity
+    /// keeps current -- this used to be a linear scan of `nodes` run on every
+    /// insert (the dedup check in `insert_with_effect`), which measured
+    /// 35.9M text-equality probes and 0.558s cumulative at 8,767 stored
+    /// entries: cheap at that scale, but O(current node count) per call makes
+    /// cumulative insert cost O(N^2) as the store grows.
     fn find_leaf_by_text(&self, text: &str) -> Option<NodeId> {
-        self.nodes
-            .values()
-            .find(|node| node.id != self.root && node.children.is_empty() && node.text == text)
-            .map(|node| node.id)
+        self.text_index.get(text).copied()
+    }
+
+    /// Rebuild `text_index` from scratch against the current `nodes` map.
+    ///
+    /// Only for hydration, which replaces (or repopulates) the node set in
+    /// bulk from durable rows outside `attach_child`/`promote_leaf`. Building
+    /// from the final loaded state -- once every parent/child link is correct
+    /// and `children.is_empty()` reliably means "leaf" -- avoids tracking the
+    /// index through hydration's own intermediate, partially-linked states.
+    ///
+    /// A legacy store can hold several leaves with identical text --
+    /// `retrieve`'s own doc comment records this as measured, not
+    /// hypothetical: "5 distinct texts occupied 11 of 27 nodes" on the
+    /// reference host, from data written before insertion enforced
+    /// uniqueness. `entry().or_insert()` below keeps the FIRST leaf
+    /// encountered in `nodes`' iteration order for a given text, which is
+    /// what the O(node count) scan this replaced did too
+    /// (`.values().find(...)` stops at the first match). A plain
+    /// `.collect::<HashMap<_, _>>()` would instead keep the LAST leaf written
+    /// for that text -- still just "a" leaf, not a wrong one structurally,
+    /// but a different one than pre-change code would have picked, which
+    /// silently changes which node a duplicate insert dedupes against and
+    /// reattributes provenance to.
+    pub(crate) fn rebuild_text_index(&mut self) {
+        self.text_index.clear();
+        for node in self.nodes.values() {
+            if node.id == self.root || !node.children.is_empty() {
+                continue;
+            }
+            self.text_index.entry(node.text.clone()).or_insert(node.id);
+        }
     }
 
     /// Insert text with embedding into the tree.
@@ -347,6 +398,7 @@ impl MemTree {
         let new_id = self.next_id;
         self.next_id += 1;
 
+        self.text_index.insert(text.clone(), new_id);
         self.nodes.insert(
             new_id,
             TreeNode {
@@ -419,7 +471,7 @@ impl MemTree {
                 id: moved_id,
                 parent: Some(leaf_id),
                 children: Vec::new(),
-                text: original_text,
+                text: original_text.clone(),
                 embedding: original_embedding,
                 level: level + 1,
                 created_at: original_created_at,
@@ -433,13 +485,26 @@ impl MemTree {
                 id: inserted_id,
                 parent: Some(leaf_id),
                 children: Vec::new(),
-                text,
+                text: text.clone(),
                 embedding,
                 level: level + 1,
                 created_at,
                 importance,
             },
         );
+
+        // `leaf_id` stops being a leaf here -- it becomes the internal node
+        // holding these two new children -- so its old index entry (if any;
+        // hydration can produce internal nodes that were never indexed as
+        // leaves in this session) is stale. Re-point the original text to
+        // where it actually lives now, `moved_id`, and add the new text.
+        // Getting this backwards leaves `leaf_id` in the index: it no longer
+        // identifies a leaf, so a genuine duplicate of `original_text` would
+        // either silently fail to dedup or corrupt the internal node's
+        // provisional-summary text via `insert_with_effect`'s importance-bump
+        // path.
+        self.text_index.insert(original_text, moved_id);
+        self.text_index.insert(text, inserted_id);
 
         self.dirty.insert(moved_id);
         self.dirty.insert(inserted_id);
@@ -1197,6 +1262,177 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tree.get_node(first).unwrap().importance, 3);
+    }
+
+    #[test]
+    fn test_text_index_matches_a_linear_scan_across_ordinary_inserts() {
+        // Independent oracle: exactly the linear scan `find_leaf_by_text`
+        // used before `text_index` replaced it. Every insert below re-derives
+        // the answer both ways and compares them, so a bug that leaves
+        // `text_index` out of sync on some insert path (attach, promotion,
+        // dedup-without-mutation) shows up on the very insert that desyncs
+        // it, not only on a later probe that happens to hit the gap.
+        fn linear_scan(tree: &MemTree, text: &str) -> Option<NodeId> {
+            tree.all_nodes()
+                .values()
+                .find(|node| node.id != 0 && node.children.is_empty() && node.text == text)
+                .map(|node| node.id)
+        }
+
+        let mut tree = MemTree::new_with_dim(16);
+        let texts = [
+            "alpha",
+            "beta",
+            "alpha",
+            "gamma variant one",
+            "gamma variant two",
+            "delta",
+            "alpha",
+            "epsilon",
+            "beta",
+            "gamma variant one",
+        ];
+
+        for (i, text) in texts.iter().enumerate() {
+            let axis = i % 16;
+            let noise = 0.01 * i as f32;
+            tree.insert(text.to_string(), vec_on(axis, 16, noise), 1)
+                .unwrap();
+
+            for probe in texts {
+                assert_eq!(
+                    tree.find_leaf_by_text(probe),
+                    linear_scan(&tree, probe),
+                    "text_index must agree with a linear scan of `nodes` for \
+                     {probe:?} after inserting {text:?} (insert #{i})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_promote_leaf_repoints_dedup_index_to_the_moved_child() {
+        let mut tree = MemTree::new_with_dim(8);
+
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+
+        // Close enough to clear the root-depth threshold and land on `first`,
+        // which promotes it: `first`'s old id becomes the internal node, its
+        // text moves to a NEW leaf id, and "second memory" becomes that
+        // leaf's sibling. Same fixture as
+        // `test_matched_leaf_is_promoted_to_parent_of_siblings`.
+        let effect = tree
+            .insert_with_effect("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+        let (promoted, moved) = effect
+            .promotion
+            .expect("this embedding pair must trigger a promotion for the test to be meaningful");
+        assert_eq!(
+            promoted, first,
+            "sanity: the promoted node is the original leaf id"
+        );
+        assert_ne!(
+            moved, first,
+            "sanity: the original text must live at a NEW node id after promotion"
+        );
+
+        // Re-insert the original text. If the index still maps "first
+        // memory" to `leaf_id` (now an internal, non-leaf node), this either
+        // fails to dedup (attaches or promotes again) or resolves to the
+        // stale internal node -- the more dangerous failure, because it looks
+        // like a successful dedup while silently applying the
+        // importance-bump path in `insert_with_effect` to an internal node's
+        // provisional-summary text instead of a real leaf.
+        let repeat = tree
+            .insert_with_effect("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        assert!(
+            repeat.deduplicated,
+            "identical text must dedup, not re-promote or re-attach: {repeat:?}"
+        );
+        assert_eq!(
+            repeat.node, moved,
+            "the repeat must resolve to `moved` ({moved}, the leaf's new \
+             location after promotion), not `first` ({first}, its stale \
+             pre-promotion id, which is now an internal node): {repeat:?}"
+        );
+        assert_ne!(
+            repeat.node, first,
+            "resolving to the stale pre-promotion id is exactly the bug this \
+             test guards against: {repeat:?}"
+        );
+
+        assert_eq!(
+            tree.size(),
+            3,
+            "a correct dedup attaches nothing new; tree must still hold \
+             exactly the promoted internal node plus its two children"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_text_index_resolves_duplicate_leaf_text_like_the_old_linear_scan() {
+        // Legacy stores can hold several leaves with identical text: the same
+        // condition `test_retrieve_deduplicates_identical_text_across_leaves`
+        // exercises for `retrieve` (reference host measured "5 distinct
+        // texts occupied 11 of 27 nodes"). Constructed directly, bypassing
+        // insert-time dedup, the way that legacy data actually arrived --
+        // `MemTree::insert` itself never produces two leaves with the same
+        // text.
+        //
+        // `.values().find(...)` -- the O(node count) scan `find_leaf_by_text`
+        // used to run directly -- always resolves to the FIRST of the three
+        // in `nodes`' iteration order. `rebuild_text_index` must resolve to
+        // that same node, not to whichever one a plain
+        // `.collect::<HashMap<_, _>>()` (last write wins) would happen to
+        // keep.
+        fn linear_scan(tree: &MemTree, text: &str) -> Option<NodeId> {
+            tree.all_nodes()
+                .values()
+                .find(|node| node.id != 0 && node.children.is_empty() && node.text == text)
+                .map(|node| node.id)
+        }
+
+        let mut tree = MemTree::new_with_dim(8);
+        {
+            let nodes = tree.all_nodes_mut();
+            for (id, axis) in [(1u64, 0usize), (2u64, 3usize), (3u64, 6usize)] {
+                nodes.insert(
+                    id,
+                    TreeNode {
+                        id,
+                        parent: Some(0),
+                        children: Vec::new(),
+                        text: "the signing key lives in the vault".to_string(),
+                        embedding: vec_on(axis, 8, 0.0),
+                        level: 1,
+                        created_at: 0,
+                        importance: 1,
+                    },
+                );
+                nodes.get_mut(&0).expect("root").children.push(id);
+            }
+        }
+        tree.set_next_id(4);
+
+        let oracle = linear_scan(&tree, "the signing key lives in the vault").expect(
+            "the linear-scan oracle must find one of the three duplicate \
+             leaves constructed above",
+        );
+
+        tree.rebuild_text_index();
+
+        assert_eq!(
+            tree.find_leaf_by_text("the signing key lives in the vault"),
+            Some(oracle),
+            "rebuild_text_index must resolve a duplicate-text legacy leaf \
+             set the same way the linear scan it replaced would (first \
+             match in `nodes`' iteration order); a naive `.collect()` keeps \
+             the last one instead, silently changing which node a \
+             duplicate insert dedupes against"
+        );
     }
 
     #[test]
