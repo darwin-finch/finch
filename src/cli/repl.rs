@@ -9,7 +9,7 @@ use crossterm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,8 +34,8 @@ use crate::tools::{
 };
 use crate::tools::{
     AnsibleTool, AskUserQuestionTool, BashTool, CodeOutlineTool, EditTool, EnterPlanModeTool,
-    GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
-    WebFetchTool, WriteTool,
+    FindCodeTool, GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool,
+    RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -84,6 +84,7 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "code_outline",
+    "find_code",
     "web_fetch",
     "search_memory",
     "inspect_memory",
@@ -326,6 +327,7 @@ mod disabled_training_tests {
             })),
             models_dir: Some(temp.path().join("models")),
             patterns_path: temp.path().join("tool-patterns.json"),
+            source_index_state: Some(temp.path().join("source-index")),
             conversation_log_path: temp.path().join("unused-conversations.jsonl"),
             active_persona: crate::config::Persona::load_builtin("default"),
             workspace_root,
@@ -695,10 +697,15 @@ struct ReplInitialization {
     input_handler_factory: Option<Box<dyn FnOnce() -> Result<InputHandler>>>,
     models_dir: Option<PathBuf>,
     patterns_path: PathBuf,
+    source_index_state: Option<PathBuf>,
     conversation_log_path: PathBuf,
     active_persona: Result<crate::config::Persona>,
     workspace_root: PathBuf,
     project_program_root: Option<PathBuf>,
+}
+
+fn source_index_state_for_home(home: Option<&Path>) -> Option<PathBuf> {
+    home.map(|root| root.join(".finch/source-index"))
 }
 
 impl ReplInitialization {
@@ -715,6 +722,7 @@ impl ReplInitialization {
                 .as_ref()
                 .map(|root| root.join(".finch/tool_patterns.json"))
                 .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json")),
+            source_index_state: source_index_state_for_home(home.as_deref()),
             conversation_log_path: home
                 .map(|root| root.join(".finch/conversations.jsonl"))
                 .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
@@ -912,6 +920,7 @@ impl Repl {
             input_handler_factory,
             models_dir,
             patterns_path,
+            source_index_state,
             conversation_log_path,
             active_persona,
             workspace_root,
@@ -1142,6 +1151,12 @@ impl Repl {
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+        if let Some(source_index_state) = &source_index_state {
+            tool_registry.register(Box::new(FindCodeTool::new(
+                tool_workspace_root.clone(),
+                source_index_state.clone(),
+            )));
+        }
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
         // Background command lifecycle (#754): one manager per session, so
@@ -1302,6 +1317,14 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry
                     .register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+                let fallback_patterns_path =
+                    std::env::temp_dir().join("finch_patterns_fallback.json");
+                if let Some(source_index_state) = &source_index_state {
+                    fallback_registry.register(Box::new(FindCodeTool::new(
+                        tool_workspace_root.clone(),
+                        source_index_state.clone(),
+                    )));
+                }
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
                 let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());
@@ -1341,7 +1364,7 @@ impl Repl {
                     PermissionManager::new()
                         .with_workspace_root(tool_workspace_root.clone())
                         .with_default_rule(PermissionRule::Allow),
-                    std::env::temp_dir().join("finch_patterns_fallback.json"),
+                    fallback_patterns_path,
                 )
                 .expect("Failed to create fallback tool executor")
             });

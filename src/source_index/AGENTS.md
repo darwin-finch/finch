@@ -25,11 +25,21 @@ canonical-workspace namespace prevents cross-workspace reuse; every span is tied
 stale validation and span consumption fail closed after mutation. Repository membership follows
 tracked Git index entries plus untracked `--exclude-standard` entries, without user/global ignore
 files; symlinks and gitlinks are excluded. Cache publication serializes builders and atomically
-replaces one complete image, preserving the previous generation on failure. Byte ranges are
+replaces one complete image, preserving the previous generation on failure. Publication is
+confirmed by fsyncing a directory descriptor freshly reopened beneath the held capability, never
+the traversal descriptor itself: `open_dir_nofollow` may yield an O_PATH descriptor on Linux,
+which permits fstat but rejects fsync (EBADF). Byte ranges are
 zero-based and half-open over UTF-8 source bytes; line ranges are one-based and inclusive.
 Structural outlines never copy comments, string contents, documentation, or function bodies. The
 first prose paragraph of `AGENTS.md`, capped at 512 UTF-8 bytes and carrying identity plus span, is
 the only body text persisted for routing. Tree-sitter parse errors are reported in the envelope.
+
+The state capability may create its own final directory leaf with Unix mode 0700. It admits at
+most eight workspace cache images and 512 MiB of regular cache/lock/temporary leaves, rejects
+matching symlink or non-regular leaves, and never deletes another workspace's image automatically.
+A fixed private state lock serializes shared-quota accounting with publication across workspaces.
+Bounded callers may additionally impose one aggregate source-byte budget and cooperative deadline
+across initial parsing plus generation validation.
 
 **Extension rules:** add a grammar only with deterministic fixtures proving definitions and spans.
 Change storage schema, serialized-outline, and outline algorithm versions independently. Keep cache records body-free;

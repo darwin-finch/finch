@@ -6,23 +6,11 @@ use std::path::PathBuf;
 
 /// Execution target for inference (hardware where code runs)
 ///
-/// The active llama.cpp chat path accepts `Auto` (allow GPU offload) or `Cpu`.
-/// CoreML and CUDA values remain deserializable so setup can migrate old chat
-/// configurations; they are rejected by the llama.cpp loader.
+/// The llama.cpp chat path accepts `Auto` (allow GPU offload) or `Cpu`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionTarget {
-    /// Legacy CoreML target retained so old chat configuration can be migrated.
-    #[cfg(target_os = "macos")]
-    #[serde(rename = "coreml")]
-    CoreML,
-
-    /// NVIDIA CUDA GPU (Windows/Linux, fast)
-    #[cfg(feature = "cuda")]
-    #[serde(rename = "cuda")]
-    Cuda,
-
-    /// CPU execution provider (universal fallback)
+    /// Disable GPU offload.
     #[serde(rename = "cpu")]
     Cpu,
 
@@ -39,10 +27,6 @@ impl ExecutionTarget {
     /// Get short name for logging
     pub fn name(&self) -> &'static str {
         match self {
-            #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => "CoreML (Auto: ANE/GPU/CPU)",
-            #[cfg(feature = "cuda")]
-            ExecutionTarget::Cuda => "CUDA (GPU)",
             ExecutionTarget::Cpu => "CPU",
             ExecutionTarget::Auto => "Auto",
         }
@@ -51,12 +35,8 @@ impl ExecutionTarget {
     /// Get human-readable description
     pub fn description(&self) -> &'static str {
         match self {
-            #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => "CoreML with automatic compute-unit selection (ANE/GPU/CPU)",
-            #[cfg(feature = "cuda")]
-            ExecutionTarget::Cuda => "NVIDIA GPU (CUDA) - Very fast on supported hardware",
-            ExecutionTarget::Cpu => "CPU (Universal Fallback) - Slower than specialized hardware",
-            ExecutionTarget::Auto => "Auto-detect best available target",
+            ExecutionTarget::Cpu => "CPU only (GPU offload disabled)",
+            ExecutionTarget::Auto => "Allow llama.cpp to offload to an available GPU",
         }
     }
 
@@ -64,36 +44,12 @@ impl ExecutionTarget {
     ///
     /// Simplified legacy compatibility query; this is not llama.cpp capability detection.
     pub fn is_available(&self) -> bool {
-        match self {
-            #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => true, // Assume CoreML available on all macOS
-            #[cfg(feature = "cuda")]
-            ExecutionTarget::Cuda => true, // Assume CUDA available if compiled with feature
-            ExecutionTarget::Cpu => true,  // Always available
-            ExecutionTarget::Auto => true, // Always available
-        }
+        true
     }
 
     /// Get list of available execution targets on this system
     pub fn available_targets() -> Vec<ExecutionTarget> {
-        let mut targets = vec![];
-
-        #[cfg(target_os = "macos")]
-        {
-            if ExecutionTarget::CoreML.is_available() {
-                targets.push(ExecutionTarget::CoreML);
-            }
-        }
-
-        #[cfg(feature = "cuda")]
-        {
-            if ExecutionTarget::Cuda.is_available() {
-                targets.push(ExecutionTarget::Cuda);
-            }
-        }
-
-        targets.push(ExecutionTarget::Cpu);
-        targets
+        vec![ExecutionTarget::Auto, ExecutionTarget::Cpu]
     }
 
     /// Legacy alias for available_targets()
@@ -104,65 +60,8 @@ impl ExecutionTarget {
 
     /// Select best available execution target automatically
     pub fn auto_select() -> ExecutionTarget {
-        #[cfg(target_os = "macos")]
-        {
-            if ExecutionTarget::CoreML.is_available() {
-                return ExecutionTarget::CoreML;
-            }
-        }
-
-        #[cfg(feature = "cuda")]
-        {
-            if ExecutionTarget::Cuda.is_available() {
-                return ExecutionTarget::Cuda;
-            }
-        }
-
         ExecutionTarget::Cpu
     }
-}
-
-/// Compute units Finch asks CoreML to consider.
-///
-/// This is a requested policy, not evidence that CoreML assigned any operation
-/// to a particular device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CoreMlComputeUnits {
-    /// Allow CoreML to choose among all compatible compute units.
-    #[default]
-    All,
-    /// Restrict CoreML to CPU and compatible Apple Neural Engine devices.
-    CpuAndNeuralEngine,
-    /// Restrict CoreML to CPU and compatible GPU devices.
-    CpuAndGpu,
-    /// Restrict CoreML to CPU.
-    CpuOnly,
-}
-
-impl CoreMlComputeUnits {
-    /// Human-readable requested policy. This does not describe observed placement.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::All => "Auto: ANE/GPU/CPU",
-            Self::CpuAndNeuralEngine => "CPU + ANE",
-            Self::CpuAndGpu => "CPU + GPU",
-            Self::CpuOnly => "CPU only",
-        }
-    }
-}
-
-/// CoreML execution-provider options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct CoreMlConfig {
-    /// Requested CoreML compute units.
-    pub compute_units: CoreMlComputeUnits,
-    /// Ask CoreML to emit a compute plan and Finch to attempt a private,
-    /// process-scoped capture while the session is created.
-    pub profile_compute_plan: bool,
-    /// Allow CoreML to take nodes inside Loop, Scan, and If subgraphs.
-    pub enable_subgraphs: bool,
 }
 
 /// Backend configuration for model inference
@@ -176,13 +75,9 @@ pub struct BackendConfig {
     #[serde(default = "default_inference_provider")]
     pub inference_provider: crate::models::InferenceProvider,
 
-    /// Selected execution target (where code runs: CoreML/CPU/CUDA)
+    /// Selected llama.cpp offload policy.
     #[serde(alias = "device")] // Support old config field name
     pub execution_target: ExecutionTarget,
-
-    /// Requested CoreML policy and opt-in diagnostics.
-    #[serde(default)]
-    pub coreml: CoreMlConfig,
 
     /// Model family to use (Qwen2, Gemma2, etc.)
     #[serde(default = "default_model_family")]
@@ -191,9 +86,6 @@ pub struct BackendConfig {
     /// Model size variant (Small, Medium, Large, XLarge)
     #[serde(default = "default_model_size")]
     pub model_size: ModelSize,
-
-    /// Legacy repository override retained only for migration diagnostics.
-    pub model_repo: Option<String>,
 
     /// Existing absolute GGUF path for a custom local chat model.
     pub model_path: Option<PathBuf>,
@@ -232,14 +124,7 @@ fn default_model_size() -> ModelSize {
 }
 
 fn default_fallback_chain() -> Vec<ExecutionTarget> {
-    #[cfg(target_os = "macos")]
-    return vec![ExecutionTarget::CoreML, ExecutionTarget::Cpu];
-
-    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
-    return vec![ExecutionTarget::Cuda, ExecutionTarget::Cpu];
-
-    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
-    return vec![ExecutionTarget::Cpu];
+    vec![ExecutionTarget::Auto, ExecutionTarget::Cpu]
 }
 
 /// Custom deserializer for fallback_chain that filters out deprecated/invalid entries (like "metal")
@@ -255,20 +140,8 @@ where
     let mut targets = Vec::new();
     for s in strings {
         match s.as_str() {
-            "coreml" => {
-                #[cfg(target_os = "macos")]
-                targets.push(ExecutionTarget::CoreML);
-            }
             "cpu" => targets.push(ExecutionTarget::Cpu),
-            "cuda" => {
-                #[cfg(feature = "cuda")]
-                targets.push(ExecutionTarget::Cuda);
-            }
             "auto" => targets.push(ExecutionTarget::Auto),
-            "metal" => {
-                // Silently skip deprecated "metal" variant
-                tracing::warn!("Skipping deprecated 'metal' execution target in config");
-            }
             other => {
                 tracing::warn!(
                     "Skipping unknown execution target '{}' in fallback_chain",
@@ -292,10 +165,8 @@ impl Default for BackendConfig {
             enabled: default_backend_enabled(),
             inference_provider: default_inference_provider(),
             execution_target: ExecutionTarget::Auto,
-            coreml: CoreMlConfig::default(),
             model_family: default_model_family(),
             model_size: default_model_size(),
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             fallback_chain: default_fallback_chain(),
@@ -308,11 +179,6 @@ impl Default for BackendConfig {
 impl BackendConfig {
     /// Describe the requested target policy without implying observed placement.
     pub fn requested_target_name(&self) -> String {
-        #[cfg(target_os = "macos")]
-        if self.execution_target == ExecutionTarget::CoreML {
-            return format!("CoreML ({})", self.coreml.compute_units.name());
-        }
-
         self.execution_target.name().to_string()
     }
 
@@ -322,10 +188,8 @@ impl BackendConfig {
             enabled: true,
             inference_provider: default_inference_provider(),
             execution_target: target,
-            coreml: CoreMlConfig::default(),
             model_family: default_model_family(),
             model_size: default_model_size(),
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             fallback_chain: default_fallback_chain(),
@@ -346,23 +210,14 @@ impl BackendConfig {
             enabled: true,
             inference_provider: default_inference_provider(),
             execution_target: target,
-            coreml: CoreMlConfig::default(),
             model_family: family,
             model_size: size,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             fallback_chain: default_fallback_chain(),
             #[allow(deprecated)]
             device: None,
         }
-    }
-
-    /// Get the model repository for the selected target and model size
-    ///
-    /// Legacy repository accessor retained for config callers during migration.
-    pub fn get_model_repo(&self, _model_size: &str) -> String {
-        self.model_repo.clone().unwrap_or_default()
     }
 
     /// Get the effective execution target (resolve Auto to concrete target)
@@ -429,77 +284,15 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn test_coreml_auto_label_is_truthful() {
-        let name = ExecutionTarget::CoreML.name();
-        let description = ExecutionTarget::CoreML.description();
-        assert!(name.contains("Auto"));
-        assert!(!name.contains("ANE only"));
-        assert!(!description.to_ascii_lowercase().contains("fastest"));
-
-        let config = BackendConfig::with_target(ExecutionTarget::CoreML);
-        assert_eq!(config.requested_target_name(), "CoreML (Auto: ANE/GPU/CPU)");
-
-        for (policy, expected) in [
-            (CoreMlComputeUnits::All, "Auto: ANE/GPU/CPU"),
-            (CoreMlComputeUnits::CpuAndNeuralEngine, "CPU + ANE"),
-            (CoreMlComputeUnits::CpuAndGpu, "CPU + GPU"),
-            (CoreMlComputeUnits::CpuOnly, "CPU only"),
-        ] {
-            let mut config = BackendConfig::with_target(ExecutionTarget::CoreML);
-            config.coreml.compute_units = policy;
-            assert_eq!(
-                config.requested_target_name(),
-                format!("CoreML ({expected})")
+    fn removed_execution_targets_are_rejected() {
+        for removed in ["coreml", "cuda", "metal"] {
+            let encoded = format!("\"{removed}\"");
+            assert!(
+                serde_json::from_str::<ExecutionTarget>(&encoded).is_err(),
+                "removed target {removed} must not deserialize"
             );
         }
-    }
-
-    #[test]
-    fn test_live_configuration_guide_does_not_claim_auto_is_ane_only_or_fastest() {
-        let guide = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/docs/CONFIGURATION.md"
-        ));
-        assert!(!guide.contains("Use Apple Neural Engine"));
-        assert!(!guide.contains("ANE unavailable"));
-        assert!(!guide.contains("CoreML (ANE)"));
-        assert!(!guide.contains("Fastest on Mac"));
-        assert!(guide.contains("does not prove where"));
-    }
-
-    #[test]
-    fn test_coreml_compute_units_serde_round_trip() {
-        #[derive(Debug, Serialize, Deserialize, PartialEq)]
-        struct Wrapper {
-            compute_units: CoreMlComputeUnits,
-        }
-
-        for policy in [
-            CoreMlComputeUnits::All,
-            CoreMlComputeUnits::CpuAndNeuralEngine,
-            CoreMlComputeUnits::CpuAndGpu,
-            CoreMlComputeUnits::CpuOnly,
-        ] {
-            let original = Wrapper {
-                compute_units: policy,
-            };
-            let encoded = toml::to_string(&original).unwrap();
-            assert_eq!(toml::from_str::<Wrapper>(&encoded).unwrap(), original);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_legacy_coreml_target_defaults_to_all_compute_units() {
-        let legacy = r#"
-            execution_target = "coreml"
-            model_family = "Qwen2"
-            model_size = "Medium"
-        "#;
-        let decoded: BackendConfig = toml::from_str(legacy).unwrap();
-        assert_eq!(decoded.coreml, CoreMlConfig::default());
     }
 
     #[test]

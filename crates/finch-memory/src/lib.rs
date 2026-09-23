@@ -279,6 +279,36 @@ pub struct MemoryConfig {
     /// recalibrate per engine once real distributions are measured, not as
     /// an empirically-derived constant.
     pub min_relevance_score: f32,
+    /// Turn-level injection gate (#1134): when `Some(t)`, a recall turn
+    /// whose *best* retrieved weighted score (`cosine_similarity *
+    /// importance_boost` -- the same quantity `min_relevance_score` is
+    /// applied to) does not reach `t` injects nothing at all.
+    /// `query_with_sources` returns an empty set before the per-result
+    /// floor is applied.
+    ///
+    /// The per-result floor answers "is this one result strong enough to
+    /// inject"; nearest-neighbour retrieval always returns `k` candidates,
+    /// so that floor alone cannot keep a turn that needs no memory context
+    /// from receiving `k` weak-but-individually-qualifying matches. This
+    /// knob answers the turn-level question: if even the best memory
+    /// retrieval holds for this query is weak, nothing about the turn is
+    /// memory-relevant.
+    ///
+    /// Defaults to `None` (gate off): recall behaves exactly as it did
+    /// before this knob existed. When set, the value only changes behavior
+    /// if it is strictly greater than `min_relevance_score` -- a turn floor
+    /// at or below the per-result floor can never skip a turn the
+    /// per-result floor would not have emptied anyway.
+    ///
+    /// Like `min_relevance_score`, this is an uncalibrated starting point,
+    /// not an empirically-derived constant, and is equally unvalidated
+    /// against either engine's score distribution. Two disclosed
+    /// consequences of enabling it: a skipped turn hands the committed
+    /// recall set in the query processor an empty recall set, which counts
+    /// toward `stale_after_turns` aging; and every skip is logged (`info`)
+    /// with the turn floor, the best score, and the candidate count, so the
+    /// decision is visible in the trace.
+    pub min_turn_relevance_score: Option<f32>,
     /// Maximum number of memories the committed (Brain-persisted, byte-
     /// stable) recall set may hold at once. A newly-qualifying memory
     /// above this cap must out-score the current lowest-scoring committed
@@ -303,9 +333,49 @@ impl Default for MemoryConfig {
             use_neural_embeddings: true,
             embedding_cache_dir: home.join(".finch").join("embeddings"),
             min_relevance_score: 0.15,
+            min_turn_relevance_score: None,
             max_committed_memories: 8,
             stale_after_turns: 20,
         }
+    }
+}
+
+/// The turn-level injection decision for one recall turn (#1134).
+///
+/// Produced by [`turn_injection_decision`] from the configured turn floor
+/// and this turn's retrieved scores, consumed and logged by
+/// `query_with_sources` before the per-result floor is applied. The numbers
+/// are retained so the log line discloses exactly what the decision was
+/// made from: the tested decision and the emitted diagnostics cannot drift
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TurnInjectionDecision {
+    /// The configured turn floor; `None` when the gate is disabled.
+    pub(crate) turn_floor: Option<f32>,
+    /// The highest weighted score among this turn's retrieved candidates;
+    /// `None` when retrieval returned nothing.
+    pub(crate) best_score: Option<f32>,
+}
+
+impl TurnInjectionDecision {
+    /// Whether this turn injects nothing: the gate is configured and even
+    /// the best retrieved score falls strictly below it. An empty retrieval
+    /// has nothing to gate, and a disabled gate never skips.
+    pub(crate) fn skips(&self) -> bool {
+        match (self.turn_floor, self.best_score) {
+            (Some(turn_floor), Some(best_score)) => best_score < turn_floor,
+            _ => false,
+        }
+    }
+}
+
+/// Decide whether anything at all should be injected for this turn, before
+/// the per-result relevance floor is applied (#1134). `scores` are the
+/// weighted scores of this turn's retrieved candidates in any order.
+fn turn_injection_decision(turn_floor: Option<f32>, scores: &[f32]) -> TurnInjectionDecision {
+    TurnInjectionDecision {
+        turn_floor,
+        best_score: scores.iter().copied().reduce(f32::max),
     }
 }
 
@@ -1687,13 +1757,47 @@ impl MemorySystem {
             tree.retrieve(&query_embedding, k)
         };
         let min_score = self.config.min_relevance_score;
+
+        // The turn-level gate (#1134): decide whether anything at all is
+        // injected this turn BEFORE the per-result floor is applied. The
+        // per-result floor answers "is this one result strong enough";
+        // nearest-neighbour retrieval always returns k candidates, so it
+        // cannot answer "does this turn need memory context at all" -- a
+        // query needing no memory context received k weak-but-qualifying
+        // matches injected every turn.
+        let retrieved_scores: Vec<f32> = retrieved.iter().map(|(_, _, score)| *score).collect();
+        let decision =
+            turn_injection_decision(self.config.min_turn_relevance_score, &retrieved_scores);
+        if let Some(turn_floor) = decision.turn_floor {
+            if decision.skips() {
+                // `skips` is only true when `best_score` is `Some`.
+                let best_score = decision.best_score.unwrap_or_default();
+                tracing::info!(
+                    turn_floor,
+                    best_score,
+                    candidates = retrieved.len(),
+                    "memory turn-level injection gate skipped recall: best weighted \
+                     score below the turn floor, injecting nothing this turn"
+                );
+                return Ok(Vec::new());
+            }
+            tracing::debug!(
+                turn_floor,
+                best_score = ?decision.best_score,
+                "memory turn-level injection gate allowed recall: falling through \
+                 to the per-result relevance floor"
+            );
+        }
+
         let conn = self.db.lock().await;
         let mut results = Vec::with_capacity(retrieved.len());
+        let mut dropped_below_floor = 0usize;
         for (node_id, text, score) in retrieved {
             // Applied once here so every caller (rendered `query`/`query_recall`
             // and any direct `query_with_sources` caller) drops a weak match
             // instead of only ever capping by count (#940).
             if score < min_score {
+                dropped_below_floor += 1;
                 continue;
             }
             let source = source_metadata_for_node(&conn, node_id)?;
@@ -1709,7 +1813,12 @@ impl MemorySystem {
                 source,
             });
         }
-        tracing::debug!("Memory query returned {} sourced results", results.len());
+        tracing::debug!(
+            "Memory query returned {} sourced results ({} dropped below the \
+             per-result floor)",
+            results.len(),
+            dropped_below_floor
+        );
         Ok(results)
     }
 
@@ -5679,4 +5788,268 @@ mod tests {
         );
         Ok(())
     }
+
+    // --- turn-level injection gate (#1134) ---
+
+    /// A stored fact and a probe over part of its vocabulary: the probe
+    /// retrieves the fact at a weighted score that clears the per-result
+    /// floor (0.15) -- the leak the turn-level gate exists for -- while
+    /// sitting strictly below self-similarity.
+    const GATE_SEED: &str = "The deploy key for the production environment lives \
+         in the Employee vault under the Finch signing item, not in the repository.";
+    const GATE_PROBE: &str = "The deploy key for the production environment lives \
+         in the Employee vault";
+    /// A deliberately weak-but-not-sub-floor memory. The TF-IDF fallback
+    /// embeds character n-grams, so even a topic-disjoint English sentence
+    /// shares enough letter pairs to clear the 0.15 default floor -- which
+    /// is exactly the leak family the turn-level gate addresses. Weak
+    /// entries are measured, never assumed: tests set floors just above a
+    /// baseline-measured score instead of guessing one.
+    const GATE_WEAK_MEMORY: &str =
+        "Zebra herds migrate across vast savannah plains during seasonal rains.";
+
+    /// Seed one fresh store with [`GATE_SEED`] and recall [`GATE_PROBE`],
+    /// returning the recalled best weighted score and result count. The
+    /// TF-IDF engine is deterministic over identical content, so two
+    /// identically-seeded stores produce identical scores -- the only
+    /// difference between two such recalls is the knob's value.
+    async fn seeded_recall_probe(min_turn: Option<f32>) -> Result<(f32, usize)> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            min_turn_relevance_score: min_turn,
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        let results = memory.query_with_sources(GATE_PROBE, Some(5)).await?;
+        let best = results.iter().map(|r| r.score).fold(0.0_f32, f32::max);
+        Ok((best, results.len()))
+    }
+
+    /// The leak precondition every behavior test below reasons from: under
+    /// the default configuration the probe's best result clears the 0.15
+    /// per-result floor and is injected. If this ever fails, the turn-gate
+    /// tests no longer exercise the ticket's scenario and must be re-based
+    /// on a probe that does.
+    async fn assert_leak_precondition_holds() -> Result<f32> {
+        let (best, count) = seeded_recall_probe(None).await?;
+        assert!(
+            count >= 1 && best > 0.15,
+            "leak precondition failed: the probe must recall the seeded memory \
+             at a best score above the 0.15 per-result floor (else the \
+             per-result filter alone already empties the turn and there is \
+             nothing for the turn gate to skip); observed count {count}, best \
+             score {best}"
+        );
+        Ok(best)
+    }
+
+    #[tokio::test]
+    async fn test_turn_gate_skips_injection_when_best_score_below_turn_floor() -> Result<()> {
+        let best = assert_leak_precondition_holds().await?;
+        let turn_floor = best + 0.02;
+        let (_, count) = seeded_recall_probe(Some(turn_floor)).await?;
+        assert_eq!(
+            count, 0,
+            "the turn-level gate must skip this turn: the probe's best score \
+             {best} cleared the 0.15 per-result floor (so the per-result \
+             filter alone would have injected it) but sits below the turn \
+             floor {turn_floor}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_turn_gate_allows_strong_results_and_keeps_per_result_floor() -> Result<()> {
+        // Baseline (gate off, default floors): both memories recall against
+        // the seed query. The weak memory clears the 0.15 default floor --
+        // which is why it leaks into turns today -- while sitting far below
+        // the seed's self-similarity. Its score is measured, not assumed,
+        // so the gated store's per-result floor can be set just above it.
+        let baseline_store = NamedTempFile::new()?;
+        let baseline = MemorySystem::new(MemoryConfig {
+            db_path: baseline_store.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        baseline
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        baseline
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        let base_results = baseline.query_with_sources(GATE_SEED, Some(5)).await?;
+        let weak_score = base_results
+            .iter()
+            .find(|r| r.text.contains("Zebra"))
+            .map(|r| r.score)
+            .with_context(|| {
+                format!(
+                    "the weak memory must recall in the baseline so its score \
+                     can be measured; got {base_results:?}"
+                )
+            })?;
+        assert!(
+            weak_score >= 0.15,
+            "the weak memory must clear the 0.15 default per-result floor for \
+             this test to exercise the leak family (a sub-floor entry would \
+             be dropped before the turn gate matters); measured {weak_score}"
+        );
+
+        // Gated store, identically seeded: the turn floor sits below the
+        // seed's self-similarity (the turn is allowed) while the per-result
+        // floor sits just above the measured weak score (the weak entry
+        // must still drop).
+        let gated_store = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: gated_store.path().to_path_buf(),
+            min_relevance_score: weak_score + 0.02,
+            min_turn_relevance_score: Some(0.5),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        memory
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+
+        let results = memory.query_with_sources(GATE_SEED, Some(5)).await?;
+        assert!(
+            !results.is_empty(),
+            "the gate must allow this turn: the seed's self-similar best score \
+             (~1.2 with the conversation boost) clears the 0.5 turn floor; got \
+             {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| !r.text.contains("Zebra")),
+            "on an allowed turn the per-result floor must still drop the weak \
+             entry (measured score {weak_score} vs floor {}); got texts {:?}",
+            weak_score + 0.02,
+            results.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        assert!(
+            results.iter().all(|r| r.score >= weak_score + 0.02),
+            "every allowed injection must clear the configured per-result \
+             floor; got {:?}",
+            results
+                .iter()
+                .map(|r| (&r.text, r.score))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_turn_gate_default_off_preserves_current_injection() -> Result<()> {
+        assert!(
+            MemoryConfig::default().min_turn_relevance_score.is_none(),
+            "the turn-level gate must ship disabled: MemoryConfig::default() \
+             carries min_turn_relevance_score = None so existing behavior is \
+             unchanged until the knob is set"
+        );
+        let (best, count) = seeded_recall_probe(None).await?;
+        assert!(
+            count >= 1 && best > 0.15,
+            "with the gate off (default), recall must behave exactly as before \
+             the gate existed: the probe recalls its seed (count {count}, best \
+             score {best})"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_turn_gate_knob_flips_the_injection_decision() -> Result<()> {
+        // Identically-seeded stores; TF-IDF scoring is deterministic over
+        // identical content, so the only difference between the two recalls
+        // below is the knob's value. This is the flip itself.
+        let (best_off, count_off) = seeded_recall_probe(None).await?;
+        assert!(
+            count_off >= 1,
+            "the off-half of the flip must inject (count {count_off}, best \
+             score {best_off}) or the flip proves nothing"
+        );
+        let (_, count_on) = seeded_recall_probe(Some(best_off + 0.02)).await?;
+        assert_eq!(
+            count_on,
+            0,
+            "the same query on the same content must inject with the knob off \
+             (count {count_off}) and inject nothing with the knob at {} \
+             (count {count_on})",
+            best_off + 0.02
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_turn_injection_decision_no_gate_never_skips() {
+        let empty = turn_injection_decision(None, &[]);
+        assert!(
+            !empty.skips(),
+            "a disabled gate must never skip a turn; decision {empty:?}"
+        );
+        let strong = turn_injection_decision(None, &[0.99]);
+        assert!(
+            !strong.skips(),
+            "a disabled gate must never skip a turn; decision {strong:?}"
+        );
+        let mixed = turn_injection_decision(None, &[0.1, 0.9, 0.3]);
+        assert!(
+            !mixed.skips(),
+            "a disabled gate must never skip a turn; decision {mixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_turn_injection_decision_empty_retrieval_never_skips() {
+        let decision = turn_injection_decision(Some(0.01), &[]);
+        assert!(
+            !decision.skips(),
+            "an empty retrieval has nothing to gate, so even a low floor must \
+             not skip; decision {decision:?}"
+        );
+        assert_eq!(
+            decision.best_score, None,
+            "an empty retrieval must report no best score, not a fabricated one"
+        );
+    }
+
+    #[test]
+    fn test_turn_injection_decision_best_strictly_below_floor_skips() {
+        let decision = turn_injection_decision(Some(0.6), &[0.4, 0.2, 0.55]);
+        assert!(
+            decision.skips(),
+            "the best score 0.55 sits strictly below the turn floor 0.6, so \
+             the turn must skip; decision {decision:?}"
+        );
+        assert_eq!(
+            decision,
+            TurnInjectionDecision {
+                turn_floor: Some(0.6),
+                best_score: Some(0.55),
+            },
+            "the decision must carry the exact numbers the log line discloses, \
+             computed over all candidates regardless of order"
+        );
+    }
+
+    #[test]
+    fn test_turn_injection_decision_best_at_floor_allows() {
+        let decision = turn_injection_decision(Some(0.6), &[0.6, 0.2]);
+        assert!(
+            !decision.skips(),
+            "the gate skips strictly below the floor: a best score equal to \
+             the turn floor must allow; decision {decision:?}"
+        );
+    }
+
+    // The gate's log-line observability proof lives in
+    // `tests/gate_observability_test.rs`: tracing caches per-callsite
+    // interest globally within a process, so when sibling lib tests that
+    // exercise the gate run in parallel with a `with_default` capture, a
+    // concurrent no-dispatcher evaluation can re-cache a gate callsite as
+    // disabled mid-capture and silently drop the very line being asserted.
+    // A dedicated integration binary gives the capture window the process
+    // to itself, making the proof deterministic.
 }

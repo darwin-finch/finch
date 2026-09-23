@@ -1,6 +1,6 @@
 // Configuration structs
 
-use super::backend::{BackendConfig, CoreMlConfig};
+use super::backend::BackendConfig;
 use super::diagnostics::DiagnosticsConfig;
 use super::provider::ProviderEntry;
 use super::ProviderCredential;
@@ -415,7 +415,6 @@ impl ProviderEntry {
             execution_target,
             model_family,
             model_size,
-            model_repo,
             model_path,
             managed_artifact,
             enabled,
@@ -426,10 +425,8 @@ impl ProviderEntry {
                 enabled: *enabled,
                 inference_provider: *inference_provider,
                 execution_target: *execution_target,
-                coreml: CoreMlConfig::default(),
                 model_family: *model_family,
                 model_size: *model_size,
-                model_repo: model_repo.clone(),
                 model_path: model_path.clone(),
                 managed_artifact: managed_artifact.clone(),
                 fallback_chain: BackendConfig::default().fallback_chain,
@@ -448,7 +445,6 @@ impl ProviderEntry {
             execution_target: cfg.execution_target,
             model_family: cfg.model_family,
             model_size: cfg.model_size,
-            model_repo: cfg.model_repo.clone(),
             model_path: cfg.model_path.clone(),
             managed_artifact: cfg.managed_artifact.clone(),
             enabled: cfg.enabled,
@@ -957,7 +953,6 @@ impl Config {
             providers,
             default_provider: self.default_provider.clone(),
             credentials: self.credentials.clone(),
-            coreml: Some(self.backend.coreml),
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
             license: self.license.clone(),
@@ -993,8 +988,6 @@ struct TomlConfig {
     default_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     credentials: Vec<ProviderCredential>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    coreml: Option<CoreMlConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     colors: Option<ColorScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1035,7 +1028,6 @@ mod tests {
             providers: Vec::new(),
             default_provider: None,
             credentials: Vec::new(),
-            coreml: None,
             colors: None,
             features: None,
             license: LicenseConfig::default(),
@@ -1084,71 +1076,6 @@ mod tests {
     fn test_server_config_generates_a_nonempty_brain_password() {
         let server = ServerConfig::default();
         assert!(server.brain_password.len() >= 16);
-    }
-
-    #[test]
-    fn test_coreml_policy_persistence_round_trip_uses_isolated_path() {
-        use crate::config::{CoreMlComputeUnits, ExecutionTarget, ProviderEntry};
-        use crate::models::{InferenceProvider, ModelFamily, ModelSize};
-
-        let directory = tempfile::tempdir().unwrap();
-        let first_path = directory.path().join("config.toml");
-        let second_path = directory.path().join("reloaded.toml");
-        let mut config = Config::with_providers(vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::LlamaCpp,
-            execution_target: ExecutionTarget::Auto,
-            model_family: ModelFamily::Qwen2,
-            model_size: ModelSize::Medium,
-            model_repo: None,
-            model_path: None,
-            managed_artifact: None,
-            enabled: true,
-            name: None,
-        }]);
-        config.backend.coreml = CoreMlConfig {
-            compute_units: CoreMlComputeUnits::CpuAndGpu,
-            profile_compute_plan: true,
-            enable_subgraphs: true,
-        };
-
-        config.save_to(&first_path).unwrap();
-        let reloaded = crate::config::load_config_from_path(&first_path).unwrap();
-        assert_eq!(reloaded.backend.coreml, config.backend.coreml);
-
-        reloaded.save_to(&second_path).unwrap();
-        let reloaded_again = crate::config::load_config_from_path(&second_path).unwrap();
-        assert_eq!(reloaded_again.backend.coreml, config.backend.coreml);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_legacy_onnx_entry_reloads_only_for_setup_migration() {
-        use crate::config::ExecutionTarget;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-                [[providers]]
-                type = "local"
-                inference_provider = "onnx"
-                execution_target = "coreml"
-                model_family = "Qwen2"
-                model_size = "Medium"
-                enabled = true
-            "#,
-        )
-        .unwrap();
-
-        let loaded = crate::config::load_config_from_path(&path).unwrap();
-        assert_eq!(
-            loaded.backend.inference_provider,
-            crate::models::InferenceProvider::LegacyOnnx,
-            "legacy ONNX identity must survive config load so setup can migrate it"
-        );
-        assert_eq!(loaded.backend.execution_target, ExecutionTarget::CoreML);
-        assert_eq!(loaded.backend.coreml, CoreMlConfig::default());
     }
 
     #[test]
@@ -1275,7 +1202,6 @@ mod tests {
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             enabled: true,
@@ -1308,7 +1234,6 @@ mod tests {
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,
-                model_repo: None,
                 model_path: None,
                 managed_artifact: None,
                 enabled: true,

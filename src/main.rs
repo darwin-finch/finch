@@ -1972,8 +1972,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let model_family = config.backend.model_family;
         let model_size = config.backend.model_size;
         let device = config.backend.execution_target;
-        let coreml = config.backend.coreml;
-        let model_repo = config.backend.model_repo.clone();
         let model_path = config.backend.model_path.clone();
         let managed_artifact = config.backend.managed_artifact.clone();
         tokio::spawn(async move {
@@ -1983,8 +1981,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     model_family,
                     model_size,
                     device,
-                    coreml,
-                    model_repo,
                     model_path,
                     managed_artifact,
                 )
@@ -2196,6 +2192,16 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     Ok(())
 }
 
+fn query_tool_state_paths(home: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+    let state_root = home
+        .context("Could not determine an application-state root for query tools")?
+        .join(".finch");
+    Ok((
+        state_root.join("tool_patterns.json"),
+        state_root.join("source-index"),
+    ))
+}
+
 /// Build the standard tool registry + executor used for non-interactive query mode.
 /// Auto-approves all tools (no interactive prompting in non-interactive mode).
 async fn build_query_tool_executor(
@@ -2206,8 +2212,8 @@ async fn build_query_tool_executor(
     Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::{
-        BashTool, CodeOutlineTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool,
-        WriteTool,
+        BashTool, CodeOutlineTool, EditTool, FindCodeTool, GlobTool, GrepTool, PatchTool, ReadTool,
+        WebFetchTool, WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -2215,10 +2221,15 @@ async fn build_query_tool_executor(
     let tool_workspace_root = finch::tools::resolve_workspace_root(
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
+    let (patterns_path, source_index_state) = query_tool_state_paths(dirs::home_dir())?;
     registry.register(Box::new(ReadTool));
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
     registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+    registry.register(Box::new(FindCodeTool::new(
+        tool_workspace_root.clone(),
+        source_index_state,
+    )));
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(EditTool));
@@ -2232,10 +2243,6 @@ async fn build_query_tool_executor(
     let permissions = PermissionManager::new()
         .with_workspace_root(tool_workspace_root)
         .with_default_rule(PermissionRule::Allow);
-    let patterns_path = dirs::home_dir()
-        .map(|h| h.join(".finch").join("tool_patterns.json"))
-        .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
-
     let executor = ToolExecutor::new(registry, permissions, patterns_path)
         .context("Failed to create tool executor")?
         .with_mcp(config)
@@ -3655,12 +3662,24 @@ fn remove_named_brain(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_brain_command, finish_first_run_setup, register_query_vm_tools,
-        reject_retired_session_flags, resolve_brain_name, suppress_ort_logs_unless_overridden,
-        Args, AuthCommand, BrainCommand, Command,
+        execute_brain_command, finish_first_run_setup, query_tool_state_paths,
+        register_query_vm_tools, reject_retired_session_flags, resolve_brain_name,
+        suppress_ort_logs_unless_overridden, Args, AuthCommand, BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
     use std::sync::Arc;
+
+    #[test]
+    fn query_code_search_fails_closed_without_an_application_state_root() {
+        assert!(query_tool_state_paths(None).is_err());
+        assert_eq!(
+            query_tool_state_paths(Some(std::path::PathBuf::from("/home/example"))).unwrap(),
+            (
+                std::path::PathBuf::from("/home/example/.finch/tool_patterns.json"),
+                std::path::PathBuf::from("/home/example/.finch/source-index"),
+            )
+        );
+    }
 
     /// #223: the daemon and interactive-mode call sites used to hardcode
     /// `ORT_LOGGING_LEVEL=3` unconditionally, so an operator setting it

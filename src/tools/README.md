@@ -20,9 +20,14 @@ Two callers show how those pieces meet:
    path does not currently use `ToolLoop`; do not infer the REPL's round-admission guarantees
    for it from the shared executor alone.
 
-The `code_outline` implementation is an adapter: it supplies the session workspace root to the
-source-index facade and returns its bounded JSON envelope. Corpus structure, source generations,
-and parser selection do not belong in the executor.
+The code-retrieval implementations are adapters over `source_index`. `code_outline` supplies one
+path and returns its bounded structural envelope. `find_code` accepts a path, identifier, quoted
+fixed string, or plain lexical terms, with optional path, structural-kind, and result-count
+constraints. It returns a compact list of exact line ranges for a later `read`, never source bodies
+or its internal traversal and cache diagnostics. Plain terms use deterministic string similarity;
+this is not vector or semantic search. Corpus structure, source generations, parser selection, and
+cache format do not belong in the executor. The ignored benchmark compares the complete serialized
+response and end-to-end latency with task-scored grep/read and file-list baselines.
 
 Use the [agent contract](AGENTS.md) for authority and dependency rules, [`mod.rs`](mod.rs) for
 the flat root-package facade, and the [MCP guide](mcp/README.md) for external connections.

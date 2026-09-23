@@ -47,7 +47,7 @@ mod settings;
 
 #[allow(deprecated)]
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
-pub use backend::{BackendConfig, CoreMlComputeUnits, CoreMlConfig, ExecutionTarget};
+pub use backend::{BackendConfig, ExecutionTarget};
 // Colours are a presentation vocabulary, not a configuration one: `finch-theme` defines what a
 // scheme is and this module turns a config file into one. The root `theme` compatibility path
 // keeps existing application callers working.
@@ -67,7 +67,7 @@ pub use finch_providers::{
     EnvironmentCredentialResolver, LifecycleRevocation, ProviderCredential, ReasoningEffort,
     ResolvedCredential, ResolvedSecret, DEFAULT_CLAUDE_MODEL,
 };
-pub use loader::{load_config, load_persisted_config};
+pub use loader::{load_config, load_persisted_config, load_persisted_config_for_setup};
 #[cfg(test)]
 pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths};
 pub use persona::Persona;

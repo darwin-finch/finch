@@ -107,25 +107,6 @@ generator = "~/.claude-proxy/models/generator-7b.mlmodel"
 # Path to constitutional validator model
 validator = "~/.claude-proxy/models/constitutional.mlmodel"
 
-# Legacy CoreML chat settings remain readable only so old configuration can be
-# migrated. The recorded policy does not prove where operators ran. The
-# llama.cpp/GGUF chat backend does not read this block.
-[coreml]
-compute_units = "all"
-
-# Opt-in placement diagnostics. Finch asks CoreML for its compute plan and
-# attempts to capture only this Finch process's matching Apple unified-log
-# records in a private ~/.finch/diagnostics/coreml-compute-plan-*.ndjson file,
-# alongside a 0600 JSON manifest of the requested policy, runtime/model facts,
-# session-creation latency and memory samples, and explicitly unavailable
-# evidence. Operator/model details may be present in these files. Finch reports
-# whether operation placement records were actually received; an empty capture
-# or an error-only diagnostic record is not placement or fallback evidence.
-profile_compute_plan = false
-
-# Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.
-enable_subgraphs = false
-
 # Frontend semantic memory owns its ONNX embedder separately and remains
 # unaffected by the daemon chat-backend migration.
 
@@ -521,18 +502,22 @@ training data. Review files manually before choosing any disposition.
 
 ### Custom Models
 
-To use your own fine-tuned models:
+To use your own local chat model, choose an existing GGUF file in `finch setup`. The resulting
+local provider records an absolute path:
 
 ```toml
-[models]
-classifier = "/path/to/your/classifier.mlmodel"
-generator = "/path/to/your/generator.mlmodel"
+[[providers]]
+type = "local"
+inference_provider = "llama_cpp"
+execution_target = "auto"
+model_family = "Qwen2"
+model_size = "Medium"
+model_path = "/path/to/model.gguf"
 ```
 
 Requirements:
-- CoreML format (.mlmodel or .mlpackage)
-- Compatible input/output shapes
-- See `docs/MODEL_FORMAT.md` for details
+- GGUF format supported by the pinned llama.cpp runtime
+- an instruct/chat model whose prompt family matches `model_family`
 
 ### Multiple Profiles
 

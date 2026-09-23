@@ -203,7 +203,6 @@ pub(super) fn handle_models_input(
         // Handle add-provider overlay first
         if adding_provider.is_some() {
             // Build option lists used by ConfigureLocal cycling
-            let local_backends = [InferenceProvider::LlamaCpp];
             let local_families = [
                 ModelFamily::Qwen2,
                 ModelFamily::Gemma2,
@@ -306,7 +305,7 @@ pub(super) fn handle_models_input(
                 KeyCode::Left => {
                     match adding_provider {
                         Some(AddProviderStep::ConfigureLocal {
-                            inference_provider,
+                            inference_provider: _,
                             family,
                             size,
                             quantization,
@@ -314,23 +313,7 @@ pub(super) fn handle_models_input(
                             focused_field,
                             ..
                         }) => match *focused_field {
-                            0 => {
-                                if let Some(pos) = local_backends
-                                    .iter()
-                                    .position(|x| *x == *inference_provider)
-                                {
-                                    *inference_provider = local_backends
-                                        [(pos + local_backends.len() - 1) % local_backends.len()];
-                                }
-                                if *inference_provider == InferenceProvider::LlamaCpp
-                                    && !matches!(
-                                        execution,
-                                        ExecutionTarget::Auto | ExecutionTarget::Cpu
-                                    )
-                                {
-                                    *execution = ExecutionTarget::Auto;
-                                }
-                            }
+                            0 => {}
                             1 => {
                                 if let Some(pos) = local_families.iter().position(|x| *x == *family)
                                 {
@@ -414,7 +397,7 @@ pub(super) fn handle_models_input(
                 KeyCode::Right => {
                     match adding_provider {
                         Some(AddProviderStep::ConfigureLocal {
-                            inference_provider,
+                            inference_provider: _,
                             family,
                             size,
                             quantization,
@@ -422,23 +405,7 @@ pub(super) fn handle_models_input(
                             focused_field,
                             ..
                         }) => match *focused_field {
-                            0 => {
-                                if let Some(pos) = local_backends
-                                    .iter()
-                                    .position(|x| *x == *inference_provider)
-                                {
-                                    *inference_provider =
-                                        local_backends[(pos + 1) % local_backends.len()];
-                                }
-                                if *inference_provider == InferenceProvider::LlamaCpp
-                                    && !matches!(
-                                        execution,
-                                        ExecutionTarget::Auto | ExecutionTarget::Cpu
-                                    )
-                                {
-                                    *execution = ExecutionTarget::Auto;
-                                }
-                            }
+                            0 => {}
                             1 => {
                                 if let Some(pos) = local_families.iter().position(|x| *x == *family)
                                 {
@@ -1110,6 +1077,29 @@ pub(super) fn handle_models_input(
                                 }
                                 (Some(path), None)
                             };
+                            let has_cloud_provider = std::iter::once(&*primary_model)
+                                .chain(tool_models.iter())
+                                .any(|model| {
+                                    matches!(model, ModelConfig::Remote { enabled: true, .. })
+                                        && !is_unconfigured_placeholder(model)
+                                });
+                            if !has_cloud_provider {
+                                *error = Some(
+                                    "Add and configure a cloud provider before adding a local model; the daemon currently requires a cloud fallback"
+                                        .into(),
+                                );
+                                *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                    inference_provider,
+                                    family,
+                                    size,
+                                    quantization,
+                                    execution,
+                                    model_path,
+                                    focused_field,
+                                    editing_idx,
+                                });
+                                return Ok(false);
+                            }
                             let persisted = editing_idx.and_then(|idx| {
                                 let slot = if idx == 0 {
                                     Some(&*primary_model)
@@ -1361,13 +1351,12 @@ pub(super) fn handle_models_input(
                         family,
                         size,
                         execution,
-                        inference_provider,
+                        inference_provider: _,
                         model_path,
                         managed_artifact,
                         ..
                     }) = selected
                     {
-                        let migrating_legacy = *inference_provider != InferenceProvider::LlamaCpp;
                         let focused_field = 5;
                         *adding_provider = Some(AddProviderStep::ConfigureLocal {
                             inference_provider: InferenceProvider::LlamaCpp,
@@ -1378,13 +1367,9 @@ pub(super) fn handle_models_input(
                                 .map(|artifact| artifact.quantization)
                                 .unwrap_or_default(),
                             execution: *execution,
-                            model_path: if migrating_legacy {
-                                String::new()
-                            } else {
-                                model_path.as_ref().map_or_else(String::new, |path| {
-                                    path.to_string_lossy().into_owned()
-                                })
-                            },
+                            model_path: model_path.as_ref().map_or_else(String::new, |path| {
+                                path.to_string_lossy().into_owned()
+                            }),
                             focused_field,
                             editing_idx: Some(*selected_idx),
                         });

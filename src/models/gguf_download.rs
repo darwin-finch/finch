@@ -16,6 +16,9 @@ use super::bootstrap::{DownloadProgressSnapshot, GeneratorState};
 use super::unified_loader::{ModelFamily, ModelSize};
 
 const HUGGING_FACE_ENDPOINT: &str = "https://huggingface.co";
+// Some filesystems expose whole-second metadata timestamps. Re-hash while a
+// marker is this young so a same-tick overwrite cannot inherit its identity.
+const VERIFICATION_MARKER_SETTLE_TIME: Duration = Duration::from_secs(2);
 
 /// Quantizations offered for Finch-managed GGUF artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -67,6 +70,10 @@ struct VerificationMarker {
     sha256: String,
     size: u64,
     modified_nanos: u128,
+    #[serde(default)]
+    change_marker: Option<i128>,
+    #[serde(default)]
+    settled: bool,
 }
 
 impl ManagedGgufArtifact {
@@ -171,6 +178,34 @@ pub fn managed_gguf_artifact(
                 "gemma-2-9b-it-Q5_K_M.gguf",
                 6_647_366_592,
                 "a4b0b55ce809a09baaefb789b0046ac77ecd502aba8aeb2ed63cc237d9f40ce7",
+            ),
+        ),
+        (ModelFamily::Llama3, ModelSize::Small) => (
+            "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            "5ab33fa94d1d04e903623ae72c95d1696f09f9e8",
+            (
+                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                2_019_377_696,
+                "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+            ),
+            (
+                "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+                2_322_154_016,
+                "0b94ccd04d908304cec5246a3d942b64417a423bc5c6d47c73bc557e590b5194",
+            ),
+        ),
+        (ModelFamily::Llama3, ModelSize::Medium) => (
+            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
+            (
+                "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                4_920_739_232,
+                "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c",
+            ),
+            (
+                "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+                5_732_992_416,
+                "14e10feba0c82a55da198dcd69d137206ad22d116a809926d27fa5f2398c69c7",
             ),
         ),
         _ => return None,
@@ -419,7 +454,7 @@ impl ManagedGgufDownloader {
         tokio::fs::rename(&part_path, &final_path)
             .await
             .with_context(|| format!("commit managed GGUF {}", final_path.display()))?;
-        write_verification_marker(&marker_path, &final_path, artifact)
+        write_verification_marker(&marker_path, &final_path, artifact, false)
             .await
             .with_context(|| format!("record GGUF verification {}", marker_path.display()))?;
         drop(lock);
@@ -469,13 +504,20 @@ async fn verified_cache_hit(
     if metadata.len() != artifact.expected_size {
         return Ok(false);
     }
+    let mut current_provisional_marker = false;
     if let Ok(contents) = tokio::fs::read_to_string(marker).await {
         if let Ok(verification) = serde_json::from_str::<VerificationMarker>(&contents) {
-            if verification.sha256.eq_ignore_ascii_case(&artifact.sha256)
+            let change_marker = metadata_change_marker(path, &metadata);
+            let metadata_matches = change_marker.is_some()
+                && verification.sha256.eq_ignore_ascii_case(&artifact.sha256)
                 && verification.size == metadata.len()
                 && verification.modified_nanos == modified_nanos(&metadata)?
-            {
-                return Ok(true);
+                && verification.change_marker == change_marker;
+            if metadata_matches {
+                if verification.settled {
+                    return Ok(true);
+                }
+                current_provisional_marker = true;
             }
         }
     }
@@ -484,14 +526,32 @@ async fn verified_cache_hit(
     if !digest.eq_ignore_ascii_case(&artifact.sha256) {
         return Ok(false);
     }
-    write_verification_marker(marker, path, artifact).await?;
+    if current_provisional_marker {
+        if verification_marker_is_settled(marker).await {
+            write_verification_marker(marker, path, artifact, true).await?;
+        }
+    } else {
+        write_verification_marker(marker, path, artifact, false).await?;
+    }
     Ok(true)
+}
+
+async fn verification_marker_is_settled(marker: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(marker).await else {
+        return false;
+    };
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= VERIFICATION_MARKER_SETTLE_TIME)
 }
 
 async fn write_verification_marker(
     marker: &Path,
     artifact_path: &Path,
     artifact: &ManagedGgufArtifact,
+    settled: bool,
 ) -> Result<()> {
     let metadata = tokio::fs::metadata(artifact_path)
         .await
@@ -500,6 +560,8 @@ async fn write_verification_marker(
         sha256: artifact.sha256.to_ascii_lowercase(),
         size: metadata.len(),
         modified_nanos: modified_nanos(&metadata)?,
+        change_marker: metadata_change_marker(artifact_path, &metadata),
+        settled,
     };
     let encoded = serde_json::to_vec(&verification).context("encode GGUF verification marker")?;
     tokio::fs::write(marker, encoded)
@@ -514,6 +576,40 @@ fn modified_nanos(metadata: &std::fs::Metadata) -> Result<u128> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("GGUF modification time predates Unix epoch")?
         .as_nanos())
+}
+
+#[cfg(unix)]
+fn metadata_change_marker(_path: &Path, metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
+#[cfg(windows)]
+fn metadata_change_marker(path: &Path, _metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: the handle remains open for the call and the output buffer has
+    // exactly the type and size required by `FileBasicInfo`.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    (succeeded != 0).then_some(i128::from(info.ChangeTime))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_change_marker(_path: &Path, _metadata: &std::fs::Metadata) -> Option<i128> {
+    None
 }
 
 async fn sha256_file(path: &Path, cancellation: &CancellationToken) -> Result<String> {
@@ -554,6 +650,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    #[test]
+    fn managed_catalog_contains_installable_llama_quantizations() {
+        for size in [ModelSize::Small, ModelSize::Medium] {
+            for quantization in [GgufQuantization::Q4KM, GgufQuantization::Q5KM] {
+                let artifact = managed_gguf_artifact(ModelFamily::Llama3, size, quantization)
+                    .expect("the wizard's 3B and default 8B Llama options must be managed");
+                artifact.validate().unwrap();
+                assert!(artifact.repository.contains("Llama-3"));
+                assert!(artifact.filename.ends_with(".gguf"));
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct HubFixture {
@@ -658,6 +767,22 @@ mod tests {
         cache
             .join(artifact.repository.replace('/', "--"))
             .join(&artifact.revision)
+    }
+
+    fn marker_path(cache: &Path, artifact: &ManagedGgufArtifact) -> PathBuf {
+        artifact_dir(cache, artifact).join(format!("{}.verified", artifact.filename))
+    }
+
+    fn age_marker_past_settle_time(marker: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(marker)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -810,18 +935,45 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let original_modified = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
         tokio::fs::write(&path, vec![0_u8; bytes.len()])
             .await
             .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let marker = marker_path(cache.path(), &artifact);
+        write_verification_marker(&marker, &path, &artifact, false)
+            .await
+            .unwrap();
+        age_marker_past_settle_time(&marker);
         let (_, disposition) = downloader
             .ensure(&artifact, "Test model", state, &CancellationToken::new())
             .await
             .unwrap();
 
-        assert_eq!(disposition, DownloadDisposition::Downloaded);
-        assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            disposition,
+            DownloadDisposition::Downloaded,
+            "same-size corruption with a restored mtime must invalidate the verification marker"
+        );
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            bytes,
+            "the invalid cache entry must be replaced with the pinned artifact"
+        );
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            2,
+            "cache corruption must cause exactly one replacement download"
+        );
     }
 
     #[tokio::test]

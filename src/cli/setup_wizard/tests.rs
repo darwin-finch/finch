@@ -1574,14 +1574,7 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
 
     let step = AddProviderStep::SelectAddType { selected: 0 };
     let rendered = render_card_text(
-        add_provider_card(
-            CoreMlConfig::default(),
-            &step,
-            &CatalogSource::StaticFallback,
-            false,
-            None,
-            None,
-        ),
+        add_provider_card(&step, &CatalogSource::StaticFallback, false, None, None),
         160,
         50,
     );
@@ -1665,14 +1658,7 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
     ));
 
     let rendered = render_card_text(
-        add_provider_card(
-            CoreMlConfig::default(),
-            step,
-            &CatalogSource::StaticFallback,
-            false,
-            None,
-            None,
-        ),
+        add_provider_card(step, &CatalogSource::StaticFallback, false, None, None),
         180,
         50,
     );
@@ -1755,7 +1741,6 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
     };
     let rendered = render_card_text(
         add_provider_card(
-            CoreMlConfig::default(),
             &step,
             &CatalogSource::StaticFallback,
             false,
@@ -2357,7 +2342,7 @@ fn test_configure_local_right_on_device_field_cycles() {
         focused_field: 4, // Device
         editing_idx: None,
     });
-    // Auto is first in the list; right should cycle to next (Cpu on non-macOS, CoreML on macOS)
+    // Auto is first in the list; right should cycle to CPU-only execution.
     handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
     if let Some(AddProviderStep::ConfigureLocal { execution, .. }) = get_step(&state) {
         assert_ne!(
@@ -2400,8 +2385,8 @@ fn test_configure_local_right_on_non_focused_field_does_not_affect_others() {
 // ── ConfigureLocal: Enter commits ─────────────────────────────────────────
 
 #[test]
-fn test_configure_local_enter_replaces_empty_primary() {
-    // Default state has remote claude with empty key — Enter should replace primary
+fn test_configure_local_enter_preserves_empty_cloud_primary_and_explains_requirement() {
+    // A local-only graph cannot start the daemon, so the empty cloud slot stays in place.
     let mut state = state_with_step(AddProviderStep::ConfigureLocal {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Phi,
@@ -2413,24 +2398,18 @@ fn test_configure_local_enter_replaces_empty_primary() {
         editing_idx: None,
     });
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
-    // overlay should be gone
-    assert!(get_step(&state).is_none());
-    // primary should now be local
-    if let Some(ModelConfig::Local {
-        family,
-        size,
-        execution,
-        inference_provider,
-        ..
-    }) = get_primary(&state)
-    {
-        assert_eq!(*family, ModelFamily::Phi);
-        assert_eq!(*size, ModelSize::Small);
-        assert_eq!(*execution, ExecutionTarget::Cpu);
-        assert_eq!(*inference_provider, InferenceProvider::LlamaCpp);
-    } else {
-        panic!("expected Local primary model");
-    }
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal { .. })
+    ));
+    assert!(is_unconfigured_placeholder(get_primary(&state).unwrap()));
+    let Some(SectionState::Models {
+        error: Some(error), ..
+    }) = state.sections.get(&WizardSection::Models)
+    else {
+        panic!("expected cloud fallback validation error");
+    };
+    assert!(error.contains("cloud provider"));
 }
 
 #[test]
@@ -2504,13 +2483,25 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
         focused_field: 5,
         editing_idx: None,
     });
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = ModelConfig::Remote {
+            provider: "claude".into(),
+            name: "claude".into(),
+            api_key: format!("sk-ant-{}", "x".repeat(100)),
+            model: "claude-sonnet-4-6".into(),
+            enabled: true,
+            persisted: None,
+        };
+    }
     for character in path.to_string_lossy().chars() {
         handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
     }
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
     assert!(get_step(&state).is_none());
     let result = build_setup_result(&state).unwrap();
-    assert!(matches!(&result.providers[0], ProviderEntry::Local {
+    assert!(matches!(&result.providers[1], ProviderEntry::Local {
         inference_provider: InferenceProvider::LlamaCpp,
         model_path: Some(saved),
         ..
@@ -2525,17 +2516,24 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
         crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
     assert_eq!(reloaded.backend.model_path.as_deref(), Some(path.as_path()));
     let mut reopened = WizardState::new(Some(&reloaded));
-    assert!(matches!(get_primary(&reopened), Some(ModelConfig::Local {
+    assert!(
+        matches!(get_tool_models(&reopened).last(), Some(ModelConfig::Local {
         inference_provider: InferenceProvider::LlamaCpp,
         model_path: Some(saved),
         ..
-    }) if saved == &path));
+    }) if saved == &path)
+    );
 
-    // Editing the reopened primary changes that row, not the provider count.
+    // Editing the reopened local row changes that row, not the provider count.
+    if let Some(SectionState::Models { selected_idx, .. }) =
+        reopened.sections.get_mut(&WizardSection::Models)
+    {
+        *selected_idx = 1;
+    }
     handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
     assert!(
         matches!(get_step(&reopened), Some(AddProviderStep::ConfigureLocal {
-        editing_idx: Some(0), model_path: shown, ..
+            editing_idx: Some(1), model_path: shown, ..
     }) if shown.as_str() == path.to_string_lossy().as_ref())
     );
     let replacement = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
@@ -2547,8 +2545,8 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
     }
     handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
     let edited = build_setup_result(&reopened).unwrap();
-    assert_eq!(edited.providers.len(), 1);
-    assert!(matches!(&edited.providers[0], ProviderEntry::Local {
+    assert_eq!(edited.providers.len(), 2);
+    assert!(matches!(&edited.providers[1], ProviderEntry::Local {
         model_path: Some(saved), ..
     } if saved == replacement.path()));
 }
@@ -2565,6 +2563,18 @@ fn test_managed_gguf_selection_survives_provider_save_and_reopen() {
         focused_field: 5,
         editing_idx: None,
     });
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = ModelConfig::Remote {
+            provider: "claude".into(),
+            name: "claude".into(),
+            api_key: format!("sk-ant-{}", "x".repeat(100)),
+            model: "claude-sonnet-4-6".into(),
+            enabled: true,
+            persisted: None,
+        };
+    }
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
     assert!(get_step(&state).is_none());
 
@@ -2575,7 +2585,7 @@ fn test_managed_gguf_selection_survives_provider_save_and_reopen() {
     )
     .unwrap();
     let result = build_setup_result(&state).unwrap();
-    assert!(matches!(&result.providers[0], ProviderEntry::Local {
+    assert!(matches!(&result.providers[1], ProviderEntry::Local {
         model_path: None,
         managed_artifact: Some(artifact),
         ..
@@ -2593,11 +2603,13 @@ fn test_managed_gguf_selection_survives_provider_save_and_reopen() {
     assert_eq!(reloaded.backend.managed_artifact.as_ref(), Some(&expected));
 
     let reopened = WizardState::new(Some(&reloaded));
-    assert!(matches!(get_primary(&reopened), Some(ModelConfig::Local {
+    assert!(
+        matches!(get_tool_models(&reopened).last(), Some(ModelConfig::Local {
         model_path: None,
         managed_artifact: Some(artifact),
         ..
-    }) if artifact == &expected));
+    }) if artifact == &expected)
+    );
 }
 
 #[test]
@@ -2629,50 +2641,69 @@ fn test_unsupported_managed_gguf_keeps_dialog_open_with_actionable_error() {
 }
 
 #[test]
-fn test_editing_legacy_local_chat_to_gguf_clears_onnx_repository() {
-    let original_path = "/models/old-chat.onnx";
-    let config = crate::config::Config::with_providers(vec![ProviderEntry::Local {
-        inference_provider: InferenceProvider::LegacyOnnx,
-        execution_target: ExecutionTarget::Cpu,
-        model_family: ModelFamily::Qwen2,
-        model_size: ModelSize::Small,
-        model_repo: Some("onnx-community/old-chat".into()),
-        model_path: Some(original_path.into()),
-        managed_artifact: None,
-        enabled: true,
-        name: Some("my-local-chat".into()),
-    }]);
-    let mut state = WizardState::new(Some(&config));
-    let unchanged = build_setup_result(&state).unwrap();
-    assert!(matches!(&unchanged.providers[0], ProviderEntry::Local {
-        inference_provider: InferenceProvider::LegacyOnnx,
-        model_repo: Some(repo),
-        model_path: Some(saved),
-        ..
-    } if repo == "onnx-community/old-chat" && saved == std::path::Path::new(original_path)));
-    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
-    assert!(
-        matches!(get_step(&state), Some(AddProviderStep::ConfigureLocal {
+fn test_llama_managed_gguf_can_be_added_from_wizard() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
         inference_provider: InferenceProvider::LlamaCpp,
-        model_path,
+        family: ModelFamily::Llama3,
+        size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
         focused_field: 5,
-        ..
-    }) if model_path.is_empty())
-    );
-    let gguf = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
-    for character in gguf.path().to_string_lossy().chars() {
-        handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+        editing_idx: None,
+    });
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = ModelConfig::Remote {
+            provider: "claude".into(),
+            name: "claude".into(),
+            api_key: "sk-ant-test".into(),
+            model: "claude-sonnet-4-6".into(),
+            enabled: true,
+            persisted: None,
+        };
     }
+
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
-    let result = build_setup_result(&state).unwrap();
-    assert_eq!(result.providers.len(), 1);
-    assert!(matches!(&result.providers[0], ProviderEntry::Local {
-        inference_provider: InferenceProvider::LlamaCpp,
-        model_repo: None,
-        model_path: Some(saved),
-        name: Some(name),
+
+    assert!(get_step(&state).is_none(), "supported Llama must be added");
+    assert!(
+        matches!(get_tool_models(&state).last(), Some(ModelConfig::Local {
+        family: ModelFamily::Llama3,
+        size: ModelSize::Medium,
+        managed_artifact: Some(artifact),
         ..
-    } if saved == gguf.path() && name == "my-local-chat"));
+    }) if artifact.filename == "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf")
+    );
+}
+
+#[test]
+fn test_local_model_requires_a_configured_cloud_fallback() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Llama3,
+        size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
+        focused_field: 5,
+        editing_idx: None,
+    });
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal { .. })
+    ));
+    let Some(SectionState::Models {
+        error: Some(error), ..
+    }) = state.sections.get(&WizardSection::Models)
+    else {
+        panic!("expected cloud fallback validation error");
+    };
+    assert!(error.contains("cloud provider"));
 }
 
 #[test]
@@ -3113,9 +3144,12 @@ fn test_select_add_type_esc_closes_overlay() {
 #[test]
 fn test_build_setup_result_uses_inference_provider_from_local_model() {
     let mut state = WizardState::new(None);
-    // Set primary to a local model with ONNX provider
-    if let Some(SectionState::Models { primary_model, .. }) =
-        state.sections.get_mut(&WizardSection::Models)
+    // Set primary to a local llama.cpp model with the daemon's required cloud fallback.
+    if let Some(SectionState::Models {
+        primary_model,
+        tool_models,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
     {
         *primary_model = ModelConfig::Local {
             family: ModelFamily::Llama3,
@@ -3127,6 +3161,14 @@ fn test_build_setup_result_uses_inference_provider_from_local_model() {
             enabled: true,
             persisted: None,
         };
+        tool_models.push(ModelConfig::Remote {
+            provider: "claude".into(),
+            name: "claude".into(),
+            api_key: "sk-ant-test".into(),
+            model: "claude-sonnet-4-6".into(),
+            enabled: true,
+            persisted: None,
+        });
     }
     let result = build_setup_result(&state).unwrap();
     assert!(result.backend_enabled);
@@ -3207,105 +3249,9 @@ fn test_wizard_state_new_loads_inference_provider_from_existing_config() {
 }
 
 #[test]
-fn test_coreml_policy_survives_wizard_mapping_save_and_reload_for_every_compute_unit() {
-    use crate::config::{Config, CoreMlComputeUnits};
-
-    for compute_units in [
-        CoreMlComputeUnits::All,
-        CoreMlComputeUnits::CpuAndNeuralEngine,
-        CoreMlComputeUnits::CpuAndGpu,
-        CoreMlComputeUnits::CpuOnly,
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        let metrics_dir = directory.path().join("metrics");
-        let providers = vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::LlamaCpp,
-            execution_target: ExecutionTarget::Auto,
-            model_family: ModelFamily::Qwen2,
-            model_size: ModelSize::Medium,
-            model_repo: None,
-            model_path: None,
-            managed_artifact: None,
-            enabled: true,
-            name: Some("local-coreml-policy-test".to_string()),
-        }];
-        let mut existing = Config::with_providers_and_paths(providers, metrics_dir.clone(), None);
-        existing.backend.coreml = CoreMlConfig {
-            compute_units,
-            profile_compute_plan: true,
-            enable_subgraphs: true,
-        };
-
-        let state = WizardState::new_with_catalog_cache_dir(Some(&existing), None);
-        let result = build_setup_result(&state).unwrap();
-        assert_eq!(result.coreml, existing.backend.coreml);
-
-        config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
-            .save_to(&config_path)
-            .unwrap();
-        let reloaded =
-            crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None)
-                .unwrap();
-        assert_eq!(reloaded.backend.coreml, existing.backend.coreml);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_setup_coreml_auto_label_is_dispatcher_not_ane_only_or_fastest() {
-    let label = ExecutionTarget::CoreML.name();
-    let description = ExecutionTarget::CoreML.description();
-
-    assert_eq!(label, "CoreML (Auto: ANE/GPU/CPU)");
-    assert!(description.contains("automatic compute-unit selection"));
-    assert!(!description.to_ascii_lowercase().contains("fastest"));
-    assert!(!description.contains("ANE only"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_reopened_coreml_policy_renders_requested_units_for_every_policy() {
-    use crate::config::{Config, CoreMlComputeUnits};
-
-    for (compute_units, expected) in [
-        (CoreMlComputeUnits::All, "CoreML (Auto: ANE/GPU/CPU)"),
-        (CoreMlComputeUnits::CpuAndNeuralEngine, "CoreML (CPU + ANE)"),
-        (CoreMlComputeUnits::CpuAndGpu, "CoreML (CPU + GPU)"),
-        (CoreMlComputeUnits::CpuOnly, "CoreML (CPU only)"),
-    ] {
-        let coreml = CoreMlConfig {
-            compute_units,
-            ..CoreMlConfig::default()
-        };
-        let mut reopened = Config::with_providers(vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::LlamaCpp,
-            execution_target: ExecutionTarget::CoreML,
-            model_family: ModelFamily::Qwen2,
-            model_size: ModelSize::Medium,
-            model_repo: None,
-            model_path: None,
-            managed_artifact: None,
-            enabled: true,
-            name: Some("reopened-coreml".to_string()),
-        }]);
-        reopened.backend.coreml = coreml;
-        let state = WizardState::new_with_catalog_cache_dir(Some(&reopened), None);
-        assert_eq!(state.coreml, coreml);
-        assert_eq!(
-            execution_target_display(ExecutionTarget::CoreML, state.coreml),
-            expected
-        );
-    }
-}
-
-#[test]
 fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
     use crate::config::{Config, ProviderEntry};
 
-    #[cfg(target_os = "macos")]
-    let execution_target = ExecutionTarget::CoreML;
-    #[cfg(not(target_os = "macos"))]
     let execution_target = ExecutionTarget::Cpu;
 
     let original = Config::with_providers(vec![
@@ -3318,12 +3264,11 @@ fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
             name: Some("grok-code-fast-1".to_string()),
         },
         ProviderEntry::Local {
-            inference_provider: InferenceProvider::LegacyOnnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Small,
-            model_repo: Some("onnx-community/Qwen2.5-Coder-3B-Instruct".to_string()),
-            model_path: Some("/models/qwen-coder".into()),
+            model_path: Some("/models/qwen-coder.gguf".into()),
             managed_artifact: None,
             enabled: true,
             name: Some("local-qwen".to_string()),
@@ -3354,13 +3299,11 @@ fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Small,
             execution_target: saved_execution_target,
-            model_repo: Some(ref repo),
             model_path: Some(ref path),
             name: Some(ref name),
             ..
         } if saved_execution_target == execution_target
-            && repo == "onnx-community/Qwen2.5-Coder-3B-Instruct"
-            && path == &std::path::PathBuf::from("/models/qwen-coder")
+            && path == &std::path::PathBuf::from("/models/qwen-coder.gguf")
             && name == "local-qwen"
     ));
 
@@ -3690,12 +3633,11 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
             name: Some("Grok Build".into()),
         },
         ProviderEntry::Local {
-            inference_provider: InferenceProvider::LegacyOnnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
-            model_repo: Some("Qwen/Qwen2.5-Coder-7B-Instruct-ONNX".into()),
-            model_path: Some(directory.path().join("models/qwen")),
+            model_path: Some(directory.path().join("models/qwen.gguf")),
             managed_artifact: None,
             enabled: true,
             name: Some("Local Qwen Medium".into()),

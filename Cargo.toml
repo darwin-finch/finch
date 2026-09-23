@@ -233,6 +233,10 @@ nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] 
 capnp = "0.24"
 capnp-rpc = "0.24"
 
+# Windows exposes the file change timestamp only through handle metadata.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # Root application tests construct a renderer without taking over a terminal.
 finch-tui = { path = "crates/finch-tui", features = ["test-support"] }
@@ -266,7 +270,6 @@ nix = { version = "0.29", features = ["term", "process", "signal"] }
 [features]
 default = ["llama-cpp"]  # llama.cpp GGUF is the sole daemon local-chat engine
 llama-cpp = []  # Compatibility feature name; GGUF support is always built
-cuda = []  # CUDA support (requires CUDA toolkit)
 
 [[bin]]
 name = "finch"

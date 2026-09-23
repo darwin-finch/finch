@@ -1,60 +1,32 @@
 //! Local chat-model identity and the llama.cpp GGUF loader.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::generator_new::TextGeneration;
-use crate::config::{CoreMlConfig, ExecutionTarget};
+use crate::config::ExecutionTarget;
 
 /// The daemon's local chat inference engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum InferenceProvider {
     /// llama.cpp loading a caller-selected GGUF file.
     #[serde(rename = "llama_cpp")]
     #[default]
     LlamaCpp,
-    /// Persisted ONNX chat configuration retained only so setup can migrate it.
-    #[serde(rename = "onnx")]
-    LegacyOnnx,
-    /// Persisted Candle chat configuration retained only so setup can migrate it.
-    #[serde(rename = "candle")]
-    LegacyCandle,
-}
-
-impl<'de> Deserialize<'de> for InferenceProvider {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "llama_cpp" => Ok(Self::LlamaCpp),
-            "onnx" => Ok(Self::LegacyOnnx),
-            "candle" => Ok(Self::LegacyCandle),
-            _ => Err(serde::de::Error::unknown_variant(
-                &value,
-                &["llama_cpp", "onnx", "candle"],
-            )),
-        }
-    }
 }
 
 impl InferenceProvider {
     /// Human-readable engine name.
     pub fn name(self) -> &'static str {
-        match self {
-            Self::LlamaCpp => "llama.cpp (GGUF)",
-            Self::LegacyOnnx => "Unsupported legacy ONNX chat entry",
-            Self::LegacyCandle => "Unsupported legacy Candle chat entry",
-        }
+        "llama.cpp (GGUF)"
     }
 }
 
 /// Configuration for loading a local chat model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelLoadConfig {
-    /// Engine identity; legacy values are accepted only for migration errors.
+    /// Engine identity.
     #[serde(default)]
     pub provider: InferenceProvider,
     /// Prompt/adaptation family selected by the user.
@@ -64,12 +36,6 @@ pub struct ModelLoadConfig {
     /// `auto` allows GPU offload and `cpu` disables it.
     #[serde(alias = "backend")]
     pub target: ExecutionTarget,
-    /// Legacy CoreML policy retained while old configs are migrated.
-    #[serde(default)]
-    pub coreml: CoreMlConfig,
-    /// Legacy repository field. GGUF loading never resolves a repository.
-    #[serde(default)]
-    pub repo_override: Option<String>,
     /// Explicit local GGUF artifact.
     #[serde(default)]
     pub model_path: Option<PathBuf>,
@@ -176,13 +142,10 @@ impl ModelSize {
     }
 }
 
-fn gpu_offload_policy(target: ExecutionTarget) -> Result<bool> {
+fn gpu_offload_policy(target: ExecutionTarget) -> bool {
     match target {
-        ExecutionTarget::Auto => Ok(true),
-        ExecutionTarget::Cpu => Ok(false),
-        _ => anyhow::bail!(
-            "llama.cpp local chat supports execution_target = auto or cpu; run `finch setup` to migrate the old target"
-        ),
+        ExecutionTarget::Auto => true,
+        ExecutionTarget::Cpu => false,
     }
 }
 
@@ -197,17 +160,6 @@ impl UnifiedModelLoader {
 
     /// Load the configured GGUF through llama.cpp.
     pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        if config.provider != InferenceProvider::LlamaCpp {
-            anyhow::bail!(
-                "{}; run `finch setup` and select a local GGUF file for llama.cpp",
-                config.provider.name()
-            );
-        }
-        if config.repo_override.is_some() {
-            anyhow::bail!(
-                "local chat model repositories are no longer supported; run `finch setup` and select an explicit .gguf file"
-            );
-        }
         let path = config
             .model_path
             .as_ref()
@@ -217,7 +169,7 @@ impl UnifiedModelLoader {
         }
         let model = super::loaders::llama_cpp::LlamaCppGenerator::load_with_offload(
             path,
-            gpu_offload_policy(config.target)?,
+            gpu_offload_policy(config.target),
             Some(config.family.name()),
         )?;
         Ok(Box::new(model))
@@ -227,18 +179,6 @@ impl UnifiedModelLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_chat_provider_names_deserialize_only_for_migration() {
-        assert_eq!(
-            serde_json::from_str::<InferenceProvider>("\"onnx\"").unwrap(),
-            InferenceProvider::LegacyOnnx
-        );
-        assert_eq!(
-            serde_json::from_str::<InferenceProvider>("\"candle\"").unwrap(),
-            InferenceProvider::LegacyCandle
-        );
-    }
 
     #[test]
     fn llama_cpp_provider_round_trips() {
@@ -251,29 +191,19 @@ mod tests {
     }
 
     #[test]
-    fn target_policy_honors_explicit_cpu() {
-        assert!(gpu_offload_policy(ExecutionTarget::Auto).unwrap());
-        assert!(!gpu_offload_policy(ExecutionTarget::Cpu).unwrap());
+    fn removed_chat_provider_names_are_rejected() {
+        for removed in ["onnx", "candle"] {
+            let encoded = format!("\"{removed}\"");
+            assert!(
+                serde_json::from_str::<InferenceProvider>(&encoded).is_err(),
+                "removed provider {removed} must not deserialize"
+            );
+        }
     }
 
     #[test]
-    fn legacy_chat_provider_cannot_reach_a_loader() {
-        let error = UnifiedModelLoader::new()
-            .unwrap()
-            .load(ModelLoadConfig {
-                provider: InferenceProvider::LegacyOnnx,
-                family: ModelFamily::Qwen2,
-                size: ModelSize::Small,
-                target: ExecutionTarget::Cpu,
-                coreml: CoreMlConfig::default(),
-                repo_override: None,
-                model_path: Some("/tmp/old.onnx".into()),
-            })
-            .err()
-            .expect("legacy provider must have no loader");
-        assert!(
-            error.to_string().contains("finch setup") && error.to_string().contains("GGUF"),
-            "legacy entry must provide migration direction without loading: {error:#}"
-        );
+    fn target_policy_honors_explicit_cpu() {
+        assert!(gpu_offload_policy(ExecutionTarget::Auto));
+        assert!(!gpu_offload_policy(ExecutionTarget::Cpu));
     }
 }

@@ -124,28 +124,13 @@ impl BootstrapLoader {
         model_family: ModelFamily,
         model_size: ModelSize,
         execution_target: ExecutionTarget,
-        coreml: crate::config::CoreMlConfig,
-        model_repo: Option<String>,
         model_path: Option<std::path::PathBuf>,
         managed_artifact: Option<ManagedGgufArtifact>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
 
-        let requested_target = {
-            #[cfg(target_os = "macos")]
-            {
-                if execution_target == ExecutionTarget::CoreML {
-                    format!("CoreML ({})", coreml.compute_units.name())
-                } else {
-                    execution_target.name().to_string()
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                execution_target.name().to_string()
-            }
-        };
+        let requested_target = execution_target.name().to_string();
         let model_name = format!(
             "{} {} ({:?}; requested {})",
             model_family.name(),
@@ -158,10 +143,6 @@ impl BootstrapLoader {
             model_name,
             requested_target
         );
-        if let Some(ref repo) = model_repo {
-            tracing::info!("Using custom repository: {}", repo);
-        }
-
         let model_path = match (model_path, managed_artifact.as_ref()) {
             (Some(path), None) => Some(path),
             (None, Some(artifact)) => {
@@ -191,8 +172,6 @@ impl BootstrapLoader {
             family: model_family,
             size: model_size,
             target: execution_target,
-            coreml,
-            repo_override: model_repo.clone(),
             model_path,
         };
 

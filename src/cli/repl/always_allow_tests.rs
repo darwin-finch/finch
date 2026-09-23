@@ -6,7 +6,7 @@ use crate::tools::{
     invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
     AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BackgroundBashTool,
     BackgroundPollTool, BackgroundStopTool, BashTool, CodeOutlineTool, CreateMemoryTool, EditTool,
-    EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
+    EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
     HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
     PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
     SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
@@ -14,6 +14,16 @@ use crate::tools::{
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
+use std::path::PathBuf;
+
+#[test]
+fn find_code_state_requires_an_explicit_home_root() {
+    assert_eq!(
+        super::source_index_state_for_home(Some(std::path::Path::new("/home/example"))),
+        Some(PathBuf::from("/home/example/.finch/source-index"))
+    );
+    assert_eq!(super::source_index_state_for_home(None), None);
+}
 use std::sync::Arc;
 
 struct NameAuditGenerator;
@@ -82,6 +92,10 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(CodeOutlineTool::new(std::env::current_dir().expect("cwd"))),
+        Box::new(FindCodeTool::new(
+            std::env::current_dir().expect("cwd"),
+            memory_dir.path().join("source-index"),
+        )),
         Box::new(WebFetchTool::new()),
         Box::new(BashTool),
         Box::new(BackgroundBashTool::new(std::sync::Arc::clone(
@@ -258,7 +272,7 @@ fn pre_refactor_effect(tool_name: &str) -> ExecutionEffect {
 /// Unclassified just because the legacy arms used stale spellings.
 fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
     match tool_name {
-        "code_outline" => ExecutionEffect::WorkspaceRead,
+        "code_outline" | "find_code" => ExecutionEffect::WorkspaceRead,
         "todo_read" => ExecutionEffect::VmRead,
         "todo_write" | "present_plan" | "ask_user_question" => ExecutionEffect::VmWrite,
         // Issue #754: the background bash sibling carries bash's worst-case
@@ -521,6 +535,7 @@ fn test_always_allow_list_pre_approves_named_reads_and_agent_control() {
         "glob",
         "grep",
         "code_outline",
+        "find_code",
         "web_fetch",
         "search_memory",
         "inspect_memory",
