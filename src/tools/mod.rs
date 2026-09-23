@@ -28,12 +28,12 @@ pub use implementations::restart::DeferredFrontendRestart;
 pub use implementations::{
     AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool, AnsibleTool,
     AskUserQuestionTool, BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool,
-    CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool, GetLanguageDefinitionTool,
-    GetVmStateTool, GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectProgramTool,
-    InspectVmWordTool, InspectWordTool, LLMDelegationTool, ListRecentTool, PatchTool,
-    PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool, SearchVmVocabularyTool,
-    SearchVocabularyTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool,
-    WebFetchTool, WriteTool,
+    CodeHopTool, CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
+    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
+    InspectMemoryTool, InspectProgramTool, InspectVmWordTool, InspectWordTool, LLMDelegationTool,
+    ListRecentTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool,
+    SearchVmVocabularyTool, SearchVocabularyTool, SearchWordTool, SubmitProgramTool, TodoReadTool,
+    TodoWriteTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 pub use implementations::{

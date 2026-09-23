@@ -7,8 +7,10 @@ use anyhow::{bail, Context, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 #[cfg(unix)]
+use cap_std::fs::DirBuilderExt;
+#[cfg(unix)]
 use cap_std::fs::OpenOptionsExt;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 use fs2::FileExt;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,8 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_AGENT_LEAD_BYTES: usize = 512;
 const MAX_IGNORE_CONTROL_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_WORKSPACE_CACHES: usize = 8;
 
 /// A body-free outline stored in a repository snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +170,78 @@ pub struct RepositoryCache {
 }
 
 impl RepositoryCache {
+    /// Create a missing private state leaf beneath an existing parent capability,
+    /// then open it and enforce the shared derived-cache quota.
+    pub fn prepare(
+        state_directory: impl AsRef<Path>,
+        resolver: &SourceResolver,
+    ) -> IndexResult<Self> {
+        let state_directory = state_directory.as_ref();
+        let leaf = state_directory.file_name().context(
+            "source-index state path must name a directory rather than a filesystem root",
+        )?;
+        let parent_path = state_directory
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "source-index state parent must already exist: {}",
+                    state_directory.display()
+                )
+            })?;
+        let parent =
+            Dir::open_ambient_dir(&parent_path, ambient_authority()).with_context(|| {
+                format!(
+                    "failed to capability-open source-index state parent {}",
+                    parent_path.display()
+                )
+            })?;
+        match parent.open_dir_nofollow(leaf) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = DirBuilder::new();
+                #[cfg(unix)]
+                builder.mode(0o700);
+                match parent.create_dir_with(leaf, &builder) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        parent.open_dir_nofollow(leaf).with_context(|| {
+                            format!(
+                                "concurrently created source-index state path is not a real directory: {}",
+                                state_directory.display()
+                            )
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| {
+                                format!(
+                                    "failed to create private source-index state directory {}",
+                                    state_directory.display()
+                                )
+                            })
+                            .map_err(Into::into)
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| {
+                        format!(
+                            "source-index state path must be a real non-symlink directory: {}",
+                            state_directory.display()
+                        )
+                    })
+                    .map_err(Into::into)
+            }
+        }
+        let cache = Self::open(state_directory, resolver)?;
+        cache.ensure_state_quota()?;
+        Ok(cache)
+    }
+
     /// Open an existing canonical, owner-only state directory.
     pub fn open(state_directory: impl AsRef<Path>, resolver: &SourceResolver) -> IndexResult<Self> {
         let workspace_namespace_sha256 = resolver.workspace_namespace_sha256();
@@ -249,6 +325,61 @@ impl RepositoryCache {
         Err(last_error.expect("lock retry records an error"))
     }
 
+    fn ensure_state_quota(&self) -> IndexResult<()> {
+        let mut cache_images = 0usize;
+        let mut total_bytes = 0u64;
+        let mut current_exists = false;
+        for entry in self
+            .directory
+            .entries()
+            .context("failed to enumerate source-index state directory")?
+        {
+            let entry = entry.context("failed to inspect source-index state entry")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("source-index-")
+                || !(name.ends_with(".json") || name.ends_with(".tmp") || name.ends_with(".lock"))
+            {
+                continue;
+            }
+            let metadata = self
+                .directory
+                .symlink_metadata(&name)
+                .with_context(|| format!("failed to inspect source-index state leaf {name}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "source-index state leaf {name} must be a regular non-symlink file"
+                )
+                .into());
+            }
+            total_bytes = total_bytes
+                .checked_add(metadata.len())
+                .context("source-index state byte count overflowed")?;
+            if name.ends_with(".json") {
+                cache_images += 1;
+                current_exists |= name == self.cache_leaf;
+            }
+        }
+        if total_bytes > MAX_STATE_BYTES {
+            return Err(anyhow::anyhow!(
+                "source-index state exceeds {} bytes; remove unused derived caches from ~/.finch/source-index",
+                MAX_STATE_BYTES
+            )
+            .into());
+        }
+        if cache_images > MAX_WORKSPACE_CACHES
+            || (!current_exists && cache_images == MAX_WORKSPACE_CACHES)
+        {
+            return Err(anyhow::anyhow!(
+                "source-index state already contains {MAX_WORKSPACE_CACHES} workspace caches; remove unused derived caches from ~/.finch/source-index"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn open_private_leaf(&self, leaf: &str, create: bool, truncate: bool) -> Result<std::fs::File> {
         let mut options = OpenOptions::new();
         options
@@ -326,6 +457,46 @@ impl RepositoryCache {
             return Err(anyhow::anyhow!(
                 "source-index cache would exceed {} bytes",
                 MAX_CACHE_BYTES
+            )
+            .into());
+        }
+        let mut projected_state_bytes = bytes.len() as u64;
+        for entry in self
+            .directory
+            .entries()
+            .context("failed to enumerate source-index state before publication")?
+        {
+            let entry = entry.context("failed to inspect source-index state before publication")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == self.cache_leaf || name == self.temporary_leaf {
+                continue;
+            }
+            if !name.starts_with("source-index-")
+                || !(name.ends_with(".json") || name.ends_with(".tmp") || name.ends_with(".lock"))
+            {
+                continue;
+            }
+            let metadata = self
+                .directory
+                .symlink_metadata(name)
+                .with_context(|| format!("failed to inspect source-index state leaf {name}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "source-index state leaf {name} must be a regular non-symlink file"
+                )
+                .into());
+            }
+            projected_state_bytes = projected_state_bytes
+                .checked_add(metadata.len())
+                .context("source-index projected state byte count overflowed")?;
+        }
+        if projected_state_bytes > MAX_STATE_BYTES {
+            return Err(anyhow::anyhow!(
+                "source-index publication would exceed {} shared state bytes; remove unused derived caches from ~/.finch/source-index",
+                MAX_STATE_BYTES
             )
             .into());
         }
@@ -1972,5 +2143,75 @@ mod tests {
         symlink(outside.path(), private_state.path().join(&cache.cache_leaf))
             .expect("cache symlink");
         assert!(cache.load().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_creates_private_state_leaf_and_rejects_workspace_quota_excess() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let resolver = SourceResolver::new(workspace.path()).expect("resolver");
+        let parent = tempfile::tempdir().expect("state parent");
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700))
+            .expect("private parent");
+        let state_path = parent.path().join("source-index");
+        RepositoryCache::prepare(&state_path, &resolver).expect("prepare state");
+        assert_eq!(
+            fs::metadata(&state_path)
+                .expect("state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        for index in 0..MAX_WORKSPACE_CACHES {
+            let path = state_path.join(format!("source-index-{index:064x}.json"));
+            fs::write(&path, []).expect("quota fixture");
+        }
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+        let other = SourceResolver::new(other_workspace.path()).expect("other resolver");
+        let error = RepositoryCache::prepare(&state_path, &other)
+            .err()
+            .expect("ninth cache must be rejected");
+        assert!(
+            error.to_string().contains("workspace caches"),
+            "unexpected quota error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_total_state_byte_quota_before_cache_creation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let resolver = SourceResolver::new(workspace.path()).expect("resolver");
+        let parent = tempfile::tempdir().expect("state parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700))
+                .expect("private parent");
+        }
+        let state_path = parent.path().join("source-index");
+        fs::create_dir(&state_path).expect("state directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state_path, fs::Permissions::from_mode(0o700))
+                .expect("private state");
+        }
+        let oversized = state_path.join(format!("source-index-{}.json", "a".repeat(64)));
+        fs::File::create(&oversized)
+            .expect("quota image")
+            .set_len(MAX_STATE_BYTES + 1)
+            .expect("sparse quota image");
+
+        let error = RepositoryCache::prepare(&state_path, &resolver)
+            .err()
+            .expect("byte quota must be rejected");
+        assert!(
+            error.to_string().contains("state exceeds"),
+            "unexpected quota error: {error:#}"
+        );
     }
 }

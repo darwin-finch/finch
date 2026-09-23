@@ -2206,8 +2206,8 @@ async fn build_query_tool_executor(
     Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::{
-        BashTool, CodeOutlineTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool,
-        WriteTool,
+        BashTool, CodeHopTool, CodeOutlineTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool,
+        WebFetchTool, WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -2215,10 +2215,21 @@ async fn build_query_tool_executor(
     let tool_workspace_root = finch::tools::resolve_workspace_root(
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
+    let patterns_path = dirs::home_dir()
+        .map(|h| h.join(".finch").join("tool_patterns.json"))
+        .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
+    let source_index_state = patterns_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("source-index");
     registry.register(Box::new(ReadTool));
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
     registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+    registry.register(Box::new(CodeHopTool::new(
+        tool_workspace_root.clone(),
+        source_index_state,
+    )));
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(EditTool));
@@ -2232,10 +2243,6 @@ async fn build_query_tool_executor(
     let permissions = PermissionManager::new()
         .with_workspace_root(tool_workspace_root)
         .with_default_rule(PermissionRule::Allow);
-    let patterns_path = dirs::home_dir()
-        .map(|h| h.join(".finch").join("tool_patterns.json"))
-        .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
-
     let executor = ToolExecutor::new(registry, permissions, patterns_path)
         .context("Failed to create tool executor")?
         .with_mcp(config)

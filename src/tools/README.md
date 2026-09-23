@@ -20,9 +20,14 @@ Two callers show how those pieces meet:
    path does not currently use `ToolLoop`; do not infer the REPL's round-admission guarantees
    for it from the shared executor alone.
 
-The `code_outline` implementation is an adapter: it supplies the session workspace root to the
-source-index facade and returns its bounded JSON envelope. Corpus structure, source generations,
-and parser selection do not belong in the executor.
+The code-retrieval implementations are adapters over `source_index`. `code_outline` supplies one
+path and returns its bounded structural envelope. `code_hop` refreshes the injected derived cache,
+tries bounded fixed-string routing for paths/identifiers/literals, then walks sibling directory and
+symbol menus with deterministic lexical scoring. It returns exact spans for a later `read`, never
+source bodies. Ambiguous hops stay ranker-only with a warning today; a future local `compress`
+adapter may receive only opaque candidate ids, labels, and the documented bounded `AGENTS.md` lead.
+Corpus structure, source generations, parser selection, and cache format do not belong in the
+executor.
 
 Use the [agent contract](AGENTS.md) for authority and dependency rules, [`mod.rs`](mod.rs) for
 the flat root-package facade, and the [MCP guide](mcp/README.md) for external connections.

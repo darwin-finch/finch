@@ -33,9 +33,9 @@ use crate::tools::{
     resolve_workspace_root, PermissionManager, PermissionRule, ToolExecutor, ToolRegistry,
 };
 use crate::tools::{
-    AnsibleTool, AskUserQuestionTool, BashTool, CodeOutlineTool, EditTool, EnterPlanModeTool,
-    GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
-    WebFetchTool, WriteTool,
+    AnsibleTool, AskUserQuestionTool, BashTool, CodeHopTool, CodeOutlineTool, EditTool,
+    EnterPlanModeTool, GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool,
+    RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -84,6 +84,7 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "code_outline",
+    "code_hop",
     "web_fetch",
     "search_memory",
     "inspect_memory",
@@ -918,6 +919,10 @@ impl Repl {
             project_program_root,
         } = initialization;
         let tool_workspace_root = resolve_workspace_root(&workspace_root);
+        let source_index_state = patterns_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("source-index");
         let mention_port = crate::cli::mention_session::MentionSession::new(workspace_root.clone())
             as Arc<dyn crate::cli::tui::MentionPort>;
 
@@ -1071,6 +1076,10 @@ impl Repl {
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+        tool_registry.register(Box::new(CodeHopTool::new(
+            tool_workspace_root.clone(),
+            source_index_state.clone(),
+        )));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
         // Background command lifecycle (#754): one manager per session, so
@@ -1231,6 +1240,10 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry
                     .register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+                fallback_registry.register(Box::new(CodeHopTool::new(
+                    tool_workspace_root.clone(),
+                    source_index_state.clone(),
+                )));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
                 let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());

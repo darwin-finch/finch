@@ -45,6 +45,7 @@ pub(crate) const PLANNING_ALLOWED_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "code_outline",
+    "code_hop",
     "web_fetch",
     // Read-only by convention and confirmed normally, so the model can run
     // inspection commands like `which gh` or `cargo check` while planning.
@@ -655,8 +656,9 @@ mod tests {
     fn test_plan_allowlist_entries_are_registered_tool_names() {
         use crate::cli::repl::REPL_TOOL_ALIASES;
         use crate::tools::{
-            AskUserQuestionTool, BashTool, CodeOutlineTool, EnterPlanModeTool, GlobTool, GrepTool,
-            PresentPlanTool, ReadTool, TodoReadTool, TodoWriteTool, ToolRegistry, WebFetchTool,
+            AskUserQuestionTool, BashTool, CodeHopTool, CodeOutlineTool, EnterPlanModeTool,
+            GlobTool, GrepTool, PresentPlanTool, ReadTool, TodoReadTool, TodoWriteTool,
+            ToolRegistry, WebFetchTool,
         };
 
         let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
@@ -666,6 +668,10 @@ mod tests {
         registry.register(Box::new(GrepTool));
         registry.register(Box::new(CodeOutlineTool::new(
             std::env::current_dir().expect("cwd"),
+        )));
+        registry.register(Box::new(CodeHopTool::new(
+            std::env::current_dir().expect("cwd"),
+            std::env::temp_dir().join("finch-code-hop-plan-catalog"),
         )));
         registry.register(Box::new(WebFetchTool::new()));
         registry.register(Box::new(BashTool));

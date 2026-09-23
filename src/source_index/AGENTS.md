@@ -31,6 +31,10 @@ Structural outlines never copy comments, string contents, documentation, or func
 first prose paragraph of `AGENTS.md`, capped at 512 UTF-8 bytes and carrying identity plus span, is
 the only body text persisted for routing. Tree-sitter parse errors are reported in the envelope.
 
+The state capability may create its own final directory leaf with Unix mode 0700. It admits at
+most eight workspace cache images and 512 MiB of regular cache/lock/temporary leaves, rejects
+matching symlink or non-regular leaves, and never deletes another workspace's image automatically.
+
 **Extension rules:** add a grammar only with deterministic fixtures proving definitions and spans.
 Change storage schema, serialized-outline, and outline algorithm versions independently. Keep cache records body-free;
 new body exceptions require explicit review and a hard bound. Sibling hops, semantic ranking, and

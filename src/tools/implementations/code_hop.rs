@@ -1,0 +1,1409 @@
+//! Body-free sibling routing over the persistent repository source index.
+
+use crate::source_index::{
+    DirectoryChildKind, IndexedOutline, RepositoryCache, RepositoryIndexError, RepositoryIndexer,
+    RepositorySnapshot, RetrievalMethod, RetrievalProvenance, RetrievalProvenanceClass,
+    SourceIdentity, SourceResolver, SourceSpan,
+};
+use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
+use serde::Serialize;
+use serde_json::Value;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+const MAX_QUERY_BYTES: usize = 1_024;
+const MAX_HOPS: usize = 32;
+const MAX_MENU_CANDIDATES: usize = 2_000;
+const MAX_DISAMBIGUATION_CANDIDATES: usize = 16;
+const MAX_DISAMBIGUATION_BYTES: usize = 16 * 1024;
+const MAX_DISAMBIGUATION_CALLS: usize = 8;
+const DISAMBIGUATION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SELECTED_PER_MENU: usize = 3;
+const MAX_RETURNED_SPANS: usize = 5;
+const MAX_WHY_BYTES: usize = 256;
+const MAX_MECHANICAL_FILES: usize = 2_048;
+const MAX_MECHANICAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MECHANICAL_MATCHES: usize = 100;
+const MAX_MECHANICAL_METADATA_BYTES: usize = 64 * 1024;
+const EXACT_PATH_WINDOW_LINES: usize = 80;
+const CONFIDENT_SCORE_FLOOR: f64 = 1.0;
+const CONFIDENT_MARGIN: f64 = 0.75;
+
+/// Optional local-only chooser. Production roots intentionally leave this unbound
+/// until the dedicated local `compress` lane exists.
+#[async_trait]
+trait CodeHopDisambiguator: Send + Sync {
+    async fn choose(&self, request: &DisambiguationRequest) -> Result<Vec<String>>;
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DisambiguationRequest {
+    query: String,
+    candidates: Vec<DisambiguationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DisambiguationCandidate {
+    id: String,
+    name: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lead: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RankedCandidate {
+    id: String,
+    name: String,
+    kind: String,
+    target: String,
+    lead: Option<String>,
+    score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodeHopSpan {
+    path: String,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    why: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HopStep {
+    directory: String,
+    picks: Vec<String>,
+    method: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct CodeHopMetrics {
+    menus_considered: usize,
+    candidates_considered: usize,
+    routing_context_bytes: usize,
+    mechanical_files_examined: usize,
+    mechanical_source_bytes_examined: usize,
+    selected_files: usize,
+    body_bytes_disclosed: usize,
+    disambiguation_calls: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodeHopResult {
+    spans: Vec<CodeHopSpan>,
+    hop_path: Vec<HopStep>,
+    provenance: RetrievalProvenance,
+    warnings: Vec<String>,
+    metrics: CodeHopMetrics,
+}
+
+struct RouteAttempt {
+    result: CodeHopResult,
+    selected: Vec<(SourceIdentity, SourceSpan)>,
+}
+
+/// Routes a question to a bounded set of exact source spans without returning bodies.
+pub struct CodeHopTool {
+    workspace_root: PathBuf,
+    state_directory: PathBuf,
+    disambiguator: Option<Arc<dyn CodeHopDisambiguator>>,
+}
+
+impl CodeHopTool {
+    pub fn new(workspace_root: impl Into<PathBuf>, state_directory: impl Into<PathBuf>) -> Self {
+        let workspace_root = workspace_root.into();
+        Self {
+            workspace_root: finch_tools_api::resolve_workspace_root(&workspace_root),
+            state_directory: state_directory.into(),
+            disambiguator: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_disambiguator(mut self, disambiguator: Arc<dyn CodeHopDisambiguator>) -> Self {
+        self.disambiguator = Some(disambiguator);
+        self
+    }
+
+    fn snapshot(&self, force_rebuild: bool) -> Result<(SourceResolver, RepositorySnapshot)> {
+        let resolver = SourceResolver::new(&self.workspace_root)?;
+        let cache = RepositoryCache::prepare(&self.state_directory, &resolver)?;
+        let cached = match cache.load() {
+            Ok(cached) => cached,
+            Err(RepositoryIndexError::IncompatibleCache { .. }) => {
+                let indexer = RepositoryIndexer::new(resolver, cache)?;
+                let snapshot = indexer.rebuild()?.snapshot;
+                return Ok((SourceResolver::new(&self.workspace_root)?, snapshot));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let indexer = RepositoryIndexer::new(resolver, cache)?;
+        let snapshot = if force_rebuild {
+            indexer.rebuild()?.snapshot
+        } else if let Some(snapshot) = cached {
+            if indexer.is_snapshot_current(&snapshot)? {
+                snapshot
+            } else {
+                indexer.build()?.snapshot
+            }
+        } else {
+            indexer.build()?.snapshot
+        };
+        Ok((SourceResolver::new(&self.workspace_root)?, snapshot))
+    }
+
+    async fn execute_query(&self, query: &str) -> Result<CodeHopResult> {
+        for attempt in 0..2 {
+            let (resolver, snapshot) = self.snapshot(attempt == 1)?;
+            let routed = self.route(query, &resolver, &snapshot).await?;
+            let mut stale = false;
+            for (source, span) in &routed.selected {
+                if resolver.read_span(source, span).is_err() {
+                    stale = true;
+                    break;
+                }
+            }
+            if !stale {
+                return Ok(routed.result);
+            }
+        }
+        bail!("source generation changed during both code_hop routing attempts")
+    }
+
+    async fn route(
+        &self,
+        query: &str,
+        resolver: &SourceResolver,
+        snapshot: &RepositorySnapshot,
+    ) -> Result<RouteAttempt> {
+        let (mechanical, partial_warning) = mechanical_route(query, resolver, snapshot)?;
+        if partial_warning.is_none() {
+            if let Some(mechanical) = mechanical {
+                return Ok(mechanical);
+            }
+        }
+        let sibling = self.sibling_route(query, resolver, snapshot).await;
+        match (mechanical, sibling) {
+            (Some(mut mechanical), Ok(sibling)) => {
+                merge_route_attempts(&mut mechanical, sibling);
+                if let Some(warning) = partial_warning {
+                    push_warning_once(&mut mechanical.result.warnings, &warning);
+                }
+                Ok(mechanical)
+            }
+            (Some(mut mechanical), Err(_)) => {
+                if let Some(warning) = partial_warning {
+                    push_warning_once(&mut mechanical.result.warnings, &warning);
+                }
+                Ok(mechanical)
+            }
+            (None, Ok(mut sibling)) => {
+                if let Some(warning) = partial_warning {
+                    push_warning_once(&mut sibling.result.warnings, &warning);
+                }
+                Ok(sibling)
+            }
+            (None, Err(error)) => Err(error),
+        }
+    }
+
+    async fn sibling_route(
+        &self,
+        query: &str,
+        resolver: &SourceResolver,
+        snapshot: &RepositorySnapshot,
+    ) -> Result<RouteAttempt> {
+        let mut queue = VecDeque::from([(String::new(), Vec::<HopStep>::new())]);
+        let mut chosen_files = Vec::new();
+        let mut warnings = Vec::new();
+        let mut metrics = CodeHopMetrics::default();
+        let mut used_model = false;
+        let mut hops = 0usize;
+
+        while let Some((directory_path, path_steps)) = queue.pop_front() {
+            if chosen_files.len() >= MAX_RETURNED_SPANS || hops >= MAX_HOPS {
+                break;
+            }
+            hops += 1;
+            let Some(directory) = snapshot.directory(&directory_path) else {
+                continue;
+            };
+            if directory.children.len() > MAX_MENU_CANDIDATES {
+                warnings.push(format!(
+                    "directory {directory_path:?} was partially routed at {MAX_MENU_CANDIDATES} children"
+                ));
+            }
+            let candidates = directory
+                .children
+                .iter()
+                .take(MAX_MENU_CANDIDATES)
+                .enumerate()
+                .map(|(index, child)| {
+                    let target = join_path(&directory_path, &child.name);
+                    let lead = (child.kind == DirectoryChildKind::Directory)
+                        .then(|| snapshot.directory(&target))
+                        .flatten()
+                        .and_then(|record| record.agent_lead.as_ref())
+                        .map(|lead| lead.text.clone());
+                    let rank_text = subtree_rank_text(snapshot, &target, child.kind);
+                    RankedCandidate {
+                        id: format!("h{hops}c{index}"),
+                        name: child.name.clone(),
+                        kind: match child.kind {
+                            DirectoryChildKind::Directory => "directory",
+                            DirectoryChildKind::File => "file",
+                        }
+                        .to_string(),
+                        target,
+                        lead,
+                        score: lexical_score(query, &rank_text),
+                    }
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                continue;
+            }
+            let selection = self
+                .select_candidates(query, candidates, &mut warnings, &mut metrics)
+                .await?;
+            used_model |= selection.used_model;
+            let picks = selection
+                .candidates
+                .iter()
+                .map(|candidate| candidate.name.clone())
+                .collect::<Vec<_>>();
+            let mut next_steps = path_steps;
+            next_steps.push(HopStep {
+                directory: directory_path.clone(),
+                picks,
+                method: selection.method.to_string(),
+            });
+            for candidate in selection.candidates {
+                if candidate.kind == "directory" {
+                    queue.push_back((candidate.target, next_steps.clone()));
+                } else if let Some(file) = snapshot.file(&candidate.target) {
+                    chosen_files.push((file, next_steps.clone()));
+                }
+            }
+        }
+
+        if chosen_files.is_empty() {
+            bail!("code_hop could not route the query to an indexed file")
+        }
+
+        let mut spans = Vec::new();
+        let mut selected = Vec::new();
+        let mut final_hops = Vec::new();
+        for (file, mut path_steps) in chosen_files {
+            if spans.len() >= MAX_RETURNED_SPANS {
+                break;
+            }
+            let records = rank_file_records(query, resolver, file)?;
+            if records.is_empty() {
+                continue;
+            }
+            let selection = self
+                .select_candidates(query, records, &mut warnings, &mut metrics)
+                .await?;
+            used_model |= selection.used_model;
+            path_steps.push(HopStep {
+                directory: file.outline.source.path.clone(),
+                picks: selection
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.name.clone())
+                    .collect(),
+                method: selection.method.to_string(),
+            });
+            for candidate in selection.candidates {
+                let index = candidate
+                    .target
+                    .parse::<usize>()
+                    .context("invalid internal outline candidate index")?;
+                let record = &file.outline.records[index];
+                let why = bounded_why(format!(
+                    "{} match for {} ({})",
+                    selection.method, record.name, record.kind
+                ));
+                spans.push(span_result(&file.outline.source, &record.span, why));
+                selected.push((file.outline.source.clone(), record.span.clone()));
+                if spans.len() == MAX_RETURNED_SPANS {
+                    break;
+                }
+            }
+            if final_hops.is_empty() {
+                final_hops = path_steps;
+            }
+        }
+        metrics.selected_files = selected
+            .iter()
+            .map(|(source, _)| source.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if spans.is_empty() {
+            bail!("code_hop found indexed files but no routable source spans")
+        }
+        Ok(RouteAttempt {
+            result: CodeHopResult {
+                spans,
+                hop_path: final_hops,
+                provenance: if used_model {
+                    RetrievalProvenance {
+                        class: RetrievalProvenanceClass::InferredModel,
+                        method: RetrievalMethod::Model,
+                    }
+                } else {
+                    RetrievalProvenance {
+                        class: RetrievalProvenanceClass::LexicalGrep,
+                        method: RetrievalMethod::Grep,
+                    }
+                },
+                warnings,
+                metrics,
+            },
+            selected,
+        })
+    }
+
+    async fn select_candidates(
+        &self,
+        query: &str,
+        mut candidates: Vec<RankedCandidate>,
+        warnings: &mut Vec<String>,
+        metrics: &mut CodeHopMetrics,
+    ) -> Result<Selection> {
+        candidates.sort_by(rank_order);
+        metrics.menus_considered += 1;
+        metrics.candidates_considered += candidates.len();
+        let offered = candidates
+            .iter()
+            .take(MAX_DISAMBIGUATION_CANDIDATES)
+            .cloned()
+            .collect::<Vec<_>>();
+        let request = DisambiguationRequest {
+            query: query.to_string(),
+            candidates: offered
+                .iter()
+                .map(|candidate| DisambiguationCandidate {
+                    id: candidate.id.clone(),
+                    name: candidate.name.clone(),
+                    kind: candidate.kind.clone(),
+                    lead: candidate.lead.clone(),
+                })
+                .collect(),
+        };
+        let request_bytes = serde_json::to_vec(&request)?;
+        if request_bytes.len() > MAX_DISAMBIGUATION_BYTES {
+            bail!("code_hop sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
+        }
+        metrics.routing_context_bytes += request_bytes.len();
+        let confident = offered.len() == 1
+            || (offered[0].score >= CONFIDENT_SCORE_FLOOR
+                && offered[0].score - offered[1].score >= CONFIDENT_MARGIN);
+        if confident {
+            return Ok(Selection {
+                candidates: vec![offered[0].clone()],
+                method: "ranker",
+                used_model: false,
+            });
+        }
+
+        if let Some(disambiguator) = &self.disambiguator {
+            if metrics.disambiguation_calls >= MAX_DISAMBIGUATION_CALLS {
+                bail!("code_hop exceeded {MAX_DISAMBIGUATION_CALLS} disambiguation calls")
+            }
+            metrics.disambiguation_calls += 1;
+            let response =
+                tokio::time::timeout(DISAMBIGUATION_TIMEOUT, disambiguator.choose(&request)).await;
+            match response {
+                Ok(Ok(ids)) => {
+                    if let Some(selected) = validate_disambiguation(&offered, &ids) {
+                        return Ok(Selection {
+                            candidates: selected,
+                            method: "local_disambiguator",
+                            used_model: true,
+                        });
+                    }
+                    push_warning_once(
+                        warnings,
+                        "local disambiguator returned invalid candidate IDs; using ranked choices",
+                    );
+                }
+                Ok(Err(_)) => {
+                    push_warning_once(warnings, "local disambiguator failed; using ranked choices")
+                }
+                Err(_) => push_warning_once(
+                    warnings,
+                    "local disambiguator timed out; using ranked choices",
+                ),
+            }
+        } else {
+            push_warning_once(
+                warnings,
+                "local compress lane is unbound; using ranker-only choices",
+            );
+        }
+        Ok(Selection {
+            candidates: offered.into_iter().take(MAX_SELECTED_PER_MENU).collect(),
+            method: "ranker_ambiguous",
+            used_model: false,
+        })
+    }
+}
+
+struct Selection {
+    candidates: Vec<RankedCandidate>,
+    method: &'static str,
+    used_model: bool,
+}
+
+#[async_trait]
+impl Tool for CodeHopTool {
+    fn name(&self) -> &str {
+        "code_hop"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
+    }
+
+    fn description(&self) -> &str {
+        "Route a code question through bounded repository sibling menus and return exact source spans without source bodies."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema::simple(vec![(
+            "query",
+            "Natural-language question, identifier, quoted literal, or workspace path",
+        )])
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .context("Missing query parameter")?
+            .trim();
+        if query.is_empty() {
+            bail!("code_hop query must not be empty")
+        }
+        if query.len() > MAX_QUERY_BYTES {
+            bail!("code_hop query exceeds {MAX_QUERY_BYTES} UTF-8 bytes")
+        }
+        let result = self.execute_query(query).await?;
+        serde_json::to_string_pretty(&result).context("failed to serialize code_hop result")
+    }
+
+    fn workspace_root(&self) -> Option<&Path> {
+        Some(&self.workspace_root)
+    }
+}
+
+fn mechanical_route(
+    query: &str,
+    resolver: &SourceResolver,
+    snapshot: &RepositorySnapshot,
+) -> Result<(Option<RouteAttempt>, Option<String>)> {
+    if looks_like_path(query) {
+        let normalized = query.trim_matches(['\'', '"']).trim_start_matches("./");
+        let mut files = snapshot
+            .files
+            .iter()
+            .filter(|file| {
+                file.outline.source.path == normalized
+                    || file
+                        .outline
+                        .source
+                        .path
+                        .ends_with(&format!("/{normalized}"))
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.outline.source.path.cmp(&right.outline.source.path));
+        if let Some(file) = files.first() {
+            return Ok((
+                Some(mechanical_file_result(resolver, file, "exact path match")?),
+                None,
+            ));
+        }
+    }
+    let Some(term) = mechanical_term(query) else {
+        return Ok((None, None));
+    };
+    let mut metrics = CodeHopMetrics::default();
+    let warnings = Vec::new();
+    let mut spans = Vec::new();
+    let mut selected = Vec::new();
+    let mut metadata_bytes = 0usize;
+    let mut exhausted = false;
+    for file in &snapshot.files {
+        if metrics.mechanical_files_examined == MAX_MECHANICAL_FILES
+            || metrics.mechanical_source_bytes_examined + file.outline.source.byte_len
+                > MAX_MECHANICAL_BYTES
+        {
+            exhausted = true;
+            break;
+        }
+        metrics.mechanical_files_examined += 1;
+        metrics.mechanical_source_bytes_examined += file.outline.source.byte_len;
+        let source = resolver.read(&file.outline.source.path)?;
+        for (start, _) in source.text.match_indices(&term) {
+            let end = start + term.len();
+            let (start_line, end_line) = line_coordinates(&source.text, start, end);
+            let matched_record = file
+                .outline
+                .records
+                .iter()
+                .find(|record| record.span.start_byte <= start && record.span.end_byte >= end);
+            let span = matched_record
+                .map(|record| record.span.clone())
+                .unwrap_or(SourceSpan {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line,
+                    end_line,
+                });
+            let why = bounded_why(format!("fixed-string match for {term:?}"));
+            metadata_bytes += file.outline.source.path.len() + why.len() + 64;
+            if metadata_bytes > MAX_MECHANICAL_METADATA_BYTES
+                || spans.len() == MAX_MECHANICAL_MATCHES
+            {
+                exhausted = true;
+                break;
+            }
+            spans.push(span_result(&file.outline.source, &span, why));
+            selected.push((file.outline.source.clone(), span));
+        }
+        if exhausted {
+            break;
+        }
+    }
+    if spans.is_empty() {
+        return Ok((
+            None,
+            exhausted.then(|| {
+                "mechanical fixed-string search reached its deterministic scan bound; sibling routing continued"
+                    .to_string()
+            }),
+        ));
+    }
+    spans.truncate(MAX_RETURNED_SPANS);
+    selected.truncate(MAX_RETURNED_SPANS);
+    let partial_warning = exhausted.then(|| {
+        "mechanical fixed-string search reached its deterministic scan/result bound; sibling routing continued"
+            .to_string()
+    });
+    metrics.selected_files = selected
+        .iter()
+        .map(|(source, _)| source.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    Ok((
+        Some(RouteAttempt {
+            result: CodeHopResult {
+                spans,
+                hop_path: vec![HopStep {
+                    directory: String::new(),
+                    picks: vec![term],
+                    method: "mechanical_fixed_string".to_string(),
+                }],
+                provenance: RetrievalProvenance {
+                    class: RetrievalProvenanceClass::LexicalGrep,
+                    method: RetrievalMethod::Grep,
+                },
+                warnings,
+                metrics,
+            },
+            selected,
+        }),
+        partial_warning,
+    ))
+}
+
+fn merge_route_attempts(primary: &mut RouteAttempt, secondary: RouteAttempt) {
+    let mut seen = primary
+        .selected
+        .iter()
+        .map(|(source, span)| (source.path.clone(), span.start_byte, span.end_byte))
+        .collect::<BTreeSet<_>>();
+    for (span, selected) in secondary
+        .result
+        .spans
+        .into_iter()
+        .zip(secondary.selected.into_iter())
+    {
+        let key = (
+            selected.0.path.clone(),
+            selected.1.start_byte,
+            selected.1.end_byte,
+        );
+        if primary.result.spans.len() == MAX_RETURNED_SPANS {
+            break;
+        }
+        if seen.insert(key) {
+            primary.result.spans.push(span);
+            primary.selected.push(selected);
+        }
+    }
+    primary.result.hop_path.extend(secondary.result.hop_path);
+    for warning in secondary.result.warnings {
+        push_warning_once(&mut primary.result.warnings, &warning);
+    }
+    primary.result.metrics.menus_considered += secondary.result.metrics.menus_considered;
+    primary.result.metrics.candidates_considered += secondary.result.metrics.candidates_considered;
+    primary.result.metrics.routing_context_bytes += secondary.result.metrics.routing_context_bytes;
+    primary.result.metrics.disambiguation_calls += secondary.result.metrics.disambiguation_calls;
+    primary.result.metrics.selected_files = primary
+        .selected
+        .iter()
+        .map(|(source, _)| source.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if secondary.result.provenance.class == RetrievalProvenanceClass::InferredModel {
+        primary.result.provenance = secondary.result.provenance;
+    }
+}
+
+fn mechanical_file_result(
+    resolver: &SourceResolver,
+    file: &IndexedOutline,
+    why: &str,
+) -> Result<RouteAttempt> {
+    let mut selected_records = file
+        .outline
+        .records
+        .iter()
+        .map(|record| record.span.clone())
+        .take(MAX_RETURNED_SPANS)
+        .collect::<Vec<_>>();
+    if selected_records.is_empty() {
+        let source = resolver.read(&file.outline.source.path)?;
+        let end_byte = source
+            .text
+            .match_indices('\n')
+            .nth(EXACT_PATH_WINDOW_LINES - 1)
+            .map(|(index, _)| index + 1)
+            .unwrap_or(source.text.len());
+        let (start_line, end_line) = line_coordinates(&source.text, 0, end_byte);
+        selected_records.push(SourceSpan {
+            start_byte: 0,
+            end_byte,
+            start_line,
+            end_line,
+        });
+    }
+    let spans = selected_records
+        .iter()
+        .map(|span| span_result(&file.outline.source, span, why.to_string()))
+        .collect();
+    let selected = selected_records
+        .iter()
+        .map(|span| (file.outline.source.clone(), span.clone()))
+        .collect();
+    Ok(RouteAttempt {
+        result: CodeHopResult {
+            spans,
+            hop_path: vec![HopStep {
+                directory: String::new(),
+                picks: vec![file.outline.source.path.clone()],
+                method: "mechanical_path".to_string(),
+            }],
+            provenance: RetrievalProvenance {
+                class: RetrievalProvenanceClass::LexicalGrep,
+                method: RetrievalMethod::Grep,
+            },
+            warnings: Vec::new(),
+            metrics: CodeHopMetrics {
+                selected_files: 1,
+                ..CodeHopMetrics::default()
+            },
+        },
+        selected,
+    })
+}
+
+fn rank_file_records(
+    query: &str,
+    resolver: &SourceResolver,
+    file: &IndexedOutline,
+) -> Result<Vec<RankedCandidate>> {
+    let fallback = file.outline.provenance.class == RetrievalProvenanceClass::StructuralFallback;
+    let source = fallback
+        .then(|| resolver.read(&file.outline.source.path))
+        .transpose()?;
+    Ok(file
+        .outline
+        .records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let rank_text = source
+                .as_ref()
+                .and_then(|source| {
+                    source
+                        .text
+                        .get(record.span.start_byte..record.span.end_byte)
+                })
+                .unwrap_or(&record.name);
+            RankedCandidate {
+                id: format!("s{index}"),
+                name: record.name.clone(),
+                kind: record.kind.clone(),
+                target: index.to_string(),
+                lead: None,
+                score: lexical_score(query, rank_text),
+            }
+        })
+        .collect())
+}
+
+fn subtree_rank_text(
+    snapshot: &RepositorySnapshot,
+    target: &str,
+    kind: DirectoryChildKind,
+) -> String {
+    let mut text = target.to_string();
+    let prefix = format!("{target}/");
+    for file in &snapshot.files {
+        let path = &file.outline.source.path;
+        let participates = match kind {
+            DirectoryChildKind::File => path == target,
+            DirectoryChildKind::Directory => path.starts_with(&prefix),
+        };
+        if !participates {
+            continue;
+        }
+        text.push(' ');
+        text.push_str(path);
+        for record in &file.outline.records {
+            text.push(' ');
+            text.push_str(&record.name);
+            text.push(' ');
+            text.push_str(&record.kind);
+            if text.len() >= 16 * 1024 {
+                text.truncate(16 * 1024);
+                return text;
+            }
+        }
+    }
+    text
+}
+
+fn lexical_score(query: &str, candidate: &str) -> f64 {
+    let query_tokens = tokens(query);
+    let candidate_tokens = tokens(candidate);
+    let mut score = 0.0;
+    for query_token in &query_tokens {
+        for candidate_token in &candidate_tokens {
+            if query_token == candidate_token {
+                score += 2.0;
+            } else if query_token.starts_with(candidate_token)
+                || candidate_token.starts_with(query_token)
+            {
+                score += 1.0;
+            }
+        }
+    }
+    score + trigram_similarity(query, candidate)
+}
+
+fn tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.len() > 1)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn trigram_similarity(left: &str, right: &str) -> f64 {
+    let grams = |value: &str| {
+        let normalized = value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<Vec<_>>();
+        normalized
+            .windows(3)
+            .map(|window| window.iter().collect::<String>())
+            .collect::<BTreeSet<_>>()
+    };
+    let left = grams(left);
+    let right = grams(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.intersection(&right).count() as f64;
+    let union = left.union(&right).count() as f64;
+    intersection / union
+}
+
+fn rank_order(left: &RankedCandidate, right: &RankedCandidate) -> Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.target.cmp(&right.target))
+}
+
+fn validate_disambiguation(
+    offered: &[RankedCandidate],
+    ids: &[String],
+) -> Option<Vec<RankedCandidate>> {
+    if ids.is_empty() || ids.len() > MAX_SELECTED_PER_MENU {
+        return None;
+    }
+    let unique = ids.iter().collect::<BTreeSet<_>>();
+    if unique.len() != ids.len() {
+        return None;
+    }
+    ids.iter()
+        .map(|id| {
+            offered
+                .iter()
+                .find(|candidate| candidate.id == *id)
+                .cloned()
+        })
+        .collect()
+}
+
+fn mechanical_term(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        let literal = &trimmed[1..trimmed.len() - 1];
+        return (!literal.is_empty()).then(|| literal.to_string());
+    }
+    (trimmed
+        .chars()
+        .all(|character| character.is_alphanumeric() || "_:-.".contains(character))
+        && trimmed.chars().any(|character| character.is_alphabetic()))
+    .then(|| trimmed.to_string())
+}
+
+fn looks_like_path(query: &str) -> bool {
+    let query = query.trim_matches(['\'', '"']);
+    query.contains('/') || Path::new(query).extension().is_some()
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn line_coordinates(text: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
+    let start_line = text[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let end_line = if end_byte == start_byte {
+        start_line
+    } else {
+        text[..end_byte - 1]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1
+    };
+    (start_line, end_line)
+}
+
+fn span_result(source: &SourceIdentity, span: &SourceSpan, why: String) -> CodeHopSpan {
+    CodeHopSpan {
+        path: source.path.clone(),
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        start_line: span.start_line,
+        end_line: span.end_line,
+        why: bounded_why(why),
+    }
+}
+
+fn bounded_why(mut why: String) -> String {
+    if why.len() <= MAX_WHY_BYTES {
+        return why;
+    }
+    let mut end = MAX_WHY_BYTES;
+    while !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    why.truncate(end);
+    why
+}
+
+fn push_warning_once(warnings: &mut Vec<String>, warning: &str) {
+    if !warnings.iter().any(|existing| existing == warning) {
+        warnings.push(warning.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry, ToolUse};
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git fixture failed: {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("workspace");
+        run_git(root.path(), &["init", "-q"]);
+        fs::create_dir(root.path().join("src")).expect("src");
+        fs::write(root.path().join("AGENTS.md"), "Repository map.\n").expect("root agents");
+        fs::write(
+            root.path().join("src/AGENTS.md"),
+            "Claim admission and scheduling live in this capsule.\n",
+        )
+        .expect("src agents");
+        fs::write(
+            root.path().join("src/claim.rs"),
+            "pub fn admit_claim() { let _ = \"TARGET_BODY_PRIVATE\"; }\n",
+        )
+        .expect("claim source");
+        fs::write(
+            root.path().join("src/distractor.rs"),
+            "// DISTRACTOR_SECRET_MUST_NOT_ROUTE\npub fn render_status() {}\n",
+        )
+        .expect("distractor source");
+        fs::write(
+            root.path().join("src/ambiguous.rs"),
+            "pub fn alpha_route() {}\npub fn beta_route() {}\n",
+        )
+        .expect("ambiguous source");
+        fs::write(
+            root.path().join("fallback.txt"),
+            "ordinary text\nwhere unusual widgets are calibrated\n",
+        )
+        .expect("fallback source");
+        fs::write(
+            root.path().join("headingless.md"),
+            "introductory prose without a heading\nsecond line\n",
+        )
+        .expect("headingless Markdown");
+        run_git(root.path(), &["add", "."]);
+        run_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Finch Test",
+                "-c",
+                "user.email=finch-test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        root
+    }
+
+    fn state_parent() -> tempfile::TempDir {
+        let state = tempfile::tempdir().expect("state parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700))
+                .expect("private state parent");
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn test_natural_query_returns_claim_definition_without_body_or_distractor_secret() {
+        let root = fixture();
+        let state = state_parent();
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .execute_query("where does claim admission live?")
+            .await
+            .expect("code hop");
+        let json = serde_json::to_string(&result).expect("result JSON");
+
+        assert!(json.contains("src/claim.rs"), "{json}");
+        assert!(json.contains("admit_claim"), "{json}");
+        assert!(!json.contains("TARGET_BODY_PRIVATE"), "{json}");
+        assert!(!json.contains("DISTRACTOR_SECRET_MUST_NOT_ROUTE"), "{json}");
+        assert_eq!(result.metrics.body_bytes_disclosed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_exact_headingless_path_returns_a_bounded_span() {
+        let root = fixture();
+        let state = state_parent();
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .execute_query("headingless.md")
+            .await
+            .expect("exact path route");
+
+        assert_eq!(result.spans.len(), 1);
+        assert_eq!(result.spans[0].path, "headingless.md");
+        assert_eq!(result.spans[0].start_byte, 0);
+        assert!(result.spans[0].end_byte > 0);
+        assert_eq!(result.metrics.body_bytes_disclosed, 0);
+    }
+
+    struct RecordingDisambiguator {
+        calls: AtomicUsize,
+        payloads: Mutex<Vec<String>>,
+        preferred_name: String,
+        invalid: bool,
+    }
+
+    struct MutatingDisambiguator {
+        source: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CodeHopDisambiguator for MutatingDisambiguator {
+        async fn choose(&self, request: &DisambiguationRequest) -> Result<Vec<String>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::write(
+                    &self.source,
+                    "pub fn alpha_route() {}\npub fn beta_route() {}\n// changed generation\n",
+                )
+                .expect("mutate selected source");
+            }
+            Ok(request
+                .candidates
+                .first()
+                .map(|candidate| vec![candidate.id.clone()])
+                .unwrap_or_default())
+        }
+    }
+
+    #[async_trait]
+    impl CodeHopDisambiguator for RecordingDisambiguator {
+        async fn choose(&self, request: &DisambiguationRequest) -> Result<Vec<String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.payloads
+                .lock()
+                .expect("payload lock")
+                .push(serde_json::to_string(request)?);
+            if self.invalid {
+                return Ok(vec!["invented-path.rs".to_string()]);
+            }
+            Ok(request
+                .candidates
+                .iter()
+                .find(|candidate| candidate.name == self.preferred_name)
+                .or_else(|| request.candidates.first())
+                .map(|candidate| vec![candidate.id.clone()])
+                .unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_identifier_route_skips_disambiguator_and_model_payloads_omit_bodies() {
+        let root = fixture();
+        let state = state_parent();
+        let recorder = Arc::new(RecordingDisambiguator {
+            calls: AtomicUsize::new(0),
+            payloads: Mutex::new(Vec::new()),
+            preferred_name: "claim.rs".to_string(),
+            invalid: false,
+        });
+        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .with_disambiguator(recorder.clone());
+
+        let mechanical = tool
+            .execute_query("admit_claim")
+            .await
+            .expect("mechanical route");
+        assert_eq!(recorder.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mechanical.provenance.method, RetrievalMethod::Grep);
+
+        let literal = tool
+            .execute_query("\"TARGET_BODY_PRIVATE\"")
+            .await
+            .expect("quoted literal route");
+        assert_eq!(recorder.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            literal.spans.iter().any(|span| span.path == "src/claim.rs"),
+            "spans: {:?}",
+            literal.spans
+        );
+
+        let routed = tool
+            .execute_query("alpha beta")
+            .await
+            .expect("ambiguous route");
+        assert!(!routed.spans.is_empty());
+        let payloads = recorder.payloads.lock().expect("payload lock");
+        let payload = payloads.join("\n");
+        assert!(!payload.contains("TARGET_BODY_PRIVATE"), "{payload}");
+        assert!(
+            !payload.contains("DISTRACTOR_SECRET_MUST_NOT_ROUTE"),
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_selected_leaf_discards_result_rebuilds_and_reroutes_once() {
+        let root = fixture();
+        let state = state_parent();
+        let disambiguator = Arc::new(MutatingDisambiguator {
+            source: root.path().join("src/ambiguous.rs"),
+            calls: AtomicUsize::new(0),
+        });
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .with_disambiguator(disambiguator.clone())
+            .execute_query("alpha beta")
+            .await
+            .expect("rerouted result");
+
+        assert!(
+            disambiguator.calls.load(Ordering::SeqCst) >= 2,
+            "stale first selection must cause a complete reroute"
+        );
+        assert!(
+            result
+                .spans
+                .iter()
+                .all(|span| span.path == "src/ambiguous.rs"),
+            "spans: {:?}",
+            result.spans
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeat_route_is_byte_deterministic_and_records_comparative_metrics() {
+        let root = fixture();
+        let state = state_parent();
+        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"));
+        let first = tool
+            .execute_query("where does claim admission live?")
+            .await
+            .expect("first route");
+        let second = tool
+            .execute_query("where does claim admission live?")
+            .await
+            .expect("second route");
+        assert_eq!(
+            serde_json::to_vec(&first).expect("first JSON"),
+            serde_json::to_vec(&second).expect("second JSON"),
+            "same-generation routing must be byte deterministic"
+        );
+
+        let resolver = SourceResolver::new(root.path()).expect("resolver");
+        let cache =
+            RepositoryCache::prepare(state.path().join("source-index"), &resolver).expect("cache");
+        let snapshot = cache.load().expect("load cache").expect("snapshot");
+        let naive_files = snapshot.files.len();
+        let naive_body_bytes = snapshot
+            .files
+            .iter()
+            .map(|file| file.outline.source.byte_len)
+            .sum::<usize>();
+        let file_list_bytes = serde_json::to_vec(
+            &snapshot
+                .files
+                .iter()
+                .map(|file| file.outline.source.path.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .expect("file-list JSON")
+        .len();
+
+        assert_eq!(first.metrics.body_bytes_disclosed, 0);
+        assert_eq!(first.metrics.selected_files, 1);
+        assert!(naive_files > first.metrics.selected_files);
+        assert!(naive_body_bytes > 0);
+        assert!(file_list_bytes > 0);
+        assert!(first.metrics.routing_context_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_disambiguator_ids_fall_back_with_warning() {
+        let root = fixture();
+        let state = state_parent();
+        let recorder = Arc::new(RecordingDisambiguator {
+            calls: AtomicUsize::new(0),
+            payloads: Mutex::new(Vec::new()),
+            preferred_name: String::new(),
+            invalid: true,
+        });
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .with_disambiguator(recorder)
+            .execute_query("alpha beta")
+            .await
+            .expect("fallback route");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("invalid candidate IDs")),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.provenance.method, RetrievalMethod::Grep);
+    }
+
+    #[tokio::test]
+    async fn test_unbound_ranker_warns_and_routes_unsupported_language_window() {
+        let root = fixture();
+        let state = state_parent();
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .execute_query("where are unusual widgets calibrated?")
+            .await
+            .expect("fallback route");
+        assert!(
+            result.spans.iter().any(|span| span.path == "fallback.txt"),
+            "spans: {:?}",
+            result.spans
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unbound")),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_runs_through_executor_with_workspace_read_authority() {
+        let root = fixture();
+        let state = state_parent();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CodeHopTool::new(
+            root.path(),
+            state.path().join("source-index"),
+        )));
+        let permissions = PermissionManager::new()
+            .with_default_rule(PermissionRule::Allow)
+            .with_workspace_root(root.path().to_path_buf());
+        let executor = ToolExecutor::new(
+            registry,
+            permissions,
+            state.path().join("tool-patterns.json"),
+        )
+        .expect("executor");
+        let result = executor
+            .execute_tool(
+                &ToolUse::new(
+                    "code_hop".to_string(),
+                    serde_json::json!({"query": "admit_claim"}),
+                ),
+                None::<fn() -> anyhow::Result<()>>,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("tool result");
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("src/claim.rs"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("TARGET_BODY_PRIVATE"));
+    }
+
+    #[test]
+    fn test_rank_order_is_deterministic_for_ties() {
+        let mut candidates = vec![
+            RankedCandidate {
+                id: "b".to_string(),
+                name: "beta".to_string(),
+                kind: "file".to_string(),
+                target: "beta".to_string(),
+                lead: None,
+                score: 1.0,
+            },
+            RankedCandidate {
+                id: "a".to_string(),
+                name: "alpha".to_string(),
+                kind: "file".to_string(),
+                target: "alpha".to_string(),
+                lead: None,
+                score: 1.0,
+            },
+        ];
+        candidates.sort_by(rank_order);
+        assert_eq!(candidates[0].name, "alpha");
+    }
+
+    #[tokio::test]
+    #[ignore = "reports comparative latency; correctness is covered by deterministic tests"]
+    async fn benchmark_code_hop_routing_latency() {
+        const ITERATIONS: usize = 25;
+        let root = fixture();
+        let state = state_parent();
+        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"));
+        let query = "where does claim admission live?";
+        tool.execute_query(query)
+            .await
+            .expect("warm repository cache");
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(tool.execute_query(query).await.expect("code_hop route"));
+        }
+        let code_hop_elapsed = start.elapsed();
+
+        let resolver = SourceResolver::new(root.path()).expect("resolver");
+        let cache =
+            RepositoryCache::prepare(state.path().join("source-index"), &resolver).expect("cache");
+        let snapshot = cache.load().expect("load cache").expect("snapshot");
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            for file in &snapshot.files {
+                let source = resolver
+                    .read(&file.outline.source.path)
+                    .expect("naive read");
+                std::hint::black_box(source.text.contains("claim admission"));
+            }
+        }
+        let naive_scan_elapsed = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(
+                serde_json::to_vec(
+                    &snapshot
+                        .files
+                        .iter()
+                        .map(|file| file.outline.source.path.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("file list JSON"),
+            );
+        }
+        let file_list_elapsed = start.elapsed();
+        eprintln!(
+            "{ITERATIONS} iterations: code_hop={code_hop_elapsed:?}, naive_full_scan={naive_scan_elapsed:?}, file_list_serialization={file_list_elapsed:?}"
+        );
+    }
+}

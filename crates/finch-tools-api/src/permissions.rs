@@ -305,6 +305,7 @@ pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "code_outline",
+    "code_hop",
     "get_vm_state",
     "get_language_definition",
     "search_vm_vocabulary",

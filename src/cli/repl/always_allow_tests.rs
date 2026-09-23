@@ -5,12 +5,12 @@ use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
     invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
     AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BackgroundBashTool,
-    BackgroundPollTool, BackgroundStopTool, BashTool, CodeOutlineTool, CreateMemoryTool, EditTool,
-    EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
-    HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
-    PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
-    SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
-    ToolRegistry, WebFetchTool, WriteTool,
+    BackgroundPollTool, BackgroundStopTool, BashTool, CodeHopTool, CodeOutlineTool,
+    CreateMemoryTool, EditTool, EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool,
+    GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool,
+    PatchTool, PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool,
+    RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool,
+    Tool, ToolRegistry, WebFetchTool, WriteTool,
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
@@ -82,6 +82,10 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(CodeOutlineTool::new(std::env::current_dir().expect("cwd"))),
+        Box::new(CodeHopTool::new(
+            std::env::current_dir().expect("cwd"),
+            memory_dir.path().join("source-index"),
+        )),
         Box::new(WebFetchTool::new()),
         Box::new(BashTool),
         Box::new(BackgroundBashTool::new(std::sync::Arc::clone(
@@ -258,7 +262,7 @@ fn pre_refactor_effect(tool_name: &str) -> ExecutionEffect {
 /// Unclassified just because the legacy arms used stale spellings.
 fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
     match tool_name {
-        "code_outline" => ExecutionEffect::WorkspaceRead,
+        "code_outline" | "code_hop" => ExecutionEffect::WorkspaceRead,
         "todo_read" => ExecutionEffect::VmRead,
         "todo_write" | "present_plan" | "ask_user_question" => ExecutionEffect::VmWrite,
         // Issue #754: the background bash sibling carries bash's worst-case
@@ -521,6 +525,7 @@ fn test_always_allow_list_pre_approves_named_reads_and_agent_control() {
         "glob",
         "grep",
         "code_outline",
+        "code_hop",
         "web_fetch",
         "search_memory",
         "inspect_memory",

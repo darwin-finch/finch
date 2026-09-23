@@ -8,10 +8,15 @@ generation-bound span reads before consuming source bytes.
 
 A code-outline caller supplies one workspace file and receives named definitions with line and byte
 spans, then reads only a selected span against the same identity. A repository-routing caller opens
-an owner-only cache, builds a Git-defined snapshot, and walks direct-child menus and body-free file
+or securely creates an owner-only cache directory, builds a Git-defined snapshot, and walks direct-child menus and body-free file
 outlines; the first prose paragraph of a directory's `AGENTS.md` is the sole bounded body exception
 and helps choose the next capsule. A changed file, revision, ignore rule, or path set makes that
 snapshot stale before source is returned.
+
+The shared state directory holds at most eight workspace images and 512 MiB. It never deletes an
+older workspace on its own: when that quota is full, the application reports the derived-cache
+directory for explicit cleanup. Each workspace image retains its independent 128 MiB bound and
+fixed lock/temporary leaves.
 
 Repository consistency is optimistic rather than an atomic filesystem snapshot. A routing caller
 rebuilds whenever generation validation fails, then validates each selected leaf again by consuming
