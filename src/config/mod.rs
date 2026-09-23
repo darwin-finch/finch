@@ -67,7 +67,10 @@ pub use finch_providers::{
     EnvironmentCredentialResolver, LifecycleRevocation, ProviderCredential, ReasoningEffort,
     ResolvedCredential, ResolvedSecret, DEFAULT_CLAUDE_MODEL,
 };
-pub use loader::{load_config, load_persisted_config, load_persisted_config_for_setup};
+pub use loader::{
+    load_config, load_persisted_config, load_persisted_config_for_setup,
+    migrate_removed_local_chat_config_for_setup,
+};
 #[cfg(test)]
 pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths};
 pub use persona::Persona;

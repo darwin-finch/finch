@@ -31,10 +31,12 @@ loads the cached path. The optional top-level `huggingface_token` is used first;
 environment/cache credentials remain the fallback. These settings are for daemon chat LLMs only; the frontend memory
 subsystem selects and downloads its own models. ONNX and Candle are no longer chat providers.
 The daemon currently requires at least one configured cloud provider as a fallback alongside local models.
-Loading a legacy entry tells the operator to back up the config, remove only the affected local
-`[[providers]]` block (or legacy `[backend]` block) and obsolete `[coreml]` block, preserve
-unrelated providers and credentials, and then use `finch setup`; an old repository or model file
-is never treated as a GGUF path.
+Normal startup rejects a legacy entry without changing the file. Running `finch setup` creates a
+private adjacent `config.toml.pre-gguf-migration.bak` backup (using a numeric suffix rather than
+overwriting an earlier backup), removes only the affected local `[[providers]]` block or legacy
+`[backend]` block plus obsolete `[coreml]` sections, and preserves unrelated providers,
+credentials, settings, and comments before opening the editor. An old repository or model file is
+never treated as a GGUF path.
 
 Automatic training is disabled and there are no active `auto_train` settings.
 Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without

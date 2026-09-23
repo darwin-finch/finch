@@ -100,6 +100,15 @@ fn cleanup_terminal() -> Result<()> {
 
 /// Show first-run setup wizard and return configuration
 pub fn show_setup_wizard() -> Result<SetupResult> {
+    if let Some(backup_path) = crate::config::migrate_removed_local_chat_config_for_setup()
+        .context("Existing Finch configuration could not be migrated for setup")?
+    {
+        eprintln!(
+            "Removed retired ONNX/Candle local-chat settings. Original configuration backed up to {}\n",
+            backup_path.display()
+        );
+    }
+
     // `None` is reserved for a genuinely absent file. Existing configuration
     // failures must stop setup before it can render or save an empty fallback.
     let existing_config = crate::config::load_persisted_config_for_setup().context(
