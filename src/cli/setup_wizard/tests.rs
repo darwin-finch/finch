@@ -536,7 +536,11 @@ fn gui_permission_required_status_includes_non_authoritative_process_diagnostics
         target,
         None,
     );
-    let output = lines.join("\n");
+    let output = lines
+        .iter()
+        .map(crate::cli::tui::WizardLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(output.contains("current Finch process is not Accessibility-trusted"));
     assert!(output.contains("headless prompt suppressed"));
@@ -695,6 +699,9 @@ fn test_gui_accessibility_expanded_details_preserve_long_identity_hints() {
             "test opener failure".to_string(),
         )),
     )
+    .iter()
+    .map(crate::cli::tui::WizardLine::plain_text)
+    .collect::<Vec<_>>()
     .join("\n");
     assert!(full_status.contains(&long_path));
 
@@ -6807,4 +6814,186 @@ fn test_wizard_view_borders_are_glyph_runs_of_exact_frame_width_at_80_and_120() 
             );
         }
     }
+}
+
+// ── #1140: the styling symptoms stage 4 kills ────────────────────────────────
+
+/// The raw SGR bytes of one planned wizard frame — what the blit prints, not
+/// the shadow buffer's stripped text.
+fn wizard_frame_bytes(state: &WizardState, width: usize, height: usize) -> String {
+    let view = wizard_view_with_permission_target(state, "", width, height);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+    frame.lines.join("\n")
+}
+
+/// REGRESSION (#1140, selection contrast): the selected row wears the
+/// selection style — bold bright-white on a black background — not just the
+/// `>>>` prefix, and unselected rows carry no selection marking. The
+/// pre-migration painter styled selections `bg(Black).fg(White)`; the widget
+/// host lost the background channel and selections read grey-on-grey on a
+/// grey terminal.
+#[test]
+fn test_selected_rows_carry_selection_contrast_beyond_the_prefix() {
+    // The style at the props boundary: foreground white, background black,
+    // bold — the #1140 contrast prop, in one place.
+    let selected = crate::cli::tui::wizard_selected(">>> Selected provider <<<");
+    let span = &selected.0[0];
+    assert_eq!(
+        (span.fg, span.bg, span.bold),
+        (
+            Some(crate::cli::tui::WizardColor::White),
+            Some(crate::cli::tui::WizardColor::Black),
+            true,
+        ),
+        "the selection style must be bold white on black; got span {span:?}"
+    );
+    assert!(
+        crate::cli::tui::wizard_line_is_selected(&selected)
+            && !crate::cli::tui::wizard_line_is_selected(&crate::cli::tui::wizard_line(
+                "plain row",
+                crate::cli::tui::WizardColor::Blue,
+            )),
+        "the selection marker is a styled span, not a prefix; selected={selected:?}"
+    );
+
+    // The render boundary: the models section paints the selection SGR run on
+    // the selected row and nothing on the unselected ones.
+    let state = WizardState::new(None);
+    let bytes = wizard_frame_bytes(&state, 80, 24);
+    assert!(
+        bytes.contains("\x1b[1;97;40m"),
+        "a selected wizard row must paint bold bright-white on black; frame: {bytes:?}"
+    );
+    let unselected_prefix_count = bytes.matches("\x1b[1;97;40m").count();
+    assert!(
+        unselected_prefix_count == 1,
+        "exactly the selected row wears the selection style; count was \
+         {unselected_prefix_count} in: {bytes:?}"
+    );
+}
+
+/// REGRESSION (#1140, tab highlight): the `selected_tab` prop decides which
+/// tab wears the active style — bold magenta on black — and moving the
+/// marker moves the highlight. The tab row carries the active marker prop at
+/// the props/render boundary, so every section shows which pane is active.
+#[test]
+fn test_active_tab_marker_prop_selects_the_highlighted_tab() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Themes;
+    let themes_view = wizard_view_with_permission_target(&state, "", 100, 24);
+    let themes_marker = themes_view.selected_tab;
+    assert_eq!(
+        WizardSection::all()[themes_marker],
+        WizardSection::Themes,
+        "the view's selected_tab prop must carry the current section; prop was {themes_marker}"
+    );
+
+    // Render two frames whose marker props differ; the highlight follows.
+    let mut state_second = WizardState::new(None);
+    state_second.current_section = WizardSection::Models;
+    let bytes_first = wizard_frame_bytes(&state, 100, 24);
+    let bytes_second = wizard_frame_bytes(&state_second, 100, 24);
+    for (name, tab_title, bytes, other) in [
+        ("Themes", "Look & Feel", &bytes_first, &bytes_second),
+        ("Models", "Model Setup", &bytes_second, &bytes_first),
+    ] {
+        let active_run = format!("\x1b[1;35;40m{tab_title}");
+        assert!(
+            bytes.contains(&active_run),
+            "the {name} tab must wear the active style (bold magenta on black) when \
+             selected_tab marks it; frame: {bytes:?}"
+        );
+        assert!(
+            !other.contains(&active_run),
+            "the {name} tab must not wear the active style while another pane is \
+             selected; frame: {other:?}"
+        );
+    }
+}
+
+/// REGRESSION (#1140, context lines): the spinner row shows its value, the
+/// ◀/▶ affordance is advertised in the instructions on every platform, and
+/// the Left/Right keys actually adjust the value.
+#[test]
+fn test_context_lines_spinner_value_is_visible_keys_adjust_and_keys_are_advertised() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Features;
+    for _ in 0..SETTINGS_CONTEXT_IDX {
+        handle_features_input(&mut state, key(KeyCode::Down)).unwrap();
+    }
+    let before = features_context_lines(&state);
+    assert_eq!(before, 4, "the default context-lines value starts at 4");
+
+    // ◀ decrements, ▶ increments, and the value renders (the value IS the
+    // row's content — the #1140 report could not set it).
+    handle_features_input(&mut state, key(KeyCode::Left)).unwrap();
+    assert_eq!(
+        features_context_lines(&state),
+        3,
+        "◀ must decrement the context-lines spinner"
+    );
+    handle_features_input(&mut state, key(KeyCode::Right)).unwrap();
+    handle_features_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert_eq!(
+        features_context_lines(&state),
+        5,
+        "▶ must increment the context-lines spinner"
+    );
+    let rendered = wizard_text_with_permission_target(&state, "", 80, 24);
+    assert!(
+        rendered.contains("Context lines: 5"),
+        "the spinner's current value must be visible; rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("◀ Context lines: 5 ▶"),
+        "the spinner affordances must be visible; rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("◀/▶: Context lines"),
+        "the instructions must advertise the ◀/▶ keys (#1140: the spinner was \
+         undiscoverable on macOS); rendered: {rendered}"
+    );
+    // Bounds hold: 1..=8.
+    for _ in 0..10 {
+        handle_features_input(&mut state, key(KeyCode::Left)).unwrap();
+    }
+    assert_eq!(features_context_lines(&state), 1, "the spinner clamps at 1");
+    for _ in 0..10 {
+        handle_features_input(&mut state, key(KeyCode::Right)).unwrap();
+    }
+    assert_eq!(features_context_lines(&state), 8, "the spinner clamps at 8");
+}
+
+fn features_context_lines(state: &WizardState) -> usize {
+    match state.sections.get(&WizardSection::Features) {
+        Some(SectionState::Features {
+            memory_context_lines,
+            ..
+        }) => *memory_context_lines,
+        other => panic!("features section state must exist; got {other:?}"),
+    }
+}
+
+/// SCAN REGRESSION (#1141): the wizard view builders construct spans, never
+/// SGR bytes — the only escape sequences in the wizard surface live in the
+/// host's lowering. Mirrors the component-renderer scan.
+#[test]
+fn test_wizard_view_builders_construct_no_sgr_bytes() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/cli/setup_wizard/render.rs"
+    ))
+    .expect("cannot read the wizard view builders under test");
+    let offenders: Vec<String> = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("\\x1b") || line.contains("\\u{1b}"))
+        .map(|(index, line)| format!("line {}: {line}", index + 1))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "wizard view builders must carry no SGR bytes (stage 4 #1141); \
+         found escape sequences at:\n{}",
+        offenders.join("\n")
+    );
 }

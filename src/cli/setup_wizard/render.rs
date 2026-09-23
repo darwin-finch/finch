@@ -1,10 +1,11 @@
 //! Wizard view props: what the widget host paints, one function per section.
 //!
 //! #812: this file no longer paints. The second painter is gone — each
-//! function converts `WizardState` into plain styled lines and overlay-card
+//! function converts `WizardState` into styled span lines and overlay-card
 //! props ([`WizardView`], [`WizardCard`]), and `crate::cli::tui::wizard_host`
-//! claims the frame, records the shadow buffer, and blits. The lines are the
-//! speakable canonical form, so a GUI host (#808) can consume the same props.
+//! claims the frame, lowers the spans to SGR, records the shadow buffer, and
+//! blits. The spans are the speakable canonical form, so a GUI host (#808)
+//! can consume the same props without any terminal bytes.
 //!
 //! The windowing helpers here count physical rows with the same shadow-buffer
 //! arithmetic the host's claiming pass uses, so the one list that must keep a
@@ -16,8 +17,8 @@ use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary}
 use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
-    wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_physical_rows,
-    wizard_plain, WizardCard, WizardSectionContent, WizardView,
+    wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_plain,
+    wizard_selected, WizardCard, WizardLine, WizardSectionContent, WizardView,
 };
 
 // ─── Small shared helpers ────────────────────────────────────────────────────
@@ -44,8 +45,8 @@ pub(super) fn mask_secret(value: &str, keep_start: usize, keep_end: usize) -> St
 /// The host's claiming pass and the view's windowing must count rows with the
 /// same terminal-accurate arithmetic (#926): emoji-presentation characters
 /// render two columns, and a one-column disagreement shifts a whole frame.
-fn rows_of(line: &str, width: usize) -> usize {
-    wizard_physical_rows(line, width)
+fn rows_of(line: &WizardLine, width: usize) -> usize {
+    line.physical_rows(width)
 }
 
 /// `Auto` or `CPU` — the llama.cpp execution-target display.
@@ -102,7 +103,7 @@ pub(super) fn format_catalog_label(
 }
 
 /// Skip the first `skip` wrapped rows of `lines`, by whole logical lines.
-fn skip_wrapped_rows(lines: &[String], skip: usize, width: usize) -> Vec<String> {
+fn skip_wrapped_rows(lines: &[WizardLine], skip: usize, width: usize) -> Vec<WizardLine> {
     let mut used = 0usize;
     let mut start = 0usize;
     for line in lines {
@@ -118,7 +119,7 @@ fn skip_wrapped_rows(lines: &[String], skip: usize, width: usize) -> Vec<String>
 }
 
 /// Keep the head of `lines` that fits `budget` wrapped rows.
-fn head_fitting_rows(lines: &[String], budget: usize, width: usize) -> Vec<String> {
+fn head_fitting_rows(lines: &[WizardLine], budget: usize, width: usize) -> Vec<WizardLine> {
     let mut used = 0usize;
     let mut out = Vec::new();
     for line in lines {
@@ -147,7 +148,7 @@ fn tab_titles(state: &WizardState) -> Vec<String> {
         .collect()
 }
 
-fn help_line(state: &WizardState, width: usize) -> String {
+fn help_line(state: &WizardState, width: usize) -> WizardLine {
     let section_help = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next",
         WizardSection::Models => "Enter: Edit provider | A: Add | D: Remove",
@@ -157,30 +158,31 @@ fn help_line(state: &WizardState, width: usize) -> String {
         WizardSection::Review => "Enter: Save & start",
     };
     let text = format!("{section_help} | Ctrl+S: Save | Esc: Back | Tab: Next | Ctrl+C: Cancel");
-    wizard_centered(&wizard_bold(&text, Color::Blue), width)
+    wizard_centered(wizard_bold(&text, Color::Blue), width)
 }
 
 // ─── Section content ─────────────────────────────────────────────────────────
 
 /// Themes section: list, preview, instructions.
-fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<String> {
+fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> {
     use crate::theme::ColorTheme;
 
     let mut lines = vec![wizard_centered(
-        &wizard_bold("Theme Selection", Color::Blue),
+        wizard_bold("Theme Selection", Color::Blue),
         width,
     )];
 
     let themes = ColorTheme::all();
-    let items: Vec<String> = themes
+    let items: Vec<WizardLine> = themes
         .iter()
         .enumerate()
         .map(|(index, theme)| {
             if index == selected_theme {
-                wizard_bold(
-                    &format!(">>> {} - {} <<<", theme.name(), theme.description()),
-                    Color::White,
-                )
+                wizard_selected(&format!(
+                    ">>> {} - {} <<<",
+                    theme.name(),
+                    theme.description()
+                ))
             } else {
                 wizard_line(
                     &format!("    {} - {}", theme.name(), theme.description()),
@@ -194,29 +196,25 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<String> {
     // Preview of the selected theme, in the theme's own colours.
     let preview_theme = themes[selected_theme].to_scheme();
     let preview = vec![
-        format!(
-            "{}{}",
+        WizardLine::concat(&[
             wizard_line("User: ", preview_theme.messages.user.to_color().into()),
-            wizard_plain("What is 2+2?")
-        ),
-        format!(
-            "{}{}",
+            wizard_plain("What is 2+2?"),
+        ]),
+        WizardLine::concat(&[
             wizard_line(
                 "Assistant: ",
-                preview_theme.messages.assistant.to_color().into()
+                preview_theme.messages.assistant.to_color().into(),
             ),
-            wizard_plain("The answer is 4.")
-        ),
-        format!(
-            "{}{}",
+            wizard_plain("The answer is 4."),
+        ]),
+        WizardLine::concat(&[
             wizard_line("🔧 Tool: ", preview_theme.messages.tool.to_color().into()),
-            wizard_plain("Reading file...")
-        ),
-        format!(
-            "{}{}",
+            wizard_plain("Reading file..."),
+        ]),
+        WizardLine::concat(&[
             wizard_line("❌ Error: ", preview_theme.messages.error.to_color().into()),
-            wizard_plain("File not found")
-        ),
+            wizard_plain("File not found"),
+        ]),
     ];
     lines.extend(wizard_boxed("Preview", &preview, Color::Blue, width));
 
@@ -324,9 +322,9 @@ fn provider_row_display(model: &ModelConfig, primary: bool) -> String {
     }
 }
 
-fn marked_row(display: &str, selected: bool, enabled: bool) -> String {
+fn marked_row(display: &str, selected: bool, enabled: bool) -> WizardLine {
     if selected {
-        wizard_bold(&format!(">>> {display} <<<"), Color::White)
+        wizard_selected(&format!(">>> {display} <<<"))
     } else if enabled {
         wizard_plain(&format!("    {display}"))
     } else {
@@ -345,9 +343,9 @@ fn models_section_lines(
     model_input: &str,
     error: Option<&str>,
     width: usize,
-) -> Vec<String> {
+) -> Vec<WizardLine> {
     let mut lines = vec![wizard_centered(
-        &wizard_bold("AI Providers", Color::Cyan),
+        wizard_bold("AI Providers", Color::Cyan),
         width,
     )];
 
@@ -384,12 +382,12 @@ fn models_section_lines(
     };
     for text in description_text.split('\n') {
         lines.push(wizard_centered(
-            &wizard_line(text.trim(), Color::Blue),
+            wizard_line(text.trim(), Color::Blue),
             width,
         ));
     }
 
-    let mut list_rows = Vec::new();
+    let mut list_rows: Vec<WizardLine> = Vec::new();
     for (index, model) in std::iter::once(primary_model)
         .chain(tool_models.iter())
         .enumerate()
@@ -442,7 +440,7 @@ fn models_section_lines(
         ));
     } else {
         lines.push(wizard_centered(
-            &wizard_line(
+            wizard_line(
                 "Press Enter to edit the selected provider · P for primary",
                 Color::DarkGray,
             ),
@@ -456,11 +454,11 @@ fn models_section_lines(
         "Enter: Edit | P: Primary | A: Add | D: Remove | Tab: Next"
     };
     lines.push(wizard_centered(
-        &wizard_bold(instructions_text, Color::Yellow),
+        wizard_bold(instructions_text, Color::Yellow),
         width,
     ));
     if let Some(error) = error {
-        lines.push(wizard_centered(&wizard_line(error, Color::Red), width));
+        lines.push(wizard_centered(wizard_line(error, Color::Red), width));
     }
     lines
 }
@@ -478,15 +476,15 @@ fn personas_section_lines(
     prompt_input: &str,
     cursor_pos: usize,
     width: usize,
-) -> Vec<String> {
+) -> Vec<WizardLine> {
     let mut lines = Vec::new();
-    let rows: Vec<String> = personas
+    let rows: Vec<WizardLine> = personas
         .iter()
         .enumerate()
         .map(|(index, persona)| {
             let is_default = persona.name.to_lowercase() == default_persona.to_lowercase();
             if index == selected_idx {
-                wizard_bold(&format!(">>> {} <<<", persona.name), Color::White)
+                wizard_selected(&format!(">>> {} <<<", persona.name))
             } else if is_default {
                 wizard_line(&format!("★   {}", persona.name), Color::Yellow)
             } else {
@@ -506,7 +504,7 @@ fn personas_section_lines(
             "Editing system prompt  (Ctrl+S: Save | Esc: Cancel)",
             Color::Yellow,
         )];
-        body.push(String::new());
+        body.push(WizardLine::blank());
         for text in format!("{before}\u{2588}{after}").split('\n') {
             body.push(wizard_plain(text));
         }
@@ -518,22 +516,20 @@ fn personas_section_lines(
         ));
     } else {
         let preview = vec![
-            format!(
-                "{}{}",
+            WizardLine::concat(&[
                 wizard_paint("Name: ", None, true),
-                wizard_plain(&persona.name)
-            ),
-            String::new(),
-            format!(
-                "{}{}",
+                wizard_plain(&persona.name),
+            ]),
+            WizardLine::blank(),
+            WizardLine::concat(&[
                 wizard_paint("Description: ", None, true),
-                wizard_plain(&persona.description)
-            ),
-            String::new(),
+                wizard_plain(&persona.description),
+            ]),
+            WizardLine::blank(),
             wizard_paint("System Prompt:", None, true),
-            String::new(),
+            WizardLine::blank(),
             wizard_plain(&persona.system_prompt),
-            String::new(),
+            WizardLine::blank(),
             wizard_line("E: Edit system prompt", Color::DarkGray),
         ];
         lines.extend(wizard_boxed("Preview", &preview, Color::Blue, width));
@@ -552,7 +548,7 @@ pub(super) fn gui_automation_status_lines(
     last_known_available: bool,
     target_description: &str,
     settings_feedback: Option<&GuiSettingsFeedback>,
-) -> Vec<String> {
+) -> Vec<WizardLine> {
     let summary = match (availability.state, prompt) {
         (AutomationState::Disabled, _) => "Finch capability consent is disabled",
         (AutomationState::Unsupported, _) => "Configured, but unsupported on this launch",
@@ -582,11 +578,14 @@ pub(super) fn gui_automation_status_lines(
         }
     };
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<WizardLine> = Vec::new();
     if let Some(feedback) = settings_feedback {
-        lines.push(format!("Settings action: {}", feedback.full_message()));
+        lines.push(WizardLine::plain(format!(
+            "Settings action: {}",
+            feedback.full_message()
+        )));
     }
-    lines.push(format!("Trust status: {summary}"));
+    lines.push(wizard_plain(&summary));
     if configured
         && matches!(
             availability.state,
@@ -596,19 +595,17 @@ pub(super) fn gui_automation_status_lines(
         lines.extend(
             target_description
                 .lines()
-                .map(|line| format!("Diagnostic only — {line}")),
+                .map(|line| WizardLine::plain(format!("Diagnostic only — {line}"))),
         );
     }
     if availability.state == AutomationState::PermissionRequired {
-        lines.push(
-            "Recovery: a checkbox or prompt is not proof of access. Press P to request the macOS prompt, or open System Settings → Privacy & Security → Accessibility, then press R for a passive re-check of this live process. If it remains untrusted, relaunch the same executable/host context and check again."
-                .to_string(),
-        );
+        lines.push(wizard_plain(
+            "Recovery: a checkbox or prompt is not proof of access. Press P to request the macOS prompt, or open System Settings → Privacy & Security → Accessibility, then press R for a passive re-check of this live process. If it remains untrusted, relaunch the same executable/host context and check again.",
+        ));
     }
-    lines.push(
-        "This full view is read/scroll only; clipboard copying is unavailable in the setup wizard."
-            .to_string(),
-    );
+    lines.push(wizard_plain(
+        "This full view is read/scroll only; clipboard copying is unavailable in the setup wizard.",
+    ));
     lines
 }
 
@@ -618,14 +615,14 @@ fn feature_group(
     enabled: Option<bool>,
     name: &str,
     description: &str,
-) -> Vec<String> {
+) -> Vec<WizardLine> {
     let checkbox = match enabled {
         Some(true) => "✅ ",
         Some(false) => "☐ ",
         None => "",
     };
     let name_line = if selected {
-        wizard_bold(&format!(">>> {checkbox}{name} <<<"), Color::White)
+        wizard_selected(&format!(">>> {checkbox}{name} <<<"))
     } else {
         match enabled {
             Some(true) => wizard_line(&format!("    {checkbox}{name}"), Color::Blue),
@@ -712,10 +709,7 @@ fn features_section_content(
             inner_width,
         );
         let body = head_fitting_rows(&scrolled, body_budget, inner_width);
-        let mut lines = vec![wizard_centered(
-            &wizard_bold("Settings", Color::Cyan),
-            width,
-        )];
+        let mut lines = vec![wizard_centered(wizard_bold("Settings", Color::Cyan), width)];
         lines.extend(wizard_boxed(
             "Full GUI automation status (read/scroll only)",
             &body,
@@ -723,7 +717,7 @@ fn features_section_content(
             width,
         ));
         lines.push(wizard_centered(
-            &wizard_bold(
+            wizard_bold(
                 "↑/↓ or PgUp/PgDn: Scroll | Home: Top | D/Esc: Back to settings",
                 Color::Yellow,
             ),
@@ -735,8 +729,12 @@ fn features_section_content(
     #[cfg(target_os = "macos")]
     let gui_automation_description = gui_automation_status
         .iter()
-        .find_map(|line| line.strip_prefix("Trust status: "))
-        .unwrap_or("GUI automation status unavailable")
+        .find_map(|line| {
+            line.plain_text()
+                .strip_prefix("Trust status: ")
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "GUI automation status unavailable".to_string())
         .to_string();
     #[cfg(not(target_os = "macos"))]
     let gui_automation_description = String::new();
@@ -813,7 +811,7 @@ fn features_section_content(
         ),
     ];
 
-    let hf_group = |selected: bool| -> Vec<String> {
+    let hf_group = |selected: bool| -> Vec<WizardLine> {
         let (prefix, suffix) = if selected {
             (">>> ", " <<<")
         } else {
@@ -826,15 +824,25 @@ fn features_section_content(
         } else {
             format!("{prefix}HF Token: {}{suffix}", mask_secret(hf_token, 4, 4))
         };
-        vec![
-            wizard_line(&line, Color::Cyan),
-            wizard_line(
-                "        For model downloads from HuggingFace",
-                Color::DarkGray,
-            ),
-        ]
+        if selected {
+            vec![
+                wizard_selected(&line),
+                wizard_line(
+                    "        For model downloads from HuggingFace",
+                    Color::DarkGray,
+                ),
+            ]
+        } else {
+            vec![
+                wizard_line(&line, Color::Cyan),
+                wizard_line(
+                    "        For model downloads from HuggingFace",
+                    Color::DarkGray,
+                ),
+            ]
+        }
     };
-    let finch_key_group = |selected: bool| -> Vec<String> {
+    let finch_key_group = |selected: bool| -> Vec<WizardLine> {
         let (prefix, suffix) = if selected {
             (">>> ", " <<<")
         } else {
@@ -850,17 +858,27 @@ fn features_section_content(
                 mask_secret(finch_api_key, 4, 4)
             )
         };
-        vec![
-            wizard_line(&line, Color::Cyan),
-            wizard_line(
-                "        Key OpenAI-compatible clients use to connect to Finch",
-                Color::DarkGray,
-            ),
-        ]
+        if selected {
+            vec![
+                wizard_selected(&line),
+                wizard_line(
+                    "        Key OpenAI-compatible clients use to connect to Finch",
+                    Color::DarkGray,
+                ),
+            ]
+        } else {
+            vec![
+                wizard_line(&line, Color::Cyan),
+                wizard_line(
+                    "        Key OpenAI-compatible clients use to connect to Finch",
+                    Color::DarkGray,
+                ),
+            ]
+        }
     };
 
     // Build the groups in the exact order the input handler indexes them.
-    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut groups: Vec<Vec<WizardLine>> = Vec::new();
     let mut list_idx = 0usize;
     for (name, enabled, description) in bool_features.iter() {
         if list_idx == SETTINGS_HF_TOKEN_IDX {
@@ -882,7 +900,10 @@ fn features_section_content(
     if SETTINGS_HF_TOKEN_IDX >= list_idx {
         groups.push(hf_group(selected_idx == list_idx));
     }
-    // Context-lines spinner row (always last).
+    // Context-lines spinner row (always last). The value is the row's point:
+    // it renders in the selection contrast when selected (bg Black, #1140)
+    // and stays bold blue otherwise, so the number is always readable and
+    // the ◀/▶ affordance is visible.
     {
         let selected = selected_idx == SETTINGS_CONTEXT_IDX;
         let (prefix, suffix) = if selected {
@@ -890,20 +911,22 @@ fn features_section_content(
         } else {
             ("    ", "")
         };
-        groups.push(vec![
-            format!(
-                "{}{}{}",
+        let spinner_line = if selected {
+            wizard_selected(&format!(
+                "{prefix}◀ Context lines: {memory_context_lines} ▶{suffix}"
+            ))
+        } else {
+            WizardLine::concat(&[
                 wizard_plain(prefix),
                 wizard_bold(
-                    &format!("◀ Context lines: {} ▶", memory_context_lines),
-                    if selected { Color::White } else { Color::Blue },
+                    &format!("◀ Context lines: {memory_context_lines} ▶"),
+                    Color::Blue,
                 ),
-                if selected {
-                    wizard_bold(suffix, Color::White)
-                } else {
-                    String::new()
-                },
-            ),
+                wizard_plain(suffix),
+            ])
+        };
+        groups.push(vec![
+            spinner_line,
             wizard_line(
                 "        Status-strip summary lines shown below the prompt (1–8)",
                 Color::DarkGray,
@@ -913,7 +936,7 @@ fn features_section_content(
 
     // Compact GUI status box claims rows under the list when its row is active.
     #[cfg(target_os = "macos")]
-    let compact_rows: Vec<String> = if show_gui_details {
+    let compact_rows: Vec<WizardLine> = if show_gui_details {
         let mut rows = Vec::new();
         if let Some(feedback) = gui_automation_settings_feedback {
             rows.push(wizard_plain(feedback.compact_message()));
@@ -940,7 +963,7 @@ fn features_section_content(
         Vec::new()
     };
     #[cfg(not(target_os = "macos"))]
-    let compact_rows: Vec<String> = Vec::new();
+    let compact_rows: Vec<WizardLine> = Vec::new();
 
     // Window the groups so the selected row stays visible with the same
     // minimal-scroll guarantee the old painter's list state gave. The budget
@@ -985,7 +1008,7 @@ fn features_section_content(
         start += 1;
     }
     let start = start.min(selected_idx);
-    let mut windowed: Vec<String> = Vec::new();
+    let mut windowed: Vec<WizardLine> = Vec::new();
     {
         let mut used = 0usize;
         for (index, group) in groups.iter().enumerate().skip(start) {
@@ -1011,10 +1034,7 @@ fn features_section_content(
         }
     }
 
-    let mut lines = vec![wizard_centered(
-        &wizard_bold("Settings", Color::Cyan),
-        width,
-    )];
+    let mut lines = vec![wizard_centered(wizard_bold("Settings", Color::Cyan), width)];
     lines.extend(wizard_boxed("Options", &windowed, Color::Blue, width));
     #[cfg(target_os = "macos")]
     if show_gui_details {
@@ -1035,7 +1055,9 @@ fn features_section_content(
             if show_gui_details {
                 "R: Check | P: Prompt | O/D: More"
             } else {
-                "↑/↓: Move | Space: Toggle | E: Edit | Enter: Continue"
+                // The ◀/▶ affordance is advertised on every platform (#1140:
+                // the context-lines spinner was undiscoverable on macOS).
+                "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1044,19 +1066,19 @@ fn features_section_content(
         }
     };
     lines.push(wizard_centered(
-        &wizard_bold(instructions_text, Color::Yellow),
+        wizard_bold(instructions_text, Color::Yellow),
         width,
     ));
     WizardSectionContent::plain(lines)
 }
 
 /// Review section: the summary the user confirms before saving.
-fn review_section_lines(state: &WizardState, width: usize) -> Vec<String> {
+fn review_section_lines(state: &WizardState, width: usize) -> Vec<WizardLine> {
     use crate::theme::ColorTheme;
 
     let mut body = vec![
-        wizard_centered(&wizard_bold("Ready to go!", Color::Green), width),
-        wizard_centered(&wizard_bold("Here's what you set up:", Color::Cyan), width),
+        wizard_centered(wizard_bold("Ready to go!", Color::Green), width),
+        wizard_centered(wizard_bold("Here's what you set up:", Color::Cyan), width),
     ];
 
     if let Some(SectionState::Themes { selected_theme }) =
@@ -1064,11 +1086,10 @@ fn review_section_lines(state: &WizardState, width: usize) -> Vec<String> {
     {
         let themes = ColorTheme::all();
         let theme_name = themes[*selected_theme].name().to_string();
-        body.push(format!(
-            "{}{}",
+        body.push(WizardLine::concat(&[
             wizard_line("Theme: ", Color::Yellow),
-            wizard_plain(&theme_name)
-        ));
+            wizard_plain(&theme_name),
+        ]));
     }
 
     if let Some(SectionState::Models { primary_model, .. }) =
@@ -1081,22 +1102,20 @@ fn review_section_lines(state: &WizardState, width: usize) -> Vec<String> {
             ModelConfig::Remote { .. } => "Claude (no API key — will prompt on first use)",
             ModelConfig::Local { .. } => "Local model",
         };
-        body.push(format!(
-            "{}{}",
+        body.push(WizardLine::concat(&[
             wizard_line("AI: ", Color::Yellow),
-            wizard_plain(ai_label)
-        ));
+            wizard_plain(ai_label),
+        ]));
     }
 
     if let Some(SectionState::Personas {
         default_persona, ..
     }) = state.sections.get(&WizardSection::Personas)
     {
-        body.push(format!(
-            "{}{}",
+        body.push(WizardLine::concat(&[
             wizard_line("Style: ", Color::Yellow),
-            wizard_plain(default_persona)
-        ));
+            wizard_plain(default_persona),
+        ]));
     }
 
     if let Some(SectionState::Features {
@@ -1117,14 +1136,13 @@ fn review_section_lines(state: &WizardState, width: usize) -> Vec<String> {
         } else {
             settings.join(", ")
         };
-        body.push(format!(
-            "{}{}",
+        body.push(WizardLine::concat(&[
             wizard_line("Settings: ", Color::Yellow),
-            wizard_plain(&settings_text)
-        ));
+            wizard_plain(&settings_text),
+        ]));
     }
 
-    body.push(String::new());
+    body.push(WizardLine::blank());
     body.push(wizard_bold(
         "Press Enter or Ctrl+S to save & start chatting",
         Color::Green,
@@ -1144,9 +1162,12 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
         title: "Cancel setup?".to_string(),
         body: vec![
             wizard_plain("Discard all setup changes and cancel?"),
-            String::new(),
+            WizardLine::blank(),
         ],
-        controls: Some("Y / Enter: Discard    N / Esc: Keep editing".to_string()),
+        controls: Some(wizard_line(
+            "Y / Enter: Discard    N / Esc: Keep editing",
+            Color::Yellow,
+        )),
         accent: Color::Yellow,
     }
 }
@@ -1194,7 +1215,8 @@ fn device_auth_card(
     } else {
         format!("ChatGPT device sign-in for {provider_name}")
     };
-    let mut body = vec![wizard_bold(&title_text, Color::Cyan), String::new()];
+    let mut body: Vec<WizardLine> =
+        vec![wizard_bold(&title_text, Color::Cyan), WizardLine::blank()];
     let controls;
     match outcome.lock().unwrap().as_ref() {
         Some(Ok(ensured)) => {
@@ -1206,7 +1228,7 @@ fn device_auth_card(
             body.push(wizard_plain(&format!(
                 "{provider_name} is authenticated. Press Enter to return to the provider list."
             )));
-            controls = "Enter: Continue".to_string();
+            controls = wizard_line("Enter: Continue", Color::Yellow);
         }
         Some(Err(failure)) => {
             let summary = if is_grok_sub {
@@ -1217,7 +1239,10 @@ fn device_auth_card(
             for sentence in failure_summary_sentences(&summary) {
                 body.push(wizard_plain(&sentence));
             }
-            controls = "Enter: Retry sign-in | Esc: Back to provider details".to_string();
+            controls = wizard_line(
+                "Enter: Retry sign-in | Esc: Back to provider details",
+                Color::Yellow,
+            );
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
@@ -1229,7 +1254,7 @@ fn device_auth_card(
                     &format!("One-time code: {}", presentation.user_code),
                     Color::White,
                 ));
-                body.push(String::new());
+                body.push(WizardLine::blank());
                 body.push(wizard_plain(
                     "Approve the code in your browser; this dialog finishes automatically.",
                 ));
@@ -1237,11 +1262,11 @@ fn device_auth_card(
                     "The code expires in {} minutes.",
                     presentation.expires_in.as_secs().div_ceil(60)
                 )));
-                controls = "Esc: Cancel".to_string();
+                controls = wizard_line("Esc: Cancel", Color::Yellow);
             }
             None => {
                 body.push(wizard_plain("Starting the device sign-in…"));
-                controls = "Esc: Cancel".to_string();
+                controls = wizard_line("Esc: Cancel", Color::Yellow);
             }
         },
     }
@@ -1259,7 +1284,7 @@ fn device_auth_card(
 }
 
 /// One bracketed form row; the exact shapes the compact editors always showed.
-fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool) -> String {
+fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool) -> WizardLine {
     let label_text = if focused {
         wizard_bold(&format!("{:<10}", label), Color::White)
     } else {
@@ -1277,7 +1302,7 @@ fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool)
     } else {
         wizard_line(&value_text, Color::Cyan)
     };
-    format!("{label_text}{value_painted}")
+    WizardLine::concat(&[label_text, value_painted])
 }
 
 /// The add-provider overlay as one claimed card: type selection, the
@@ -1298,7 +1323,7 @@ pub(super) fn add_provider_card(
             let mut body = Vec::new();
             for (index, (_, display_name, _, hint)) in CLOUD_PROVIDERS.iter().enumerate() {
                 body.push(if index == *selected {
-                    wizard_bold(&format!(">>> {display_name} <<<"), Color::White)
+                    wizard_selected(&format!(">>> {display_name} <<<"))
                 } else {
                     wizard_line(&format!("    {display_name}"), Color::Cyan)
                 });
@@ -1306,13 +1331,13 @@ pub(super) fn add_provider_card(
             }
             let (local_line, scan_line) = if *selected == n_cloud {
                 (
-                    wizard_bold(">>> Local model <<<", Color::White),
+                    wizard_selected(">>> Local model <<<"),
                     wizard_line("    Scan local network", Color::DarkGray),
                 )
             } else if *selected == n_cloud + 1 {
                 (
                     wizard_line("    Local model", Color::Cyan),
-                    wizard_bold(">>> Scan local network <<<", Color::White),
+                    wizard_selected(">>> Scan local network <<<"),
                 )
             } else {
                 (
@@ -1333,7 +1358,10 @@ pub(super) fn add_provider_card(
             WizardCard::new(
                 "Add AI Provider",
                 body,
-                Some("↑/↓: Move | Enter: Select | Esc: Cancel".to_string()),
+                Some(wizard_line(
+                    "↑/↓: Move | Enter: Select | Esc: Cancel",
+                    Color::Yellow,
+                )),
             )
         }
         // ── single-screen cloud provider form ────────────────────────────────
@@ -1352,8 +1380,8 @@ pub(super) fn add_provider_card(
             let provider_value =
                 format!("{} ({})", provider_name, cloud_provider_id(*provider_idx));
             let model_display = if model.is_empty() { "(default)" } else { model };
-            let mut body = vec![
-                String::new(),
+            let mut body: Vec<WizardLine> = vec![
+                WizardLine::blank(),
                 remote_form_row("Provider", &provider_value, *focused_field == 0, false),
                 remote_form_row("Name", name, *focused_field == 1, true),
                 remote_form_row("Model", model_display, *focused_field == 2, true),
@@ -1378,7 +1406,7 @@ pub(super) fn add_provider_card(
                     false,
                 ));
             }
-            body.push(String::new());
+            body.push(WizardLine::blank());
             body.push(wizard_line(key_hint, Color::DarkGray));
             body.push(wizard_line(
                 &format_catalog_label(
@@ -1407,7 +1435,7 @@ pub(super) fn add_provider_card(
                     "Add Cloud Provider"
                 },
                 body,
-                Some(controls.to_string()),
+                Some(wizard_line(controls, Color::Yellow)),
             )
         }
         // ── single-screen local model form ───────────────────────────────────
@@ -1438,8 +1466,8 @@ pub(super) fn add_provider_card(
                 || "RAM depends on GGUF file".to_string(),
                 |artifact| format!("Download {:.1} GB", artifact.expected_size as f64 / 1e9),
             );
-            let mut body = vec![
-                String::new(),
+            let mut body: Vec<WizardLine> = vec![
+                WizardLine::blank(),
                 row("Backend", backend_name, *focused_field == 0),
                 row("Family", &family_name, *focused_field == 1),
                 row("Size", size_name, *focused_field == 2),
@@ -1459,12 +1487,11 @@ pub(super) fn add_provider_card(
                 true,
             ));
             body.extend([
-                String::new(),
-                format!(
-                    "{}  {}",
+                WizardLine::blank(),
+                WizardLine::concat(&[
                     wizard_line(&format!("{ram_estimate}  "), Color::Cyan),
-                    wizard_line(&repo_preview, Color::DarkGray)
-                ),
+                    wizard_line(&repo_preview, Color::DarkGray),
+                ]),
             ]);
             WizardCard::new(
                 if editing_idx.is_some() {
@@ -1473,32 +1500,35 @@ pub(super) fn add_provider_card(
                     "Add Local Model"
                 },
                 body,
-                Some(if editing_idx.is_some() {
-                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to save · Esc back".to_string()
-                } else {
-                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to add · Esc back".to_string()
-                }),
+                Some(wizard_line(
+                    if editing_idx.is_some() {
+                        "↑↓ navigate · ←→ change · leave path blank to download · Enter to save · Esc back"
+                    } else {
+                        "↑↓ navigate · ←→ change · leave path blank to download · Enter to add · Esc back"
+                    },
+                    Color::Yellow,
+                )),
             )
         }
         // ── network scan path ────────────────────────────────────────────────
         AddProviderStep::Scanning { .. } => WizardCard::new(
             "Add AI Provider",
             vec![
-                String::new(),
+                WizardLine::blank(),
                 wizard_bold("Scanning for Finch agents on local network…", Color::Cyan),
-                String::new(),
+                WizardLine::blank(),
                 wizard_line("(this takes up to 5 seconds)", Color::DarkGray),
             ],
-            Some("Esc: Cancel".to_string()),
+            Some(wizard_line("Esc: Cancel", Color::Yellow)),
         ),
         AddProviderStep::SelectAgent { agents, selected } => {
-            let body: Vec<String> = agents
+            let body: Vec<WizardLine> = agents
                 .iter()
                 .enumerate()
                 .map(|(index, agent)| {
                     let label = format!("{} @ {}:{}", agent.name, agent.host, agent.port);
                     if index == *selected {
-                        wizard_bold(&format!(">>> {label} <<<"), Color::White)
+                        wizard_selected(&format!(">>> {label} <<<"))
                     } else {
                         wizard_line(&format!("    {label}"), Color::Cyan)
                     }
@@ -1507,7 +1537,10 @@ pub(super) fn add_provider_card(
             WizardCard::new(
                 "Discovered agents",
                 body,
-                Some("↑/↓: Move | Enter: Add | Esc: Cancel".to_string()),
+                Some(wizard_line(
+                    "↑/↓: Move | Enter: Add | Esc: Cancel",
+                    Color::Yellow,
+                )),
             )
         }
         // ── add-time device ceremony (#424) ──────────────────────────────────

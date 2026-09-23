@@ -40,6 +40,21 @@ stage 4), and the canonical record is untouched — the legacy projection remain
 canonical-commit path for unmigrated rows. Remaining scope: other WorkUnit presentations,
 thinking section #749, agent activity (stage-2 remainder), then the DOM lowering (stage 4).
 
+**Stage-4 outcome (#1141, 2026-09-23): implemented on the feature branch.** Styled spans
+run through the component pipeline: a line's semantic content is its span sequence
+(`finch_ui_model::span`), `RenderedTranscriptLine` carries `spans` that concatenate exactly
+to its plain `text`, and component renderers read styles from an injected
+`ComponentStylePalette` (scheme-owned roles via `ColorScheme`; the ⏺/⎿ glyph vocabulary
+keeps the pre-migration colours). The terminal mode lowers spans at the two paint seams
+(live viewport, scrolled transcript); the canonical commit never sees spans and keeps its
+raw bytes. The wizard migrated first (#1140): props are `WizardLine` spans, the host lowers
+them, and selections/active tab paint with a background again (bold white/magenta on
+black). The DOM lowering exists: `finch_tui::dom_manifest` lowers the same tree and
+component snapshots to the versioned `UiManifest`/`DynamicUiNode` (golden say-card JSON,
+serde round-trip, ts-rs-generated TS types committed under `crates/finch-tui/bindings/`,
+contract in `docs/UI_MANIFEST.md`). No webview or #808 transport in this repo; the
+wizard's own manifest surface and a JSX-side registry remain open.
+
 ## The maintainer's constraints, verbatim
 
 From the #824 closure ruling and the 2026-09-18 design session:

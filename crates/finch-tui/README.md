@@ -19,10 +19,17 @@ Two callers show the boundary:
    external-editor activity query. If a mention submission fails, the event loop asks the
    renderer to restore the draft; render failures are recorded and acknowledged through
    renderer methods. This module owns layout, input polling, and terminal lifecycle.
-2. The [setup wizard driver](../../src/cli/setup_wizard/driver.rs) converts its form state into a `WizardView`,
-   calls `plan_wizard_frame`, and lets `WizardHost` paint the frame. The driver owns provider setup,
-   credential flow, and key-driven state transitions; this module owns the shared claiming tree,
-   shadow-buffer diff, and terminal blit.
+2. The [setup wizard driver](../../src/cli/setup_wizard/driver.rs) converts its form state into a `WizardView` of
+   styled span lines (stage 4, #1141 — no terminal bytes in the props), calls `plan_wizard_frame`, and lets
+   `WizardHost` lower the spans and paint the frame. The driver owns provider setup, credential flow, and
+   key-driven state transitions; this module owns the span lowering, the shared claiming tree, shadow-buffer
+   diff, and terminal blit.
+
+A third consumer is the future GUI client (#808): the engine lowers the same widget tree and
+component snapshots to the versioned DOM manifest (`dom_manifest.rs`; contract in
+[docs/UI_MANIFEST.md](../../docs/UI_MANIFEST.md), generated TS types committed under
+`bindings/dom/`). Components never write HTML; the golden JSON test pins the say card's wire
+shape.
 
 The [agent contract](AGENTS.md) states dependency and rendering invariants. [`src/lib.rs`](src/lib.rs)
 is the callable facade; [ARCHITECTURE.md](ARCHITECTURE.md) explains the paint pipeline. Completion

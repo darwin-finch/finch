@@ -1803,6 +1803,34 @@ async fn run_train_setup() -> Result<()> {
     Ok(())
 }
 
+/// Awaits a spawned model-loader task's `JoinHandle` and, if the task
+/// unwound from a panic (or was otherwise cancelled) rather than returning
+/// normally, records that as `GeneratorState::Failed` instead of letting it
+/// vanish silently.
+///
+/// `BootstrapLoader::load_generator_async` already turns a panic inside its
+/// `spawn_blocking(...)` call into a normal `Err`, which the caller then
+/// turns into `GeneratorState::Failed` -- but that is the only panic path it
+/// catches. Before this helper, the task that runs `load_generator_async`
+/// was spawned fire-and-forget: nothing awaited its `JoinHandle`, so a panic
+/// anywhere else in that outer async block (e.g. in a `state.write().await`)
+/// was logged by Tokio's default panic hook and then dropped, leaving
+/// `state` stuck forever with no diagnostic signal to the user (#905).
+async fn supervise_generator_loader_task(
+    task: tokio::task::JoinHandle<()>,
+    state: Arc<tokio::sync::RwLock<finch::models::GeneratorState>>,
+) {
+    if let Err(join_error) = task.await {
+        let message = if join_error.is_panic() {
+            format!("model loader task panicked: {join_error}")
+        } else {
+            format!("model loader task was cancelled: {join_error}")
+        };
+        tracing::error!("{}", message);
+        *state.write().await = finch::models::GeneratorState::Failed { error: message };
+    }
+}
+
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::daemon::DaemonLifecycle;
     use finch::local::LocalGenerator;
@@ -1974,7 +2002,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let device = config.backend.execution_target;
         let model_path = config.backend.model_path.clone();
         let managed_artifact = config.backend.managed_artifact.clone();
-        tokio::spawn(async move {
+        let loader_task = tokio::spawn(async move {
             if let Err(e) = loader_clone
                 .load_generator_async(
                     provider,
@@ -1994,6 +2022,20 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 };
             }
         });
+        // The task above already turns an `Err` from `load_generator_async`
+        // into `GeneratorState::Failed` -- but the inner `spawn_blocking(...)`
+        // panic path (BootstrapLoader::load_generator_async) is the *only*
+        // panic that call chain catches. A panic anywhere else in the outer
+        // async block (e.g. a `state_clone.write().await` or similar) would
+        // otherwise kill this task silently: Tokio's default panic hook logs
+        // it and nothing awaits the JoinHandle to notice, leaving
+        // `generator_state` stuck forever and the poller below spinning with
+        // no diagnostic signal to the user (#905). Supervise the handle so
+        // that outcome surfaces the same way the guarded inner panic does.
+        tokio::spawn(supervise_generator_loader_task(
+            loader_task,
+            Arc::clone(&generator_state),
+        ));
     } else {
         // Proxy-only mode: Skip model loading
         output_status!("🔌 Proxy-only mode enabled (no local model)");
@@ -3664,10 +3706,13 @@ mod tests {
     use super::{
         execute_brain_command, finish_first_run_setup, query_tool_state_paths,
         register_query_vm_tools, reject_retired_session_flags, resolve_brain_name,
-        suppress_ort_logs_unless_overridden, Args, AuthCommand, BrainCommand, Command,
+        supervise_generator_loader_task, suppress_ort_logs_unless_overridden, Args, AuthCommand,
+        BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
+    use finch::models::GeneratorState;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn query_code_search_fails_closed_without_an_application_state_root() {
@@ -4523,6 +4568,69 @@ mod tests {
             error.to_string().contains("finch attach"),
             "the retirement error must name the replacement command, got {}",
             error
+        );
+    }
+
+    /// #905: the model-loader task in `run_daemon` used to be spawned
+    /// fire-and-forget (`tokio::spawn(async move { .. });` with the
+    /// `JoinHandle` discarded). `BootstrapLoader::load_generator_async` only
+    /// catches a panic inside its own `spawn_blocking` call; a panic
+    /// anywhere else in the outer async block -- reproduced here with a
+    /// task that panics directly, standing in for the real loader per the
+    /// no-live-model-load constraint -- used to be silently swallowed by
+    /// Tokio's default panic hook, leaving `generator_state` stuck at
+    /// whatever it last was (here, `Initializing`) forever, with the
+    /// "wait for Ready" poller in `run_daemon` spinning with no diagnostic
+    /// signal. `supervise_generator_loader_task` closes that gap by
+    /// awaiting the `JoinHandle` and setting `GeneratorState::Failed` on any
+    /// `JoinError`. This test awaits the supervisor's own completion
+    /// directly (no sleep) and asserts the resulting state, not a timing
+    /// ratio.
+    #[tokio::test]
+    async fn supervisor_marks_generator_failed_when_loader_task_panics() {
+        let state = Arc::new(RwLock::new(GeneratorState::Initializing));
+        let panicking_task = tokio::spawn(async move {
+            panic!("simulated panic outside the guarded spawn_blocking call");
+        });
+
+        // Awaiting the supervisor's own completion is the deterministic
+        // signal here: it does not return until it has observed the
+        // JoinHandle resolve and has written the resulting state.
+        supervise_generator_loader_task(panicking_task, Arc::clone(&state)).await;
+
+        let observed = state.read().await;
+        match &*observed {
+            GeneratorState::Failed { error } => {
+                assert!(
+                    error.contains("panicked"),
+                    "failure message must name that the loader task itself panicked \
+                     (distinct from the already-handled spawn_blocking panic path), got: {error}"
+                );
+            }
+            other => panic!(
+                "expected GeneratorState::Failed after the supervised task panicked, \
+                 got {other:?} -- a panic outside the guarded spawn_blocking call must \
+                 not leave the state stuck forever"
+            ),
+        }
+    }
+
+    /// Companion to the panic case above: when the supervised task
+    /// completes normally, the supervisor must not touch the state at all
+    /// (the loader itself, or its `Err` branch in `run_daemon`, owns every
+    /// non-panic transition).
+    #[tokio::test]
+    async fn supervisor_leaves_state_untouched_when_loader_task_completes_normally() {
+        let state = Arc::new(RwLock::new(GeneratorState::Initializing));
+        let normal_task = tokio::spawn(async move {});
+
+        supervise_generator_loader_task(normal_task, Arc::clone(&state)).await;
+
+        let observed = state.read().await;
+        assert!(
+            matches!(&*observed, GeneratorState::Initializing),
+            "a normally-completing loader task must not have its state touched by the \
+             supervisor, got {observed:?}"
         );
     }
 }
