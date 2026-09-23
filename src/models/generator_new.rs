@@ -310,8 +310,6 @@ mod tests {
                 family: crate::models::unified_loader::ModelFamily::Qwen2,
                 size: crate::models::unified_loader::ModelSize::Small,
                 target: crate::config::ExecutionTarget::Cpu,
-                coreml: crate::config::CoreMlConfig::default(),
-                repo_override: None,
                 model_path: None,
             }),
         };

@@ -205,7 +205,8 @@ Three historical weight tiers are retained for explicit feedback: high (10x), me
 Daemon local chat uses llama.cpp with either a verified, commit-pinned Hugging Face GGUF managed
 by Finch or an explicit user-selected GGUF file. Download bytes cross the daemon boundary through
 `/v1/status`; terminal presentation remains client-owned. Legacy ONNX/Candle
-chat entries are loadable only as setup-migration markers and cannot reach an inference engine.
+chat providers and their setup-migration markers have been removed. Configurations naming those
+engines are rejected instead of entering the runtime.
 The frontend memory selector still owns its required defaults, automatic model download, and
 current ONNX/TF-IDF implementation; its replacement and index-identity migration belong to
 separate memory work. Historical backend experiments

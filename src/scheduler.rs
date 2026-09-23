@@ -1330,7 +1330,6 @@ mod tests {
             execution_target: crate::config::ExecutionTarget::Auto,
             model_family: crate::models::ModelFamily::Qwen2,
             model_size: crate::models::ModelSize::Medium,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             enabled: true,

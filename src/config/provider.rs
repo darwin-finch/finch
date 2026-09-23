@@ -203,8 +203,6 @@ pub enum ProviderEntry {
         #[serde(default = "default_model_size")]
         model_size: ModelSize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_repo: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         model_path: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         managed_artifact: Option<crate::models::ManagedGgufArtifact>,
@@ -638,7 +636,6 @@ credential_ref = "work"
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             enabled: true,
@@ -697,7 +694,6 @@ credential_ref = "work"
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             enabled: true,
@@ -723,7 +719,6 @@ credential_ref = "work"
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
-            model_repo: None,
             model_path: None,
             managed_artifact: None,
             enabled: true,
@@ -764,7 +759,6 @@ credential_ref = "work"
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,
-                model_repo: None,
                 model_path: None,
                 managed_artifact: None,
                 enabled: true,
@@ -799,7 +793,6 @@ credential_ref = "work"
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,
-                model_repo: None,
                 model_path: None,
                 managed_artifact: None,
                 enabled: true,

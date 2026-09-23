@@ -48,13 +48,8 @@ fn rows_of(line: &str, width: usize) -> usize {
     wizard_physical_rows(line, width)
 }
 
-/// `Auto`, `CPU`, or `CoreML (all)` — the execution-target display.
-pub(super) fn execution_target_display(execution: ExecutionTarget, coreml: CoreMlConfig) -> String {
-    #[cfg(target_os = "macos")]
-    if execution == ExecutionTarget::CoreML {
-        return format!("CoreML ({})", coreml.compute_units.name());
-    }
-
+/// `Auto` or `CPU` — the llama.cpp execution-target display.
+pub(super) fn execution_target_display(execution: ExecutionTarget) -> String {
     execution.name().to_string()
 }
 
@@ -237,7 +232,7 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<String> {
 
 /// The display text for one provider row: primary marker, tool checkbox, and
 /// masked key state — the exact shapes the old painter rendered.
-fn provider_row_display(model: &ModelConfig, coreml: CoreMlConfig, primary: bool) -> String {
+fn provider_row_display(model: &ModelConfig, primary: bool) -> String {
     if primary {
         return match model {
             ModelConfig::Local {
@@ -249,7 +244,7 @@ fn provider_row_display(model: &ModelConfig, coreml: CoreMlConfig, primary: bool
                 "★ Primary: Local {} {} ({})",
                 family.name(),
                 model_size_display(size),
-                execution_target_display(*execution, coreml)
+                execution_target_display(*execution)
             ),
             ModelConfig::Remote {
                 provider,
@@ -307,7 +302,6 @@ fn marked_row(display: &str, selected: bool, enabled: bool) -> String {
 /// Models section: description, provider list, edit panel, instructions, error.
 #[allow(clippy::too_many_arguments)]
 fn models_section_lines(
-    coreml: CoreMlConfig,
     primary_model: &ModelConfig,
     tool_models: &[ModelConfig],
     selected_idx: usize,
@@ -365,7 +359,7 @@ fn models_section_lines(
         .chain(tool_models.iter())
         .enumerate()
     {
-        let display = provider_row_display(model, coreml, index == 0);
+        let display = provider_row_display(model, index == 0);
         list_rows.push(marked_row(&display, selected_idx == index, model.enabled()));
     }
     lines.extend(wizard_boxed("AI Providers", &list_rows, Color::Blue, width));
@@ -1256,7 +1250,6 @@ fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool)
 /// ceremony all render as body lines whose controls stay pinned inside the
 /// card (#807) — no floating second painter.
 pub(super) fn add_provider_card(
-    coreml: CoreMlConfig,
     step: &AddProviderStep,
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
@@ -1397,7 +1390,7 @@ pub(super) fn add_provider_card(
             let family_name = family.name().to_string();
             let size_name = model_size_display(size);
             let quantization_name = quantization.name();
-            let device_name = execution_target_display(*execution, coreml);
+            let device_name = execution_target_display(*execution);
             let row = |label: &str, value: &str, focused: bool| {
                 remote_form_row(label, value, focused, false)
             };
@@ -1523,7 +1516,6 @@ pub(super) fn wizard_view_with_permission_target(
             error,
             ..
         }) => WizardSectionContent::plain(models_section_lines(
-            state.coreml,
             primary_model,
             tool_models,
             *selected_idx,
@@ -1637,7 +1629,6 @@ pub(super) fn wizard_view_with_permission_target(
                 catalog_error,
                 ..
             }) => Some(add_provider_card(
-                state.coreml,
                 step,
                 catalog_source,
                 catalog_refresh.is_some(),

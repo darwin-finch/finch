@@ -36,7 +36,7 @@ mod tests;
 #[cfg(test)]
 use crate::cli::chatgpt_auth::EnsuredChatGptCredential;
 use crate::cli::chatgpt_auth::{ChatGptCredentialAuthenticator, ChatGptNamedCredentialStart};
-use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry};
+use crate::config::{ExecutionTarget, ProviderEntry};
 use crate::models::{
     managed_gguf_artifact, GgufQuantization, InferenceProvider, ManagedGgufArtifact, ModelFamily,
     ModelSize,
@@ -102,7 +102,7 @@ fn cleanup_terminal() -> Result<()> {
 pub fn show_setup_wizard() -> Result<SetupResult> {
     // `None` is reserved for a genuinely absent file. Existing configuration
     // failures must stop setup before it can render or save an empty fallback.
-    let existing_config = crate::config::load_persisted_config().context(
+    let existing_config = crate::config::load_persisted_config_for_setup().context(
         "Existing Finch configuration could not be loaded; setup was not opened because saving an empty wizard would overwrite it",
     )?;
     if let Some(config) = existing_config.as_ref() {

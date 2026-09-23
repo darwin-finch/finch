@@ -67,7 +67,6 @@ pub(super) fn apply_setup_result_to_config(
     use crate::config::FeaturesConfig;
 
     apply_daemon_api_key(&mut new_config, &result.finch_api_key);
-    new_config.backend.coreml = result.coreml;
     new_config.active_theme = result.active_theme.clone();
     new_config.active_persona = result.default_persona.clone();
     if let Some(ref hf_tok) = result.hf_token {
@@ -321,51 +320,22 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 enabled,
                 persisted,
             } => {
-                let (name, model_repo, legacy_artifact_changed) = match persisted {
-                    Some(ProviderEntry::Local {
-                        name,
-                        model_repo,
-                        inference_provider: old_provider,
-                        model_family: old_family,
-                        model_size: old_size,
-                        ..
-                    }) => (
-                        name.clone(),
-                        model_repo.clone(),
-                        old_provider != inference_provider
-                            || old_family != family
-                            || old_size != size,
-                    ),
-                    _ => (
-                        Some(format!(
-                            "local-{}-{}",
-                            family.name().to_ascii_lowercase().replace(' ', "-"),
-                            size.to_size_string(*family)
-                                .to_ascii_lowercase()
-                                .replace(' ', "-")
-                        )),
-                        None,
-                        false,
-                    ),
-                };
-                let gguf_selected = *inference_provider == InferenceProvider::LlamaCpp;
-                let model_repo = if gguf_selected || legacy_artifact_changed {
-                    None
-                } else {
-                    model_repo
-                };
-                let model_path = if !gguf_selected && legacy_artifact_changed {
-                    None
-                } else {
-                    configured_path.clone()
+                let name = match persisted {
+                    Some(ProviderEntry::Local { name, .. }) => name.clone(),
+                    _ => Some(format!(
+                        "local-{}-{}",
+                        family.name().to_ascii_lowercase().replace(' ', "-"),
+                        size.to_size_string(*family)
+                            .to_ascii_lowercase()
+                            .replace(' ', "-")
+                    )),
                 };
                 Some(ProviderEntry::Local {
                     inference_provider: *inference_provider,
                     execution_target: *execution,
                     model_family: *family,
                     model_size: *size,
-                    model_repo,
-                    model_path,
+                    model_path: configured_path.clone(),
                     managed_artifact: configured_artifact.clone(),
                     enabled: *enabled,
                     name,
@@ -373,6 +343,12 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             }
         })
         .collect();
+
+    if !providers.iter().any(|provider| !provider.is_local()) {
+        anyhow::bail!(
+            "At least one cloud provider is required alongside local models; add a cloud provider before saving setup"
+        );
+    }
 
     Ok(SetupResult {
         active_theme,
@@ -385,10 +361,8 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         backend_enabled,
         inference_provider,
         execution_target,
-        coreml: state.coreml,
         model_family,
         model_size,
-        custom_model_repo: None,
         finch_api_key: finch_api_key_val,
         default_persona,
         custom_system_prompt,

@@ -23,8 +23,8 @@
    immutable Hugging Face artifact identity.
 3. Managed artifacts resume into a partial file, then pass exact-size and SHA-256 checks before
    an atomic rename. The daemon exposes byte progress through `/v1/status`.
-4. `UnifiedModelLoader` receives only the verified local path and rejects legacy ONNX/Candle
-   entries and unsupported targets.
+4. `UnifiedModelLoader` receives only the verified local path. Configuration parsing rejects
+   removed ONNX/Candle provider identities and unsupported targets before bootstrap begins.
 5. llama.cpp loads the GGUF and creates the shared generator.
 6. State becomes `Ready`; the client removes its download status entry and eligible queries can
    use the local model.

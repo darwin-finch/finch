@@ -37,7 +37,7 @@ pub fn load_config() -> Result<Config> {
         This will guide you through:\n\
         • API key configuration (Claude, OpenAI, etc.)\n\
         • Local model selection (Qwen, Gemma, Llama, Mistral)\n\
-        • Device selection (CoreML, Metal, CUDA, CPU)\n\
+        • llama.cpp execution selection (automatic GPU offload or CPU only)\n\
         • Model size selection based on your RAM\n\n\
         Alternatively, set environment variable:\n\
         export ANTHROPIC_API_KEY=\"sk-ant-...\"",
@@ -55,6 +55,14 @@ pub fn load_persisted_config() -> Result<Option<Config>> {
     try_load_from_finch_config()
 }
 
+/// Load existing settings for the setup editor, accepting a transitional file
+/// whose last removed local provider has already been deleted by the operator.
+/// Normal startup continues to reject providerless configurations.
+pub fn load_persisted_config_for_setup() -> Result<Option<Config>> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    try_load_from_path_with_mode(&home.join(".finch/config.toml"), true)
+}
+
 fn try_load_from_finch_config() -> Result<Option<Config>> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
@@ -63,6 +71,13 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 }
 
 fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
+    try_load_from_path_with_mode(config_path, false)
+}
+
+fn try_load_from_path_with_mode(
+    config_path: &std::path::Path,
+    allow_empty_providers_for_setup: bool,
+) -> Result<Option<Config>> {
     match fs::symlink_metadata(config_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!(
@@ -82,7 +97,11 @@ fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
         }
     }
 
-    Ok(Some(load_config_from_path(&config_path)?))
+    Ok(Some(load_config_from_path_with_factory_mode(
+        config_path,
+        Config::with_providers,
+        allow_empty_providers_for_setup,
+    )?))
 }
 
 pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Config> {
@@ -135,6 +154,17 @@ fn load_config_from_path_with_factory<F>(
 where
     F: FnOnce(Vec<ProviderEntry>) -> Config,
 {
+    load_config_from_path_with_factory_mode(config_path, config_factory, false)
+}
+
+fn load_config_from_path_with_factory_mode<F>(
+    config_path: &std::path::Path,
+    config_factory: F,
+    allow_empty_providers_for_setup: bool,
+) -> Result<Config>
+where
+    F: FnOnce(Vec<ProviderEntry>) -> Config,
+{
     use super::backend::BackendConfig;
     use super::settings::{ClientConfig, FeaturesConfig, ServerConfig};
     use crate::theme::ColorScheme;
@@ -164,8 +194,6 @@ where
         #[serde(default)]
         backend: Option<BackendConfig>,
         #[serde(default)]
-        coreml: Option<super::backend::CoreMlConfig>,
-        #[serde(default)]
         client: Option<ClientConfig>,
         #[serde(default)]
         server: Option<ServerConfig>,
@@ -193,9 +221,49 @@ where
         true
     }
 
+    let mut current_section = "";
+    let mut removed_provider_block = false;
+    let mut removed_backend_block = false;
+    for line in contents.lines() {
+        let setting = line.split('#').next().unwrap_or_default().trim();
+        if setting.starts_with('[') && setting.ends_with(']') {
+            current_section = setting;
+            continue;
+        }
+        let Some((key, value)) = setting.split_once('=') else {
+            continue;
+        };
+        let removed = matches!(
+            (key.trim(), value.trim()),
+            ("inference_provider", "\"onnx\"")
+                | ("inference_provider", "\"candle\"")
+                | ("execution_target", "\"coreml\"")
+                | ("execution_target", "\"cuda\"")
+                | ("execution_target", "\"metal\"")
+        );
+        if removed {
+            if current_section == "[backend]" {
+                removed_backend_block = true;
+            } else {
+                removed_provider_block = true;
+            }
+        }
+    }
+    if removed_provider_block || removed_backend_block {
+        let affected_blocks = match (removed_provider_block, removed_backend_block) {
+            (true, true) => "the affected local [[providers]] block and legacy [backend] block",
+            (true, false) => "the affected local [[providers]] block",
+            (false, true) => "the legacy [backend] block",
+            (false, false) => unreachable!(),
+        };
+        bail!(
+            "Configuration {} contains a removed ONNX/Candle local-chat provider or execution target. Back up the file, remove only {affected_blocks} and any obsolete [coreml] block, then run `finch setup` to add a llama.cpp/GGUF local model. Other provider and credential entries can remain unchanged.",
+            config_path.display(),
+        );
+    }
+
     let toml_config: TomlConfig = toml::from_str(&contents)
         .map_err(|e| anyhow::anyhow!(errors::config_parse_error(&e.to_string())))?;
-    let legacy_coreml = toml_config.backend.as_ref().map(|backend| backend.coreml);
 
     // Determine providers: prefer new format; fall back to legacy teachers/backend.
     let providers = if !toml_config.providers.is_empty() {
@@ -213,21 +281,24 @@ where
             }
         }
         providers
+    } else if allow_empty_providers_for_setup {
+        Vec::new()
     } else {
         bail!("Config has no providers configured. Please run 'finch setup' to configure.");
     };
 
-    if providers.is_empty() {
+    if providers.is_empty() && !allow_empty_providers_for_setup {
         bail!("Config has no providers configured. Please run 'finch setup' to configure.");
     }
 
+    let providerless_setup = providers.is_empty();
     let mut config = config_factory(providers);
-    config.default_provider = toml_config.default_provider;
+    config.default_provider = if providerless_setup {
+        None
+    } else {
+        toml_config.default_provider
+    };
     config.replace_loaded_credentials(toml_config.credentials);
-
-    if let Some(coreml) = toml_config.coreml.or(legacy_coreml) {
-        config.backend.coreml = coreml;
-    }
 
     // Apply scalar overrides
     if let Some(features) = toml_config.features {
@@ -345,6 +416,88 @@ mod tests {
             .expect_err("filesystem inspection errors must not look like first run")
             .to_string();
         assert!(error.contains("Could not inspect existing Finch configuration"));
+    }
+
+    #[test]
+    fn removed_local_chat_config_reports_safe_manual_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[providers]]
+type = "local"
+inference_provider="onnx"
+execution_target = "coreml" # old macOS target
+model_family = "Qwen2"
+model_size = "Medium"
+"#,
+        )
+        .unwrap();
+
+        let error = load_config_from_path(&config_path)
+            .expect_err("removed local chat values must require explicit migration")
+            .to_string();
+        assert!(error.contains("Back up the file"), "{error}");
+        assert!(
+            error.contains("remove only the affected [[providers]] local block"),
+            "{error}"
+        );
+        assert!(error.contains("finch setup"), "{error}");
+    }
+
+    #[test]
+    fn removed_legacy_backend_reports_backend_specific_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[backend]
+enabled = true
+inference_provider = "candle"
+execution_target = "cpu"
+model_family = "Qwen2"
+model_size = "Medium"
+"#,
+        )
+        .unwrap();
+
+        let error = load_config_from_path(&config_path)
+            .expect_err("removed legacy backend must require explicit migration")
+            .to_string();
+        assert!(
+            error.contains("remove only the legacy [backend] block"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("affected local [[providers]] block"),
+            "{error}"
+        );
+        assert!(error.contains("finch setup"), "{error}");
+
+        // Simulate following the instruction: the provider is gone, while
+        // unrelated settings remain available to the setup editor.
+        std::fs::write(
+            &config_path,
+            r#"
+active_theme = "solarized"
+
+[features]
+streaming_enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(
+            try_load_from_path(&config_path).is_err(),
+            "normal startup must continue rejecting a providerless config"
+        );
+        let setup_config = try_load_from_path_with_mode(&config_path, true)
+            .expect("setup loader must accept the transitional providerless file")
+            .expect("the existing file must remain distinguishable from absence");
+        assert!(setup_config.providers.is_empty());
+        assert_eq!(setup_config.active_theme, "solarized");
+        assert!(!setup_config.features.streaming_enabled);
     }
 
     #[cfg(unix)]

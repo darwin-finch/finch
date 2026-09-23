@@ -166,6 +166,34 @@ pub fn managed_gguf_artifact(
                 "a4b0b55ce809a09baaefb789b0046ac77ecd502aba8aeb2ed63cc237d9f40ce7",
             ),
         ),
+        (ModelFamily::Llama3, ModelSize::Small) => (
+            "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            "5ab33fa94d1d04e903623ae72c95d1696f09f9e8",
+            (
+                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                2_019_377_696,
+                "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+            ),
+            (
+                "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+                2_322_154_016,
+                "0b94ccd04d908304cec5246a3d942b64417a423bc5c6d47c73bc557e590b5194",
+            ),
+        ),
+        (ModelFamily::Llama3, ModelSize::Medium) => (
+            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
+            (
+                "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                4_920_739_232,
+                "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c",
+            ),
+            (
+                "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+                5_732_992_416,
+                "14e10feba0c82a55da198dcd69d137206ad22d116a809926d27fa5f2398c69c7",
+            ),
+        ),
         _ => return None,
     };
     let (filename, expected_size, sha256) = match quantization {
@@ -525,6 +553,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    #[test]
+    fn managed_catalog_contains_installable_llama_quantizations() {
+        for size in [ModelSize::Small, ModelSize::Medium] {
+            for quantization in [GgufQuantization::Q4KM, GgufQuantization::Q5KM] {
+                let artifact = managed_gguf_artifact(ModelFamily::Llama3, size, quantization)
+                    .expect("the wizard's 3B and default 8B Llama options must be managed");
+                artifact.validate().unwrap();
+                assert!(artifact.repository.contains("Llama-3"));
+                assert!(artifact.filename.ends_with(".gguf"));
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct HubFixture {
