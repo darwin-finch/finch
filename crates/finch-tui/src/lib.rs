@@ -208,9 +208,9 @@ pub use tabbed_dialog_widget::TabbedDialogWidget;
 // client will consume over the daemon IPC (#808). The lowerings are engine
 // render modes; components never write HTML.
 pub use dom_manifest::{
-    component_manifest, component_ui_manifest, manifest_path_id, manifest_row_id,
-    manifest_spans, say_card_manifest, ui_manifest, widget_manifest, widget_ui_manifest,
-    DynamicUiNode, ManifestColor, ManifestSpan, UiManifest, MANIFEST_VERSION,
+    component_manifest, component_ui_manifest, manifest_path_id, manifest_row_id, manifest_spans,
+    say_card_manifest, ui_manifest, widget_manifest, widget_ui_manifest, DynamicUiNode,
+    ManifestColor, ManifestSpan, UiManifest, MANIFEST_VERSION,
 };
 // The root setup wizard uses this named widget-host surface; keep the child
 // module private so the crate facade remains the only external path.
