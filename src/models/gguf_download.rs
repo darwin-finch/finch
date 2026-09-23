@@ -60,6 +60,8 @@ struct VerificationMarker {
     sha256: String,
     size: u64,
     modified_nanos: u128,
+    #[serde(default)]
+    change_marker: Option<i128>,
 }
 
 impl ManagedGgufArtifact {
@@ -470,9 +472,12 @@ async fn verified_cache_hit(
     }
     if let Ok(contents) = tokio::fs::read_to_string(marker).await {
         if let Ok(verification) = serde_json::from_str::<VerificationMarker>(&contents) {
-            if verification.sha256.eq_ignore_ascii_case(&artifact.sha256)
+            let change_marker = metadata_change_marker(path, &metadata);
+            if change_marker.is_some()
+                && verification.sha256.eq_ignore_ascii_case(&artifact.sha256)
                 && verification.size == metadata.len()
                 && verification.modified_nanos == modified_nanos(&metadata)?
+                && verification.change_marker == change_marker
             {
                 return Ok(true);
             }
@@ -499,6 +504,7 @@ async fn write_verification_marker(
         sha256: artifact.sha256.to_ascii_lowercase(),
         size: metadata.len(),
         modified_nanos: modified_nanos(&metadata)?,
+        change_marker: metadata_change_marker(artifact_path, &metadata),
     };
     let encoded = serde_json::to_vec(&verification).context("encode GGUF verification marker")?;
     tokio::fs::write(marker, encoded)
@@ -513,6 +519,40 @@ fn modified_nanos(metadata: &std::fs::Metadata) -> Result<u128> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("GGUF modification time predates Unix epoch")?
         .as_nanos())
+}
+
+#[cfg(unix)]
+fn metadata_change_marker(_path: &Path, metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
+#[cfg(windows)]
+fn metadata_change_marker(path: &Path, _metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: the handle remains open for the call and the output buffer has
+    // exactly the type and size required by `FileBasicInfo`.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    (succeeded != 0).then_some(i128::from(info.ChangeTime))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_change_marker(_path: &Path, _metadata: &std::fs::Metadata) -> Option<i128> {
+    None
 }
 
 async fn sha256_file(path: &Path, cancellation: &CancellationToken) -> Result<String> {
@@ -822,18 +862,40 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let original_modified = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
         tokio::fs::write(&path, vec![0_u8; bytes.len()])
             .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
             .unwrap();
         let (_, disposition) = downloader
             .ensure(&artifact, "Test model", state, &CancellationToken::new())
             .await
             .unwrap();
 
-        assert_eq!(disposition, DownloadDisposition::Downloaded);
-        assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            disposition,
+            DownloadDisposition::Downloaded,
+            "same-size corruption with a restored mtime must invalidate the verification marker"
+        );
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            bytes,
+            "the invalid cache entry must be replaced with the pinned artifact"
+        );
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            2,
+            "cache corruption must cause exactly one replacement download"
+        );
     }
 
     #[tokio::test]
