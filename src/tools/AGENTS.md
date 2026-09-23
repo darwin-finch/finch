@@ -37,9 +37,11 @@ carry zero `crate::` imports (the former knot metric).
 may depend on any composition-root subsystem, and each of those may import `tools` back — that
 reverse edge is why implementations stay here. The shared surface they implement
 (`finch-tools-api`) depends on nothing in the root crate; add no new dependency from the API
-crate to any `src/` subsystem, and add no new authority surface outside it. `code_outline` is a
-thin adapter over the one-way `tools -> source_index` dependency: source identity, parsing,
-provenance, and stale-result semantics remain owned by that capsule.
+crate to any `src/` subsystem, and add no new authority surface outside it. `code_outline` and
+`find_code` form a one-way `tools -> source_index` dependency: source identity, parsing,
+provenance, cache format, and stale-result semantics remain owned by that capsule. Lexical ranking and
+the optional application-specific local disambiguation port stay here; they must not enter
+`source_index` or depend on MemTree.
 
 **Permissions are authority.** Peer and constitutional rules — defined in the
 `finch-tools-api` crate, re-exported here — are invariants, not defaults to relax. Facade changes
@@ -59,6 +61,15 @@ means “any path under the workspace root”, not “any string”. Bash has no
 `code_outline.path` is a discrete path slot and receives the same containment decision as
 `read.file_path`; `ToolExecutor::new` rejects any path-bound tool whose declared execution root
 differs from the permission root, and the implementation capability-opens beneath that same root.
+`find_code.path`, when supplied, is a workspace-contained permission slot and an in-memory scope on
+the already capability-bounded index; omitting it searches only the workspace injected at
+construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived
+index bytes under the separately injected application-state capability; it cannot mutate source,
+conversation, provider, or approval state. One-shot query mode fails closed and the REPL omits this
+tool when no home-backed application-state root is available; neither falls back to a workspace
+cache. Current roots bind no disambiguator, so ambiguity never
+reconstructs or calls a provider. Index freshness/build work runs off the async worker thread and
+cooperatively fails after 20 seconds or 256 MiB of aggregate source reads, including validation.
 `test_dotdot_escape_is_ask_user_not_allow`, `test_symlink_escape_is_ask_user_live_and_dangling`,
 `test_escaped_path_is_not_pattern_admissible_through_approval_path`, and
 `test_star_pattern_does_not_match_escaped_path` pin this.
