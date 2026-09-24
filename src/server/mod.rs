@@ -659,6 +659,15 @@ impl AgentServer {
         } else {
             tokio::net::TcpListener::bind(addr).await?
         };
+        // #868: between agent-server construction and the first serve-path log
+        // line, the startup path validates its proof, duplicates the
+        // supervisor's listener, and binds — all silent. Name the boundary so
+        // a stall in it is attributable from daemon.log alone.
+        tracing::info!(
+            elapsed_ms = proof_start.elapsed().as_millis(),
+            address = %addr,
+            "daemon startup: listener acquired"
+        );
         self.serve_on_listener(listener).await
     }
 
