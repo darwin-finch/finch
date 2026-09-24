@@ -5030,7 +5030,11 @@ mod model_download_status_tests {
             1,
             "progress updates must replace one status line rather than append rows"
         );
-        assert!(download_lines[0].content.contains("75%"));
+        assert!(
+            download_lines[0].content.contains("75.0%"),
+            "expected one-decimal percentage formatting to keep early progress visible, got content={:?}",
+            download_lines[0].content
+        );
 
         assert!(project_local_model_download_status(
             &status_bar,

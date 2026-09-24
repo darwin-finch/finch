@@ -1461,6 +1461,12 @@ pub struct TuiRenderer {
     /// unconditional erase+draw every 33 ms tick when nothing changed.
     live_area_dirty: bool,
 
+    /// Last application-owned status snapshot painted or observed. Status can
+    /// change from daemon-monitor tasks without going through the renderer, so
+    /// the render tick compares this snapshot before deciding the live area is
+    /// idle.
+    last_status_snapshot: Option<(String, Option<String>)>,
+
     /// Whether this renderer currently holds mouse tracking. Default is held
     /// so wheels scroll the conversation ScrollView (#806); native history
     /// stays the copyable record, not the reader.
@@ -1522,6 +1528,7 @@ impl TuiRenderer {
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
             live_area_dirty: true,
+            last_status_snapshot: None,
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         }
     }
@@ -1611,6 +1618,7 @@ impl TuiRenderer {
             pre_typing_mode: PosetPanelMode::Forth,
 
             live_area_dirty: true,
+            last_status_snapshot: None,
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         })
     }
@@ -2466,6 +2474,7 @@ impl TuiRenderer {
     pub fn flush_output_safe(&mut self) -> Result<()> {
         let messages = self.output_manager.get_messages();
         let plan = plan_canonical_commit(&messages, &self.printed_ids);
+        self.poll_status_changes();
 
         // Re-establish trustworthy live-area coordinates before committing a
         // completion that raced resize. The completed message remains in the
@@ -2525,6 +2534,17 @@ impl TuiRenderer {
         }
 
         Ok(())
+    }
+
+    fn poll_status_changes(&mut self) {
+        let snapshot = (
+            self.status_port.status_without_session(),
+            self.status_port.session_label(),
+        );
+        if self.last_status_snapshot.as_ref() != Some(&snapshot) {
+            self.last_status_snapshot = Some(snapshot);
+            self.live_area_dirty = true;
+        }
     }
 
     /// Redraw the live area.  Called by the event loop and by async_input.
@@ -7097,6 +7117,21 @@ mod tests {
     #[test]
     fn test_redraw_predicate_triggers_when_dirty() {
         assert!(should_redraw_live_area(false, true));
+    }
+
+    #[test]
+    fn externally_updated_status_marks_idle_live_area_dirty() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer = TuiRenderer::new_headless(output, Arc::clone(&status), colors);
+
+        renderer.poll_status_changes();
+        renderer.live_area_dirty = false;
+        TuiStatusPort::set_operation(status.as_ref(), "Downloading 30.3MB".to_string());
+        renderer.poll_status_changes();
+
+        assert!(renderer.live_area_dirty);
     }
 
     // ── count_status_lines ────────────────────────────────────────────────────

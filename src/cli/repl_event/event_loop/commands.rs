@@ -105,12 +105,96 @@ impl EventLoop {
             let Some(client) = self.daemon_client.clone() else {
                 anyhow::bail!("Local model switching requires a running Finch daemon.");
             };
-            let generator: Arc<dyn Generator> = Arc::new(
-                crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
-            );
-            self.model_selection
-                .activate(effective.provider_index, generator)
-                .await;
+            match client.local_model_status().await? {
+                crate::client::LocalModelStatus::Ready(_) => {
+                    let generator: Arc<dyn Generator> = Arc::new(
+                        crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
+                    );
+                    self.model_selection
+                        .activate(effective.provider_index, generator)
+                        .await;
+                }
+                crate::client::LocalModelStatus::Initializing
+                | crate::client::LocalModelStatus::Downloading(_)
+                | crate::client::LocalModelStatus::Loading(_) => {
+                    let target_index = effective.provider_index;
+                    let local_identity = effective.identity_label();
+                    let token = self.model_selection.begin_pending(target_index).await;
+                    let active_name = self.model_selection.generator().await.name().to_string();
+                    if let Ok(mut tui) = self.tui_renderer.try_lock() {
+                        tui.set_model_identity(format!(
+                            "{active_name} · active while {} starts",
+                            entry.profile_name()
+                        ));
+                    }
+                    let local_generator: Arc<dyn Generator> =
+                        Arc::new(crate::generators::DaemonLocalGenerator::new(
+                            Arc::clone(&client),
+                            entry.profile_name(),
+                        ));
+                    let selection = self.model_selection.clone();
+                    let output = Arc::clone(&self.output_manager);
+                    let tui_renderer = Arc::clone(&self.tui_renderer);
+                    let profile_name = entry.profile_name();
+                    output.write_info(format!(
+                        "⏳ {profile_name} is still starting; {active_name} stays active until it is ready."
+                    ));
+                    // Failure/not-available/status-error mean `fail_pending`
+                    // cleared the pending slot and the generator captured in
+                    // `active_name` above is still the one serving queries;
+                    // the "active while X starts" identity set above must be
+                    // reverted so the status bar stops claiming a dead
+                    // startup is still in progress. `Cancelled` means a later
+                    // switch already owns identity, so it is left alone.
+                    let restore_identity = active_name.clone();
+                    tokio::spawn(async move {
+                        let outcome = activate_local_when_ready(
+                            selection,
+                            token,
+                            target_index,
+                            local_generator,
+                            || {
+                                let client = Arc::clone(&client);
+                                async move { client.local_model_status().await }
+                            },
+                            Duration::from_millis(750),
+                        )
+                        .await;
+                        if let Some(identity) = identity_after_local_activation(
+                            &outcome,
+                            &local_identity,
+                            &restore_identity,
+                        ) {
+                            tui_renderer.lock().await.set_model_identity(identity);
+                        }
+                        match outcome {
+                            LocalActivationOutcome::Activated(model) => {
+                                output.write_info(format!("✓ Switched to {profile_name} · {model}"))
+                            }
+                            LocalActivationOutcome::Failed(error) => output.write_error(format!(
+                                "Local model {profile_name} failed to start: {error}"
+                            )),
+                            LocalActivationOutcome::NotAvailable => output.write_error(format!(
+                                "Local model {profile_name} is not enabled in the daemon"
+                            )),
+                            LocalActivationOutcome::StatusError(error) => output.write_error(
+                                format!("Could not monitor local model {profile_name}: {error}"),
+                            ),
+                            LocalActivationOutcome::Cancelled => {}
+                        }
+                    });
+                    // Keep the currently usable generator active while the
+                    // selected local model downloads and loads. The monitor
+                    // atomically switches it once the daemon reports Ready.
+                    return Ok(());
+                }
+                crate::client::LocalModelStatus::Failed(error) => {
+                    anyhow::bail!("Local model failed to start: {error}");
+                }
+                crate::client::LocalModelStatus::NotAvailable => {
+                    anyhow::bail!("Local model is not enabled in the daemon");
+                }
+            }
         } else {
             match self.provider_resolver.resolve_entry(&entry).await {
                 Ok(generator) => {
@@ -626,5 +710,93 @@ impl EventLoop {
             tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Forth;
         }
         self.render_tui().await
+    }
+}
+
+/// What the status bar's model identity should become once a deferred local
+/// model activation settles, given the identity it would show once the
+/// switch succeeds (`local_identity`) and the identity that was active
+/// before the switch was attempted (`previous_identity`).
+///
+/// `Activated` adopts the new identity. `Failed`, `NotAvailable`, and
+/// `StatusError` all mean `fail_pending` cleared the pending slot and the
+/// original generator is still serving queries, so the "active while X
+/// starts" identity set when the switch began must be reverted — otherwise
+/// the status bar keeps claiming a dead startup is still in progress.
+/// `Cancelled` means a later switch already owns the identity, so the caller
+/// must leave it alone (`None`).
+fn identity_after_local_activation(
+    outcome: &LocalActivationOutcome,
+    local_identity: &str,
+    previous_identity: &str,
+) -> Option<String> {
+    match outcome {
+        LocalActivationOutcome::Activated(_) => Some(local_identity.to_string()),
+        LocalActivationOutcome::Failed(_)
+        | LocalActivationOutcome::NotAvailable
+        | LocalActivationOutcome::StatusError(_) => Some(previous_identity.to_string()),
+        LocalActivationOutcome::Cancelled => None,
+    }
+}
+
+#[cfg(test)]
+mod local_activation_identity_tests {
+    use super::*;
+
+    #[test]
+    fn activated_outcome_adopts_the_local_identity() {
+        let outcome = LocalActivationOutcome::Activated("Qwen 2.5 3B".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity,
+            Some("local · Qwen 2.5 3B".to_string()),
+            "a successful activation must adopt the new model's identity"
+        );
+    }
+
+    #[test]
+    fn failed_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::Failed("bad weights".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity,
+            Some("cloud".to_string()),
+            "a failed startup must stop claiming the dead download is still in progress \
+             and revert to the generator that is actually still serving queries"
+        );
+    }
+
+    #[test]
+    fn not_available_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::NotAvailable;
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(identity, Some("cloud".to_string()));
+    }
+
+    #[test]
+    fn status_error_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::StatusError("daemon unreachable".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(identity, Some("cloud".to_string()));
+    }
+
+    #[test]
+    fn cancelled_outcome_leaves_identity_alone() {
+        let outcome = LocalActivationOutcome::Cancelled;
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity, None,
+            "a superseding switch already owns the identity; this branch must not clobber it"
+        );
     }
 }
