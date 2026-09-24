@@ -55,6 +55,8 @@ run_arch() {
 run_ci() {
   gate "workflow allocation" python3 scripts/check_ci_workflow_manifest.py
   gate "workflow checker tests" python3 scripts/test_ci_workflow_manifest.py
+  gate "supervised isolation pairing" python3 scripts/check_factory_gates.py
+  gate "supervised isolation pairing self-test" python3 scripts/check_factory_gates.py --self-test
   gate "tracked tree" python3 scripts/check_repository_hygiene.py
   gate "repository hygiene tests" python3 scripts/test_repository_hygiene.py
 }
@@ -80,10 +82,17 @@ case "$stage" in
     run_ci
     gate "formatting" $slot cargo fmt --check
     gate "compiles (all targets)" $slot cargo check --all-targets
-    # This fixture changes the process-relative root and refuses a broad test
-    # process. Run it in its own exact supervisor-owned subprocess.
-    gate "library tests" ./scripts/test_brains.sh cargo test --lib -- --skip server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap
+    # These fixtures mutate state shared by the entire supervised process tree,
+    # or refuse a broad test process outright: the ancestor-swap fixture moves
+    # the process-relative root, and the production-constructor forgery windows
+    # rewrite the sealed wrapper-proof inode that every other test validates
+    # (#1116). A concurrent validator observes the mutation window and fails,
+    # so the broad run skips them and each gets a dedicated exact
+    # supervisor-owned subprocess where the parent blocks on its child alone.
+    gate "library tests" ./scripts/test_brains.sh cargo test --lib -- --skip server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap --skip server::tests::production_constructor_rejects_unverified_environment_before_store_mutation --skip server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
     gate "exact HTTP fixture containment" ./scripts/test_brains.sh cargo test -p finch --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact
+    gate "exact constructor unverified environment" ./scripts/test_brains.sh cargo test -p finch --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact
+    gate "exact constructor rewritten proof restore" ./scripts/test_brains.sh cargo test -p finch --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --exact
     ;;
   *)
     printf 'usage: scripts/factory/gates <docs|arch|ci|rust|full> [test-filter...]\n' >&2
