@@ -21,8 +21,20 @@ impl ProgramLanguage {
 
     /// Compact wire-format inference used only when the submission envelope
     /// omits `language`; the resolved value is recorded before execution.
+    ///
+    /// Ignores a small amount of leading backtick noise before the
+    /// discriminator byte: a model that was told not to use Markdown still
+    /// sometimes wraps a real `(...)` form in an inline-code backtick out of
+    /// habit, and a bare `trim_start` alone left that one stray byte enough
+    /// to misclassify real Lisp as Forth -- which then cascades into asking
+    /// the model to "repair" already-correct Lisp as Forth instead of just
+    /// dropping the backtick.
     pub fn infer_source(source: &str) -> Self {
-        if source.trim_start().starts_with('(') {
+        let trimmed = source
+            .trim_start()
+            .trim_start_matches('`')
+            .trim_start();
+        if trimmed.starts_with('(') {
             Self::Lisp
         } else {
             Self::Forth
@@ -57,5 +69,58 @@ impl std::str::FromStr for ProgramLanguage {
             "lisp" => Ok(Self::Lisp),
             other => bail!("unknown program language: {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_infer_source_detects_plain_lisp_and_forth() {
+        assert_eq!(
+            ProgramLanguage::infer_source("(define (fib (n : int)) : int (say n))"),
+            ProgramLanguage::Lisp
+        );
+        assert_eq!(
+            ProgramLanguage::infer_source(": fib ( n -- n ) ;"),
+            ProgramLanguage::Forth
+        );
+    }
+
+    #[test]
+    fn test_infer_source_sees_past_a_stray_leading_backtick() {
+        // Reproduces a real rejected wire response: a model told not to use
+        // Markdown still prefixed a real Lisp form with one inline-code
+        // backtick out of habit. A bare `trim_start` alone let that single
+        // byte misclassify genuine Lisp as Forth, cascading into a wire
+        // repair request that told the model to rewrite correct Lisp as
+        // (malformed) Forth instead of just dropping the backtick.
+        let source = "`(define (fib (n : int)) : int\n  (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))";
+        assert_eq!(
+            ProgramLanguage::infer_source(source),
+            ProgramLanguage::Lisp,
+            "a single leading backtick must not misclassify a real Lisp form as Forth: {source}"
+        );
+    }
+
+    #[test]
+    fn test_infer_source_handles_whitespace_between_backtick_and_paren() {
+        assert_eq!(
+            ProgramLanguage::infer_source("  ` (say \"hi\")"),
+            ProgramLanguage::Lisp
+        );
+    }
+
+    #[test]
+    fn test_infer_wire_source_still_rejects_a_full_markdown_fence() {
+        let error = ProgramLanguage::infer_wire_source("```lisp\n(say \"hi\")\n```")
+            .expect_err("a real triple-backtick fence must still be rejected, not silently unwrapped");
+        assert!(error.to_string().contains("E-WIRE-002"));
+    }
+
+    #[test]
+    fn test_infer_wire_source_rejects_empty() {
+        assert!(ProgramLanguage::infer_wire_source("   ").is_err());
     }
 }
