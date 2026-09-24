@@ -50,6 +50,21 @@ const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
+fn cached_request_json(request: &MessageRequest, stream: bool) -> Result<serde_json::Value> {
+    let mut payload = serde_json::to_value(request).context("encode Claude request")?;
+    let object = payload
+        .as_object_mut()
+        .context("Claude request did not encode as an object")?;
+    object.insert(
+        "cache_control".to_string(),
+        serde_json::json!({"type": "ephemeral"}),
+    );
+    if stream {
+        object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    }
+    Ok(payload)
+}
+
 /// Parse an Anthropic API error body and return a human-friendly message with hints.
 fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
     // Anthropic errors look like: {"type":"error","error":{"type":"...","message":"..."}}
@@ -167,6 +182,7 @@ impl ClaudeProvider {
         bindings: &ToolBindingTable,
     ) -> Result<ProviderResponse> {
         let msg_request = self.to_message_request(request, bindings);
+        let request_json = cached_request_json(&msg_request, false)?;
 
         tracing::debug!(
             model = %msg_request.model,
@@ -181,7 +197,7 @@ impl ClaudeProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(&msg_request)
+            .json(&request_json)
             .send()
             .await
             .context("Failed to send request to Claude API")?;
@@ -233,8 +249,7 @@ impl ClaudeProvider {
         let msg_request = self.to_message_request(request, bindings);
 
         // Convert to JSON and add stream: true
-        let mut request_json = serde_json::to_value(&msg_request)?;
-        request_json["stream"] = serde_json::json!(true);
+        let request_json = cached_request_json(&msg_request, true)?;
 
         tracing::debug!("Sending streaming request to Claude API");
 
@@ -655,6 +670,31 @@ mod tests {
             &Default::default(),
         )
         .expect("test tool bindings")
+    }
+
+    #[test]
+    fn all_claude_requests_enable_automatic_prompt_caching() {
+        let request = MessageRequest::new("remember this prefix");
+        let ordinary = cached_request_json(&request, false).expect("encode ordinary request");
+        let streaming = cached_request_json(&request, true).expect("encode streaming request");
+
+        for (kind, payload) in [("ordinary", &ordinary), ("streaming", &streaming)] {
+            assert_eq!(
+                payload.get("cache_control"),
+                Some(&serde_json::json!({"type": "ephemeral"})),
+                "INVARIANT: every {kind} Claude request must opt into automatic moving-prefix \
+                 caching; payload={payload}"
+            );
+        }
+        assert_eq!(
+            streaming.get("stream"),
+            Some(&serde_json::Value::Bool(true)),
+            "streaming request must retain its transport flag while enabling caching"
+        );
+        assert!(
+            ordinary.get("stream").is_none(),
+            "ordinary request must not accidentally become a streaming request: {ordinary}"
+        );
     }
 
     #[tokio::test]

@@ -17,6 +17,11 @@ For GGUF, `execution_target = "auto"` permits GPU offload when available;
 `execution_target = "cpu"` disables it. Removed CoreML and CUDA chat target names are rejected
 rather than silently remapped.
 
+The loaded generator retains one opaque llama.cpp sequence snapshot for the last prompt. When the
+next tokenized prompt strictly extends that exact prefix, Finch restores its KV state and evaluates
+only the suffix; divergent, equal, or shortened prompts automatically fall back to full evaluation.
+This cache is in memory and lasts only for the daemon lifetime.
+
 Memory embeddings are outside this local chat-provider slice. The frontend memory selector,
 defaults, and automatic model download remain independently owned. Its current ONNX dependency
 does not make ONNX a daemon chat provider.

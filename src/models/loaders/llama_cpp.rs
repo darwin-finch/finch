@@ -8,6 +8,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 use once_cell::sync::OnceCell;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -71,6 +72,22 @@ fn display_name(path: &Path, configured_family: Option<&str>) -> Result<String> 
 pub(in crate::models) struct LlamaCppGenerator {
     model: Arc<LlamaModel>,
     name: String,
+    prompt_cache: Option<PromptCache>,
+    #[cfg(test)]
+    last_cached_prompt_tokens: usize,
+}
+
+struct PromptCache {
+    tokens: Vec<u32>,
+    state: SeqState,
+}
+
+fn reusable_prompt_tokens(cached: &[u32], requested: &[u32]) -> usize {
+    if cached.len() < requested.len() && requested.starts_with(cached) {
+        cached.len()
+    } else {
+        0
+    }
 }
 
 impl LlamaCppGenerator {
@@ -82,7 +99,13 @@ impl LlamaCppGenerator {
     ) -> Result<Self> {
         let name = display_name(path, configured_family)?;
         let model = load_model(path, allow_gpu_offload)?;
-        Ok(Self { model, name })
+        Ok(Self {
+            model,
+            name,
+            prompt_cache: None,
+            #[cfg(test)]
+            last_cached_prompt_tokens: 0,
+        })
     }
 
     fn token_bytes(&self, token: LlamaToken) -> Result<Vec<u8>> {
@@ -129,12 +152,44 @@ impl LlamaCppGenerator {
                     .context("GGUF token ID overflow")
             })
             .collect::<Result<Vec<_>>>()?;
+        let cached_tokens = self
+            .prompt_cache
+            .as_ref()
+            .map_or(0, |cache| reusable_prompt_tokens(&cache.tokens, input_ids));
+        #[cfg(test)]
+        {
+            self.last_cached_prompt_tokens = cached_tokens;
+        }
+        if cached_tokens > 0 {
+            let cache = self
+                .prompt_cache
+                .as_ref()
+                .expect("cache length came from cache");
+            context
+                .state_seq_set(&cache.state, 0)
+                .context("restore cached GGUF prompt state")?;
+        }
         let mut batch = LlamaBatch::new(capacity, 1);
-        // Only the final prompt token needs logits for next-token sampling.
-        for (index, token) in prompt.iter().copied().enumerate() {
+        // A cache hit always leaves a non-empty suffix. Only its final token
+        // needs logits for next-token sampling.
+        for (index, token) in prompt.iter().copied().enumerate().skip(cached_tokens) {
             batch.add(token, index as i32, &[0], index + 1 == prompt.len())?;
         }
+        tracing::debug!(
+            model = %self.name,
+            prompt_tokens = input_ids.len(),
+            cached_prompt_tokens = cached_tokens,
+            evaluated_prompt_tokens = input_ids.len() - cached_tokens,
+            "evaluating llama.cpp prompt"
+        );
         context.decode(&mut batch).context("decode GGUF prompt")?;
+        let state = context
+            .state_seq_get(0, LlamaStateSeqFlags::empty())
+            .context("snapshot GGUF prompt state")?;
+        self.prompt_cache = Some(PromptCache {
+            tokens: input_ids.to_vec(),
+            state,
+        });
         let mut sampler = LlamaSampler::greedy();
         let mut output = Vec::with_capacity(max_new_tokens);
         let mut pending_utf8 = Vec::new();
@@ -239,6 +294,14 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_reuses_only_an_exact_strict_prefix() {
+        assert_eq!(reusable_prompt_tokens(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
+        assert_eq!(reusable_prompt_tokens(&[1, 2, 3], &[1, 2, 9, 4]), 0);
+        assert_eq!(reusable_prompt_tokens(&[1, 2, 3], &[1, 2, 3]), 0);
+        assert_eq!(reusable_prompt_tokens(&[1, 2, 3], &[1, 2]), 0);
+    }
+
+    #[test]
     fn test_non_gguf_fails_before_native_initialization() {
         let error = LlamaCppGenerator::load_with_offload(Path::new(file!()), true, None)
             .err()
@@ -303,6 +366,22 @@ mod tests {
             *streamed.lock().expect("lock stream"),
             text,
             "streamed chunks must reconstruct the decoded generation"
+        );
+
+        let mut continued = tokens.clone();
+        continued.extend(output);
+        continued.extend(
+            generator
+                .tokenize(" And then")
+                .expect("tokenize continuation"),
+        );
+        generator
+            .generate(&continued, 1)
+            .expect("generate from cached prompt prefix");
+        assert_eq!(
+            generator.last_cached_prompt_tokens,
+            tokens.len(),
+            "a continuing conversation must restore the preceding prompt state"
         );
     }
 
