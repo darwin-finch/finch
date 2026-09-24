@@ -328,15 +328,27 @@ const KERNEL_STATE_LIMIT: usize = 64 * 1024;
 /// existed even when their content did not fit.
 fn compose_kernel_state_sections(limit: usize, sections: Vec<(String, String)>) -> String {
     let mut output = String::new();
+    let mut bound_reached = false;
     for (name, body) in sections {
-        let section = format!("\n--- {name} ---\n{body}");
-        if output.len() + section.len() > limit {
-            output.push_str(&format!(
-                "\n--- {name} ---\n<truncated: kernel-state capture bound of {limit} bytes reached>"
-            ));
-            break;
+        if !bound_reached {
+            let section = format!("\n--- {name} ---\n{body}");
+            if output.len() + section.len() <= limit {
+                output.push_str(&section);
+                continue;
+            }
+            bound_reached = true;
         }
-        output.push_str(&section);
+        // Once the bound is reached, every remaining section — including
+        // this one — is still named with a truncation note instead of being
+        // silently dropped from the loop. A `break` here previously stopped
+        // naming after the *first* overflowing section, so a snapshot with
+        // several sections past the bound (readily reached: up to 16 threads
+        // x 3 files each against a 64KB total) left later sections absent
+        // with no marker at all, indistinguishable from a section the
+        // composer never received.
+        output.push_str(&format!(
+            "\n--- {name} ---\n<truncated: kernel-state capture bound of {limit} bytes reached>"
+        ));
     }
     output
 }
@@ -387,6 +399,38 @@ fn bounded_proc_file(path: &Path, limit: usize) -> String {
 /// `/proc/<pid>/mem` — a hang diagnosis needs "where is it blocked", not a
 /// memory dump. Threads are capped so a runaway thread count cannot exceed
 /// the capture bound.
+/// Choose which threads get a full (comm/wchan/stack) capture when there are
+/// more threads than `limit`.
+///
+/// Threads whose wchan is rare among the process are preferred over threads
+/// sharing the plurality wchan (e.g. many idle runtime workers parked on the
+/// same epoll wait) — a thread blocked somewhere unusual is a more likely
+/// culprit than one of many idling identically. Ties, and the case where no
+/// wchan is rarer than any other, fall back to ascending tid, which keeps
+/// selection deterministic for the unit tests below.
+///
+/// Selecting only the lowest-numbered (oldest) tids — the prior
+/// implementation — systematically excludes threads spawned later, such as
+/// `tokio`'s on-demand blocking-pool threads that do exactly the blocking
+/// I/O (#868's own diagnosis: hashing the supervisor executable, credential
+/// and Brain-store I/O) this capture exists to catch.
+fn select_tids_for_detail(wchans: &[(u32, String)], limit: usize) -> Vec<u32> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, wchan) in wchans {
+        *counts.entry(wchan.as_str()).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(u32, &str)> = wchans
+        .iter()
+        .map(|(tid, wchan)| (*tid, wchan.as_str()))
+        .collect();
+    ranked.sort_by(|(tid_a, wchan_a), (tid_b, wchan_b)| {
+        counts[wchan_a].cmp(&counts[wchan_b]).then(tid_a.cmp(tid_b))
+    });
+    let mut selected: Vec<u32> = ranked.into_iter().take(limit).map(|(tid, _)| tid).collect();
+    selected.sort_unstable();
+    selected
+}
+
 #[cfg(target_os = "linux")]
 fn daemon_kernel_state_snapshot(pid: u32, waited: Duration) -> String {
     const THREAD_LIMIT: usize = 16;
@@ -415,8 +459,31 @@ fn daemon_kernel_state_snapshot(pid: u32, waited: Duration) -> String {
         })
         .unwrap_or_default();
     tids.sort_unstable();
-    tids.truncate(THREAD_LIMIT);
-    for tid in tids {
+
+    // Every thread's wchan is one short line and is captured for ALL
+    // threads, not just the ones selected for a full stack dump below — a
+    // thread excluded from detailed capture is still named and its wait
+    // state still visible, instead of disappearing from the snapshot
+    // entirely.
+    let wchans: Vec<(u32, String)> = tids
+        .iter()
+        .map(|&tid| {
+            (
+                tid,
+                bounded_proc_file(&root.join("task").join(tid.to_string()).join("wchan"), 256),
+            )
+        })
+        .collect();
+    sections.push((
+        "thread wchans (all threads)".to_owned(),
+        wchans
+            .iter()
+            .map(|(tid, wchan)| format!("tid={tid} wchan={wchan}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+
+    for tid in select_tids_for_detail(&wchans, THREAD_LIMIT) {
         for name in ["comm", "wchan", "stack"] {
             sections.push((
                 format!("/proc/{pid}/task/{tid}/{name}"),
@@ -668,6 +735,43 @@ mod kernel_state_capture_tests {
         );
     }
 
+    /// A section past the one that first overflows the bound must still be
+    /// named with its own truncation note — the composer must not stop
+    /// after the first overflowing section and silently drop the rest.
+    #[test]
+    fn test_kernel_state_sections_name_every_section_past_the_first_overflow() {
+        let composed = compose_kernel_state_sections(
+            64,
+            vec![
+                ("fits".to_owned(), "ok".to_owned()),
+                ("overflows-first".to_owned(), "y".repeat(200)),
+                ("also-overflows".to_owned(), "z".repeat(200)),
+            ],
+        );
+        assert!(
+            composed.contains("--- fits ---") && composed.contains("ok"),
+            "the fitting section must survive whole; got {composed:?}"
+        );
+        assert!(
+            composed.contains("--- overflows-first ---"),
+            "the section that first crosses the bound must be named; got {composed:?}"
+        );
+        assert!(
+            composed.contains("--- also-overflows ---"),
+            "a section AFTER the one that first crossed the bound must still be \
+             named with a truncation note rather than silently dropped by an \
+             early loop exit; got {composed:?}"
+        );
+        assert_eq!(
+            composed
+                .matches("<truncated: kernel-state capture bound of 64 bytes reached>")
+                .count(),
+            2,
+            "both sections past the bound must carry their own truncation note, \
+             not just the first one; got {composed:?}"
+        );
+    }
+
     /// The composer's bound must hold even when a single section alone
     /// exceeds it: the output never grows past the limit plus one truncation
     /// note, and that section is named.
@@ -686,6 +790,50 @@ mod kernel_state_capture_tests {
             composed.contains("--- huge ---"),
             "the oversized section must still be named; got {} bytes",
             composed.len()
+        );
+    }
+
+    /// Selecting the lowest-numbered tids (the prior implementation) would
+    /// keep only the process's oldest threads. Build a process shape where
+    /// the odd-one-out thread — the one whose wchan differs from every
+    /// other thread — has the HIGHEST tid, as a later-spawned blocking-pool
+    /// thread would; selection must still include it even though it would
+    /// be the very last tid an ascending-sort-and-truncate kept.
+    #[test]
+    fn test_select_tids_for_detail_prefers_the_rare_wchan_over_the_oldest_tids() {
+        let mut wchans: Vec<(u32, String)> =
+            (1..=20).map(|tid| (tid, "ep_poll".to_owned())).collect();
+        wchans.push((999, "rwsem_down_write".to_owned()));
+
+        let selected = select_tids_for_detail(&wchans, 16);
+
+        assert!(
+            selected.contains(&999),
+            "the thread with the process's only non-plurality wchan is the most \
+             plausible hang candidate and must be selected even though its tid \
+             (999) is far past the 16 lowest tids; selected {selected:?}"
+        );
+        assert_eq!(
+            selected.len(),
+            16,
+            "selection must still respect the limit; got {selected:?}"
+        );
+    }
+
+    /// With no rare wchan (every thread shares the same wait state),
+    /// selection must fall back to a deterministic, reproducible choice —
+    /// ascending tid — rather than an arbitrary or unstable order.
+    #[test]
+    fn test_select_tids_for_detail_falls_back_to_ascending_tid_with_no_outlier() {
+        let wchans: Vec<(u32, String)> = (1..=20).map(|tid| (tid, "ep_poll".to_owned())).collect();
+
+        let selected = select_tids_for_detail(&wchans, 16);
+
+        let expected: Vec<u32> = (1..=16).collect();
+        assert_eq!(
+            selected, expected,
+            "with a uniform wchan across all threads, selection must \
+             deterministically keep the lowest tids; got {selected:?}"
         );
     }
 

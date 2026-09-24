@@ -659,10 +659,15 @@ impl AgentServer {
         } else {
             tokio::net::TcpListener::bind(addr).await?
         };
-        // #868: between agent-server construction and the first serve-path log
-        // line, the startup path validates its proof, duplicates the
-        // supervisor's listener, and binds — all silent. Name the boundary so
-        // a stall in it is attributable from daemon.log alone.
+        // #868: from `serve()` being entered to the listener being ready, the
+        // startup path re-validates its proof, duplicates the supervisor's
+        // listener, and binds — all silent until now. Name the boundary so a
+        // stall in it is attributable from daemon.log alone. elapsed_ms
+        // measures only this span (serve() entry to here); it is not the gap
+        // since `AgentServer::new` — that construction logs its own elapsed
+        // time separately (`main.rs`'s "agent server constructed"), and a
+        // reader wanting the full construction-to-bind gap must diff the two
+        // log lines' timestamps rather than read this field alone.
         tracing::info!(
             elapsed_ms = proof_start.elapsed().as_millis(),
             address = %addr,
