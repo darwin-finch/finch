@@ -371,4 +371,42 @@ mod tests {
             "related texts (sim={sim_related:.3}) should outscore unrelated (sim={sim_unrelated:.3})"
         );
     }
+
+    /// Production-boundary regression test for the Metal residency-set
+    /// teardown abort: load the real model with the production params,
+    /// embed, and let the engine (and the `LlamaModel` it owns) drop at
+    /// scope exit. `memory_embedding_model_stays_off_metal` above only
+    /// checks the params builder's own return value and would pass even if
+    /// those params were never wired into the load path; this test
+    /// exercises the actual load-then-drop sequence. Before this fix, GPU
+    /// offload on this ~37MB support model could create a Metal residency
+    /// set and abort the whole process on drop -- a failure mode no
+    /// in-process assertion can observe directly, since reaching the
+    /// assertion below is exactly what such an abort would prevent. Still
+    /// `#[ignore]`d like the other real-model tests in this file: it needs
+    /// the downloaded GGUF (`FINCH_TEST_EMBEDDING_GGUF`) and, to actually
+    /// exercise the Metal path this guards against, a macOS Metal machine --
+    /// neither is available in this repo's Linux PR CI (macOS CI here is a
+    /// post-merge cache warmer, not a merge gate; see `test-macos` in
+    /// `.github/workflows/ci.yml`).
+    #[test]
+    #[ignore]
+    fn test_neural_embed_load_and_drop_does_not_abort_process() {
+        let Ok(path) = std::env::var("FINCH_TEST_EMBEDDING_GGUF") else {
+            return;
+        };
+        let embedding_len = {
+            let engine = NeuralEmbeddingEngine::load(Path::new(&path)).expect("load from path");
+            let embedding = engine.embed("teardown probe").expect("embed after load");
+            embedding.len()
+            // `engine` drops here, taking its `LlamaModel` with it.
+        };
+        assert_eq!(
+            embedding_len, EMBEDDING_DIM,
+            "engine must produce a full-dimension embedding, and this \
+             assertion must be reached at all: an abort during the drop \
+             above would kill the test process before it ever prints a \
+             result"
+        );
+    }
 }
