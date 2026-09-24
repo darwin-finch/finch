@@ -81,6 +81,10 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
 - Subscription and API billing are never automatically interchangeable.
+- Claude requests opt into Anthropic's top-level automatic moving-prefix cache. OpenAI API and
+  ChatGPT transports continue to send stable, complete prefixes and rely on those services'
+  implicit prompt caching; provider context caching never permits Finch to omit conversation
+  messages from a stateless request.
 
 **Focused tests:**
 ```bash

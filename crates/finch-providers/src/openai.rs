@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,17 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
+fn prompt_cache_key(model: &str, system: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"finch-openai-prompt-cache-v1\0");
+    digest.update(model.as_bytes());
+    digest.update(b"\0");
+    if let Some(system) = system {
+        digest.update(system.as_bytes());
+    }
+    format!("finch-{:x}", digest.finalize())
+}
 
 #[cfg(test)]
 fn openai_bindings(
@@ -1597,6 +1609,8 @@ impl OpenAIProvider {
             )
         };
 
+        let cache_key = (rule == TransportRule::CanonicalGpt56ChatCompletions)
+            .then(|| prompt_cache_key(&model, request.system.as_deref()));
         let openai_request = OpenAIRequest {
             model,
             messages,
@@ -1614,6 +1628,7 @@ impl OpenAIProvider {
                     include_usage: true,
                     include_obfuscation: false,
                 }),
+            prompt_cache_key: cache_key,
         };
         Self::validate_request_payload(&openai_request)?;
         Ok(openai_request)
@@ -2412,6 +2427,8 @@ struct OpenAIRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2605,6 +2622,15 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn prompt_cache_key_is_stable_for_a_stable_prefix() {
+        let first = prompt_cache_key("gpt-5.6-sol", Some("system"));
+        assert_eq!(first, prompt_cache_key("gpt-5.6-sol", Some("system")));
+        assert_ne!(first, prompt_cache_key("gpt-5.6-sol", Some("changed")));
+        assert_ne!(first, prompt_cache_key("gpt-5.6", Some("system")));
+        assert!(first.len() <= 256, "OpenAI bounds cache keys to 256 bytes");
+    }
 
     fn test_tool_bindings(names: &[&str]) -> ToolBindingTable {
         compile_from_definitions(
@@ -2890,6 +2916,7 @@ mod tests {
         let jpeg = valid_jpeg_base64();
         let expected = serde_json::json!({
             "model": "gpt-5.6-sol",
+            "prompt_cache_key": prompt_cache_key("gpt-5.6-sol", Some("guard")),
             "messages": [
                 {"role":"developer","content":"guard"},
                 {"role":"user","content":[

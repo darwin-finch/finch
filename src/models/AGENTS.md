@@ -37,6 +37,10 @@ by repository, commit, filename, byte size, and SHA-256; partial downloads are r
 file is committed only after verification. This user-configured model selector must not also
 select memory's embedding/reranking models.
 It owns the process-wide llama.cpp backend and creates a fresh context per generation request.
+The generator keeps one opaque llama.cpp sequence snapshot for the preceding prompt and restores it
+only when those tokens are an exact strict prefix of the next request; it then evaluates only the
+new suffix. Equal, shortened, or divergent prompts are evaluated in full, and replacing the loaded
+generator discards the cache.
 Memory model selection and persisted embedding identity belong to the separate memory work.
 `execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
 reports it; `cpu` forbids offload. ONNX and Candle are not chat providers. ORT remains only

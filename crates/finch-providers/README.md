@@ -18,6 +18,12 @@ wizard asks the catalog for available models and retains the application decisio
 save. A catalog response is not proof that a model or provider path has passed end-to-end
 conformance.
 
+Provider requests keep stable conversation prefixes so service-side prompt caches can match them.
+Claude requests explicitly enable Anthropic's automatic moving-prefix cache; OpenAI API and
+ChatGPT use their service-managed implicit caches. Finch still sends complete request context to
+remote stateless APIs, because a cache hit is a provider optimization rather than stored
+conversation authority.
+
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth
 state machine has its own [capsule](src/oauth/AGENTS.md); its contract is re-exported flat from
