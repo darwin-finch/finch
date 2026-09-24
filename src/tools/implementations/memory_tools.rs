@@ -455,16 +455,33 @@ mod tests {
         Ok(())
     }
 
+    /// Coarse liveness bound for `settled_hydration`: far past any plausible
+    /// scheduler starvation for a one-row load, far under a CI job timeout.
+    /// Its only job is to turn a hung loader into a named failure instead of
+    /// an opaque CI timeout; it is not a latency oracle.
+    const HYDRATION_SETTLE_LIVENESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Wait for the background loader to stop, rather than racing it.
+    ///
+    /// Awaits the loader's own completion signal instead of polling a fixed
+    /// deadline. `ensure_hydrated` latches on the watch the failed arm also
+    /// fires (`fail` records the failure before `complete` marks done), so the
+    /// wait wakes exactly when hydration settles, however long the scheduler
+    /// leaves the spawned task unscheduled -- a fixed 200×10 ms poll is what
+    /// timed this fixture out under all-target CI load (#1067). The bound
+    /// below only converts a genuinely hung loader into a panic that says so.
     async fn settled_hydration(memory: &MemorySystem) -> finch_memory::HydrationStatus {
-        for _ in 0..200 {
+        let waited =
+            tokio::time::timeout(HYDRATION_SETTLE_LIVENESS_BOUND, memory.ensure_hydrated()).await;
+        if waited.is_err() {
             let status = memory.hydration_status();
-            if !matches!(status, finch_memory::HydrationStatus::Loading { .. }) {
-                return status;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            panic!(
+                "the background hydration loader hung: still {status:?} after \
+                 {HYDRATION_SETTLE_LIVENESS_BOUND:?}, never reached a terminal state -- \
+                 a liveness failure, not slowness"
+            );
         }
-        panic!("hydration never reached a terminal state");
+        memory.hydration_status()
     }
 
     /// A search that read nothing must not report that nothing exists.
@@ -545,28 +562,28 @@ mod tests {
 
     /// The same guarantee on the loader production actually runs.
     ///
-    /// `MemorySystem::new` only spawns the batched background loader on a
+    /// `MemorySystem::new` only spawns the background loader on a
     /// multi-threaded runtime; a current-thread runtime loads synchronously.
-    /// So the test above, despite its subject, never executes `load_batch` --
-    /// and the batched path is where `Failed` is raised from a different place,
-    /// where hydration is still in flight when `new` returns, and where #242
-    /// made a partial index a normal part of startup rather than an edge case.
+    /// So the test above, despite its subject, never exercises the spawned
+    /// loader -- and that path is where `Failed` is raised from a different
+    /// place (`hydrate_in_background`'s error arm), where hydration is still
+    /// in flight when `new` returns.
     ///
     /// Waits for a settled status rather than asserting immediately: `new`
     /// returns while the loader is still running, so an immediate assert would
     /// be a race that passes or fails by timing.
     ///
-    /// The batched path is guaranteed by construction, not by an assertion.
+    /// The spawned path is guaranteed by construction, not by an assertion.
     /// `MemorySystem::new` dispatches on `Handle::runtime_flavor()`, so
     /// `flavor = "multi_thread"` is what selects the spawned loader. An earlier
     /// version asserted the status was `Loading` the instant `new` returned to
     /// prove it; that is a head start, not a guarantee, and the obvious
     /// weakening -- asserting the status is not `Ready` -- does not
     /// discriminate at all, since the synchronous path lands on `Failed` here
-    /// too. Nothing observable from outside `src/memory` separates the two
+    /// too. Nothing observable from outside the crate separates the two
     /// without a race, so this says so rather than shipping a knowing flake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_search_qualifies_its_answer_when_the_batched_loader_fails() -> Result<()> {
+    async fn test_search_qualifies_its_answer_when_the_background_loader_fails() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let db_path = temp.path().to_path_buf();
 
@@ -590,7 +607,7 @@ mod tests {
         let settled = settled_hydration(&memory).await;
         assert!(
             matches!(settled, finch_memory::HydrationStatus::Failed { .. }),
-            "the batched loader must actually fail, or this test cannot fail: {settled:?}"
+            "the background loader must actually fail, or this test cannot fail: {settled:?}"
         );
 
         let result = SearchMemoryTool::new(memory)
@@ -602,7 +619,7 @@ mod tests {
 
         assert!(
             !result.contains("No relevant memories found"),
-            "asserted absence on an index the batched loader never read: {result}"
+            "asserted absence on an index the background loader never read: {result}"
         );
         assert!(
             result.contains("did not finish loading"),
