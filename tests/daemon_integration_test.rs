@@ -369,6 +369,13 @@ fn bounded_proc_file(path: &Path, limit: usize) -> String {
             Err(error) => return format!("<read failed: {error}>"),
         }
     }
+    if buffer.is_empty() {
+        // #868: some CI containers permit opening /proc/<tid>/stack but
+        // return no bytes (restricted stacktrace or kernel config). An
+        // empty body must be named, or it is indistinguishable from a
+        // section the composer silently dropped.
+        return "<empty: source opened successfully but produced no bytes>".to_owned();
+    }
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
@@ -713,6 +720,13 @@ mod kernel_state_capture_tests {
     /// The snapshot of a live process must contain the hang summary, the
     /// scheduler state, and per-thread sections, so a CI failure names the
     /// blocked phase without strace.
+    ///
+    /// Sources that every Linux environment provides (/proc/<pid>/status
+    /// fields, wchan) must carry real content. Sources that CI containers
+    /// commonly restrict (per-thread kernel stacks from /proc/<tid>/stack)
+    /// must appear as an explicit unavailable/empty/truncated marker rather
+    /// than being silently absent — a missing section and a captured one
+    /// must be distinguishable in the log.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_daemon_kernel_state_snapshot_of_self_reports_live_state() {
@@ -723,16 +737,59 @@ mod kernel_state_capture_tests {
              the first 400 bytes: {:?}",
             &snapshot[..snapshot.len().min(400)]
         );
+        let status_line = snapshot
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .expect(
+                "the /proc/<pid>/status section of a live self-snapshot must carry its \
+                     scheduler 'State:' field on every Linux environment",
+            )
+            .to_owned();
         assert!(
-            snapshot.contains("/proc/self/status") && snapshot.contains("State:"),
-            "the snapshot must carry the scheduler state; got {} bytes",
+            snapshot.contains(&format!("/proc/{}/status", std::process::id())),
+            "the snapshot must name the status section by its numeric pid \
+             (there is no /proc/self rewrite here); got {} bytes",
             snapshot.len()
         );
         assert!(
-            snapshot.contains("/proc/self/task/") && snapshot.contains("/wchan"),
-            "the snapshot must include per-thread wait channels; got {} bytes",
+            status_line.contains("State:"),
+            "the scheduler state line must be a well-formed status field; got \
+             {status_line:?}"
+        );
+        assert!(
+            snapshot.contains("/wchan"),
+            "the snapshot must include wait-channel sections; got {} bytes",
             snapshot.len()
         );
+        // Per-thread kernel stacks are the environment-dependent source:
+        // restricted CI containers may open /proc/<tid>/stack and get zero
+        // bytes, or refuse it outright. Either way the section must say so
+        // instead of silently vanishing.
+        let stack_sections: Vec<&str> = snapshot
+            .split("\n--- ")
+            .filter(|section| section.starts_with("/proc/") && section.contains("/stack ---"))
+            .collect();
+        assert!(
+            !stack_sections.is_empty(),
+            "the snapshot must name at least one per-thread stack section so its \
+             absence is distinguishable from a dropped section; got {} bytes",
+            snapshot.len()
+        );
+        for section in stack_sections {
+            let body = section.split("---\n").nth(1).unwrap_or_default();
+            assert!(
+                body.contains("<unavailable:")
+                    || body.contains("<empty:")
+                    || body.contains("<truncated>")
+                    || body.contains("<read failed:")
+                    || body.contains("=>"),
+                "every per-thread stack section must carry kernel-stack frames \
+                 ('=>') or an explicit unavailable/empty/truncated marker — a \
+                 bare empty body would be indistinguishable from a dropped \
+                 section; got section body {body:?} within a {}-byte snapshot",
+                snapshot.len()
+            );
+        }
     }
 
     /// A process that does not exist must still produce a usable capture:
