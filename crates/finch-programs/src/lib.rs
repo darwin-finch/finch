@@ -69,6 +69,62 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     )
 }
 
+/// Whether `source` shows no sign of being an attempted Forth or Lisp
+/// program at all: no `(` form opener, no Forth definition keyword, and no
+/// recognized string-literal opener, plus an English-prose marker
+/// (contraction apostrophe or question mark) in its first line that a
+/// deliberate program opener would not contain.
+///
+/// Conservative by design: a near-miss program (one wrong token inside a
+/// real `(...)` form, or a string literal followed by the wrong word) never
+/// matches, so it still gets the normal one-shot model repair. This only
+/// catches the case that repair cannot fix: the model never attempted a
+/// program, so asking it to "correct" one just produces a second, equally
+/// invalid generation.
+pub fn is_unattempted_prose(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('(') || trimmed.starts_with(':') {
+        return false;
+    }
+    const OPENERS: &[&str] = &["s\"", ".\"", "\"", "say\"", "call\"", "exec\""];
+    if OPENERS.iter().any(|opener| trimmed.starts_with(opener)) {
+        return false;
+    }
+    let first_line = trimmed.lines().next().unwrap_or(trimmed);
+    first_line.contains('\'') || first_line.contains('?')
+}
+
+/// Wrap `text` as a single output-effect program in `language`.
+///
+/// Used only for a rejected wire response classified by
+/// [`is_unattempted_prose`]: the one class of failure a same-model repair
+/// cannot fix, because there was never a program to repair. Deterministic
+/// and effect-free, so it never asks the model to try again -- it cannot
+/// compound one bad generation into a second.
+pub fn wrap_prose_as_say(text: &str, language: ProgramLanguage) -> String {
+    match language {
+        ProgramLanguage::Lisp => {
+            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("(say \"{escaped}\")")
+        }
+        ProgramLanguage::Forth => {
+            // The raw `s"""..."""` literal has no escape handling of its
+            // own (it ends at the next literal `"""`), so prose containing
+            // that exact sequence -- never seen in practice -- falls back
+            // to the escaped single-quoted form instead of mis-parsing.
+            if text.contains("\"\"\"") {
+                let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("s\"{escaped}\" say")
+            } else {
+                format!("s\"\"\"{text}\"\"\" say")
+            }
+        }
+    }
+}
+
 /// One complete Co-Forth lexical token observed while a provider response is
 /// still streaming. The runtime must not execute these incrementally: callers
 /// use them only for safe progress/display projection before the complete
@@ -943,6 +999,69 @@ mod tests {
         assert!(!is_repairable_wire_diagnostic(
             "error[X-OTHER-001]: not ours"
         ));
+    }
+
+    #[test]
+    fn test_plain_prose_is_unattempted() {
+        // A real rejected response from a local model that never attempted
+        // a program at all.
+        let prose = "I'm currently unable to access or inspect external \
+                      repositories. Would you like to proceed with a \
+                      computation or task using the available resources?";
+        assert!(
+            is_unattempted_prose(prose),
+            "prose with a contraction and a question mark, and no code \
+             opener, must be classified as unattempted: {prose}"
+        );
+    }
+
+    #[test]
+    fn test_near_miss_lisp_form_is_not_unattempted_prose() {
+        // A real rejected response one wrong function name away from valid:
+        // this must still go through the normal one-shot model repair, not
+        // the deterministic prose fallback.
+        let near_miss = "(shammah say \"Qwen, I'm here. How can I assist you today?\")";
+        assert!(
+            !is_unattempted_prose(near_miss),
+            "a real `(...)` form attempt, even with prose inside a string \
+             literal, must not be classified as unattempted prose: {near_miss}"
+        );
+    }
+
+    #[test]
+    fn test_forth_string_literal_opener_is_not_unattempted_prose() {
+        assert!(!is_unattempted_prose("s\"hello\" say"));
+        assert!(!is_unattempted_prose(".\"hello\""));
+    }
+
+    #[test]
+    fn test_empty_and_forth_definition_are_not_unattempted_prose() {
+        assert!(!is_unattempted_prose(""));
+        assert!(!is_unattempted_prose("   "));
+        assert!(!is_unattempted_prose(": greet s\" hi\" say ;"));
+    }
+
+    #[test]
+    fn test_wrap_prose_as_say_lisp_escapes_embedded_quotes() {
+        let wrapped = wrap_prose_as_say("She said \"hi\" and left.", ProgramLanguage::Lisp);
+        assert_eq!(wrapped, "(say \"She said \\\"hi\\\" and left.\")");
+    }
+
+    #[test]
+    fn test_wrap_prose_as_say_forth_uses_raw_triple_quote_literal() {
+        let text = "I'm currently unable to access external repositories.";
+        let wrapped = wrap_prose_as_say(text, ProgramLanguage::Forth);
+        assert_eq!(wrapped, format!("s\"\"\"{text}\"\"\" say"));
+    }
+
+    #[test]
+    fn test_wrap_prose_as_say_forth_falls_back_when_text_contains_triple_quote() {
+        let text = "a weird reply containing \"\"\" itself";
+        let wrapped = wrap_prose_as_say(text, ProgramLanguage::Forth);
+        assert_eq!(
+            wrapped,
+            "s\"a weird reply containing \\\"\\\"\\\" itself\" say"
+        );
     }
 
     use super::*;

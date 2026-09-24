@@ -494,6 +494,66 @@ async fn execute_wire_with_single_repair(
             output_unit,
         };
     }
+    if finch_programs::is_unattempted_prose(&source) {
+        // The model never attempted a program -- plain prose, not a
+        // near-miss. Asking the same model to "repair" it just compounds
+        // one bad generation into a second; the correction needs no model
+        // round-trip. Wrap the exact text it already produced as a `say`
+        // effect deterministically.
+        output_unit.set_complete();
+        let language = finch_programs::ProgramLanguage::infer_source(&source);
+        let wrapped = finch_programs::wrap_prose_as_say(&source, language);
+        let wrapped_unit = output_manager.start_work_unit("VM program output");
+        wrapped_unit.set_program_output();
+        wrapped_unit.begin_say_turn(language.as_str(), &wrapped);
+        return match execute_direct_wire_response(
+            runtime,
+            output_manager,
+            Arc::clone(&wrapped_unit),
+            event_tx.clone(),
+            cancel,
+            wrapped.clone(),
+            effect_audit,
+        )
+        .await
+        {
+            Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
+                effect_journal.extend(runner_effect_records(&outcome));
+                metric.repaired_successfully = !outcome.output.is_empty();
+                metric.terminal_failure = outcome.output.is_empty();
+                record_wire_metric(metrics_logger, &metric);
+                if !outcome.output.is_empty() {
+                    wrapped_unit.present_as_assistant_prose();
+                }
+                let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&wrapped_unit),
+                });
+                WireExecution {
+                    source_for_history: wrapped,
+                    response: outcome.output,
+                    effect_journal,
+                    output_unit: wrapped_unit,
+                }
+            }
+            _ => {
+                // The wrapped form is always syntactically valid, so this
+                // should not happen; never leave the fallback path itself
+                // unhandled.
+                metric.terminal_failure = true;
+                record_wire_metric(metrics_logger, &metric);
+                wrapped_unit.set_complete();
+                let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&wrapped_unit),
+                });
+                WireExecution {
+                    source_for_history: wrapped,
+                    response: diagnostic,
+                    effect_journal,
+                    output_unit: wrapped_unit,
+                }
+            }
+        };
+    }
     metric.repair_attempted = true;
 
     // Keep the rejected result visibly live while the bounded corrective
@@ -4340,6 +4400,64 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn unattempted_prose_is_wrapped_deterministically_without_a_repair_round_trip() {
+        // Reproduces a real failure mode from a weak local model: it emits
+        // plain English instead of any Forth/Lisp attempt, so the VM rejects
+        // the first word as an unknown Co-Forth word. A same-model repair
+        // request cannot fix prose that was never a program attempt --
+        // asking anyway just produces a second, equally invalid generation.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "I'm currently unable to access or inspect external \
+                       repositories. Would you like to proceed with a \
+                       computation or task using the available resources?"
+            .to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source.clone(),
+            Some(&metrics),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "a model that produced pure prose must never be asked to repair it"
+        );
+        assert_eq!(
+            execution.source_for_history,
+            format!("s\"\"\"{source}\"\"\" say")
+        );
+        assert_eq!(execution.response, source);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = metrics.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].first_pass_valid);
+        assert!(
+            !recorded[0].repair_attempted,
+            "the deterministic wrap path must not count as a model repair attempt"
+        );
+        assert!(recorded[0].repaired_successfully);
+        assert!(!recorded[0].terminal_failure);
+
+        drain_vm_events_as_event_loop(&mut event_rx);
     }
 
     fn drain_vm_events_as_event_loop(event_rx: &mut mpsc::UnboundedReceiver<ReplEvent>) {

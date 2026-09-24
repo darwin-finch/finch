@@ -244,10 +244,9 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
     ));
 
     let checkbox = if use_neural_embeddings { "[x]" } else { "[ ]" };
-    let item = wizard_bold(
-        &format!(">>> {checkbox} Memory embeddings: use the neural model <<<"),
-        Color::White,
-    );
+    let item = wizard_selected(format!(
+        ">>> {checkbox} Memory embeddings: use the neural model <<<"
+    ));
     lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
 
     let detail = if use_neural_embeddings {
@@ -1286,7 +1285,7 @@ fn device_auth_card(
 /// One bracketed form row; the exact shapes the compact editors always showed.
 fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool) -> WizardLine {
     let label_text = if focused {
-        wizard_bold(&format!("{:<10}", label), Color::White)
+        wizard_selected(format!("{:<10}", label))
     } else {
         wizard_line(&format!("{:<10}", label), Color::DarkGray)
     };
@@ -1298,7 +1297,7 @@ fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool)
         format!("[  {:<34} ]", value)
     };
     let value_painted = if focused {
-        wizard_bold(&value_text, Color::White)
+        wizard_selected(value_text)
     } else {
         wizard_line(&value_text, Color::Cyan)
     };
