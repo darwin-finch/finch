@@ -64,6 +64,8 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_USAGE_METADATA_BYTES: usize = 256 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
+const MAX_NAMED_UNKNOWN_FIELDS: usize = 8;
+const MAX_UNKNOWN_FIELD_NAME_BYTES: usize = 128;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
@@ -1845,7 +1847,7 @@ fn parse_completed(
     allowed_tools: &ToolBindingTable,
     accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
-    exact_keys(
+    exact_keys_naming_unknown(
         response,
         &[
             "id",
@@ -2563,6 +2565,56 @@ fn exact_keys(object: &Map<String, Value>, allowed: &[&str], location: &'static 
         bail!("ChatGPT subscription {location} contained an unknown field");
     }
     Ok(())
+}
+
+/// Terminal-response allowlist check whose failure names the unknown fields so
+/// provider-side schema drift is diagnosable from the message. Field names are
+/// bounded; values are never reflected.
+fn exact_keys_naming_unknown(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    location: &'static str,
+) -> Result<()> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let label = if unknown.len() == 1 {
+        "an unknown field"
+    } else {
+        "unknown fields"
+    };
+    let named: Vec<String> = unknown
+        .iter()
+        .take(MAX_NAMED_UNKNOWN_FIELDS)
+        .map(|field| quoted_bounded_field_name(field))
+        .collect();
+    let omitted = unknown.len() - named.len();
+    let suffix = if omitted == 0 {
+        String::new()
+    } else {
+        format!(", and {omitted} more")
+    };
+    bail!(
+        "ChatGPT subscription {location} contained {label}: {}{suffix}",
+        named.join(", ")
+    );
+}
+
+fn quoted_bounded_field_name(name: &str) -> String {
+    if name.len() <= MAX_UNKNOWN_FIELD_NAME_BYTES {
+        return format!("{name:?}");
+    }
+    let mut end = MAX_UNKNOWN_FIELD_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}…", &name[..end])
 }
 
 /// Validate an audited SSE event envelope while accepting only bounded passive
