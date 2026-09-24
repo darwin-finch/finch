@@ -193,12 +193,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # the same tables the test-only vt_oracle terminal model uses.
 unicode-width = "0.2"
 
-# Machine learning: llama.cpp backs both chat generation and, via its own
-# embeddings mode, memory's embedding engine (bge-small-en-v1.5 GGUF) -- the
-# same in-process backend and GPU offload path for both, not the separate
-# ONNX+CoreML path memory embeddings used before, which was never confirmed
-# to place work on the GPU either.
-llama-cpp-2 = { version = "=0.1.156", default-features = false, features = ["common"] }
+# Machine learning: llama.cpp backs daemon chat generation and, via its own
+# embeddings mode, memory's frontend embedding engine (bge-small-en-v1.5
+# GGUF). Keep the safe wrapper and vendored sys crate on the same release;
+# chat uses Metal while the tiny embedding helper remains CPU-only until the
+# upstream Metal residency-set teardown bug is resolved.
+llama-cpp-2 = { version = "=0.1.157", default-features = false, features = ["common"] }
 # Shared dependencies
 sysinfo = "0.32"  # System RAM detection for model selection
 tokenizers = "0.23"  # Retained training configuration (src/models/lora.rs)

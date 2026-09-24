@@ -58,7 +58,13 @@ const EMBEDDING_DIM: usize = 384;
 static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
-    BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
+    BACKEND.get_or_try_init(|| {
+        let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
+        // This backend lives in the interactive frontend. Native llama.cpp
+        // stderr bypasses the TUI renderer and corrupts its cursor geometry.
+        backend.void_logs();
+        Ok(backend)
+    })
 }
 
 /// The one fixed managed GGUF artifact backing memory's embedding engine.
@@ -103,7 +109,7 @@ impl NeuralEmbeddingEngine {
         info!("Loading GGUF embedding model from: {:?}", model_path);
 
         let backend = backend()?;
-        let params = LlamaModelParams::default();
+        let params = memory_embedding_model_params();
         let model = LlamaModel::load_from_file(backend, model_path, &params)
             .with_context(|| format!("load GGUF embedding model from {:?}", model_path))?;
 
@@ -183,6 +189,13 @@ fn context_params() -> LlamaContextParams {
     LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(512))
         .with_embeddings(true)
+}
+
+fn memory_embedding_model_params() -> LlamaModelParams {
+    // The support model is only ~37 MB. GPU offload has negligible benefit,
+    // but it creates Metal residency sets in the frontend and can make
+    // llama.cpp abort during process teardown while those sets are live.
+    LlamaModelParams::default().with_n_gpu_layers(0)
 }
 
 impl EmbeddingEngine for NeuralEmbeddingEngine {
@@ -274,6 +287,11 @@ mod tests {
     }
 
     #[test]
+    fn memory_embedding_model_stays_off_metal() {
+        assert_eq!(memory_embedding_model_params().n_gpu_layers(), 0);
+    }
+
+    #[test]
     fn test_memory_embedding_artifact_matches_independently_verified_values() {
         let artifact = memory_embedding_gguf_artifact();
         assert_eq!(artifact.repository, "CompendiumLabs/bge-small-en-v1.5-gguf");
@@ -351,6 +369,44 @@ mod tests {
         assert!(
             sim_related > sim_unrelated,
             "related texts (sim={sim_related:.3}) should outscore unrelated (sim={sim_unrelated:.3})"
+        );
+    }
+
+    /// Production-boundary regression test for the Metal residency-set
+    /// teardown abort: load the real model with the production params,
+    /// embed, and let the engine (and the `LlamaModel` it owns) drop at
+    /// scope exit. `memory_embedding_model_stays_off_metal` above only
+    /// checks the params builder's own return value and would pass even if
+    /// those params were never wired into the load path; this test
+    /// exercises the actual load-then-drop sequence. Before this fix, GPU
+    /// offload on this ~37MB support model could create a Metal residency
+    /// set and abort the whole process on drop -- a failure mode no
+    /// in-process assertion can observe directly, since reaching the
+    /// assertion below is exactly what such an abort would prevent. Still
+    /// `#[ignore]`d like the other real-model tests in this file: it needs
+    /// the downloaded GGUF (`FINCH_TEST_EMBEDDING_GGUF`) and, to actually
+    /// exercise the Metal path this guards against, a macOS Metal machine --
+    /// neither is available in this repo's Linux PR CI (macOS CI here is a
+    /// post-merge cache warmer, not a merge gate; see `test-macos` in
+    /// `.github/workflows/ci.yml`).
+    #[test]
+    #[ignore]
+    fn test_neural_embed_load_and_drop_does_not_abort_process() {
+        let Ok(path) = std::env::var("FINCH_TEST_EMBEDDING_GGUF") else {
+            return;
+        };
+        let embedding_len = {
+            let engine = NeuralEmbeddingEngine::load(Path::new(&path)).expect("load from path");
+            let embedding = engine.embed("teardown probe").expect("embed after load");
+            embedding.len()
+            // `engine` drops here, taking its `LlamaModel` with it.
+        };
+        assert_eq!(
+            embedding_len, EMBEDDING_DIM,
+            "engine must produce a full-dimension embedding, and this \
+             assertion must be reached at all: an abort during the drop \
+             above would kill the test process before it ever prints a \
+             result"
         );
     }
 }
