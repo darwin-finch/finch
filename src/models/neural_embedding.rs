@@ -58,7 +58,13 @@ const EMBEDDING_DIM: usize = 384;
 static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
-    BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
+    BACKEND.get_or_try_init(|| {
+        let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
+        // This backend lives in the interactive frontend. Native llama.cpp
+        // stderr bypasses the TUI renderer and corrupts its cursor geometry.
+        backend.void_logs();
+        Ok(backend)
+    })
 }
 
 /// The one fixed managed GGUF artifact backing memory's embedding engine.
@@ -103,7 +109,7 @@ impl NeuralEmbeddingEngine {
         info!("Loading GGUF embedding model from: {:?}", model_path);
 
         let backend = backend()?;
-        let params = LlamaModelParams::default();
+        let params = memory_embedding_model_params();
         let model = LlamaModel::load_from_file(backend, model_path, &params)
             .with_context(|| format!("load GGUF embedding model from {:?}", model_path))?;
 
@@ -183,6 +189,13 @@ fn context_params() -> LlamaContextParams {
     LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(512))
         .with_embeddings(true)
+}
+
+fn memory_embedding_model_params() -> LlamaModelParams {
+    // The support model is only ~37 MB. GPU offload has negligible benefit,
+    // but it creates Metal residency sets in the frontend and can make
+    // llama.cpp abort during process teardown while those sets are live.
+    LlamaModelParams::default().with_n_gpu_layers(0)
 }
 
 impl EmbeddingEngine for NeuralEmbeddingEngine {
@@ -271,6 +284,11 @@ mod tests {
     #[test]
     fn test_neural_embedding_dim_constant() {
         assert_eq!(EMBEDDING_DIM, 384);
+    }
+
+    #[test]
+    fn memory_embedding_model_stays_off_metal() {
+        assert_eq!(memory_embedding_model_params().n_gpu_layers(), 0);
     }
 
     #[test]
