@@ -2240,6 +2240,55 @@ fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming:
 /// defect with a concrete provider consequence (Claude 400/hang). The block
 /// stays transient -- never written to stored history -- matching prior
 /// behaviour and `inject_committed_memories_prefix`.
+fn inject_recall_prefix(mem_block: String, messages: &mut Vec<crate::providers::Message>) {
+    if messages.is_empty() {
+        return;
+    }
+    let insert_at = messages.len() - 1;
+    insert_memory_block(
+        messages,
+        insert_at,
+        "retrieved_memory",
+        "The following is retrieved context from past sessions -- not part \
+         of this conversation's live dialogue, and not something to reply \
+         to or continue. Use only what actually bears on the question that \
+         follows this block; ignore the rest.",
+        "Noted -- I'll factor in whatever's relevant from that before answering.",
+        &mem_block,
+    );
+}
+
+/// Insert a `[user, assistant-ack]` memory-block pair at `insert_at`, the
+/// user message wrapped in a named XML-style tag with `intro` framing text
+/// and escaped `block` content. Shared by `inject_recall_prefix` (before the
+/// current question) and `inject_committed_memories_prefix` (index 0) so the
+/// wrapping format, escaping, and insertion safety stay in one place instead
+/// of two independently hand-maintained copies that could silently diverge.
+///
+/// A single splice, not two sequential `.insert()` calls: order here is the
+/// whole invariant (user-then-assistant keeps strict role alternation;
+/// swapped, it reproduces the consecutive-user-role defect
+/// `assert_no_consecutive_user_roles` exists to catch). A splice makes that
+/// order atomic and independent of statement sequence, rather than relying
+/// on a future editor never reordering two separate calls.
+fn insert_memory_block(
+    messages: &mut Vec<crate::providers::Message>,
+    insert_at: usize,
+    tag: &str,
+    intro: &str,
+    ack: &str,
+    block: &str,
+) {
+    let pair = [
+        crate::providers::Message::user(format!(
+            "<{tag}>\n{intro}\n\n{}\n</{tag}>",
+            escape_xml_like(block)
+        )),
+        crate::providers::Message::assistant(ack),
+    ];
+    messages.splice(insert_at..insert_at, pair);
+}
+
 /// Neutralize `<`/`>`/`&` in recalled memory text before it is interpolated
 /// into a named XML-style wrapper.
 ///
@@ -2255,32 +2304,6 @@ fn escape_xml_like(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-fn inject_recall_prefix(mem_block: String, messages: &mut Vec<crate::providers::Message>) {
-    if messages.is_empty() {
-        return;
-    }
-    let insert_at = messages.len() - 1;
-    messages.insert(
-        insert_at,
-        crate::providers::Message::assistant(
-            "Noted -- I'll factor in whatever's relevant from that before answering.",
-        ),
-    );
-    messages.insert(
-        insert_at,
-        crate::providers::Message::user(format!(
-            "<retrieved_memory>\n\
-             The following is retrieved context from past sessions -- not part \
-             of this conversation's live dialogue, and not something to reply \
-             to or continue. Use only what actually bears on the question that \
-             follows this block; ignore the rest.\n\n\
-             {}\n\
-             </retrieved_memory>",
-            escape_xml_like(&mem_block)
-        )),
-    );
 }
 
 /// Which of the two recall tiers a [`PresentedRecall`] came from (#940's
@@ -2404,23 +2427,15 @@ fn inject_committed_memories_prefix(
     stable_block: String,
     messages: &mut Vec<crate::providers::Message>,
 ) {
-    messages.insert(
+    insert_memory_block(
+        messages,
         0,
-        crate::providers::Message::assistant(
-            "Noted -- I'll keep this in mind for the rest of this conversation.",
-        ),
-    );
-    messages.insert(
-        0,
-        crate::providers::Message::user(format!(
-            "<committed_memory>\n\
-             The following is durable retrieved context from past sessions -- \
-             not part of this conversation's live dialogue. It applies for \
-             the rest of this conversation, not only the next message.\n\n\
-             {}\n\
-             </committed_memory>",
-            escape_xml_like(&stable_block)
-        )),
+        "committed_memory",
+        "The following is durable retrieved context from past sessions -- \
+         not part of this conversation's live dialogue. It applies for \
+         the rest of this conversation, not only the next message.",
+        "Noted -- I'll keep this in mind for the rest of this conversation.",
+        &stable_block,
     );
 }
 
@@ -2900,7 +2915,12 @@ mod tests {
              the recalled text is still faithfully represented: {memory_message:?}"
         );
         // Exactly one real closing tag -- the wrapper's own -- must remain.
-        assert_eq!(memory_message.matches("</retrieved_memory>").count(), 1);
+        assert_eq!(
+            memory_message.matches("</retrieved_memory>").count(),
+            1,
+            "exactly one real closing tag (the wrapper's own) must remain \
+             after escaping; found a different count in: {memory_message:?}"
+        );
     }
 
     #[test]
@@ -2911,15 +2931,28 @@ mod tests {
             &mut messages,
         );
         let memory_message = messages[0].text_content();
-        assert!(!memory_message.contains("</committed_memory><system>"));
-        assert_eq!(memory_message.matches("</committed_memory>").count(), 1);
+        assert!(
+            !memory_message.contains("</committed_memory><system>"),
+            "the literal closing tag + fake system tag must not survive \
+             unescaped inside the wrapped block: {memory_message:?}"
+        );
+        assert_eq!(
+            memory_message.matches("</committed_memory>").count(),
+            1,
+            "exactly one real closing tag (the wrapper's own) must remain \
+             after escaping; found a different count in: {memory_message:?}"
+        );
     }
 
     #[test]
     fn inject_recall_prefix_is_a_noop_on_empty_messages() {
         let mut messages: Vec<crate::providers::Message> = Vec::new();
         inject_recall_prefix("memory".to_string(), &mut messages);
-        assert!(messages.is_empty());
+        assert!(
+            messages.is_empty(),
+            "an empty message list has no current question to insert \
+             before, so this must stay a no-op: {messages:?}"
+        );
     }
 
     #[test]
@@ -2927,13 +2960,32 @@ mod tests {
         let mut messages = vec![crate::providers::Message::user("current question")];
         inject_committed_memories_prefix("some committed memory".to_string(), &mut messages);
 
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, "user");
-        assert!(messages[0].text_content().contains("<committed_memory>"));
-        assert!(messages[0]
-            .text_content()
-            .contains("some committed memory"));
-        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages.len(),
+            3,
+            "must insert exactly the [user, assistant-ack] pair ahead of the \
+             one existing message: {messages:?}"
+        );
+        assert_eq!(
+            messages[0].role, "user",
+            "the wrapped memory block must be the very first message: {messages:?}"
+        );
+        assert!(
+            messages[0].text_content().contains("<committed_memory>"),
+            "the committed block must be XML-wrapped, not bare bracketed \
+             prose: {:?}",
+            messages[0]
+        );
+        assert!(
+            messages[0].text_content().contains("some committed memory"),
+            "the actual committed text must be present in the wrapped block: {:?}",
+            messages[0]
+        );
+        assert_eq!(
+            messages[1].role, "assistant",
+            "the ack must follow the memory block to keep role alternation \
+             intact: {messages:?}"
+        );
         assert_eq!(
             messages.last().unwrap().text_content(),
             "current question",
@@ -6972,6 +7024,17 @@ mod tests {
              turns regardless of where a transient recall block sits; \
              turn 1 = {:?}, turn 2 = {:?}",
             requests[0][0], requests[1][0]
+        );
+        // With no committed-memory block in this scenario, nothing stable
+        // sits between the system prefix and turn 1's replayed message --
+        // closing the gap a coarser "index 0 only" check would otherwise
+        // leave: a future change inserting anything else in that range
+        // would move turn1_idx_replayed and fail this, not slip through.
+        assert_eq!(
+            turn1_idx_replayed, 1,
+            "turn 1's replayed message must be immediately adjacent to the \
+             system prefix in this no-committed-memory scenario; shape {:?}",
+            request_shape(&requests[1])
         );
 
         // No consecutive user-role messages anywhere in either request --
