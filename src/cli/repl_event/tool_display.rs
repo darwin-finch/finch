@@ -171,6 +171,10 @@ pub(crate) const MAX_TOOL_BODY_LINES: usize = 20;
 ///   Glob  → "N files" + first 8 paths
 ///   Grep  → "N matches" + first 8 match lines
 ///   Bash  → semantic summary line + remaining lines as body
+///   WebFetch / Task / PresentPlan / MCP → "N lines" + first bounded lines of
+///       untrusted content, sanitized (#903)
+///   AskUserQuestion → "N lines" (body suppressed — the answers were shown in
+///       the interactive dialog; the result is model-facing JSON, #903)
 pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String, Vec<String>) {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -291,8 +295,55 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
             (summary, body)
         }
 
+        // Fetched pages (#903), subagent reports, and presented plans carry
+        // plain-text results worth reading when the row is expanded: keep the
+        // collapsed compact summary and add bounded, sanitized body lines.
+        "webfetch" | "web_fetch" | "task" | "spawn_task" | "presentplan" | "present_plan" => (
+            compact_tool_summary(content),
+            bounded_untrusted_body(trimmed),
+        ),
+
+        // MCP tools are namespaced `mcp_<server>_<tool>` before they reach the
+        // registry, so a prefix arm is the only way to name them; their result
+        // is the server's answer and gets the same bounded body (#903).
+        name if name.starts_with("mcp_") => (
+            compact_tool_summary(content),
+            bounded_untrusted_body(trimmed),
+        ),
+
+        // ask_user_question's result is the model-facing answer JSON (or the
+        // dismissal notice). The user just answered the interactive dialog, so
+        // the body stays suppressed rather than printing raw JSON (#903, #425).
+        "askuserquestion" | "ask_user_question" => (compact_tool_summary(content), Vec::new()),
+
         _ => (compact_tool_summary(content), Vec::new()),
     }
+}
+
+/// Bounded, sanitized body lines for tools whose result content is untrusted
+/// plain text: fetched pages, subagent reports, presented plans, and MCP
+/// server output (#903).
+///
+/// Mirrors the bash pattern — the first `MAX_TOOL_BODY_LINES` lines, then an
+/// overflow hint. Lines pass through `sanitize_terminal` because fetched and
+/// server-produced content can carry escape sequences, and body lines are not
+/// sanitized downstream (`WorkUnit::complete_row_with_body` sanitizes only the
+/// summary).
+fn bounded_untrusted_body(trimmed: &str) -> Vec<String> {
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let total = lines.len();
+    let mut body: Vec<String> = lines
+        .iter()
+        .take(MAX_TOOL_BODY_LINES)
+        .map(|line| crate::cli::diff::sanitize_terminal(line))
+        .collect();
+    if total > MAX_TOOL_BODY_LINES {
+        body.push(format!(
+            "{GRAY}… +{} lines (ctrl+o to expand){RESET}",
+            total - MAX_TOOL_BODY_LINES
+        ));
+    }
+    body
 }
 
 /// Build the approval preview for a mutating file tool using the same bounded,
@@ -1545,7 +1596,19 @@ mod tests {
 
     #[test]
     fn test_tool_result_empty_returns_empty() {
-        for tool in &["bash", "read", "edit", "write", "glob", "grep"] {
+        for tool in &[
+            "bash",
+            "read",
+            "edit",
+            "write",
+            "glob",
+            "grep",
+            "web_fetch",
+            "task",
+            "present_plan",
+            "ask_user_question",
+            "mcp_server_tool",
+        ] {
             let (summary, body) = tool_result_to_display(tool, "");
             assert!(
                 summary.is_empty(),
@@ -1580,6 +1643,146 @@ mod tests {
         let (summary, body) = tool_result_to_display("unknown", content);
         assert_eq!(summary, "3 lines");
         assert!(body.is_empty());
+    }
+
+    // ── unlisted-tool body lines (#903) ──────────────────────────────────────
+
+    #[test]
+    fn test_tool_result_webfetch_shows_body_lines_when_expanded() {
+        let content = "<!DOCTYPE html>\n<html>\n  <body>hello</body>\n</html>";
+        for name in ["webfetch", "web_fetch", "WebFetch"] {
+            let (summary, body) = tool_result_to_display(name, content);
+            assert_eq!(
+                summary, "4 lines",
+                "collapsed summary for {name} must keep the line count: {summary:?}"
+            );
+            assert_eq!(
+                body.len(),
+                4,
+                "expanded {name} row must show all 4 fetched lines (expected 4 body lines), got {}: {body:?}",
+                body.len()
+            );
+            assert!(
+                body.iter().any(|line| line.contains("<body>hello</body>")),
+                "expanded {name} row must carry real page content, got {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_result_webfetch_large_body_capped_with_overflow_hint() {
+        let lines: Vec<String> = (0..30).map(|i| format!("page line {i}")).collect();
+        let content = lines.join("\n");
+        for name in ["webfetch", "web_fetch"] {
+            let (summary, body) = tool_result_to_display(name, &content);
+            assert_eq!(
+                summary, "30 lines",
+                "collapsed summary for {name} must count the fetched lines: {summary:?}"
+            );
+            assert_eq!(
+                body.len(),
+                MAX_TOOL_BODY_LINES + 1,
+                "{name} body must be capped at {MAX_TOOL_BODY_LINES} lines plus one overflow hint, got {}: {body:?}",
+                body.len()
+            );
+            assert!(
+                body.last().unwrap().contains("ctrl+o to expand"),
+                "{name} overflow hint missing after the cap: {:?}",
+                body.last()
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_result_webfetch_sanitizes_untrusted_page_content() {
+        let content = "<html>\x1b[31mhostile\x1b[0m\nnext line";
+        let (summary, body) = tool_result_to_display("webfetch", content);
+        assert_eq!(
+            summary, "2 lines",
+            "collapsed summary must count the fetched lines: {summary:?}"
+        );
+        assert!(
+            body.iter().all(|line| !line.contains('\x1b')),
+            "escape sequences in fetched content must not reach the terminal body: {body:?}"
+        );
+        assert!(
+            body[0].contains("hostile"),
+            "sanitization must keep the visible text: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_task_shows_subagent_report_body() {
+        let content = "Explored the repo.\nRouter decision lives in src/router/decision.rs.\nNo regressions found.";
+        for name in ["task", "spawn_task", "Task"] {
+            let (summary, body) = tool_result_to_display(name, content);
+            assert_eq!(
+                summary, "3 lines",
+                "collapsed summary for {name} must keep the report line count: {summary:?}"
+            );
+            assert_eq!(
+                body.len(),
+                3,
+                "expanded {name} row must show the 3-line subagent report, got {}: {body:?}",
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_result_present_plan_shows_plan_body() {
+        let content = "📋 **Implementation Plan Presented**\n\n## Plan\n1. Add the arm\n2. Test it";
+        for name in ["present_plan", "PresentPlan"] {
+            let (summary, body) = tool_result_to_display(name, content);
+            assert_eq!(
+                summary, "5 lines",
+                "collapsed summary for {name} must keep the plan line count: {summary:?}"
+            );
+            assert!(
+                body.iter().any(|line| line.contains("## Plan")),
+                "expanded {name} row must show the plan text, got {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_result_mcp_tool_shows_server_output_body() {
+        let content = "row one\nrow two\nrow three";
+        for name in ["mcp_filesystem_read_file", "MCP_Server_Tool"] {
+            let (summary, body) = tool_result_to_display(name, content);
+            assert_eq!(
+                summary, "3 lines",
+                "collapsed summary for {name} must keep the server output line count: {summary:?}"
+            );
+            assert_eq!(
+                body.len(),
+                3,
+                "expanded {name} row must show all 3 server output lines, got {}: {body:?}",
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_result_ask_user_question_body_stays_suppressed() {
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "questions": [{"question": "Which approach?"}],
+            "answers": {"Which approach?": "B"}
+        }))
+        .unwrap();
+        let expected = content.lines().count();
+        for name in ["ask_user_question", "AskUserQuestion"] {
+            let (summary, body) = tool_result_to_display(name, &content);
+            assert_eq!(
+                summary,
+                format!("{expected} lines"),
+                "collapsed summary for {name} must keep the count: {summary:?}"
+            );
+            assert!(
+                body.is_empty(),
+                "{name} answers were shown in the interactive dialog; the body must stay suppressed instead of printing answer JSON, got {body:?}"
+            );
+        }
     }
 
     // ── strip_ansi ───────────────────────────────────────────────────────────
