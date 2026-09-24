@@ -110,6 +110,9 @@ pub enum ShortcutAuthority {
     /// `TuiRenderer::handle_accordion_key` claims the key (conversation
     /// scroll).
     ConversationScroll,
+    /// `TuiRenderer::handle_accordion_key` routes the key to the diagnostic
+    /// console before conversation controls.
+    DiagnosticConsole,
 }
 
 /// One documented keyboard binding: the key its dispatcher matches plus the
@@ -241,6 +244,16 @@ const COMPOSER_HELP: KeyboardShortcut = KeyboardShortcut {
     authority: ShortcutAuthority::ComposerShortcut,
 };
 
+/// Ctrl+`: toggle the in-terminal diagnostic console.
+const DIAGNOSTIC_CONSOLE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('`'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+`",
+    description: "Toggle daemon and frontend diagnostic output",
+    submit: None,
+    authority: ShortcutAuthority::DiagnosticConsole,
+};
+
 /// Shift+Tab: cycle Normal → AutoAccept → Planning.
 const COMPOSER_CYCLE_MODE: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::BackTab,
@@ -327,6 +340,7 @@ pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
     COMPOSER_POP,
     COMPOSER_DELETE_CHAR,
     COMPOSER_HELP,
+    DIAGNOSTIC_CONSOLE,
     COMPOSER_CYCLE_MODE,
     COMPOSER_TAB_COMPLETE,
     COMPOSER_NEWLINE,
@@ -1203,6 +1217,14 @@ mod tests {
                         (modified, submitted),
                         (false, Some("/cycle-mode".to_string())),
                         "{why}: Shift+Tab must submit /cycle-mode"
+                    );
+                }
+                ("Ctrl+`", ShortcutAuthority::DiagnosticConsole) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    assert!(
+                        renderer.handle_accordion_key(event),
+                        "{why}: Ctrl+` must be claimed by the diagnostic console dispatcher"
                     );
                 }
                 ("Tab", ShortcutAuthority::ComposerDispatch) => {

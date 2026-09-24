@@ -48,6 +48,7 @@ pub use activity::{
 mod async_input;
 mod autocomplete_widget;
 mod command_autocomplete;
+mod diagnostic_console;
 mod dialog;
 mod dialog_widget;
 mod dom_manifest;
@@ -85,6 +86,7 @@ pub use async_input::{
 use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace_mention_prefix};
 use command_autocomplete::{CommandRegistry, CommandSpec};
+pub use diagnostic_console::{DiagnosticConsolePort, DiagnosticConsoleSnapshot};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::{
@@ -1386,6 +1388,7 @@ pub struct TuiRenderer {
     // expanded surface. Presentation-only, like the accordion state.
     tool_viewports: ToolViewportState,
     pub(crate) expanded_tool: Option<ExpandedToolView>,
+    diagnostic_console: diagnostic_console::DiagnosticConsoleState,
 
     // The conversation ScrollView (#806): how far the retained transcript is
     // scrolled up from the newest row, plus the transcript claim of the last
@@ -1504,6 +1507,7 @@ impl TuiRenderer {
             accordion: AccordionState::default(),
             tool_viewports: ToolViewportState::default(),
             expanded_tool: None,
+            diagnostic_console: diagnostic_console::DiagnosticConsoleState::default(),
             transcript_scroll: TranscriptScrollView::new(),
             active_dialog: None,
             active_tabbed_dialog: None,
@@ -1588,6 +1592,7 @@ impl TuiRenderer {
             accordion: AccordionState::default(),
             tool_viewports: ToolViewportState::default(),
             expanded_tool: None,
+            diagnostic_console: diagnostic_console::DiagnosticConsoleState::default(),
             transcript_scroll: TranscriptScrollView::new(),
 
             active_dialog: None,
@@ -1633,6 +1638,12 @@ impl TuiRenderer {
     /// Attach a source the live area polls for task rows each time it redraws.
     pub fn set_task_rows(&mut self, rows: activity::SharedActivityRows) {
         self.task_rows = Some(rows);
+    }
+
+    /// Attach the application-owned source shown by the diagnostic console.
+    pub fn set_diagnostic_console(&mut self, source: Arc<dyn DiagnosticConsolePort>) {
+        self.diagnostic_console.set_source(source);
+        self.live_area_dirty = true;
     }
 
     /// Fold a scheduler event into the live child-agent projection.
@@ -1892,7 +1903,11 @@ impl TuiRenderer {
         let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
         let (term_width, term_h) = (term_width as usize, term_h as usize);
 
-        if term_h <= 3 && self.active_dialog.is_none() && self.expanded_tool.is_none() {
+        if term_h <= 3
+            && self.active_dialog.is_none()
+            && self.expanded_tool.is_none()
+            && !self.diagnostic_console.is_open()
+        {
             let sources = self.live_frame_sources(term_width);
             completion_pane_lines(&mut self.autocomplete_state, term_width, 0);
             let frame = plan_tiny_live_frame(
@@ -1919,15 +1934,20 @@ impl TuiRenderer {
 
         // The expanded tool-result surface owns the frame when open. A body
         // that can no longer be found closes the surface before drawing.
-        let expanded_lines = match self.expanded_surface_frame(term_width, term_h.saturating_sub(1))
-        {
+        let console_lines = self
+            .diagnostic_console
+            .frame(term_width, term_h.saturating_sub(1));
+        let expanded_lines = match console_lines {
             Some(lines) => Some(lines),
-            None => {
-                if self.expanded_tool.is_some() {
-                    self.close_expanded_tool();
+            None => match self.expanded_surface_frame(term_width, term_h.saturating_sub(1)) {
+                Some(lines) => Some(lines),
+                None => {
+                    if self.expanded_tool.is_some() {
+                        self.close_expanded_tool();
+                    }
+                    None
                 }
-                None
-            }
+            },
         };
 
         // `sources` is the owned state the ViewModel borrows; the dialog and
@@ -1961,12 +1981,16 @@ impl TuiRenderer {
         let input_lines = self.input_textarea.lines().to_vec();
         let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
-        let effective_status = compute_effective_status(
+        let mut effective_status = compute_effective_status(
             self.ghost_text.as_deref(),
             &raw_status,
             &current_input,
             &self.command_registry,
         );
+        let console_lines = self.diagnostic_console.line_count();
+        if console_lines > 0 && !self.diagnostic_console.is_open() {
+            effective_status.push_str(&format!(" · console: {console_lines} lines (Ctrl+`)"));
+        }
         let task_rows = self
             .task_rows
             .as_ref()
@@ -2483,6 +2507,12 @@ impl TuiRenderer {
         let plan = plan_canonical_commit(&messages, &self.printed_ids);
         self.poll_status_changes();
         self.poll_message_changes(&messages);
+        // Poll file-backed diagnostics only while their surface is visible.
+        // Closed-console log traffic must not reintroduce an idle redraw loop
+        // that disrupts terminal-native text selection.
+        if self.diagnostic_console.is_open() && self.diagnostic_console.refresh() {
+            self.live_area_dirty = true;
+        }
 
         // Re-establish trustworthy live-area coordinates before committing a
         // completion that raced resize. The completed message remains in the
@@ -3016,6 +3046,11 @@ impl TuiRenderer {
         if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
             return false;
         }
+        if self.diagnostic_console.handle_key(key) {
+            self.viewport_invalidated = true;
+            self.live_area_dirty = true;
+            return true;
+        }
         if self.expanded_tool.is_some() {
             return self.handle_expanded_tool_key(key);
         }
@@ -3436,6 +3471,20 @@ impl TuiRenderer {
             let sources = self.live_frame_sources(draw_width);
             let mut autocomplete = self.autocomplete_state.clone();
             let vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            let frame = plan_live_frame(&vm, &mut autocomplete);
+            return Some((frame.physical_rows(draw_width), frame.cursor_row));
+        }
+        if self.diagnostic_console.is_open() {
+            if terminal_rows == 0 {
+                return Some((0, 0));
+            }
+            let draw_width = usize::from(width).max(1);
+            let lines = self
+                .diagnostic_console
+                .frame(draw_width, terminal_rows.saturating_sub(1))?;
+            let sources = self.live_frame_sources(draw_width);
+            let mut autocomplete = self.autocomplete_state.clone();
+            let vm = live_view_model(&sources, draw_width, terminal_rows, None, Some(&lines));
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }

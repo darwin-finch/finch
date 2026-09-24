@@ -1485,6 +1485,7 @@ fn frontend_log_file() -> Option<finch::daemon::RotatingLog> {
     let path = finch::daemon::frontend_log_path(&identity).ok()?;
     match finch::daemon::RotatingLog::open(&path, finch::daemon::RotationPolicy::default()) {
         Ok(log) => {
+            finch::cli::register_frontend_log_path(path.clone());
             if finch::cli::logging_enabled() {
                 eprintln!("Frontend logs: {}", path.display());
             }
