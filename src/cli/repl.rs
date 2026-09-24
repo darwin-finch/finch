@@ -1489,7 +1489,8 @@ impl Repl {
                 config.colors.clone(),
                 Arc::clone(&mention_port),
             ) {
-                Ok(renderer) => {
+                Ok(mut renderer) => {
+                    renderer.set_diagnostic_console(crate::cli::diagnostic_console_source());
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
                     set_global_tui_renderer(renderer);

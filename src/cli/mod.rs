@@ -5,6 +5,7 @@ mod chatgpt_auth;
 mod commands;
 use finch_conversation as conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
+mod diagnostic_console;
 mod diff;
 mod global_output; // Phase 3.5: Global output system with macros
 mod grok_auth;
@@ -32,6 +33,8 @@ pub use chatgpt_auth::{
 };
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;
+pub use diagnostic_console::register_frontend_log_path;
+pub(crate) use diagnostic_console::source as diagnostic_console_source;
 pub(crate) use diff::{
     render_files, sanitize_multiline, sanitize_terminal, summarize_files, DiffColorMode, DiffHunk,
     DiffLine, DiffLineKind, FileDiff, MAX_DIFF_HUNKS, MAX_DIFF_INPUT_BYTES, MAX_DIFF_LINES,
@@ -72,6 +75,7 @@ pub use setup_wizard::{
 };
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
 pub use tui::{
-    ActivityUsage, Dialog, DialogOption, DialogResult, QuestionOptionView, QuestionView,
-    TabbedDialog, TabbedDialogResult, TuiOutputPort, TuiRenderer, TuiStatusPort,
+    ActivityUsage, DiagnosticConsolePort, DiagnosticConsoleSnapshot, Dialog, DialogOption,
+    DialogResult, QuestionOptionView, QuestionView, TabbedDialog, TabbedDialogResult,
+    TuiOutputPort, TuiRenderer, TuiStatusPort,
 };

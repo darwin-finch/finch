@@ -5,6 +5,9 @@ dialog widgets, transcript viewport, native-scrollback commit, and the setup wiz
 It turns caller-supplied presentation state into terminal rows. It does not own a conversation,
 Brain, tool execution, provider request, or project-file discovery. The application supplies
 those through message snapshots, status state, and narrow ports such as `MentionPort`.
+The diagnostic console follows the same boundary: the application supplies bounded, sanitised
+log snapshots through `DiagnosticConsolePort`, while the renderer owns its Ctrl+` surface and
+scroll state.
 
 Two callers show the boundary:
 

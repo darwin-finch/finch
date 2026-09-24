@@ -21,6 +21,10 @@ that port. Keep status ordering and status-line policy in the application; do no
 `TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
 retains message identity, controls stdout, and accepts settled dialog records. Production TUI
 code must not import `OutputManager`; blit and canonical commit read its message snapshots.
+`DiagnosticConsolePort` is the diagnostic-output seam: the application reads and sanitises its
+frontend/daemon logs and supplies a bounded snapshot; the renderer owns only the Ctrl+` surface,
+its line indicator, and scrolling. Filesystem paths and log retention policy stay outside this
+crate.
 The renderer owns its composer draft and failed-frame recovery state. Application callers use
 `restore_input_draft`, `record_render_failure`, and `take_render_failure_for_retry`; they must
 not mutate the textarea, refresh flag, or render-error slot directly. A failed process

@@ -13,6 +13,10 @@ REPL's event loop routes input and tool results, updates message snapshots, and 
 to draw them. The CLI owns turn timing and application decisions; the renderer owns terminal
 layout and input, and `finch-ui-model` owns pure WorkUnit projection.
 
+For the in-terminal diagnostic console, `diagnostic_console` tails bounded portions of this
+frontend's log and the daemon log, strips terminal controls, and implements the renderer-owned
+`DiagnosticConsolePort`. The renderer decides how Ctrl+` presents and scrolls that snapshot.
+
 For an `AskUserQuestion` tool call, `repl_event::plan_handler` parses the wire request owned by
 `llm_dialogs`. A single question becomes an inline `Dialog`; multiple questions become
 renderer-owned `QuestionView` values in a tabbed dialog. The resulting answers and markdown
