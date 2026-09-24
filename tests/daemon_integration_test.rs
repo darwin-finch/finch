@@ -61,6 +61,7 @@ impl TestDaemon {
             .stderr(Stdio::from(stderr_file.try_clone()?));
         let child = command.spawn().context("spawn isolated Finch daemon")?;
         let mut child = OwnedChild(child);
+        let spawn_started = Instant::now();
 
         // Coarse liveness bound, not a latency assertion (#476): a full daemon
         // startup on a loaded shared runner can exceed 30s (measured 0-byte
@@ -113,9 +114,26 @@ impl TestDaemon {
                     &brain_password,
                     api_key,
                 );
+                // #868: a hang this deep has historically produced no
+                // evidence — the daemon is alive, daemon.log is empty or
+                // absent, and stderr carries only the startup hint. Capture
+                // the kernel's view of the process instead: its scheduler
+                // state, wait channel, current syscall, and per-thread kernel
+                // stacks. This names the blocked phase without strace or a
+                // debugger, which the supervised runner does not offer.
+                let kernel_state = redact_daemon_diagnostic(
+                    daemon_kernel_state_snapshot(child.0.id(), spawn_started.elapsed()),
+                    &home,
+                    &socket_root,
+                    &brain_address,
+                    &daemon_address,
+                    &brain_password,
+                    api_key,
+                );
                 anyhow::bail!(
                     "isolated daemon remained alive but did not publish its ephemeral address \
-                     within 60s; bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}"
+                     within 60s; bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}; \
+                     bounded kernel state={kernel_state:?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -299,6 +317,193 @@ fn bounded_child_stderr(_stderr: &std::fs::File) -> String {
     "<bounded daemon stderr capture requires Unix>".to_owned()
 }
 
+/// Upper bound on one daemon kernel-state capture.
+const KERNEL_STATE_LIMIT: usize = 64 * 1024;
+
+/// Compose named capture sections into one bounded diagnostic string.
+///
+/// Sections are emitted in order under `--- <name> ---` headers. Once the
+/// bound is reached, the remaining headers are named but their bodies are
+/// replaced with a truncation note, so a reader always sees which sources
+/// existed even when their content did not fit.
+fn compose_kernel_state_sections(limit: usize, sections: Vec<(String, String)>) -> String {
+    let mut output = String::new();
+    let mut bound_reached = false;
+    for (name, body) in sections {
+        if !bound_reached {
+            let section = format!("\n--- {name} ---\n{body}");
+            if output.len() + section.len() <= limit {
+                output.push_str(&section);
+                continue;
+            }
+            bound_reached = true;
+        }
+        // Once the bound is reached, every remaining section — including
+        // this one — is still named with a truncation note instead of being
+        // silently dropped from the loop. A `break` here previously stopped
+        // naming after the *first* overflowing section, so a snapshot with
+        // several sections past the bound (readily reached: up to 16 threads
+        // x 3 files each against a 64KB total) left later sections absent
+        // with no marker at all, indistinguishable from a section the
+        // composer never received.
+        output.push_str(&format!(
+            "\n--- {name} ---\n<truncated: kernel-state capture bound of {limit} bytes reached>"
+        ));
+    }
+    output
+}
+
+/// Read one small procfs file to a bounded string.
+///
+/// procfs files report `st_size` as 0, so the existing
+/// [`bounded_child_stderr`] — which sizes its buffer from the metadata —
+/// cannot read them. This reads to EOF instead, bounding by bytes consumed.
+#[cfg(target_os = "linux")]
+fn bounded_proc_file(path: &Path, limit: usize) -> String {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<unavailable: {error}>"),
+    };
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+                if buffer.len() >= limit {
+                    buffer.truncate(limit);
+                    buffer.extend_from_slice(b"<truncated>");
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return format!("<read failed: {error}>"),
+        }
+    }
+    if buffer.is_empty() {
+        // #868: some CI containers permit opening /proc/<tid>/stack but
+        // return no bytes (restricted stacktrace or kernel config). An
+        // empty body must be named, or it is indistinguishable from a
+        // section the composer silently dropped.
+        return "<empty: source opened successfully but produced no bytes>".to_owned();
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// Kernel-visible state of a live daemon, for startup-hang diagnosis (#868).
+///
+/// Read-only: scheduler state, wait channel, current syscall, and kernel
+/// stacks. Deliberately excludes `/proc/<pid>/environ` (it carries the
+/// supervisor's sealed credentials), `/proc/<pid>/maps`, and
+/// `/proc/<pid>/mem` — a hang diagnosis needs "where is it blocked", not a
+/// memory dump. Threads are capped so a runaway thread count cannot exceed
+/// the capture bound.
+/// Choose which threads get a full (comm/wchan/stack) capture when there are
+/// more threads than `limit`.
+///
+/// Threads whose wchan is rare among the process are preferred over threads
+/// sharing the plurality wchan (e.g. many idle runtime workers parked on the
+/// same epoll wait) — a thread blocked somewhere unusual is a more likely
+/// culprit than one of many idling identically. Ties, and the case where no
+/// wchan is rarer than any other, fall back to ascending tid, which keeps
+/// selection deterministic for the unit tests below.
+///
+/// Selecting only the lowest-numbered (oldest) tids — the prior
+/// implementation — systematically excludes threads spawned later, such as
+/// `tokio`'s on-demand blocking-pool threads that do exactly the blocking
+/// I/O (#868's own diagnosis: hashing the supervisor executable, credential
+/// and Brain-store I/O) this capture exists to catch.
+fn select_tids_for_detail(wchans: &[(u32, String)], limit: usize) -> Vec<u32> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, wchan) in wchans {
+        *counts.entry(wchan.as_str()).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(u32, &str)> = wchans
+        .iter()
+        .map(|(tid, wchan)| (*tid, wchan.as_str()))
+        .collect();
+    ranked.sort_by(|(tid_a, wchan_a), (tid_b, wchan_b)| {
+        counts[wchan_a].cmp(&counts[wchan_b]).then(tid_a.cmp(tid_b))
+    });
+    let mut selected: Vec<u32> = ranked.into_iter().take(limit).map(|(tid, _)| tid).collect();
+    selected.sort_unstable();
+    selected
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_kernel_state_snapshot(pid: u32, waited: Duration) -> String {
+    const THREAD_LIMIT: usize = 16;
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let mut sections = vec![(
+        "daemon hang summary".to_owned(),
+        format!(
+            "pid={pid} still alive after {}s without publishing its address; \
+             kernel state follows (read-only /proc capture)",
+            waited.as_secs()
+        ),
+    )];
+    for name in ["status", "wchan", "syscall", "stack"] {
+        sections.push((
+            format!("/proc/{pid}/{name}"),
+            bounded_proc_file(&root.join(name), 8 * 1024),
+        ));
+    }
+    let mut tids: Vec<u32> = std::fs::read_dir(root.join("task"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|name| name.parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    tids.sort_unstable();
+
+    // Every thread's wchan is one short line and is captured for ALL
+    // threads, not just the ones selected for a full stack dump below — a
+    // thread excluded from detailed capture is still named and its wait
+    // state still visible, instead of disappearing from the snapshot
+    // entirely.
+    let wchans: Vec<(u32, String)> = tids
+        .iter()
+        .map(|&tid| {
+            (
+                tid,
+                bounded_proc_file(&root.join("task").join(tid.to_string()).join("wchan"), 256),
+            )
+        })
+        .collect();
+    sections.push((
+        "thread wchans (all threads)".to_owned(),
+        wchans
+            .iter()
+            .map(|(tid, wchan)| format!("tid={tid} wchan={wchan}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+
+    for tid in select_tids_for_detail(&wchans, THREAD_LIMIT) {
+        for name in ["comm", "wchan", "stack"] {
+            sections.push((
+                format!("/proc/{pid}/task/{tid}/{name}"),
+                bounded_proc_file(
+                    &root.join("task").join(tid.to_string()).join(name),
+                    4 * 1024,
+                ),
+            ));
+        }
+    }
+    compose_kernel_state_sections(KERNEL_STATE_LIMIT, sections)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_kernel_state_snapshot(_pid: u32, _waited: Duration) -> String {
+    "<daemon kernel-state capture requires Linux; read the bounded stderr and \
+     daemon log sections above>"
+        .to_owned()
+}
+
 // `[backend]` must stay disabled here: `BackendConfig::default()` (enabled=true)
 // spawns real local GGUF model loading as a plain `tokio::spawn` task that does
 // not yield, which on a 2-vCPU CI runner starves the same multi-thread runtime
@@ -473,4 +678,292 @@ fn test_write_config_disables_local_backend() {
          spawns real local model loading and can miss its address-publication bound under CI \
          load: config={contents:?}"
     );
+}
+
+#[cfg(test)]
+mod kernel_state_capture_tests {
+    use super::*;
+
+    /// The composer must name every section it was given, keep bodies in
+    /// order, and — when the bound is hit — still name the remaining sources
+    /// with an explicit truncation note, so a reader of a CI log can tell
+    /// "this section existed but did not fit" from "this section was empty".
+    #[test]
+    fn test_kernel_state_sections_compose_bounded_and_name_their_sources() {
+        let small = compose_kernel_state_sections(
+            1024,
+            vec![
+                ("one".to_owned(), "first body".to_owned()),
+                ("two".to_owned(), String::new()),
+            ],
+        );
+        assert!(
+            small.contains("--- one ---") && small.contains("first body"),
+            "a fitting section must appear with its body; got {small:?}"
+        );
+        assert!(
+            small.contains("--- two ---"),
+            "an empty section must still be named so its emptiness is \
+             distinguishable from a missing source; got {small:?}"
+        );
+
+        let big_body = "x".repeat(2048);
+        let overflow_body = "y".repeat(4096);
+        let bounded = compose_kernel_state_sections(
+            4096,
+            vec![
+                ("first".to_owned(), big_body.clone()),
+                ("second".to_owned(), overflow_body.clone()),
+            ],
+        );
+        assert!(
+            bounded.contains("--- first ---") && bounded.contains(&big_body),
+            "the first section must survive whole when it fits the bound; got {} bytes",
+            bounded.len()
+        );
+        assert!(
+            bounded.contains("--- second ---")
+                && bounded
+                    .contains("<truncated: kernel-state capture bound of 4096 bytes reached>"),
+            "an overflowing section must be named with a truncation note rather \
+             than silently dropped; got {bounded:?}"
+        );
+        assert!(
+            !bounded.contains(&overflow_body),
+            "a section past the bound must not leak its content; got {} bytes",
+            bounded.len()
+        );
+    }
+
+    /// A section past the one that first overflows the bound must still be
+    /// named with its own truncation note — the composer must not stop
+    /// after the first overflowing section and silently drop the rest.
+    #[test]
+    fn test_kernel_state_sections_name_every_section_past_the_first_overflow() {
+        let composed = compose_kernel_state_sections(
+            64,
+            vec![
+                ("fits".to_owned(), "ok".to_owned()),
+                ("overflows-first".to_owned(), "y".repeat(200)),
+                ("also-overflows".to_owned(), "z".repeat(200)),
+            ],
+        );
+        assert!(
+            composed.contains("--- fits ---") && composed.contains("ok"),
+            "the fitting section must survive whole; got {composed:?}"
+        );
+        assert!(
+            composed.contains("--- overflows-first ---"),
+            "the section that first crosses the bound must be named; got {composed:?}"
+        );
+        assert!(
+            composed.contains("--- also-overflows ---"),
+            "a section AFTER the one that first crossed the bound must still be \
+             named with a truncation note rather than silently dropped by an \
+             early loop exit; got {composed:?}"
+        );
+        assert_eq!(
+            composed
+                .matches("<truncated: kernel-state capture bound of 64 bytes reached>")
+                .count(),
+            2,
+            "both sections past the bound must carry their own truncation note, \
+             not just the first one; got {composed:?}"
+        );
+    }
+
+    /// The composer's bound must hold even when a single section alone
+    /// exceeds it: the output never grows past the limit plus one truncation
+    /// note, and that section is named.
+    #[test]
+    fn test_kernel_state_sections_never_exceed_their_bound() {
+        let huge = "y".repeat(4 * KERNEL_STATE_LIMIT);
+        let composed =
+            compose_kernel_state_sections(KERNEL_STATE_LIMIT, vec![("huge".to_owned(), huge)]);
+        assert!(
+            composed.len() <= KERNEL_STATE_LIMIT + 512,
+            "the composed capture must stay within the bound plus one truncation \
+             note; got {} bytes with bound {KERNEL_STATE_LIMIT}",
+            composed.len()
+        );
+        assert!(
+            composed.contains("--- huge ---"),
+            "the oversized section must still be named; got {} bytes",
+            composed.len()
+        );
+    }
+
+    /// Selecting the lowest-numbered tids (the prior implementation) would
+    /// keep only the process's oldest threads. Build a process shape where
+    /// the odd-one-out thread — the one whose wchan differs from every
+    /// other thread — has the HIGHEST tid, as a later-spawned blocking-pool
+    /// thread would; selection must still include it even though it would
+    /// be the very last tid an ascending-sort-and-truncate kept.
+    #[test]
+    fn test_select_tids_for_detail_prefers_the_rare_wchan_over_the_oldest_tids() {
+        let mut wchans: Vec<(u32, String)> =
+            (1..=20).map(|tid| (tid, "ep_poll".to_owned())).collect();
+        wchans.push((999, "rwsem_down_write".to_owned()));
+
+        let selected = select_tids_for_detail(&wchans, 16);
+
+        assert!(
+            selected.contains(&999),
+            "the thread with the process's only non-plurality wchan is the most \
+             plausible hang candidate and must be selected even though its tid \
+             (999) is far past the 16 lowest tids; selected {selected:?}"
+        );
+        assert_eq!(
+            selected.len(),
+            16,
+            "selection must still respect the limit; got {selected:?}"
+        );
+    }
+
+    /// With no rare wchan (every thread shares the same wait state),
+    /// selection must fall back to a deterministic, reproducible choice —
+    /// ascending tid — rather than an arbitrary or unstable order.
+    #[test]
+    fn test_select_tids_for_detail_falls_back_to_ascending_tid_with_no_outlier() {
+        let wchans: Vec<(u32, String)> = (1..=20).map(|tid| (tid, "ep_poll".to_owned())).collect();
+
+        let selected = select_tids_for_detail(&wchans, 16);
+
+        let expected: Vec<u32> = (1..=16).collect();
+        assert_eq!(
+            selected, expected,
+            "with a uniform wchan across all threads, selection must \
+             deterministically keep the lowest tids; got {selected:?}"
+        );
+    }
+
+    /// Reading a procfs file through the dedicated reader must produce
+    /// content even though procfs reports `st_size` 0 — the reason
+    /// `bounded_child_stderr` cannot be reused here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_proc_file_reader_reads_sizeless_procfs_content() {
+        let status = bounded_proc_file(Path::new("/proc/self/status"), 8 * 1024);
+        assert!(
+            status.contains("Name:") && status.contains("State:"),
+            "/proc/self/status read through the procfs reader must carry its \
+             fields despite st_size 0; got {status:?}"
+        );
+    }
+
+    /// A missing process must be reported as unavailable with the OS error,
+    /// not as empty output — "the process is gone" and "the file is empty"
+    /// are different diagnoses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_proc_file_reader_names_a_missing_process() {
+        let missing = bounded_proc_file(Path::new("/proc/4294967295/status"), 1024);
+        assert!(
+            missing.starts_with("<unavailable:"),
+            "a nonexistent /proc entry must report unavailability with its \
+             error, not an empty string; got {missing:?}"
+        );
+    }
+
+    /// The snapshot of a live process must contain the hang summary, the
+    /// scheduler state, and per-thread sections, so a CI failure names the
+    /// blocked phase without strace.
+    ///
+    /// Sources that every Linux environment provides (/proc/<pid>/status
+    /// fields, wchan) must carry real content. Sources that CI containers
+    /// commonly restrict (per-thread kernel stacks from /proc/<tid>/stack)
+    /// must appear as an explicit unavailable/empty/truncated marker rather
+    /// than being silently absent — a missing section and a captured one
+    /// must be distinguishable in the log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_daemon_kernel_state_snapshot_of_self_reports_live_state() {
+        let snapshot = daemon_kernel_state_snapshot(std::process::id(), Duration::from_secs(7));
+        assert!(
+            snapshot.contains("still alive after 7s"),
+            "the snapshot must open with the hang summary naming the wait; got \
+             the first 400 bytes: {:?}",
+            &snapshot[..snapshot.len().min(400)]
+        );
+        let status_line = snapshot
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .expect(
+                "the /proc/<pid>/status section of a live self-snapshot must carry its \
+                     scheduler 'State:' field on every Linux environment",
+            )
+            .to_owned();
+        assert!(
+            snapshot.contains(&format!("/proc/{}/status", std::process::id())),
+            "the snapshot must name the status section by its numeric pid \
+             (there is no /proc/self rewrite here); got {} bytes",
+            snapshot.len()
+        );
+        assert!(
+            status_line.contains("State:"),
+            "the scheduler state line must be a well-formed status field; got \
+             {status_line:?}"
+        );
+        assert!(
+            snapshot.contains("/wchan"),
+            "the snapshot must include wait-channel sections; got {} bytes",
+            snapshot.len()
+        );
+        // Per-thread kernel stacks are the environment-dependent source:
+        // restricted CI containers may open /proc/<tid>/stack and get zero
+        // bytes, or refuse it outright. Either way the section must say so
+        // instead of silently vanishing.
+        let stack_sections: Vec<&str> = snapshot
+            .split("\n--- ")
+            .filter(|section| section.starts_with("/proc/") && section.contains("/stack ---"))
+            .collect();
+        assert!(
+            !stack_sections.is_empty(),
+            "the snapshot must name at least one per-thread stack section so its \
+             absence is distinguishable from a dropped section; got {} bytes",
+            snapshot.len()
+        );
+        for section in stack_sections {
+            let body = section.split("---\n").nth(1).unwrap_or_default();
+            assert!(
+                body.contains("<unavailable:")
+                    || body.contains("<empty:")
+                    || body.contains("<truncated>")
+                    || body.contains("<read failed:")
+                    || body.contains("=>"),
+                "every per-thread stack section must carry kernel-stack frames \
+                 ('=>') or an explicit unavailable/empty/truncated marker — a \
+                 bare empty body would be indistinguishable from a dropped \
+                 section; got section body {body:?} within a {}-byte snapshot",
+                snapshot.len()
+            );
+        }
+    }
+
+    /// A process that does not exist must still produce a usable capture:
+    /// every section names its unavailability, which distinguishes "exited
+    /// between try_wait and capture" from a truncated read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_daemon_kernel_state_snapshot_names_an_unavailable_process() {
+        let snapshot = daemon_kernel_state_snapshot(4294967295, Duration::from_secs(1));
+        assert!(
+            snapshot.matches("<unavailable:").count() >= 4,
+            "all four root sections of a missing process must report \
+             unavailability; got {snapshot:?}"
+        );
+    }
+
+    /// Off-Linux the capture says so explicitly rather than returning an
+    /// empty string, so a macOS local failure message does not silently lose
+    /// the section.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_daemon_kernel_state_snapshot_requires_linux_off_linux() {
+        let snapshot = daemon_kernel_state_snapshot(1, Duration::from_secs(1));
+        assert!(
+            snapshot.contains("requires Linux"),
+            "the off-Linux capture must name its limitation; got {snapshot:?}"
+        );
+    }
 }

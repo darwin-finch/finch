@@ -1848,6 +1848,20 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // proof over a daemon's startup (#858); the validation itself is cached
     // for the process, so only whichever call site runs first pays the cost
     // of reading and hashing the supervisor executable.
+    //
+    // The pre-validation stderr marker names the silent phase. #868's CI
+    // signature was an alive process with a 0-byte log and no bind: the
+    // 10s/30s-bound runs caught the daemon here, in this hash, before the log
+    // file existed, and the 60s run stalled one call site later, in the same
+    // validation inside `AgentServer::new` — under runner load each hash
+    // costs tens of seconds. The stall is now attributable from the captured
+    // stderr alone. stderr is this function's established pre-auth
+    // diagnostic channel (the timing line below), and the marker carries no
+    // authority material.
+    eprintln!(
+        "[daemon] validating supervisor authority before startup (pid={})...",
+        std::process::id()
+    );
     let proof_start = std::time::Instant::now();
     let isolated_proof = finch::brain::isolated_test_proof_if_present()?;
     eprintln!(
@@ -2100,6 +2114,17 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         generator_state,
         provider_graph,
     )?;
+    // #868: the construction above is a long silent stretch between the last
+    // generator log line and the serve path's first log line — supervisor
+    // proof revalidation, credential authority, Brain store, feedback store —
+    // so a stall in it looked like "alive, 0-byte log, never binds". The
+    // failing 60s CI run stopped exactly here: its last log line was the
+    // generator's, so the blocked phase was this construction. Name the
+    // boundary and how long it took.
+    tracing::info!(
+        elapsed_ms = proof_start.elapsed().as_millis(),
+        "daemon startup: agent server constructed"
+    );
 
     // Set up mDNS service advertisement if enabled
     let service_discovery = if config.server.advertise {
