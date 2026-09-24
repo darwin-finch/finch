@@ -378,6 +378,11 @@ impl EventLoop {
                     .await;
                 if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
                     unit.set_failed();
+                    // The turn failed; tool rows it left in flight resolve
+                    // with that failure instead of running forever (#910).
+                    // A later physical tool outcome still overwrites the row
+                    // with its real summary.
+                    unit.resolve_running_rows_with_run_outcome(true, &error);
                     self.query_states.set_tool_work_unit(query_id, None).await;
                 }
 

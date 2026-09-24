@@ -1175,10 +1175,20 @@ fn apply_brain_run_status(
         let summary = detail
             .filter(|detail| !detail.is_empty())
             .map(|detail| format!("{label}: {detail}"))
-            .unwrap_or(label);
+            .unwrap_or(label.clone());
         unit.complete_row(status_row, summary);
     }
     if status.is_terminal() {
+        let detail = detail.filter(|detail| !detail.is_empty());
+        let failed = !matches!(status, crate::brain::BrainRunStatus::Completed);
+        let summary = match (failed, detail) {
+            (false, _) => "resolved by run completion".to_string(),
+            (true, Some(detail)) => detail.to_string(),
+            (true, None) => format!("run {}", label.to_lowercase()),
+        };
+        // A run that resolved while child rows were still in flight must not
+        // leave them at their last-known running status (#910).
+        unit.resolve_running_rows_with_run_outcome(failed, summary);
         unit.set_complete();
     }
 }
