@@ -79,7 +79,9 @@ use tool_viewport::{
     PAGE_STEP_LINES,
 };
 
-pub use async_input::{spawn_input_task, InputEvent};
+pub use async_input::{
+    spawn_input_task, InputEvent, KeyboardShortcut, ShortcutAuthority, KEYBOARD_SHORTCUTS,
+};
 use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace_mention_prefix};
 use command_autocomplete::{CommandRegistry, CommandSpec};
@@ -713,6 +715,7 @@ fn apply_selected_completion_for_submit(
 }
 
 /// Result of the composer key path shared by the input task and tests.
+#[derive(Debug)]
 enum ComposerDispatch {
     /// Enter submitted a non-empty composer line.
     Submit(String),
@@ -5459,6 +5462,64 @@ mod tests {
             );
             renderer.is_active = false;
         }
+    }
+
+    /// INVARIANT: the PgUp/PgDn rows in `KEYBOARD_SHORTCUTS` document real
+    /// dispatch — the binding table's page keys scroll the conversation
+    /// through `handle_accordion_key` by the ScrollView's own page step (#897).
+    #[test]
+    fn test_page_shortcut_table_entries_scroll_the_conversation() {
+        let up = KEYBOARD_SHORTCUTS
+            .iter()
+            .find(|binding| binding.label == "PgUp")
+            .unwrap_or_else(|| panic!("invariant: the binding table must document PgUp"));
+        let down = KEYBOARD_SHORTCUTS
+            .iter()
+            .find(|binding| binding.label == "PgDn")
+            .unwrap_or_else(|| panic!("invariant: the binding table must document PgDn"));
+        assert_eq!(
+            (up.code, up.authority),
+            (
+                KeyCode::PageUp,
+                async_input::ShortcutAuthority::ConversationScroll
+            ),
+            "invariant: PgUp must name the conversation-scroll PageUp binding; got {up:?}"
+        );
+        assert_eq!(
+            (down.code, down.authority),
+            (
+                KeyCode::PageDown,
+                async_input::ShortcutAuthority::ConversationScroll
+            ),
+            "invariant: PgDn must name the conversation-scroll PageDown binding; got {down:?}"
+        );
+
+        let mut renderer = renderer_owning_mouse_capture();
+        let frame = plan_frame_for_test(80, 24, &[]);
+        renderer.transcript_scroll.set_claim(frame.rects.transcript);
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(up.code, up.requires)),
+            "invariant: the PgUp binding-table entry's key must scroll the \
+             conversation when nothing more specific claims it"
+        );
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            renderer.transcript_scroll.page_step(),
+            "invariant: PgUp moved the conversation up one page of the visible \
+             pane; offset={:?} claim={:?}",
+            renderer.transcript_scroll.offset(),
+            frame.rects.transcript
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(down.code, down.requires)),
+            "invariant: the PgDn binding-table entry's key must scroll back"
+        );
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            0,
+            "invariant: one page down from a one-page offset returns to follow mode"
+        );
+        renderer.is_active = false;
     }
 
     /// The bottom-most non-empty live transcript line the live area would

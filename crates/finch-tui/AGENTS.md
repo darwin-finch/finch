@@ -28,6 +28,11 @@ replacement uses `resume_after_emergency_restore` to reacquire terminal modes.
 The event loop supplies package-version/tagline text for the startup header and a function
 that reports whether an external editor owns the terminal. The input task must consult that
 query before polling and before rendering; quit control messages use `finch-ipc` directly.
+`async_input` also owns the keyboard-binding catalog (`KEYBOARD_SHORTCUTS`, re-exported flat):
+its `ComposerShortcut` entries are the dispatch guards of the composer shortcut handler, and
+the CLI `/help` renderer (`cli::commands::format_help`) generates its Keyboard Shortcuts
+section from the same table, so help prose and key handling cannot drift (#893). Tests pin
+every entry to its real dispatcher (this module and `lib.rs`).
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-tui --lib`.
 

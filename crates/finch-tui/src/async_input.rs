@@ -90,6 +90,338 @@ fn dialog_owns_key(has_dialog: bool, key: &KeyEvent, input: &str) -> bool {
             && !input.trim().is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// Keyboard binding table — shared authority for composer dispatch and /help
+// ---------------------------------------------------------------------------
+
+/// Which dispatcher owns a documented keyboard binding.
+///
+/// Every entry in [`KEYBOARD_SHORTCUTS`] names its real dispatcher so the
+/// `/help` renderer (`cli::commands::format_help`) and the input path cannot
+/// disagree about which keys exist or what they do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutAuthority {
+    /// The input task's composer shortcut dispatch consumes this entry as its
+    /// guard ([`KeyboardShortcut::owns`]); the key data here is authoritative.
+    ComposerShortcut,
+    /// `TuiRenderer::dispatch_composer_key` claims the key (completions,
+    /// newline insertion, history recall).
+    ComposerDispatch,
+    /// `TuiRenderer::handle_accordion_key` claims the key (conversation
+    /// scroll).
+    ConversationScroll,
+}
+
+/// One documented keyboard binding: the key its dispatcher matches plus the
+/// exact `/help` text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyboardShortcut {
+    /// Key code the dispatcher matches.
+    pub code: KeyCode,
+    /// Modifier mask the dispatcher requires (`NONE` = no modifier needed).
+    pub requires: KeyModifiers,
+    /// Key label as rendered by `/help`, e.g. `"Ctrl+C"`.
+    pub label: &'static str,
+    /// What the binding does, as rendered by `/help`.
+    pub description: &'static str,
+    /// Slash command the binding submits, when it submits one.
+    pub submit: Option<&'static str>,
+    /// Dispatcher that owns the key.
+    pub authority: ShortcutAuthority,
+}
+
+impl KeyboardShortcut {
+    /// Guard predicate for [`ShortcutAuthority::ComposerShortcut`] entries:
+    /// the code must match and the required modifier must be present
+    /// (`requires == NONE` matches any modifier). Navigation bindings are
+    /// claimed by their own dispatchers with their own conditions and must
+    /// not be routed through this predicate.
+    pub fn owns(&self, key: &KeyEvent) -> bool {
+        if key.code != self.code {
+            return false;
+        }
+        if self.requires == KeyModifiers::NONE {
+            return true;
+        }
+        key.modifiers.intersects(self.requires)
+    }
+}
+
+/// Ctrl+V on every platform; macOS terminals also report Cmd+V as SUPER.
+const PASTE_MODIFIERS: KeyModifiers =
+    KeyModifiers::from_bits_retain(KeyModifiers::CONTROL.bits() | KeyModifiers::SUPER.bits());
+
+/// Ctrl+C: clear the draft, or cancel the running query when it is empty.
+const COMPOSER_CTRL_C: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('c'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+C",
+    description: "Clear the draft; cancel the query when empty",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Escape: same clear-then-cancel behavior as Ctrl+C.
+const COMPOSER_ESCAPE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Esc,
+    requires: KeyModifiers::NONE,
+    label: "Esc",
+    description: "Clear the draft; cancel the query when empty",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Cmd+V on macOS / Ctrl+V: paste a clipboard image into the draft.
+const COMPOSER_PASTE_IMAGE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('v'),
+    requires: PASTE_MODIFIERS,
+    label: "Ctrl+V",
+    description: "Paste a clipboard image into the draft (Cmd+V)",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+G: good feedback on the last response.
+const COMPOSER_FEEDBACK_GOOD: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('g'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+G",
+    description: "Mark last response as good (1x stored weight)",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+B: bad feedback on the last response.
+const COMPOSER_FEEDBACK_BAD: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('b'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+B",
+    description: "Mark last response as bad (10x stored weight)",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+Z: deliberate no-op; typed VM definitions are revisioned.
+const COMPOSER_NOOP_UNDO: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('z'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+Z",
+    description: "Deliberate no-op; VM definitions are revisioned",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+P: pop the top word off the vocabulary stack.
+const COMPOSER_POP: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('p'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+P",
+    description: "Pop top word off the vocabulary stack (/pop)",
+    submit: Some("/pop"),
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+D: Readline/Emacs delete-char under the cursor.
+const COMPOSER_DELETE_CHAR: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('d'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+D",
+    description: "Delete the character under the cursor",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Ctrl+/: show help.
+const COMPOSER_HELP: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('/'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+/",
+    description: "Show this help (/help)",
+    submit: Some("/help"),
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Shift+Tab: cycle Normal → AutoAccept → Planning.
+const COMPOSER_CYCLE_MODE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::BackTab,
+    requires: KeyModifiers::NONE,
+    label: "Shift+Tab",
+    description: "Cycle Normal → AutoAccept → Planning",
+    submit: Some("/cycle-mode"),
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
+/// Tab: accept the slash-command ghost text.
+const COMPOSER_TAB_COMPLETE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Tab,
+    requires: KeyModifiers::NONE,
+    label: "Tab",
+    description: "Accept the /command ghost text",
+    submit: None,
+    authority: ShortcutAuthority::ComposerDispatch,
+};
+
+/// Shift/Option+Enter: insert an in-buffer newline.
+const COMPOSER_NEWLINE: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Enter,
+    requires: KeyModifiers::SHIFT,
+    label: "Shift+Enter",
+    description: "Insert a newline (multi-line input)",
+    submit: None,
+    authority: ShortcutAuthority::ComposerDispatch,
+};
+
+/// Up: recall older command history.
+const COMPOSER_HISTORY_OLDER: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Up,
+    requires: KeyModifiers::NONE,
+    label: "↑",
+    description: "Recall older command history",
+    submit: None,
+    authority: ShortcutAuthority::ComposerDispatch,
+};
+
+/// Down: recall newer command history.
+const COMPOSER_HISTORY_NEWER: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Down,
+    requires: KeyModifiers::NONE,
+    label: "↓",
+    description: "Recall newer command history",
+    submit: None,
+    authority: ShortcutAuthority::ComposerDispatch,
+};
+
+/// PageUp: scroll the conversation up one page of the visible pane.
+const COMPOSER_PAGE_UP: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::PageUp,
+    requires: KeyModifiers::NONE,
+    label: "PgUp",
+    description: "Scroll the conversation up one page",
+    submit: None,
+    authority: ShortcutAuthority::ConversationScroll,
+};
+
+/// PageDown: scroll the conversation back toward the bottom.
+const COMPOSER_PAGE_DOWN: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::PageDown,
+    requires: KeyModifiers::NONE,
+    label: "PgDn",
+    description: "Scroll the conversation down one page",
+    submit: None,
+    authority: ShortcutAuthority::ConversationScroll,
+};
+
+/// The keyboard-binding catalog rendered by `/help`.
+///
+/// [`ShortcutAuthority::ComposerShortcut`] entries double as the dispatch
+/// guards in [`handle_composer_shortcuts`], so the dispatcher and the help
+/// text share one key table and cannot drift apart; the other entries are
+/// pinned to their real dispatchers by tests in this module and in `lib.rs`.
+pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
+    COMPOSER_CTRL_C,
+    COMPOSER_ESCAPE,
+    COMPOSER_PASTE_IMAGE,
+    COMPOSER_FEEDBACK_GOOD,
+    COMPOSER_FEEDBACK_BAD,
+    COMPOSER_NOOP_UNDO,
+    COMPOSER_POP,
+    COMPOSER_DELETE_CHAR,
+    COMPOSER_HELP,
+    COMPOSER_CYCLE_MODE,
+    COMPOSER_TAB_COMPLETE,
+    COMPOSER_NEWLINE,
+    COMPOSER_HISTORY_OLDER,
+    COMPOSER_HISTORY_NEWER,
+    COMPOSER_PAGE_UP,
+    COMPOSER_PAGE_DOWN,
+];
+
+/// Priority-3 composer handling shared by the input task and tests: the
+/// `ComposerShortcut` entries of [`KEYBOARD_SHORTCUTS`], then plain typing
+/// input for the textarea.
+///
+/// Returns `(input_modified, submitted_line)`. `input_modified` mirrors the
+/// input task's `first_event_modified_input` flag; `submitted_line` carries
+/// the entry's `submit` command for the input task to submit.
+fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Option<String>) {
+    if COMPOSER_CTRL_C.owns(&key) {
+        // Ctrl+C: Clear input if non-empty, otherwise cancel query
+        let content = tui.input_textarea.lines().join("");
+        if content.trim().is_empty() {
+            tui.pending_cancellation = true;
+            (false, None)
+        } else {
+            tui.input_textarea = TuiRenderer::create_clean_textarea();
+            (true, None)
+        }
+    } else if COMPOSER_ESCAPE.owns(&key) {
+        // Escape: Clear input if non-empty, otherwise cancel query
+        let content = tui.input_textarea.lines().join("");
+        if content.trim().is_empty() {
+            tui.pending_cancellation = true;
+            (false, None)
+        } else {
+            tui.input_textarea = TuiRenderer::create_clean_textarea();
+            (true, None)
+        }
+    } else if COMPOSER_PASTE_IMAGE.owns(&key) {
+        // Cmd+V on macOS / Ctrl+V: check clipboard for images
+        if let Some((b64, media_type)) = try_grab_clipboard_image() {
+            tui.image_counter += 1;
+            let idx = tui.image_counter;
+            tui.pending_images.push((idx, b64, media_type));
+
+            // Insert marker into textarea
+            let marker = format!("[Image #{}]", idx);
+            let current = tui.input_textarea.lines().join("\n");
+            let new_text = if current.trim().is_empty() {
+                marker
+            } else {
+                format!("{}\n{}", current, marker)
+            };
+            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&new_text);
+            (true, None)
+        } else {
+            // No image - pass V to textarea for text paste
+            tui.input_textarea.input(Event::Key(key));
+            (true, None)
+        }
+    } else if COMPOSER_FEEDBACK_GOOD.owns(&key) {
+        // Ctrl+G: Good feedback
+        tui.pending_feedback = Some(super::Verdict::Approve);
+        (false, None)
+    } else if COMPOSER_FEEDBACK_BAD.owns(&key) {
+        // Ctrl+B: Bad feedback
+        tui.pending_feedback = Some(super::Verdict::Reject);
+        (false, None)
+    } else if COMPOSER_NOOP_UNDO.owns(&key) {
+        // Typed VM definitions are revisioned; do not route Ctrl+Z into the
+        // removed legacy-Forth undo path.
+        (false, None)
+    } else if COMPOSER_POP.owns(&key) {
+        // Ctrl+P: Pop top word off vocabulary stack
+        (false, COMPOSER_POP.submit.map(str::to_string))
+    } else if COMPOSER_DELETE_CHAR.owns(&key) {
+        // Readline/Emacs semantics: delete the character under the cursor. On
+        // an empty buffer this is a no-op; Finch exits only through the
+        // explicit `/quit` command.
+        tui.input_textarea.delete_next_char();
+        (true, None)
+    } else if COMPOSER_HELP.owns(&key) {
+        // Ctrl+/: Show help (send as command)
+        (false, COMPOSER_HELP.submit.map(str::to_string))
+    } else if COMPOSER_CYCLE_MODE.owns(&key) {
+        // Shift+Tab: cycle Normal → AutoAccept → Planning
+        (false, COMPOSER_CYCLE_MODE.submit.map(str::to_string))
+    } else if should_accept_key_event(&key) {
+        // Pass key event to textarea (with sanitization)
+        tui.input_textarea.input(Event::Key(key));
+        (true, None)
+    } else {
+        (false, None)
+    }
+}
+
 /// Encode a Cap'n Proto `ControlMessage { quit }` into bytes.
 ///
 /// Used to send a quit signal through the out-of-band quit channel.
@@ -233,128 +565,15 @@ pub fn spawn_input_task(
                                         Ok(None)
                                     }
                                     ComposerDispatch::Unhandled => {
-                                        // Priority 3: Handle other keys (feedback shortcuts, input)
-                                        let _input_empty =
-                                            tui.input_textarea.lines().join("").trim().is_empty();
-
-                                        match (key.code, key.modifiers) {
-                                            (KeyCode::Char('c'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Ctrl+C: Clear input if non-empty, otherwise cancel query
-                                                let content = tui.input_textarea.lines().join("");
-                                                if content.trim().is_empty() {
-                                                    tui.pending_cancellation = true;
-                                                } else {
-                                                    tui.input_textarea =
-                                                        TuiRenderer::create_clean_textarea();
-                                                    first_event_modified_input = true;
-                                                }
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Esc, _) => {
-                                                // Escape: Clear input if non-empty, otherwise cancel query
-                                                let content = tui.input_textarea.lines().join("");
-                                                if content.trim().is_empty() {
-                                                    tui.pending_cancellation = true;
-                                                } else {
-                                                    tui.input_textarea =
-                                                        TuiRenderer::create_clean_textarea();
-                                                    first_event_modified_input = true;
-                                                }
-                                                Ok(None)
-                                            }
-                                            // Cmd+V on macOS / Ctrl+V: check clipboard for images
-                                            (KeyCode::Char('v'), m)
-                                                if m.contains(KeyModifiers::SUPER)
-                                                    || m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Try to grab image from clipboard first
-                                                if let Some((b64, media_type)) =
-                                                    try_grab_clipboard_image()
-                                                {
-                                                    tui.image_counter += 1;
-                                                    let idx = tui.image_counter;
-                                                    tui.pending_images.push((idx, b64, media_type));
-
-                                                    // Insert marker into textarea
-                                                    let marker = format!("[Image #{}]", idx);
-                                                    let current =
-                                                        tui.input_textarea.lines().join("\n");
-                                                    let new_text = if current.trim().is_empty() {
-                                                        marker
-                                                    } else {
-                                                        format!("{}\n{}", current, marker)
-                                                    };
-                                                    tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea_with_text(
-                                                    &new_text,
-                                                );
-                                                    first_event_modified_input = true;
-                                                } else {
-                                                    // No image - pass V to textarea for text paste
-                                                    tui.input_textarea.input(Event::Key(key));
-                                                    first_event_modified_input = true;
-                                                }
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Char('g'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Ctrl+G: Good feedback
-                                                tui.pending_feedback =
-                                                    Some(super::Verdict::Approve);
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Char('b'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Ctrl+B: Bad feedback
-                                                tui.pending_feedback = Some(super::Verdict::Reject);
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Char('z'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Typed VM definitions are revisioned; do not route
-                                                // Ctrl+Z into the removed legacy-Forth undo path.
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Char('p'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Ctrl+P: Pop top word off vocabulary stack
-                                                Ok(Some("/pop".to_string()))
-                                            }
-                                            (KeyCode::Char('d'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Readline/Emacs semantics: delete the character under
-                                                // the cursor. On an empty buffer this is a no-op; Finch
-                                                // exits only through the explicit `/quit` command.
-                                                tui.input_textarea.delete_next_char();
-                                                first_event_modified_input = true;
-                                                Ok(None)
-                                            }
-                                            (KeyCode::Char('/'), m)
-                                                if m.contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                // Ctrl+/: Show help (send as command)
-                                                Ok(Some("/help".to_string()))
-                                            }
-                                            (KeyCode::BackTab, _) => {
-                                                // Shift+Tab: cycle Normal → AutoAccept → Planning
-                                                Ok(Some("/cycle-mode".to_string()))
-                                            }
-                                            _ => {
-                                                // Pass key event to textarea (with sanitization)
-                                                if should_accept_key_event(&key) {
-                                                    tui.input_textarea.input(Event::Key(key));
-                                                    first_event_modified_input = true;
-                                                }
-                                                Ok(None)
-                                            }
+                                        // Priority 3: the composer shortcut table
+                                        // (KEYBOARD_SHORTCUTS), then plain typing
+                                        // input.
+                                        let (input_modified, submitted) =
+                                            handle_composer_shortcuts(&mut tui, key);
+                                        if input_modified {
+                                            first_event_modified_input = true;
                                         }
+                                        Ok(submitted)
                                     }
                                 }
                             }
@@ -786,6 +1005,378 @@ mod tests {
         )));
 
         assert_eq!(textarea.lines(), [""]);
+    }
+
+    // --- keyboard binding table (KEYBOARD_SHORTCUTS) ---
+
+    fn headless_renderer() -> TuiRenderer {
+        let colors = finch_theme::ColorScheme::default();
+        let output = Arc::new(crate::test_support::OutputManager::new(colors.clone()));
+        let status = Arc::new(crate::test_support::StatusBar::new());
+        TuiRenderer::new_headless(output, status, colors)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// INVARIANT: the /help keyboard-shortcut section is generated from
+    /// KEYBOARD_SHORTCUTS, so every table entry must match what its real
+    /// dispatcher actually does with the key it declares. A table entry with
+    /// no behavioral case below fails here — a new binding cannot ship
+    /// documented prose without a dispatch-backed assertion.
+    #[test]
+    fn test_keyboard_shortcut_table_matches_the_real_dispatch_paths() {
+        let mut covered = 0usize;
+        for entry in KEYBOARD_SHORTCUTS {
+            let event = KeyEvent::new(entry.code, entry.requires);
+            let why = format!(
+                "binding={:?} label={:?} code={:?} requires={:?} authority={:?}",
+                entry.description, entry.label, entry.code, entry.requires, entry.authority
+            );
+            match (entry.label, entry.authority) {
+                ("Ctrl+C", ShortcutAuthority::ComposerShortcut)
+                | ("Esc", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        modified && submitted.is_none(),
+                        "{why}: with a non-empty draft the binding must clear the \
+                         draft, not cancel or submit"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        [""],
+                        "{why}: the draft must be cleared"
+                    );
+                    assert!(
+                        !renderer.pending_cancellation,
+                        "{why}: a non-empty draft is cleared, never cancelled"
+                    );
+
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        !modified && submitted.is_none(),
+                        "{why}: with an empty draft nothing is submitted or modified"
+                    );
+                    assert!(
+                        renderer.pending_cancellation,
+                        "{why}: an empty draft must request cancellation"
+                    );
+                }
+                ("Ctrl+V", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(submitted, None, "{why}: paste never submits a command");
+                    assert!(
+                        modified,
+                        "{why}: Ctrl+V always modifies the draft (image marker or \
+                         text paste fallback)"
+                    );
+                    let pasted_image = !renderer.pending_images.is_empty();
+                    if pasted_image {
+                        let draft = renderer.input_textarea.lines().join("");
+                        assert!(
+                            draft.contains("[Image #"),
+                            "{why}: a clipboard image must leave its [Image #N] \
+                             marker in the draft; draft={draft:?}"
+                        );
+                    }
+                    let cmd_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
+                    assert!(
+                        COMPOSER_PASTE_IMAGE.owns(&cmd_v),
+                        "{why}: macOS Cmd+V must own the same image-paste binding"
+                    );
+                }
+                ("Ctrl+G", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, None),
+                        "{why}: good feedback must not modify the draft or submit"
+                    );
+                    assert_eq!(
+                        renderer.pending_feedback,
+                        Some(crate::Verdict::Approve),
+                        "{why}: Ctrl+G must record a good verdict"
+                    );
+                }
+                ("Ctrl+B", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, None),
+                        "{why}: bad feedback must not modify the draft or submit"
+                    );
+                    assert_eq!(
+                        renderer.pending_feedback,
+                        Some(crate::Verdict::Reject),
+                        "{why}: Ctrl+B must record a bad verdict"
+                    );
+                }
+                ("Ctrl+Z", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("abc");
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, None),
+                        "{why}: Ctrl+Z is a deliberate no-op — nothing may change"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["abc"],
+                        "{why}: the draft must be untouched"
+                    );
+                    assert!(
+                        renderer.pending_feedback.is_none() && !renderer.pending_cancellation,
+                        "{why}: a no-op must not set feedback or cancellation state"
+                    );
+                }
+                ("Ctrl+P", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, Some("/pop".to_string())),
+                        "{why}: Ctrl+P must submit /pop (vocabulary pop)"
+                    );
+                }
+                ("Ctrl+D", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("abc");
+                    // Compose a draft: the cursor lands after the last typed
+                    // character, where Readline semantics make Ctrl+D a no-op.
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (true, None),
+                        "{why}: Ctrl+D never submits; the arm marks input as \
+                         touched for the render pass even when nothing is deleted"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["abc"],
+                        "{why}: Ctrl+D after the last character must be a no-op"
+                    );
+                    // Cursor under a character: Readline delete-char.
+                    use tui_textarea::CursorMove;
+                    renderer.input_textarea.move_cursor(CursorMove::Head);
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (true, None),
+                        "{why}: Ctrl+D deletes a character instead of submitting"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["bc"],
+                        "{why}: the character under the cursor must be deleted"
+                    );
+                }
+                ("Ctrl+/", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, Some("/help".to_string())),
+                        "{why}: Ctrl+/ must submit /help"
+                    );
+                }
+                ("Shift+Tab", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, Some("/cycle-mode".to_string())),
+                        "{why}: Shift+Tab must submit /cycle-mode"
+                    );
+                }
+                ("Tab", ShortcutAuthority::ComposerDispatch) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("/hel");
+                    renderer.update_ghost_text();
+                    // The real input task paints the completion pane between
+                    // the keystroke that opened it and the Tab that accepts
+                    // it; painting is what makes the pane keyboard-owning.
+                    crate::autocomplete_widget::completion_pane_lines(
+                        &mut renderer.autocomplete_state,
+                        80,
+                        9,
+                    );
+                    let dispatch = renderer.dispatch_composer_key(event);
+                    assert!(
+                        matches!(dispatch, ComposerDispatch::Handled { .. }),
+                        "{why}: Tab over a painted completion must be consumed; \
+                         got {dispatch:?}"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["/help"],
+                        "{why}: Tab must accept the ghost text into the draft"
+                    );
+                }
+                ("Shift+Enter", ShortcutAuthority::ComposerDispatch) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("abc");
+                    let dispatch = renderer.dispatch_composer_key(event);
+                    assert!(
+                        matches!(
+                            dispatch,
+                            ComposerDispatch::Handled {
+                                input_changed: true
+                            }
+                        ),
+                        "{why}: Shift+Enter inserts a newline, not a submit; got \
+                         {dispatch:?}"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["abc", ""],
+                        "{why}: the newline must be an in-buffer line"
+                    );
+                }
+                ("↑", ShortcutAuthority::ComposerDispatch) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.command_history = vec!["/pop".to_string()];
+                    let dispatch = renderer.dispatch_composer_key(event);
+                    assert!(
+                        matches!(
+                            dispatch,
+                            ComposerDispatch::Handled {
+                                input_changed: true
+                            }
+                        ),
+                        "{why}: Up must be claimed by history recall; got {dispatch:?}"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["/pop"],
+                        "{why}: Up must recall the most recent history line"
+                    );
+                }
+                ("↓", ShortcutAuthority::ComposerDispatch) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.command_history = vec!["/one".to_string(), "/two".to_string()];
+                    renderer.dispatch_composer_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                    let dispatch = renderer.dispatch_composer_key(event);
+                    assert!(
+                        matches!(
+                            dispatch,
+                            ComposerDispatch::Handled {
+                                input_changed: true
+                            }
+                        ),
+                        "{why}: Down must be claimed by history recall; got {dispatch:?}"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        [""],
+                        "{why}: Down past the newest entry must return to the empty draft"
+                    );
+                }
+                ("PgUp", ShortcutAuthority::ConversationScroll)
+                | ("PgDn", ShortcutAuthority::ConversationScroll) => {
+                    covered += 1;
+                    // The scroll state lives behind the renderer's private
+                    // transcript field; the behavior is pinned against
+                    // handle_accordion_key in lib.rs's
+                    // test_page_shortcut_table_entries_scroll_the_conversation.
+                    assert_eq!(
+                        entry.code,
+                        if entry.label == "PgUp" {
+                            KeyCode::PageUp
+                        } else {
+                            KeyCode::PageDown
+                        },
+                        "{why}: the page bindings must name their scroll keys"
+                    );
+                }
+                (label, authority) => panic!(
+                    "invariant: every KEYBOARD_SHORTCUTS entry needs a behavioral \
+                     case against its real dispatcher; label={label:?} \
+                     authority={authority:?} — extend this test with the entry"
+                ),
+            }
+        }
+        assert_eq!(
+            covered,
+            KEYBOARD_SHORTCUTS.len(),
+            "invariant: every binding-table entry must reach exactly one \
+             behavioral case; covered={covered} table={:?}",
+            KEYBOARD_SHORTCUTS
+                .iter()
+                .map(|b| b.label)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// INVARIANT: the composer guards consume the binding table, so
+    /// `owns` must reproduce exactly the pre-table match-arm predicates — a
+    /// guard rewrite cannot silently change which key triggers which shortcut.
+    #[test]
+    fn test_composer_shortcut_guards_match_the_pre_refactor_match_arms() {
+        let cases: &[(KeyEvent, &[&str])] = &[
+            (ctrl(KeyCode::Char('c')), &["Ctrl+C"]),
+            (key(KeyCode::Char('c')), &[]),
+            (ctrl(KeyCode::Char('v')), &["Ctrl+V"]),
+            (
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER),
+                &["Ctrl+V"],
+            ),
+            (key(KeyCode::Char('v')), &[]),
+            (ctrl(KeyCode::Char('g')), &["Ctrl+G"]),
+            (ctrl(KeyCode::Char('b')), &["Ctrl+B"]),
+            (ctrl(KeyCode::Char('z')), &["Ctrl+Z"]),
+            (ctrl(KeyCode::Char('p')), &["Ctrl+P"]),
+            (ctrl(KeyCode::Char('d')), &["Ctrl+D"]),
+            (ctrl(KeyCode::Char('/')), &["Ctrl+/"]),
+            (key(KeyCode::Esc), &["Esc"]),
+            (KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT), &["Esc"]),
+            (key(KeyCode::BackTab), &["Shift+Tab"]),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &["Shift+Tab"],
+            ),
+            (key(KeyCode::Enter), &[]),
+            (KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &[]),
+            (key(KeyCode::Tab), &[]),
+            (ctrl(KeyCode::Char('x')), &[]),
+        ];
+        for (event, expected) in cases {
+            for binding in KEYBOARD_SHORTCUTS
+                .iter()
+                .filter(|b| b.authority == ShortcutAuthority::ComposerShortcut)
+            {
+                let owns = binding.owns(event);
+                assert_eq!(
+                    owns,
+                    expected.contains(&binding.label),
+                    "invariant: the composer guard must match the pre-table match \
+                     arm for its key; binding={:?} label={:?} key={:?} owns={owns}",
+                    binding.description,
+                    binding.label,
+                    event
+                );
+            }
+        }
     }
 
     // --- encode_rgba_to_png ---

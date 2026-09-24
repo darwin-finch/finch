@@ -767,6 +767,24 @@ pub fn format_help() -> String {
     let cyan_bold = format!("{}{}", SetAttribute(Attribute::Bold), cyan);
     let green_bold = format!("{}{}", SetAttribute(Attribute::Bold), green);
     let yellow_bold = format!("{}{}", SetAttribute(Attribute::Bold), yellow);
+    // The Keyboard Shortcuts section is generated from the finch-tui binding
+    // table (KEYBOARD_SHORTCUTS) — the same table the composer dispatch
+    // consumes — so the prose cannot drift from the actual key handling.
+    // Description column is 21 characters after the section's 9-space indent,
+    // matching every other `/help` list.
+    let shortcuts_block = crate::cli::tui::KEYBOARD_SHORTCUTS
+        .iter()
+        .map(|binding| {
+            let pad = 19usize.saturating_sub(binding.label.chars().count());
+            format!(
+                "{cyan}  {}{reset}{}{}",
+                binding.label,
+                " ".repeat(pad),
+                binding.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n         ");
     format!("{cyan_bold}╔═══════════════════════════════════════════════════════════════════════╗{reset}\n\
          {cyan_bold}║{reset}                   {green_bold}Finch Help - Commands & Shortcuts{reset}                   {cyan_bold}║{reset}\n\
          {cyan_bold}╚═══════════════════════════════════════════════════════════════════════╝{reset}\n\n\
@@ -841,17 +859,7 @@ pub fn format_help() -> String {
          {gray}    /medium{reset} Prefer iterator chains over manual loops\n\
          {gray}    /good{reset} This is exactly the right approach\n\n\
          {yellow_bold}⌨️  Keyboard Shortcuts:{reset}\n\
-         {cyan}  Ctrl+C{reset}             Cancel current query (interrupts generation)\n\
-         {cyan}  Ctrl+D{reset}             Delete the character under the cursor\n\
-         {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x stored weight)\n\
-         {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x stored weight)\n\
-         {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
-         {cyan}  Tab{reset}                Complete /command (accepts ghost text)\n\
-         {cyan}  Shift+Tab{reset}          Cycle confirmation → auto-accept → plan mode\n\
-         {cyan}  Shift+Enter{reset}        Multi-line input (insert newline)\n\
-         {cyan}  Shift+PgUp{reset}         Scroll up in history\n\
-         {cyan}  Shift+PgDown{reset}       Scroll down in history\n\
-         {gray}  ↑ / ↓ arrows{reset}       Navigate command history\n\n\
+         {shortcuts_block}\n\n\
          {yellow_bold}🛠️  Tool Execution:{reset}\n\
          When Claude needs to use tools (read files, run commands, etc.), you'll\n\
          be asked to approve each action. You can:\n\
@@ -1137,6 +1145,73 @@ mod tests {
         assert!(help.contains("Delete the character under the cursor"));
         assert!(!help.contains("Exit REPL (same as /quit)"));
         assert!(!help.contains("Exit the REPL (also: Ctrl+D)"));
+    }
+
+    fn keyboard_shortcut_section_lines(help: &str) -> Vec<&str> {
+        let lines: Vec<&str> = help.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.contains("Keyboard Shortcuts:"))
+            .expect("invariant: /help must contain the keyboard shortcuts section");
+        lines[start + 1..]
+            .iter()
+            .take_while(|line| !line.trim().is_empty())
+            .copied()
+            .collect()
+    }
+
+    /// INVARIANT (#893): the /help Keyboard Shortcuts section is generated
+    /// from the finch-tui binding table — the same table the composer
+    /// dispatch consumes — so every documented binding must appear in the
+    /// rendered help. The previously missing Ctrl+V, Ctrl+Z, Ctrl+/, and Esc
+    /// entries are pinned here: if the table gains a binding, help follows.
+    #[test]
+    fn test_help_keyboard_shortcuts_are_generated_from_the_binding_table() {
+        let help = format_help();
+        for binding in crate::cli::tui::KEYBOARD_SHORTCUTS {
+            assert!(
+                help.contains(binding.label) && help.contains(binding.description),
+                "invariant: /help must document every keyboard binding from the \
+                 binding table (issue #893: hand-maintained prose omitted \
+                 Ctrl+V, Ctrl+Z, Ctrl+/, and Esc); binding label={:?} \
+                 description={:?} code={:?} help_excerpt_missing",
+                binding.label,
+                binding.description,
+                binding.code
+            );
+        }
+        // The previously missing entries must now be present.
+        for label in ["Ctrl+V", "Ctrl+Z", "Ctrl+/", "Esc"] {
+            assert!(
+                help.contains(label),
+                "invariant: /help must document {label} (issue #893)"
+            );
+        }
+    }
+
+    /// INVARIANT: the shortcuts section is one generated line per binding —
+    /// hand-added or hand-edited prose lines cannot coexist with the table.
+    #[test]
+    fn test_help_keyboard_shortcut_section_is_one_line_per_binding() {
+        let help = format_help();
+        let section = keyboard_shortcut_section_lines(&help);
+        let table = crate::cli::tui::KEYBOARD_SHORTCUTS;
+        assert_eq!(
+            section.len(),
+            table.len(),
+            "invariant: the keyboard shortcuts section must contain exactly one \
+             line per binding-table entry, so hand-maintained prose cannot \
+             drift back in; section lines={section:?} table={:?}",
+            table.iter().map(|b| b.label).collect::<Vec<_>>()
+        );
+        for (line, binding) in section.iter().zip(table) {
+            assert!(
+                line.contains(binding.label),
+                "invariant: each generated shortcut line renders its binding's \
+                 label in table order; line={line:?} expected_label={:?}",
+                binding.label
+            );
+        }
     }
 
     #[test]
