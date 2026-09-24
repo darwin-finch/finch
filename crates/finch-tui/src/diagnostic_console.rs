@@ -79,6 +79,21 @@ impl DiagnosticConsoleState {
         true
     }
 
+    /// Scroll the console in response to a vertical wheel delta. Negative
+    /// deltas move toward older output; positive deltas move toward newer
+    /// output, matching the renderer's other scroll surfaces.
+    pub(crate) fn handle_wheel(&mut self, delta: isize) -> bool {
+        if !self.open || delta == 0 {
+            return false;
+        }
+        if delta < 0 {
+            self.scroll = (self.scroll + delta.unsigned_abs()).min(self.max_scroll());
+        } else {
+            self.scroll = self.scroll.saturating_sub(delta as usize);
+        }
+        true
+    }
+
     fn max_scroll(&self) -> usize {
         self.snapshot.lines.len().saturating_sub(1)
     }
@@ -88,7 +103,10 @@ impl DiagnosticConsoleState {
             return None;
         }
         let width = width.max(1);
-        let body_rows = height.saturating_sub(2).max(1);
+        if height == 0 {
+            return Some(Vec::new());
+        }
+        let body_rows = height.saturating_sub(2);
         let end = self
             .snapshot
             .lines
@@ -97,12 +115,12 @@ impl DiagnosticConsoleState {
             .max(1)
             .min(self.snapshot.lines.len());
         let start = end.saturating_sub(body_rows);
-        let mut frame = Vec::with_capacity(body_rows + 2);
-        frame.push(format!(
-            "Diagnostic console — {} retained lines",
-            self.line_count()
+        let mut frame = Vec::with_capacity(height);
+        frame.push(super::shadow_buffer::truncate_to_columns(
+            &format!("Diagnostic console — {} retained lines", self.line_count()),
+            width,
         ));
-        if self.snapshot.lines.is_empty() {
+        if self.snapshot.lines.is_empty() && body_rows > 0 {
             frame.push("No diagnostic output yet.".to_string());
         } else {
             frame.extend(
@@ -111,7 +129,20 @@ impl DiagnosticConsoleState {
                     .map(|line| super::shadow_buffer::truncate_to_columns(line, width)),
             );
         }
-        frame.push("Ctrl+` / Esc close · ↑↓ PgUp/PgDn Home/End scroll".to_string());
+        while frame.len() < height.saturating_sub(1) {
+            frame.push(String::new());
+        }
+        if height > 1 {
+            let position = if self.snapshot.lines.is_empty() {
+                "lines 0 / 0".to_string()
+            } else {
+                format!("lines {}–{} / {}", start + 1, end, self.line_count())
+            };
+            frame.push(super::shadow_buffer::truncate_to_columns(
+                &format!("{position} · Ctrl+` / Esc close · wheel/↑↓ PgUp/PgDn Home/End scroll"),
+                width,
+            ));
+        }
         Some(frame)
     }
 }
@@ -150,6 +181,55 @@ mod tests {
         assert!(
             frame.iter().all(|line| line != "line 0"),
             "the bounded console must not overflow its claimed rows: {frame:?}"
+        );
+        assert_eq!(
+            frame.len(),
+            6,
+            "the console must own the entire requested frame, including blank rows: {frame:?}"
+        );
+        assert!(
+            frame
+                .last()
+                .is_some_and(|line| line.contains("lines 17–20 / 20")),
+            "the footer must state the visible log range and retained total: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn test_mouse_wheel_scrolls_console_and_updates_visible_range() {
+        let mut state = DiagnosticConsoleState::default();
+        state.set_source(Arc::new(FixedSource(DiagnosticConsoleSnapshot {
+            revision: 1,
+            lines: (0..20).map(|index| format!("line {index}")).collect(),
+        })));
+        state.handle_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL));
+
+        assert!(
+            state.handle_wheel(-3),
+            "an open console must claim wheel-up"
+        );
+        let frame = state.frame(100, 6).expect("console remains open");
+        assert!(
+            frame.iter().any(|line| line == "line 16"),
+            "wheel-up must reveal older diagnostics: {frame:?}"
+        );
+        assert!(
+            frame
+                .last()
+                .is_some_and(|line| line.contains("lines 14–17 / 20")),
+            "the visible-range indicator must follow wheel scrolling: {frame:?}"
+        );
+
+        assert!(
+            state.handle_wheel(3),
+            "an open console must claim wheel-down"
+        );
+        let frame = state.frame(100, 6).expect("console remains open");
+        assert!(
+            frame
+                .last()
+                .is_some_and(|line| line.contains("lines 17–20 / 20")),
+            "wheel-down must return to the newest diagnostics: {frame:?}"
         );
     }
 

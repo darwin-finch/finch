@@ -79,7 +79,7 @@ impl FileDiagnosticConsole {
                 continue;
             }
             lines.push(finch_diff::sanitize_terminal(&format!(
-                "── {label}: {} ──",
+                "── local {label} log file: {} ──",
                 path.display()
             )));
             lines.append(&mut log_lines);
