@@ -83,6 +83,33 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
+/// Strip a stray Markdown inline-code backtick from a provider wire response
+/// before it reaches either language detection or the compiler.
+///
+/// A leading backtick is real CoLisp quasiquote syntax (`crates/finch-colisp`
+/// tokenizes it as `Tok::BackQuote`), so this must not happen only inside
+/// `ProgramLanguage::infer_source` -- detection and the compiled source have
+/// to agree on the same bytes, or a leading backtick silently turns a real
+/// top-level definition into quoted, never-executed data while detection
+/// reports the submission as ordinary Lisp. Safe to strip unconditionally
+/// when present: a submission is only accepted once it produces a real
+/// output effect, and no valid submission places a quasiquote as the
+/// outermost expression of its very first form and still does that --
+/// every case this strips was already guaranteed to fail
+/// `MissingOutputEffect` unstripped, so stripping can only turn an
+/// always-broken submission into a potentially-working one, never break a
+/// working one. Leaves a genuine triple-backtick Markdown fence untouched;
+/// `ProgramLanguage::infer_wire_source` rejects that on its own (E-WIRE-002)
+/// before this distinction would ever matter.
+fn strip_markdown_backtick_noise(source: &str) -> String {
+    let trimmed_start = source.trim_start();
+    if !trimmed_start.starts_with('`') || trimmed_start.starts_with("```") {
+        return source.to_string();
+    }
+    let leading_ws = &source[..source.len() - trimmed_start.len()];
+    format!("{leading_ws}{}", &trimmed_start[1..])
+}
+
 /// Build the submission for a provider response carried on the VM wire rather
 /// than in a provider-native tool call.  The typed runtime derives authority
 /// from the program itself; `Pure` is only the coarse compatibility label and
@@ -91,6 +118,7 @@ fn direct_wire_submission(
     runtime: &crate::runtime::ProgramRuntime,
     source: String,
 ) -> anyhow::Result<crate::runtime::ProgramSubmission> {
+    let source = strip_markdown_backtick_noise(&source);
     let language = finch_programs::ProgramLanguage::infer_wire_source(&source)?;
     Ok(crate::runtime::ProgramSubmission {
         language,
@@ -535,19 +563,32 @@ async fn execute_wire_with_single_repair(
                     output_unit: wrapped_unit,
                 }
             }
-            _ => {
+            other => {
                 // The wrapped form is always syntactically valid, so this
                 // should not happen; never leave the fallback path itself
-                // unhandled.
+                // unhandled. Report what the wrap execution itself actually
+                // did, not the original (now stale) rejection diagnostic --
+                // that described a different failure entirely.
+                let wrap_detail = match other {
+                    Ok(outcome) => {
+                        effect_journal.extend(runner_effect_records(&outcome));
+                        format!(
+                            "say-wrapped fallback program ended as {:?}",
+                            outcome.status
+                        )
+                    }
+                    Err(error) => format!("say-wrapped fallback program failed: {error}"),
+                };
                 metric.terminal_failure = true;
                 record_wire_metric(metrics_logger, &metric);
+                wrapped_unit.append_response(&wrap_detail);
                 wrapped_unit.set_complete();
                 let _ = event_tx.send(ReplEvent::VmOutputComplete {
                     output_unit: Arc::clone(&wrapped_unit),
                 });
                 WireExecution {
                     source_for_history: wrapped,
-                    response: diagnostic,
+                    response: wrap_detail,
                     effect_journal,
                     output_unit: wrapped_unit,
                 }
@@ -4082,6 +4123,70 @@ mod tests {
         let outcome = runtime.submit_typed_only(forth).await.unwrap();
         assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "world");
+    }
+
+    #[test]
+    fn strip_markdown_backtick_noise_removes_only_a_lone_leading_backtick() {
+        assert_eq!(
+            strip_markdown_backtick_noise("`(say \"hi\")"),
+            "(say \"hi\")"
+        );
+        assert_eq!(
+            strip_markdown_backtick_noise("  `(say \"hi\")"),
+            "  (say \"hi\")"
+        );
+        // A genuine triple-backtick Markdown fence is untouched here --
+        // ProgramLanguage::infer_wire_source rejects that case on its own.
+        assert_eq!(
+            strip_markdown_backtick_noise("```lisp\n(say \"hi\")\n```"),
+            "```lisp\n(say \"hi\")\n```"
+        );
+        // No leading backtick at all: unchanged.
+        assert_eq!(strip_markdown_backtick_noise("(say \"hi\")"), "(say \"hi\")");
+    }
+
+    #[tokio::test]
+    async fn a_leading_markdown_backtick_does_not_turn_a_real_definition_into_quoted_data() {
+        // Reproduces a real rejected wire response: the model wrapped a
+        // real Lisp definition in a Markdown inline-code backtick out of
+        // habit. Backtick is real CoLisp quasiquote syntax -- stripping it
+        // only for language DETECTION while leaving it in the COMPILED
+        // source turned the whole `(begin ...)` form into
+        // `(quasiquote (begin ...))`: quoted, never-executed data that
+        // compiled "successfully" with no output effect
+        // (MissingOutputEffect) and zero repair attempted -- worse than
+        // before the detection fix, which at least produced a normal
+        // repairable Forth diagnostic.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let source = "`(begin (define (fib (n : int)) : int \
+                      (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))) \
+                      (say (int-to-string (fib 7))))"
+            .to_string();
+
+        let submission = direct_wire_submission(&runtime, source).unwrap();
+        assert_eq!(
+            submission.language,
+            finch_programs::ProgramLanguage::Lisp,
+            "detection must still classify this as Lisp despite the backtick"
+        );
+        assert!(
+            !submission.source.starts_with('`'),
+            "the backtick must be stripped from the COMPILED source too, not \
+             just used for detection, or it re-parses as quasiquote: {:?}",
+            submission.source
+        );
+
+        let outcome = runtime.submit_typed_only(submission).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "outcome={outcome:?}"
+        );
+        assert_eq!(
+            outcome.output, "13",
+            "fib(7) must actually execute and print 13, not silently \
+             succeed as quoted data with no output; outcome={outcome:?}"
+        );
     }
 
     #[tokio::test]

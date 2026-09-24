@@ -3,6 +3,73 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+/// One Co-Forth string/raw-string opener as recognized by the tokenizer.
+///
+/// The single canonical copy: `finch-coforth`'s real tokenizer builds its
+/// `ForthLexicon` from this list, and any lighter-weight surface check
+/// elsewhere (a syntax-vs-prose classifier, a CLI heuristic) reads the same
+/// spellings instead of hand-maintaining its own copy that can silently
+/// drift out of sync with what the tokenizer actually accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForthStringOpener {
+    /// Source spelling including any `s` / `.` prefix, e.g. `s"""`, `."`.
+    pub spelling: &'static str,
+    /// Conventional Forth `s"` / `."` consume one delimiter whitespace.
+    pub skip_one_ascii_ws: bool,
+    /// Triple-quote raw literal; contents run until the next `"""`.
+    pub raw: bool,
+    /// `."text"` is sugar for a string token plus an implicit `say`.
+    pub implicit_say: bool,
+    /// Diagnostic code if this opener is not closed.
+    pub unterminated_code: &'static str,
+    /// Diagnostic message if this opener is not closed.
+    pub unterminated_message: &'static str,
+}
+
+/// Co-Forth string openers, longest match first. See [`ForthStringOpener`].
+pub const FORTH_STRING_OPENERS: &[ForthStringOpener] = &[
+    ForthStringOpener {
+        spelling: "s\"\"\"",
+        skip_one_ascii_ws: false,
+        raw: true,
+        implicit_say: false,
+        unterminated_code: "E-READ-004",
+        unterminated_message: "unterminated Co-Forth raw string literal",
+    },
+    ForthStringOpener {
+        spelling: "\"\"\"",
+        skip_one_ascii_ws: false,
+        raw: true,
+        implicit_say: false,
+        unterminated_code: "E-READ-004",
+        unterminated_message: "unterminated Co-Forth raw string literal",
+    },
+    ForthStringOpener {
+        spelling: ".\"",
+        skip_one_ascii_ws: true,
+        raw: false,
+        implicit_say: true,
+        unterminated_code: "E-READ-005",
+        unterminated_message: "unterminated Co-Forth output string literal",
+    },
+    ForthStringOpener {
+        spelling: "s\"",
+        skip_one_ascii_ws: true,
+        raw: false,
+        implicit_say: false,
+        unterminated_code: "E-READ-001",
+        unterminated_message: "unterminated Co-Forth string literal",
+    },
+    ForthStringOpener {
+        spelling: "\"",
+        skip_one_ascii_ws: false,
+        raw: false,
+        implicit_say: false,
+        unterminated_code: "E-READ-001",
+        unterminated_message: "unterminated Co-Forth string literal",
+    },
+];
+
 /// Language in which a stored program's canonical source is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,19 +89,16 @@ impl ProgramLanguage {
     /// Compact wire-format inference used only when the submission envelope
     /// omits `language`; the resolved value is recorded before execution.
     ///
-    /// Ignores a small amount of leading backtick noise before the
-    /// discriminator byte: a model that was told not to use Markdown still
-    /// sometimes wraps a real `(...)` form in an inline-code backtick out of
-    /// habit, and a bare `trim_start` alone left that one stray byte enough
-    /// to misclassify real Lisp as Forth -- which then cascades into asking
-    /// the model to "repair" already-correct Lisp as Forth instead of just
-    /// dropping the backtick.
+    /// Detection only. A caller that strips leading Markdown noise before
+    /// compiling (see `strip_markdown_backtick_noise` in
+    /// `src/cli/repl_event/query_processor.rs`) must apply that same
+    /// normalization before calling this, or the detected language and the
+    /// compiled source can disagree: backtick is a real quasiquote reader
+    /// macro in CoLisp, so classifying past a leading backtick here while
+    /// leaving it in the compiled source silently turns a real definition
+    /// into quoted, never-executed data instead.
     pub fn infer_source(source: &str) -> Self {
-        let trimmed = source
-            .trim_start()
-            .trim_start_matches('`')
-            .trim_start();
-        if trimmed.starts_with('(') {
+        if source.trim_start().starts_with('(') {
             Self::Lisp
         } else {
             Self::Forth
@@ -89,26 +153,17 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_source_sees_past_a_stray_leading_backtick() {
-        // Reproduces a real rejected wire response: a model told not to use
-        // Markdown still prefixed a real Lisp form with one inline-code
-        // backtick out of habit. A bare `trim_start` alone let that single
-        // byte misclassify genuine Lisp as Forth, cascading into a wire
-        // repair request that told the model to rewrite correct Lisp as
-        // (malformed) Forth instead of just dropping the backtick.
-        let source = "`(define (fib (n : int)) : int\n  (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))";
+    fn test_infer_source_treats_a_leading_backtick_as_forth_since_this_is_detection_only() {
+        // infer_source is detection ONLY -- a real quasiquote-prefixed form
+        // and a stray Markdown backtick are indistinguishable at this layer
+        // by design. Normalizing a genuine Markdown artifact out of the
+        // source belongs to the caller, before both detection and
+        // compilation see it (strip_markdown_backtick_noise in
+        // query_processor.rs), so detection and the compiled source can
+        // never disagree about what the backtick means.
         assert_eq!(
-            ProgramLanguage::infer_source(source),
-            ProgramLanguage::Lisp,
-            "a single leading backtick must not misclassify a real Lisp form as Forth: {source}"
-        );
-    }
-
-    #[test]
-    fn test_infer_source_handles_whitespace_between_backtick_and_paren() {
-        assert_eq!(
-            ProgramLanguage::infer_source("  ` (say \"hi\")"),
-            ProgramLanguage::Lisp
+            ProgramLanguage::infer_source("`(define (fib (n : int)) : int (say n))"),
+            ProgramLanguage::Forth
         );
     }
 

@@ -71,16 +71,29 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
 
 /// Whether `source` shows no sign of being an attempted Forth or Lisp
 /// program at all: no `(` form opener, no Forth definition keyword, and no
-/// recognized string-literal opener, plus an English-prose marker
-/// (contraction apostrophe or question mark) in its first line that a
-/// deliberate program opener would not contain.
+/// `"` anywhere -- a real attempt, even a malformed one, almost always
+/// includes a quote (every Co-Forth string-literal opener contains one, and
+/// so does any compact `word"arg"` effect call), while pure prose almost
+/// never does -- plus an English-prose marker (contraction apostrophe or
+/// question mark) anywhere in the text that a deliberate program opener
+/// would not contain.
+///
+/// Deliberately does not hand-maintain its own list of recognized string-
+/// literal spellings (`s"`, `."`, `"""`, ...): every one of them contains a
+/// `"`, so the blanket "any quote anywhere" check below already subsumes a
+/// starts-with-opener check without needing to track the tokenizer's exact
+/// vocabulary -- and can't silently drift out of sync with it the way a
+/// second, independently-maintained copy could.
 ///
 /// Conservative by design: a near-miss program (one wrong token inside a
 /// real `(...)` form, or a string literal followed by the wrong word) never
 /// matches, so it still gets the normal one-shot model repair. This only
 /// catches the case that repair cannot fix: the model never attempted a
 /// program, so asking it to "correct" one just produces a second, equally
-/// invalid generation.
+/// invalid generation. The `"` check specifically excludes a near-miss like
+/// `say "What's the answer?"` -- word order reversed, no known opener
+/// spelling matches at the very start -- but the quoted argument marks it
+/// as a real, just misordered, attempt rather than prose.
 pub fn is_unattempted_prose(source: &str) -> bool {
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -89,12 +102,16 @@ pub fn is_unattempted_prose(source: &str) -> bool {
     if trimmed.starts_with('(') || trimmed.starts_with(':') {
         return false;
     }
-    const OPENERS: &[&str] = &["s\"", ".\"", "\"", "say\"", "call\"", "exec\""];
-    if OPENERS.iter().any(|opener| trimmed.starts_with(opener)) {
+    if trimmed.contains('"') {
         return false;
     }
-    let first_line = trimmed.lines().next().unwrap_or(trimmed);
-    first_line.contains('\'') || first_line.contains('?')
+    trimmed.contains('\'') || trimmed.contains('?')
+}
+
+/// Backslash-and-quote escape shared by both `wrap_prose_as_say` arms that
+/// need a conventional (non-raw) string literal.
+fn escape_string_literal(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Wrap `text` as a single output-effect program in `language`.
@@ -106,18 +123,14 @@ pub fn is_unattempted_prose(source: &str) -> bool {
 /// compound one bad generation into a second.
 pub fn wrap_prose_as_say(text: &str, language: ProgramLanguage) -> String {
     match language {
-        ProgramLanguage::Lisp => {
-            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("(say \"{escaped}\")")
-        }
+        ProgramLanguage::Lisp => format!("(say \"{}\")", escape_string_literal(text)),
         ProgramLanguage::Forth => {
             // The raw `s"""..."""` literal has no escape handling of its
             // own (it ends at the next literal `"""`), so prose containing
             // that exact sequence -- never seen in practice -- falls back
             // to the escaped single-quoted form instead of mis-parsing.
             if text.contains("\"\"\"") {
-                let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("s\"{escaped}\" say")
+                format!("s\"{}\" say", escape_string_literal(text))
             } else {
                 format!("s\"\"\"{text}\"\"\" say")
             }
@@ -1025,6 +1038,34 @@ mod tests {
             !is_unattempted_prose(near_miss),
             "a real `(...)` form attempt, even with prose inside a string \
              literal, must not be classified as unattempted prose: {near_miss}"
+        );
+    }
+
+    #[test]
+    fn test_misordered_near_miss_with_a_quoted_argument_is_not_unattempted_prose() {
+        // A real rejected response: word order reversed / opener misplaced
+        // (`say ` starts with a space, not `say"`, so no recognized opener
+        // matches), but the quoted argument marks this as a real, just
+        // misordered, attempt -- it must still reach the one-shot model
+        // repair, which can actually fix it, rather than being wrapped
+        // verbatim as literal text.
+        let near_miss = "say \"What's the answer?\"";
+        assert!(
+            !is_unattempted_prose(near_miss),
+            "a quoted argument anywhere marks a real attempt, not prose: {near_miss}"
+        );
+    }
+
+    #[test]
+    fn test_multiline_prose_without_a_marker_on_the_first_line_is_unattempted() {
+        // A real rejected response whose first sentence happens to contain
+        // neither a contraction nor a question mark, but a later line does.
+        let prose = "I am unable to access external systems right now.\n\
+                      Would you like something else?";
+        assert!(
+            is_unattempted_prose(prose),
+            "the marker check must scan the whole text, not just the first \
+             line: {prose}"
         );
     }
 

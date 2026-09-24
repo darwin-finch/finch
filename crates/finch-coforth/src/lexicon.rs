@@ -5,21 +5,13 @@
 //! without changing the machine-readable grammar.
 
 /// One Co-Forth string/raw-string opener as recognized by the tokenizer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForthStringOpener {
-    /// Source spelling including any `s` / `.` prefix, e.g. `s"""`, `."`.
-    pub spelling: &'static str,
-    /// Conventional Forth `s"` / `."` consume one delimiter whitespace.
-    pub skip_one_ascii_ws: bool,
-    /// Triple-quote raw literal; contents run until the next `"""`.
-    pub raw: bool,
-    /// `."text"` is sugar for a string token plus an implicit `say`.
-    pub implicit_say: bool,
-    /// Diagnostic code if this opener is not closed.
-    pub unterminated_code: &'static str,
-    /// Diagnostic message if this opener is not closed.
-    pub unterminated_message: &'static str,
-}
+///
+/// Re-exported from `finch-vm-core`, the single canonical copy: any lighter-
+/// weight surface check elsewhere (a syntax-vs-prose classifier, a CLI
+/// heuristic) reads the same spellings from there too, instead of hand-
+/// maintaining an independent copy that can silently drift out of sync with
+/// what this tokenizer actually accepts.
+pub use finch_vm_core::ForthStringOpener;
 
 /// Surface-syntax facts consumed by the Co-Forth tokenizer and the wire GBNF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,48 +62,7 @@ pub fn forth_lexicon() -> ForthLexicon {
         line_comment: '\\',
         comma_separator: ',',
         raw_string_close: "\"\"\"",
-        string_openers: &[
-            ForthStringOpener {
-                spelling: "s\"\"\"",
-                skip_one_ascii_ws: false,
-                raw: true,
-                implicit_say: false,
-                unterminated_code: "E-READ-004",
-                unterminated_message: "unterminated Co-Forth raw string literal",
-            },
-            ForthStringOpener {
-                spelling: "\"\"\"",
-                skip_one_ascii_ws: false,
-                raw: true,
-                implicit_say: false,
-                unterminated_code: "E-READ-004",
-                unterminated_message: "unterminated Co-Forth raw string literal",
-            },
-            ForthStringOpener {
-                spelling: ".\"",
-                skip_one_ascii_ws: true,
-                raw: false,
-                implicit_say: true,
-                unterminated_code: "E-READ-005",
-                unterminated_message: "unterminated Co-Forth output string literal",
-            },
-            ForthStringOpener {
-                spelling: "s\"",
-                skip_one_ascii_ws: true,
-                raw: false,
-                implicit_say: false,
-                unterminated_code: "E-READ-001",
-                unterminated_message: "unterminated Co-Forth string literal",
-            },
-            ForthStringOpener {
-                spelling: "\"",
-                skip_one_ascii_ws: false,
-                raw: false,
-                implicit_say: false,
-                unterminated_code: "E-READ-001",
-                unterminated_message: "unterminated Co-Forth string literal",
-            },
-        ],
+        string_openers: finch_vm_core::FORTH_STRING_OPENERS,
         quote_word: "[']",
         compact_type_prefixes: &["record{", "variant{"],
         parameterized_type_prefixes: &[

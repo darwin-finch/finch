@@ -37,7 +37,7 @@ pub use effects::{
     SelectorError, UiOperation,
 };
 pub use ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
-pub use language::ProgramLanguage;
+pub use language::{ForthStringOpener, ProgramLanguage, FORTH_STRING_OPENERS};
 pub use signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 pub use surface_types::parse_type_name;
 pub use types::{TaskKind, Type, TypedValue};
