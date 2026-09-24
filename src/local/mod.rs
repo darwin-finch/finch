@@ -300,4 +300,104 @@ mod tests {
         // Learning should not crash
         // (Response may or may not be used for local generation depending on confidence)
     }
+
+    /// Production-boundary regression for the caller's system prompt being
+    /// dropped on the local path: the daemon reaches the neural backend
+    /// through `LocalGenerator::try_generate_from_pattern_with_tools`, not
+    /// through the private prompt-assembly helper. This drives that real
+    /// entry point with a mock `TextGeneration` backend that records exactly
+    /// what text got tokenized, proving the caller's system message (the
+    /// Finch VM wire contract) reaches the model instead of being replaced
+    /// by the generic local constitution.
+    #[test]
+    fn local_daemon_boundary_forwards_caller_system_prompt_to_model_backend() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+        };
+        use crate::providers::ContentBlock;
+        use std::sync::Mutex;
+
+        struct CapturingBackend {
+            captured_prompt: Arc<Mutex<String>>,
+        }
+
+        impl crate::models::TextGeneration for CapturingBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                Ok(b"the vm reply"
+                    .iter()
+                    .map(|byte| u32::from(*byte))
+                    .collect())
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                *self.captured_prompt.lock().expect("lock captured prompt") = text.to_string();
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "Gemma 2 test"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let captured_prompt = Arc::new(Mutex::new(String::new()));
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let backend = CapturingBackend {
+            captured_prompt: Arc::clone(&captured_prompt),
+        };
+        let model = GeneratorModel::from_test_backend(Box::new(backend), config);
+        let shared = Arc::new(RwLock::new(model));
+
+        let mut local_generator = LocalGenerator::with_models(Some(shared));
+
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "FINCH VM WIRE CONTRACT: emit exactly one Co-Forth program per turn"
+                        .to_string(),
+                }],
+            },
+            Message::user("what should I run"),
+        ];
+
+        let response = local_generator
+            .try_generate_from_pattern_with_tools(&messages, None)
+            .expect("local daemon boundary must not error")
+            .expect("neural backend is configured, so a response must be produced");
+
+        assert_eq!(
+            response.text, "the vm reply",
+            "unexpected response text: {response:?}"
+        );
+
+        let sent_to_model = captured_prompt.lock().expect("lock captured prompt");
+        assert!(
+            sent_to_model.contains("FINCH VM WIRE CONTRACT"),
+            "the caller's system contract must reach the tokenizer input, got: {sent_to_model}"
+        );
+        assert!(
+            !sent_to_model.contains("helpful coding assistant"),
+            "the generic local constitution must not replace the caller's system contract, got: {sent_to_model}"
+        );
+    }
 }
