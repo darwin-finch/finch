@@ -70,45 +70,42 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
 }
 
 /// Whether `source` shows no sign of being an attempted Forth or Lisp
-/// program at all: no `(` form opener, no Forth definition keyword, and no
-/// `"` anywhere -- a real attempt, even a malformed one, almost always
-/// includes a quote (every Co-Forth string-literal opener contains one, and
-/// so does any compact `word"arg"` effect call), while pure prose almost
-/// never does -- plus an English-prose marker (contraction apostrophe or
-/// question mark) anywhere in the text that a deliberate program opener
-/// would not contain.
+/// program at all.
 ///
-/// Deliberately does not hand-maintain its own list of recognized string-
-/// literal spellings (`s"`, `."`, `"""`, ...): every one of them contains a
-/// `"`, so the blanket "any quote anywhere" check below already subsumes a
-/// starts-with-opener check without needing to track the tokenizer's exact
-/// vocabulary -- and can't silently drift out of sync with it the way a
-/// second, independently-maintained copy could.
+/// Deliberately as simple as the wire protocol's own language discriminator
+/// (`ProgramLanguage::infer_source`): a submission opens with `(` (Lisp) or
+/// `:` (a Forth definition), or it wasn't attempted as a program at all.
+/// Markdown code fences are the one transport-level exception: the wire
+/// protocol rejects them, but they still prove that the model attempted to
+/// return code and must therefore reach the one-shot repair path.
+/// Three successive marker-based heuristics (apostrophe/question-mark, then
+/// a "contains a quote anywhere" exception for near-misses, then a comma
+/// marker with its own collection-literal guard) each fixed one observed
+/// false negative and introduced its own edge cases in the process -- real
+/// production prose kept finding new ways to lack whichever markers the
+/// heuristic checked for (a declarative sentence with no contraction, no
+/// question, and no comma is exactly as valid English as one with all
+/// three). Enumerating prose signals doesn't converge; this does, because
+/// it's the same two-character contract the rest of the wire protocol
+/// already commits to.
 ///
-/// Conservative by design: a near-miss program (one wrong token inside a
-/// real `(...)` form, or a string literal followed by the wrong word) never
-/// matches, so it still gets the normal one-shot model repair. This only
-/// catches the case that repair cannot fix: the model never attempted a
-/// program, so asking it to "correct" one just produces a second, equally
-/// invalid generation. The `"` check specifically excludes a near-miss like
-/// `say "What's the answer?"` -- word order reversed, no known opener
-/// spelling matches at the very start -- but the quoted argument marks it
-/// as a real, just misordered, attempt rather than prose.
+/// The real cost: a genuine near-miss that doesn't open with `(` or `:` --
+/// a bare string-literal call like `s"hi say` (missing its closing quote),
+/// or a bare Lisp quote form like `'(+ 1 2)` -- now gets deterministically
+/// wrapped as literal text instead of reaching the one-shot model repair
+/// that might have fixed it. Accepted: that failure mode is a visibly
+/// wrong reply the user can just ask again for, not a silent one, and it
+/// is far rarer in practice than English prose was showing up here. The
+/// wire protocol's own prompt text must actually teach `(`/`:` as the
+/// mandatory discriminator for this to hold -- see `BOOT_CAPSULE`
+/// (`vocabulary/BOOT.md`), which today still advertises a bare
+/// string-literal-and-`say` form as valid Forth with no leading `:`.
 pub fn is_unattempted_prose(source: &str) -> bool {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // `'` opens CoLisp's quote reader-macro (`'(+ 1 2)`) and Co-Forth's
-    // symbol-literal prefix (`'foo`) -- a leading one is real syntax, not
-    // the contraction apostrophe the marker check below is looking for.
-    if trimmed.starts_with('(') || trimmed.starts_with(':') || trimmed.starts_with('\'') {
-        return false;
-    }
-    if trimmed.contains('"') {
-        return false;
-    }
-    trimmed.contains('\'') || trimmed.contains('?')
+    !trimmed.starts_with('(') && !trimmed.starts_with(':') && !trimmed.starts_with("```")
 }
 
 /// Backslash-and-quote escape shared by both `wrap_prose_as_say` arms that
@@ -1045,49 +1042,58 @@ mod tests {
     }
 
     #[test]
-    fn test_misordered_near_miss_with_a_quoted_argument_is_not_unattempted_prose() {
-        // A real rejected response: word order reversed / opener misplaced
-        // (`say ` starts with a space, not `say"`, so no recognized opener
-        // matches), but the quoted argument marks this as a real, just
-        // misordered, attempt -- it must still reach the one-shot model
-        // repair, which can actually fix it, rather than being wrapped
-        // verbatim as literal text.
-        let near_miss = "say \"What's the answer?\"";
-        assert!(
-            !is_unattempted_prose(near_miss),
-            "a quoted argument anywhere marks a real attempt, not prose: {near_miss}"
-        );
+    fn test_markdown_fenced_program_is_an_attempt_that_still_reaches_repair() {
+        for fenced in [
+            "```forth\ns\"hello\" say\n```",
+            "```lisp\n(say \"hello\")\n```",
+        ] {
+            assert!(
+                !is_unattempted_prose(fenced),
+                "a fenced program must reach wire repair: {fenced}"
+            );
+        }
     }
 
     #[test]
-    fn test_leading_quote_reader_macro_is_not_unattempted_prose() {
-        // `'(+ 1 2)` is CoLisp's real quote reader-macro, not a contraction
-        // apostrophe -- without the explicit leading-`'` exclusion this
-        // would have matched the "contains an apostrophe" prose marker
-        // (nothing else in it disqualifies it: no `(`/`:` at the very
-        // start, no `"` anywhere) and lost a real, if incomplete, program
-        // attempt instead of sending it to the one-shot model repair.
-        assert!(!is_unattempted_prose("'(+ 1 2)"));
-        assert!(!is_unattempted_prose("'foo"));
+    fn test_a_bare_string_literal_near_miss_is_now_treated_as_unattempted_prose() {
+        // The accepted tradeoff of simplifying to the `(`/`:` discriminator
+        // (matching ProgramLanguage::infer_source exactly): a real, if
+        // malformed, attempt that doesn't open with either -- a misordered
+        // `say "..."` call, a bare Co-Forth string-literal call, a bare
+        // Lisp quote form -- no longer reaches the one-shot model repair
+        // that might have fixed it. It gets wrapped as literal text
+        // instead: a visibly wrong reply the user can just ask again for,
+        // not a silent one, and rarer in practice than the English prose
+        // three successive marker heuristics each failed to fully catch.
+        for near_miss in [
+            "say \"What's the answer?\"",
+            "s\"hello\" say",
+            ".\"hello\"",
+            "'(+ 1 2)",
+            "'foo",
+        ] {
+            assert!(
+                is_unattempted_prose(near_miss),
+                "documenting the accepted tradeoff: {near_miss}"
+            );
+        }
     }
 
     #[test]
-    fn test_multiline_prose_without_a_marker_on_the_first_line_is_unattempted() {
-        // A real rejected response whose first sentence happens to contain
-        // neither a contraction nor a question mark, but a later line does.
+    fn test_multiline_prose_is_unattempted() {
         let prose = "I am unable to access external systems right now.\n\
                       Would you like something else?";
-        assert!(
-            is_unattempted_prose(prose),
-            "the marker check must scan the whole text, not just the first \
-             line: {prose}"
-        );
+        assert!(is_unattempted_prose(prose), "{prose}");
     }
 
     #[test]
-    fn test_forth_string_literal_opener_is_not_unattempted_prose() {
-        assert!(!is_unattempted_prose("s\"hello\" say"));
-        assert!(!is_unattempted_prose(".\"hello\""));
+    fn test_declarative_prose_with_no_contraction_or_question_is_unattempted() {
+        // A real rejected response, verbatim: no contraction, no question
+        // mark, no code opener anywhere -- exactly the case that motivated
+        // simplifying away from an ever-growing set of prose markers.
+        let prose = "Sure, I can help with that. Please provide the codebase \
+                      you would like me to examine.";
+        assert!(is_unattempted_prose(prose), "{prose}");
     }
 
     #[test]

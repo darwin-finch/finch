@@ -4346,6 +4346,31 @@ mod tests {
         assert_eq!(outcome.output, "world");
     }
 
+    #[tokio::test]
+    #[ignore = "known compiler/runtime bug, not this PR's scope: #1165 -- \
+                defining a word and invoking it in the same top-level Forth \
+                submission fails at the host-call phase (say's argument \
+                isn't on the stack when the word runs). Was exploring this \
+                as the idiom BOOT.md would need to require every Forth \
+                submission open with `:`; not pursuing that until #1165 is \
+                fixed, so this stays ignored rather than blocking CI."]
+    async fn a_forth_definition_immediately_invoked_starts_with_colon_and_produces_output() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let forth = direct_wire_submission(
+            &runtime,
+            ": r ( S -- S ! infer ) s\"hello\" say ; r".to_string(),
+        )
+        .unwrap();
+        assert_eq!(forth.language, finch_programs::ProgramLanguage::Forth);
+        let outcome = runtime.submit_typed_only(forth).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "outcome={outcome:?}"
+        );
+        assert_eq!(outcome.output, "hello");
+    }
+
     #[test]
     fn strip_markdown_backtick_noise_removes_only_a_lone_leading_backtick() {
         assert_eq!(
