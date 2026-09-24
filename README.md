@@ -179,10 +179,11 @@ authentication must not be inferred from OpenAI API-key support.
 Daemon local chat loads either a Finch-managed, pinned Hugging Face GGUF or a user-selected GGUF
 file through llama.cpp. Managed downloads are resumed, size/checksum verified, and shown as one
 temporary status-bar entry. ONNX and Candle are not chat
-providers. Configurations naming those removed engines are rejected with migration guidance: back
-up `~/.finch/config.toml`, remove only the affected local `[[providers]]` block (or legacy
-`[backend]` block) and obsolete `[coreml]` block, preserve unrelated providers and credentials,
-then use `finch setup` to add the GGUF replacement. Local artifacts can be
+providers. Normal startup rejects configurations naming those removed engines without changing
+them. `finch setup` first creates a private adjacent backup, removes only the affected local
+`[[providers]]` block (or legacy `[backend]` block) and obsolete `[coreml]` sections, and preserves
+unrelated providers, credentials, settings, and comments before opening the editor to add the GGUF
+replacement. Local artifacts can be
 large. A configured local profile does
 not currently guarantee that a query is routed locally; local bootstrap, selection, and provider
 parity remain experimental under [#74](https://github.com/darwin-finch/finch/issues/74) and
