@@ -2553,13 +2553,36 @@ impl TuiRenderer {
     }
 
     fn poll_message_changes(&mut self, messages: &[MessageRef]) {
+        let palette = span_render::component_style_palette(&self.colors);
         let snapshot = messages
             .iter()
             .map(|message| {
-                let semantic = message
-                    .work_unit_view(&self.colors)
-                    .map(|view| format!("{view:?}"))
-                    .unwrap_or_else(|| message.content());
+                // Mirror `projected_message_lines`'s own precedence
+                // (component_view, then work_unit_view, then content): a
+                // component-owned message (a say turn, an Operation's row
+                // list, a Progress bar) can carry paint-relevant state a raw
+                // domain snapshot never sees — an Operation's `content()` is
+                // just its static header, so a row completing or failing
+                // never touched the old snapshot and the repaint that
+                // invariant promises ("row transitions ... re-render from
+                // the VM on the next frame") silently stopped landing on
+                // screen. Comparing the rendered lines instead of the raw
+                // ViewModel also keeps a running say turn's live `elapsed`
+                // clock (which ticks on every poll but is not itself
+                // rendered outside the pre-program Generating spinner) from
+                // reintroducing the every-tick flicker this gate exists to
+                // stop.
+                let semantic = match message.component_view() {
+                    Some(view) => finch_ui_model::component_lines(&view, &palette)
+                        .iter()
+                        .map(|line| format!("{line:?}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    None => message
+                        .work_unit_view(&self.colors)
+                        .map(|view| format!("{view:?}"))
+                        .unwrap_or_else(|| message.content()),
+                };
                 (message.id(), message.status(), semantic)
             })
             .collect::<Vec<_>>();
@@ -7155,6 +7178,7 @@ mod tests {
         assert!(renderer.live_area_dirty);
     }
 
+    #[test]
     fn externally_updated_message_marks_live_area_dirty_once() {
         let colors = ColorScheme::default();
         let output = Arc::new(OutputManager::new(colors.clone()));
@@ -7174,6 +7198,54 @@ mod tests {
         work.append_response("new output");
         renderer.poll_message_changes(&messages);
         assert!(renderer.live_area_dirty, "new output must repaint promptly");
+    }
+
+    /// Regression: an OperationMessage's `content()` is just its static
+    /// header (#1170's own component_view fix), so a row starting, completing
+    /// or failing never showed up in a snapshot keyed off `content()` alone.
+    /// That silently broke the stage-3 invariant that "row transitions
+    /// (running -> complete/error) ... re-render from the VM on the next
+    /// frame" (see `test_operation_message_renders_row_glyphs_from_the_vm`):
+    /// the next frame's projection was correct, it just never got painted,
+    /// because `live_area_dirty` stayed false while the operation's own
+    /// status stayed InProgress. Comparing the rendered component lines
+    /// catches the row change the same way the paint path would.
+    #[test]
+    fn operation_row_transition_marks_live_area_dirty() {
+        use finch_messages::OperationMessage;
+
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer = TuiRenderer::new_headless(Arc::clone(&output), status, colors);
+        let operation = Arc::new(OperationMessage::new("Generating"));
+        output.add_trait_message(Arc::clone(&operation) as MessageRef);
+
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        renderer.live_area_dirty = false;
+        renderer.poll_message_changes(&messages);
+        assert!(
+            !renderer.live_area_dirty,
+            "no row yet and no other change: must stay still"
+        );
+
+        let call = operation.add_row("bash(git push)");
+        renderer.poll_message_changes(&messages);
+        assert!(
+            renderer.live_area_dirty,
+            "a new running row must repaint promptly, matching \
+             test_operation_message_renders_row_glyphs_from_the_vm's next-frame \
+             re-render invariant"
+        );
+
+        renderer.live_area_dirty = false;
+        operation.complete_row(call, "pushed");
+        renderer.poll_message_changes(&messages);
+        assert!(
+            renderer.live_area_dirty,
+            "a row completing (still InProgress overall) must repaint promptly"
+        );
     }
     // ── count_status_lines ────────────────────────────────────────────────────
 
