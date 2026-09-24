@@ -632,6 +632,43 @@ impl WorkUnit {
         self.fail_row_with_body(idx, error, Vec::new());
     }
 
+    /// Terminalize every still-Running child row with the parent run/turn's
+    /// terminal outcome (#910): a run or turn that resolved while a child row
+    /// was still in flight must not leave that row at its last-known running
+    /// status.
+    ///
+    /// Failure resolutions mark the rows failed with the parent's failure
+    /// detail; successful resolutions complete them with the resolution note.
+    /// Child-agent rows and their tools resolve the same way, which releases
+    /// a deferred `set_complete`/`set_failed` request exactly once.
+    pub fn resolve_running_rows_with_run_outcome(&self, failed: bool, summary: impl Into<String>) {
+        let summary = finch_diff::sanitize_terminal(&summary.into());
+        let resolved = if failed {
+            WorkRowStatus::Error(summary)
+        } else {
+            WorkRowStatus::Complete(summary)
+        };
+        let elapsed = self.started_at.elapsed();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        for row in &mut inner.rows {
+            if matches!(row.status, WorkRowStatus::Running) {
+                row.elapsed_at_finish = Some(row.started_at.elapsed());
+                row.status = resolved.clone();
+            }
+        }
+        for agent in &mut inner.agent_activity {
+            if matches!(agent.status, WorkRowStatus::Running) {
+                agent.status = resolved.clone();
+            }
+            for tool in &mut agent.tools {
+                if matches!(tool.status, WorkRowStatus::Running) {
+                    tool.status = resolved.clone();
+                }
+            }
+        }
+        finish_requested_terminal(&mut inner, elapsed);
+    }
+
     /// Queue one child-agent row, retaining the first live row for a repeated task id.
     pub fn queue_agent_activity(
         &self,

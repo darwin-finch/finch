@@ -186,6 +186,73 @@ async fn home_watch_failure_clears_todo_journal_target_scenario() {
     );
 }
 
+/// #910 at the turn dispatch boundary: a turn that failed with tool rows
+/// still running resolves those rows with the query's failure, while rows
+/// that already completed keep their own outcomes.
+#[tokio::test]
+async fn test_turn_failure_resolves_stuck_tool_rows_with_query_error() {
+    tokio::task::LocalSet::new()
+        .run_until(turn_failure_resolves_stuck_tool_rows_scenario())
+        .await;
+}
+
+async fn turn_failure_resolves_stuck_tool_rows_scenario() {
+    use std::sync::Arc;
+
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let tempdir = tempfile::tempdir().expect("create isolated tool state");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::clone(&runtime),
+    );
+    let query_id = event_loop.query_states.create_query(Vec::new()).await;
+    let unit = Arc::new(crate::cli::messages::WorkUnit::new("Tools"));
+    let done_row = unit.add_row("bash(git status)");
+    unit.complete_row(done_row, "clean");
+    let stuck_row = unit.add_row("bash(sleep 30)");
+    event_loop
+        .query_states
+        .set_tool_work_unit(query_id, Some(Arc::clone(&unit)))
+        .await;
+
+    let error = "provider stream failed";
+    event_loop
+        .handle_event(super::ReplEvent::QueryFailed {
+            query_id,
+            error: error.to_string(),
+        })
+        .await
+        .expect("turn-failure dispatch must succeed");
+
+    let report = run_group_row_report(&unit);
+    let view = unit.domain_view(&crate::theme::ColorScheme::default());
+    assert_eq!(
+        view.rows[stuck_row].status,
+        crate::cli::messages::WorkRowStatus::Error(error.to_string()),
+        "INVARIANT: a tool row still running when its turn failed must resolve with the \
+         query's failure instead of running forever; row index {stuck_row}\nrows:\n  {report}"
+    );
+    assert_eq!(
+        view.rows[done_row].status,
+        crate::cli::messages::WorkRowStatus::Complete("clean".to_string()),
+        "the row that already completed keeps its own outcome; row index {done_row}\nrows:\n  {report}"
+    );
+    assert_eq!(
+        view.head.status,
+        crate::cli::messages::MessageStatus::Failed,
+        "the turn unit head must be failed; rows:\n  {report}"
+    );
+}
+
 async fn boundary_01_dispatch_scenario() {
     use std::sync::Arc;
 
@@ -2298,6 +2365,342 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert!(canonical.contains("read_cache"));
     assert!(canonical.contains("cache hit"));
     assert!(canonical.contains("value=7"));
+}
+
+/// Row report for #910 failure payloads: label and resolved status per row.
+fn run_group_row_report(unit: &crate::cli::messages::WorkUnit) -> String {
+    let view = unit.domain_view(&crate::theme::ColorScheme::default());
+    view.rows
+        .iter()
+        .map(|row| format!("{:?} :: {}", row.status, row.label))
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+/// #910 regression at the run-group projection boundary — the issue's real
+/// transcript capture. A peer disconnect mid-run resolves the parent run as
+/// failed, and its still-in-flight child tool and approval rows must resolve
+/// with that failure instead of freezing at `running`.
+#[test]
+fn test_run_terminal_status_resolves_stuck_child_rows_on_disconnect() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+    use crate::cli::messages::WorkRowStatus;
+
+    let output = replay_output_manager();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "peer".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let disconnect_detail = "Disconnected: Peer disconnected.";
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "tool-1".into(),
+            name: "enter_plan_mode".into(),
+            input: serde_json::json!({"task": "identify a small open bug ticket"}),
+        },
+        BrainEventKind::ApprovalRequested {
+            request_seq: 1,
+            approval_id: "approval-1".into(),
+            approval_kind: "tool".into(),
+            subject: "enter_plan_mode".into(),
+            audience: None,
+            detail: serde_json::Value::Null,
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Failed,
+            detail: Some(disconnect_detail.to_string()),
+        },
+        BrainEventKind::Result {
+            request_seq: 1,
+            output: String::new(),
+            error: Some(disconnect_detail.to_string()),
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 1, "daemon", kind);
+        event.run_id = Some(run_id);
+        assert!(
+            super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+                &super::LocallyRenderedRuns::default(),
+                None,
+            ),
+            "the disconnect capture's event {index} must be handled by the run projection"
+        );
+    }
+
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let view = unit.domain_view(&crate::theme::ColorScheme::default());
+    let stuck: Vec<String> = view
+        .rows
+        .iter()
+        .filter(|row| matches!(row.status, WorkRowStatus::Running))
+        .map(|row| row.label.clone())
+        .collect();
+    assert!(
+        stuck.is_empty(),
+        "INVARIANT: no child row stays running after the parent run resolved failed \
+         (Disconnected: Peer disconnected.); stuck rows={stuck:?}\nrows:\n  {}",
+        run_group_row_report(&unit)
+    );
+    let tool_row = view
+        .rows
+        .iter()
+        .find(|row| row.label.contains("enter_plan_mode") && !row.label.contains("approval"))
+        .unwrap_or_else(|| {
+            panic!(
+                "tool row must exist; rows:\n  {}",
+                run_group_row_report(&unit)
+            )
+        });
+    assert_eq!(
+        tool_row.status,
+        WorkRowStatus::Error(disconnect_detail.to_string()),
+        "the still-running enter_plan_mode tool row must resolve with the run's disconnect \
+         failure; rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+    let approval_row = view
+        .rows
+        .iter()
+        .find(|row| row.label.contains("approval (tool)"))
+        .unwrap_or_else(|| {
+            panic!(
+                "approval row must exist; rows:\n  {}",
+                run_group_row_report(&unit)
+            )
+        });
+    assert_eq!(
+        approval_row.status,
+        WorkRowStatus::Error(disconnect_detail.to_string()),
+        "the still-running approval row must resolve with the run's disconnect failure; \
+         rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+
+    let projected = crate::cli::test_projection::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
+    assert!(
+        projected
+            .label
+            .contains("status failed: Disconnected: Peer disconnected."),
+        "the run group head must keep the parent's failed status; label={:?}",
+        projected.label
+    );
+    assert!(
+        !projected
+            .children
+            .iter()
+            .any(|child| child.label.contains("— running")),
+        "no projected child row may still read running; children={:?}",
+        projected
+            .children
+            .iter()
+            .map(|child| child.label.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// #910: a run that completes while a child tool row never received its own
+/// result resolves that row with the run, and child rows that already carry
+/// their own terminal outcome before the terminal status keep it.
+#[test]
+fn test_run_terminal_status_resolves_stuck_child_rows_on_success() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+    use crate::cli::messages::{MessageStatus, WorkRowStatus};
+
+    let output = replay_output_manager();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "peer".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "tool-1".into(),
+            name: "read_cache".into(),
+            input: serde_json::json!({"key": "alpha"}),
+        },
+        BrainEventKind::Result {
+            request_seq: 1,
+            output: "done".into(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 1, "daemon", kind);
+        event.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &event,
+            &super::LocallyRenderedRuns::default(),
+            None,
+        ));
+    }
+
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let view = unit.domain_view(&crate::theme::ColorScheme::default());
+    let tool_row = view
+        .rows
+        .iter()
+        .find(|row| row.label.contains("read_cache"))
+        .unwrap_or_else(|| {
+            panic!(
+                "tool row must exist; rows:\n  {}",
+                run_group_row_report(&unit)
+            )
+        });
+    assert_eq!(
+        tool_row.status,
+        WorkRowStatus::Complete("resolved by run completion".to_string()),
+        "the tool row that never received its result must resolve when the run completes; \
+         rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+    let result_row = view
+        .rows
+        .iter()
+        .find(|row| row.label == "result")
+        .unwrap_or_else(|| {
+            panic!(
+                "result row must exist; rows:\n  {}",
+                run_group_row_report(&unit)
+            )
+        });
+    assert_eq!(
+        result_row.status,
+        WorkRowStatus::Complete("completed".to_string()),
+        "the terminal sweep must not clobber a row that already carries its own outcome; \
+         rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+    assert_eq!(
+        view.head.status,
+        MessageStatus::Complete,
+        "the run group head must be complete; rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+    assert!(
+        view.rows
+            .iter()
+            .all(|row| !matches!(row.status, WorkRowStatus::Running)),
+        "no child row stays running after the run completed; rows:\n  {}",
+        run_group_row_report(&unit)
+    );
+}
+
+/// #910: a failed run with no failure detail still resolves its in-flight
+/// child rows with a failed status naming the run, never `running`.
+#[test]
+fn test_run_terminal_status_resolves_stuck_child_rows_on_failure_without_detail() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+    use crate::cli::messages::WorkRowStatus;
+
+    let output = replay_output_manager();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "peer".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "tool-1".into(),
+            name: "enter_plan_mode".into(),
+            input: serde_json::json!({}),
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Failed,
+            detail: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 1, "daemon", kind);
+        event.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &event,
+            &super::LocallyRenderedRuns::default(),
+            None,
+        ));
+    }
+
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let view = unit.domain_view(&crate::theme::ColorScheme::default());
+    let tool_row = view
+        .rows
+        .iter()
+        .find(|row| row.label.contains("enter_plan_mode"))
+        .unwrap_or_else(|| {
+            panic!(
+                "tool row must exist; rows:\n  {}",
+                run_group_row_report(&unit)
+            )
+        });
+    assert_eq!(
+        tool_row.status,
+        WorkRowStatus::Error("run failed".to_string()),
+        "a child row still running at a detail-less failed run must resolve failed; \
+         rows:\n  {}",
+        run_group_row_report(&unit)
+    );
 }
 
 /// The replayed-event pattern for one interactive say turn, in journal order.
