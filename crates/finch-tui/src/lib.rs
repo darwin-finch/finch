@@ -1467,6 +1467,11 @@ pub struct TuiRenderer {
     /// idle.
     last_status_snapshot: Option<(String, Option<String>)>,
 
+    /// Last semantic message state observed by the render tick. Producers
+    /// mutate shared messages without borrowing the renderer; compare their
+    /// stable domain state instead of repainting forever merely because one
+    /// message is still marked in progress.
+    last_message_snapshot: Vec<(MessageId, MessageStatus, String)>,
     /// Whether this renderer currently holds mouse tracking. Default is held
     /// so wheels scroll the conversation ScrollView (#806); native history
     /// stays the copyable record, not the reader.
@@ -1529,6 +1534,7 @@ impl TuiRenderer {
             pre_typing_mode: PosetPanelMode::Forth,
             live_area_dirty: true,
             last_status_snapshot: None,
+            last_message_snapshot: Vec::new(),
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         }
     }
@@ -1619,6 +1625,7 @@ impl TuiRenderer {
 
             live_area_dirty: true,
             last_status_snapshot: None,
+            last_message_snapshot: Vec::new(),
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         })
     }
@@ -2031,8 +2038,8 @@ impl TuiRenderer {
 
 /// Returns true when the live area needs an erase+draw cycle.
 /// Extracted so it can be unit-tested without terminal I/O.
-fn should_redraw_live_area(has_in_progress: bool, dirty: bool) -> bool {
-    has_in_progress || dirty
+fn should_redraw_live_area(dirty: bool) -> bool {
+    dirty
 }
 
 /// A message may enter the buffer after an earlier WorkUnit has started but
@@ -2475,6 +2482,7 @@ impl TuiRenderer {
         let messages = self.output_manager.get_messages();
         let plan = plan_canonical_commit(&messages, &self.printed_ids);
         self.poll_status_changes();
+        self.poll_message_changes(&messages);
 
         // Re-establish trustworthy live-area coordinates before committing a
         // completion that raced resize. The completed message remains in the
@@ -2519,14 +2527,11 @@ impl TuiRenderer {
             self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
         } else {
-            // Only redraw when something actually changed: a message is streaming
-            // (InProgress) or explicit state mutation marked the area dirty.
-            // This eliminates the unconditional erase+draw every 33 ms tick that
-            // caused visible flicker during idle and between queries.
-            let has_in_progress = messages
-                .iter()
-                .any(|m| matches!(m.status(), MessageStatus::InProgress));
-            if should_redraw_live_area(has_in_progress, self.live_area_dirty) {
+            // Redraw only for an actual semantic mutation. An in-progress
+            // marker by itself is not a clock: repainting it every 33 ms
+            // destroys terminal-native text selection, even while Option is
+            // held to bypass mouse capture.
+            if should_redraw_live_area(self.live_area_dirty) {
                 self.erase_live_area()?;
                 self.draw_live_area()?;
                 self.live_area_dirty = false;
@@ -2547,6 +2552,22 @@ impl TuiRenderer {
         }
     }
 
+    fn poll_message_changes(&mut self, messages: &[MessageRef]) {
+        let snapshot = messages
+            .iter()
+            .map(|message| {
+                let semantic = message
+                    .work_unit_view(&self.colors)
+                    .map(|view| format!("{view:?}"))
+                    .unwrap_or_else(|| message.content());
+                (message.id(), message.status(), semantic)
+            })
+            .collect::<Vec<_>>();
+        if self.last_message_snapshot != snapshot {
+            self.last_message_snapshot = snapshot;
+            self.live_area_dirty = true;
+        }
+    }
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
         if self.viewport_invalidated {
@@ -6184,12 +6205,12 @@ mod tests {
     #[test]
     fn test_redraw_predicate_does_nothing_when_idle() {
         // Idle: no in-progress messages, area not dirty — must not trigger redraw.
-        assert!(!should_redraw_live_area(false, false));
+        assert!(!should_redraw_live_area(false));
     }
 
     #[test]
-    fn test_redraw_predicate_triggers_when_in_progress() {
-        assert!(should_redraw_live_area(true, false));
+    fn test_in_progress_marker_alone_does_not_force_redraw() {
+        assert!(!should_redraw_live_area(false));
     }
 
     #[test]
@@ -7116,7 +7137,7 @@ mod tests {
 
     #[test]
     fn test_redraw_predicate_triggers_when_dirty() {
-        assert!(should_redraw_live_area(false, true));
+        assert!(should_redraw_live_area(true));
     }
 
     #[test]
@@ -7134,6 +7155,26 @@ mod tests {
         assert!(renderer.live_area_dirty);
     }
 
+    fn externally_updated_message_marks_live_area_dirty_once() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer = TuiRenderer::new_headless(Arc::clone(&output), status, colors);
+        let work = output.start_work_unit("waiting");
+
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        renderer.live_area_dirty = false;
+        renderer.poll_message_changes(&messages);
+        assert!(
+            !renderer.live_area_dirty,
+            "unchanged spinner must stay still"
+        );
+
+        work.append_response("new output");
+        renderer.poll_message_changes(&messages);
+        assert!(renderer.live_area_dirty, "new output must repaint promptly");
+    }
     // ── count_status_lines ────────────────────────────────────────────────────
 
     #[test]
