@@ -139,6 +139,14 @@ impl EventLoop {
                     output.write_info(format!(
                         "⏳ {profile_name} is still starting; {active_name} stays active until it is ready."
                     ));
+                    // Failure/not-available/status-error mean `fail_pending`
+                    // cleared the pending slot and the generator captured in
+                    // `active_name` above is still the one serving queries;
+                    // the "active while X starts" identity set above must be
+                    // reverted so the status bar stops claiming a dead
+                    // startup is still in progress. `Cancelled` means a later
+                    // switch already owns identity, so it is left alone.
+                    let restore_identity = active_name.clone();
                     tokio::spawn(async move {
                         let outcome = activate_local_when_ready(
                             selection,
@@ -152,9 +160,15 @@ impl EventLoop {
                             Duration::from_millis(750),
                         )
                         .await;
+                        if let Some(identity) = identity_after_local_activation(
+                            &outcome,
+                            &local_identity,
+                            &restore_identity,
+                        ) {
+                            tui_renderer.lock().await.set_model_identity(identity);
+                        }
                         match outcome {
                             LocalActivationOutcome::Activated(model) => {
-                                tui_renderer.lock().await.set_model_identity(local_identity);
                                 output.write_info(format!("✓ Switched to {profile_name} · {model}"))
                             }
                             LocalActivationOutcome::Failed(error) => output.write_error(format!(
@@ -696,5 +710,93 @@ impl EventLoop {
             tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Forth;
         }
         self.render_tui().await
+    }
+}
+
+/// What the status bar's model identity should become once a deferred local
+/// model activation settles, given the identity it would show once the
+/// switch succeeds (`local_identity`) and the identity that was active
+/// before the switch was attempted (`previous_identity`).
+///
+/// `Activated` adopts the new identity. `Failed`, `NotAvailable`, and
+/// `StatusError` all mean `fail_pending` cleared the pending slot and the
+/// original generator is still serving queries, so the "active while X
+/// starts" identity set when the switch began must be reverted — otherwise
+/// the status bar keeps claiming a dead startup is still in progress.
+/// `Cancelled` means a later switch already owns the identity, so the caller
+/// must leave it alone (`None`).
+fn identity_after_local_activation(
+    outcome: &LocalActivationOutcome,
+    local_identity: &str,
+    previous_identity: &str,
+) -> Option<String> {
+    match outcome {
+        LocalActivationOutcome::Activated(_) => Some(local_identity.to_string()),
+        LocalActivationOutcome::Failed(_)
+        | LocalActivationOutcome::NotAvailable
+        | LocalActivationOutcome::StatusError(_) => Some(previous_identity.to_string()),
+        LocalActivationOutcome::Cancelled => None,
+    }
+}
+
+#[cfg(test)]
+mod local_activation_identity_tests {
+    use super::*;
+
+    #[test]
+    fn activated_outcome_adopts_the_local_identity() {
+        let outcome = LocalActivationOutcome::Activated("Qwen 2.5 3B".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity,
+            Some("local · Qwen 2.5 3B".to_string()),
+            "a successful activation must adopt the new model's identity"
+        );
+    }
+
+    #[test]
+    fn failed_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::Failed("bad weights".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity,
+            Some("cloud".to_string()),
+            "a failed startup must stop claiming the dead download is still in progress \
+             and revert to the generator that is actually still serving queries"
+        );
+    }
+
+    #[test]
+    fn not_available_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::NotAvailable;
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(identity, Some("cloud".to_string()));
+    }
+
+    #[test]
+    fn status_error_outcome_restores_the_previous_identity() {
+        let outcome = LocalActivationOutcome::StatusError("daemon unreachable".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(identity, Some("cloud".to_string()));
+    }
+
+    #[test]
+    fn cancelled_outcome_leaves_identity_alone() {
+        let outcome = LocalActivationOutcome::Cancelled;
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(
+            identity, None,
+            "a superseding switch already owns the identity; this branch must not clobber it"
+        );
     }
 }
