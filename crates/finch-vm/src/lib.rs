@@ -20,13 +20,13 @@ pub use finch_vm_core::{
     CapabilityGrant, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
     CapabilityRequirement, ControlEffect, CoreHostBinding, CoreWordDocumentation,
     CoreWordImplementation, CoreWordSpec, DiagnosticPhase, EffectSet, FileOperation, FileSelector,
-    FileSelectorTemplate, FileSelectorTemplatePart, Function, GrantScope, GrantSet, Instruction,
-    LocatedInstruction, McpSelectorTemplate, Module, ModuleVerified, NetworkSelectorTemplate,
-    ProcessSelectorTemplate, ProgramLanguage, ProgramSelectorTemplate, ResourceRoot,
-    ResourceSelector, SelectorError, Severity, SourceLanguage, SourceOrigin, SourceSpan, StackRow,
-    StackSignature, SuspensionSignature, TaskKind, Type, TypedValue, UiOperation, VerifiedFunction,
-    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, SEMANTIC_CONSTRUCTION_VERSION,
-    VM_TYPE_SYSTEM_VERSION,
+    FileSelectorTemplate, FileSelectorTemplatePart, ForthStringOpener, Function, GrantScope,
+    GrantSet, Instruction, LocatedInstruction, McpSelectorTemplate, Module, ModuleVerified,
+    NetworkSelectorTemplate, ProcessSelectorTemplate, ProgramLanguage, ProgramSelectorTemplate,
+    ResourceRoot, ResourceSelector, SelectorError, Severity, SourceLanguage, SourceOrigin,
+    SourceSpan, StackRow, StackSignature, SuspensionSignature, TaskKind, Type, TypedValue,
+    UiOperation, VerifiedFunction, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
+    FORTH_STRING_OPENERS, SEMANTIC_CONSTRUCTION_VERSION, VM_TYPE_SYSTEM_VERSION,
 };
 
 /// Version of the portable Runtime/Application effect, resume, and delivery ABI.

@@ -6872,6 +6872,30 @@ fn test_selected_rows_carry_selection_contrast_beyond_the_prefix() {
     );
 }
 
+/// REGRESSION: the Local Helpers memory-embeddings checkbox used a bare
+/// white foreground with no background (`wizard_bold(_, Color::White)`)
+/// instead of the #1140 selection style (`wizard_selected`, bold white on
+/// black), so it was invisible on a light terminal theme -- the row painted
+/// the same colour as the page background. Every other selected/highlighted
+/// row in this file already used `wizard_selected`; this one didn't.
+#[test]
+fn test_local_helpers_memory_checkbox_carries_selection_contrast() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::LocalHelpers;
+    let bytes = wizard_frame_bytes(&state, 100, 30);
+    assert!(
+        bytes.contains("Memory embeddings: use the neural model"),
+        "the checkbox text itself must be present in the rendered frame: {bytes:?}"
+    );
+    let active_run = "\x1b[1;97;40m>>> [x] Memory embeddings: use the neural model <<<";
+    assert!(
+        bytes.contains(active_run),
+        "the memory-embeddings checkbox must paint bold bright-white on \
+         black (the #1140 selection style), not a bare foreground colour \
+         invisible on a light terminal; frame: {bytes:?}"
+    );
+}
+
 /// REGRESSION (#1140, tab highlight): the `selected_tab` prop decides which
 /// tab wears the active style — bold magenta on black — and moving the
 /// marker moves the highlight. The tab row carries the active marker prop at

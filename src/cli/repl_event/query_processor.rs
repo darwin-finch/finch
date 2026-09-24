@@ -83,6 +83,33 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
+/// Strip a stray Markdown inline-code backtick from a provider wire response
+/// before it reaches either language detection or the compiler.
+///
+/// A leading backtick is real CoLisp quasiquote syntax (`crates/finch-colisp`
+/// tokenizes it as `Tok::BackQuote`), so this must not happen only inside
+/// `ProgramLanguage::infer_source` -- detection and the compiled source have
+/// to agree on the same bytes, or a leading backtick silently turns a real
+/// top-level definition into quoted, never-executed data while detection
+/// reports the submission as ordinary Lisp. Safe to strip unconditionally
+/// when present: a submission is only accepted once it produces a real
+/// output effect, and no valid submission places a quasiquote as the
+/// outermost expression of its very first form and still does that --
+/// every case this strips was already guaranteed to fail
+/// `MissingOutputEffect` unstripped, so stripping can only turn an
+/// always-broken submission into a potentially-working one, never break a
+/// working one. Leaves a genuine triple-backtick Markdown fence untouched;
+/// `ProgramLanguage::infer_wire_source` rejects that on its own (E-WIRE-002)
+/// before this distinction would ever matter.
+fn strip_markdown_backtick_noise(source: &str) -> String {
+    let trimmed_start = source.trim_start();
+    if !trimmed_start.starts_with('`') || trimmed_start.starts_with("```") {
+        return source.to_string();
+    }
+    let leading_ws = &source[..source.len() - trimmed_start.len()];
+    format!("{leading_ws}{}", &trimmed_start[1..])
+}
+
 /// Build the submission for a provider response carried on the VM wire rather
 /// than in a provider-native tool call.  The typed runtime derives authority
 /// from the program itself; `Pure` is only the coarse compatibility label and
@@ -91,6 +118,7 @@ fn direct_wire_submission(
     runtime: &crate::runtime::ProgramRuntime,
     source: String,
 ) -> anyhow::Result<crate::runtime::ProgramSubmission> {
+    let source = strip_markdown_backtick_noise(&source);
     let language = finch_programs::ProgramLanguage::infer_wire_source(&source)?;
     Ok(crate::runtime::ProgramSubmission {
         language,
@@ -492,6 +520,88 @@ async fn execute_wire_with_single_repair(
             response: diagnostic,
             effect_journal,
             output_unit,
+        };
+    }
+    if finch_programs::is_unattempted_prose(&source) {
+        // The model never attempted a program -- plain prose, not a
+        // near-miss. Asking the same model to "repair" it just compounds
+        // one bad generation into a second; the correction needs no model
+        // round-trip. Wrap the exact text it already produced as a `say`
+        // effect deterministically.
+        output_unit.set_complete();
+        // Always resolves Forth here in practice: is_unattempted_prose
+        // already requires `source` not to start with `(`, infer_source's
+        // sole Lisp condition. wrap_prose_as_say's Lisp arm exists for its
+        // own public contract (and is exercised directly by its unit
+        // tests), not because this call site reaches it.
+        let language = finch_programs::ProgramLanguage::infer_source(&source);
+        let wrapped = finch_programs::wrap_prose_as_say(&source, language);
+        let wrapped_unit = output_manager.start_work_unit("VM program output");
+        wrapped_unit.set_program_output();
+        wrapped_unit.begin_say_turn(language.as_str(), &wrapped);
+        return match execute_direct_wire_response(
+            runtime,
+            output_manager,
+            Arc::clone(&wrapped_unit),
+            event_tx.clone(),
+            cancel,
+            wrapped.clone(),
+            effect_audit,
+        )
+        .await
+        {
+            Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
+                effect_journal.extend(runner_effect_records(&outcome));
+                // Not a model repair (repair_attempted stays false on this
+                // path), so repaired_successfully must stay false too --
+                // the codebase's own invariant (src/main.rs:
+                // `repaired_successfully = repair_attempted && ...`). A
+                // deterministic wrap has no dedicated report bucket yet; a
+                // successful one is honestly uncounted here rather than
+                // misreported as a model repair that never happened,
+                // inflating the wire-adherence report's repair-success rate.
+                metric.terminal_failure = outcome.output.is_empty();
+                record_wire_metric(metrics_logger, &metric);
+                if !outcome.output.is_empty() {
+                    wrapped_unit.present_as_assistant_prose();
+                }
+                let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&wrapped_unit),
+                });
+                WireExecution {
+                    source_for_history: wrapped,
+                    response: outcome.output,
+                    effect_journal,
+                    output_unit: wrapped_unit,
+                }
+            }
+            other => {
+                // The wrapped form is always syntactically valid, so this
+                // should not happen; never leave the fallback path itself
+                // unhandled. Report what the wrap execution itself actually
+                // did, not the original (now stale) rejection diagnostic --
+                // that described a different failure entirely.
+                let wrap_detail = match other {
+                    Ok(outcome) => {
+                        effect_journal.extend(runner_effect_records(&outcome));
+                        format!("say-wrapped fallback program ended as {:?}", outcome.status)
+                    }
+                    Err(error) => format!("say-wrapped fallback program failed: {error}"),
+                };
+                metric.terminal_failure = true;
+                record_wire_metric(metrics_logger, &metric);
+                wrapped_unit.append_response(&wrap_detail);
+                wrapped_unit.set_complete();
+                let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&wrapped_unit),
+                });
+                WireExecution {
+                    source_for_history: wrapped,
+                    response: wrap_detail,
+                    effect_journal,
+                    output_unit: wrapped_unit,
+                }
+            }
         };
     }
     metric.repair_attempted = true;
@@ -4024,6 +4134,73 @@ mod tests {
         assert_eq!(outcome.output, "world");
     }
 
+    #[test]
+    fn strip_markdown_backtick_noise_removes_only_a_lone_leading_backtick() {
+        assert_eq!(
+            strip_markdown_backtick_noise("`(say \"hi\")"),
+            "(say \"hi\")"
+        );
+        assert_eq!(
+            strip_markdown_backtick_noise("  `(say \"hi\")"),
+            "  (say \"hi\")"
+        );
+        // A genuine triple-backtick Markdown fence is untouched here --
+        // ProgramLanguage::infer_wire_source rejects that case on its own.
+        assert_eq!(
+            strip_markdown_backtick_noise("```lisp\n(say \"hi\")\n```"),
+            "```lisp\n(say \"hi\")\n```"
+        );
+        // No leading backtick at all: unchanged.
+        assert_eq!(
+            strip_markdown_backtick_noise("(say \"hi\")"),
+            "(say \"hi\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leading_markdown_backtick_does_not_turn_a_real_definition_into_quoted_data() {
+        // Reproduces a real rejected wire response: the model wrapped a
+        // real Lisp definition in a Markdown inline-code backtick out of
+        // habit. Backtick is real CoLisp quasiquote syntax -- stripping it
+        // only for language DETECTION while leaving it in the COMPILED
+        // source turned the whole `(begin ...)` form into
+        // `(quasiquote (begin ...))`: quoted, never-executed data that
+        // compiled "successfully" with no output effect
+        // (MissingOutputEffect) and zero repair attempted -- worse than
+        // before the detection fix, which at least produced a normal
+        // repairable Forth diagnostic.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let source = "`(begin (define (fib (n : int)) : int \
+                      (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))) \
+                      (say (int-to-string (fib 7))))"
+            .to_string();
+
+        let submission = direct_wire_submission(&runtime, source).unwrap();
+        assert_eq!(
+            submission.language,
+            finch_programs::ProgramLanguage::Lisp,
+            "detection must still classify this as Lisp despite the backtick"
+        );
+        assert!(
+            !submission.source.starts_with('`'),
+            "the backtick must be stripped from the COMPILED source too, not \
+             just used for detection, or it re-parses as quasiquote: {:?}",
+            submission.source
+        );
+
+        let outcome = runtime.submit_typed_only(submission).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "outcome={outcome:?}"
+        );
+        assert_eq!(
+            outcome.output, "13",
+            "fib(7) must actually execute and print 13, not silently \
+             succeed as quoted data with no output; outcome={outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn interactive_wire_scheduler_resumes_only_cooperative_yields() {
         use crate::cli::messages::{Message, MessageStatus};
@@ -4340,6 +4517,72 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn unattempted_prose_is_wrapped_deterministically_without_a_repair_round_trip() {
+        // Reproduces a real failure mode from a weak local model: it emits
+        // plain English instead of any Forth/Lisp attempt, so the VM rejects
+        // the first word as an unknown Co-Forth word. A same-model repair
+        // request cannot fix prose that was never a program attempt --
+        // asking anyway just produces a second, equally invalid generation.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "I'm currently unable to access or inspect external \
+                       repositories. Would you like to proceed with a \
+                       computation or task using the available resources?"
+            .to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source.clone(),
+            Some(&metrics),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "a model that produced pure prose must never be asked to repair it"
+        );
+        assert_eq!(
+            execution.source_for_history,
+            format!("s\"\"\"{source}\"\"\" say")
+        );
+        assert_eq!(execution.response, source);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = metrics.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].first_pass_valid);
+        assert!(
+            !recorded[0].repair_attempted,
+            "the deterministic wrap path must not count as a model repair attempt"
+        );
+        assert!(
+            !recorded[0].repaired_successfully,
+            "repaired_successfully must imply repair_attempted (src/main.rs's \
+             own invariant: `repaired_successfully = repair_attempted && ...`); \
+             a deterministic wrap never attempted a model repair, so this must \
+             stay false even though the turn itself succeeded -- otherwise the \
+             wire-adherence report counts it as a model repair that never \
+             happened"
+        );
+        assert!(!recorded[0].terminal_failure);
+
+        drain_vm_events_as_event_loop(&mut event_rx);
     }
 
     fn drain_vm_events_as_event_loop(event_rx: &mut mpsc::UnboundedReceiver<ReplEvent>) {
