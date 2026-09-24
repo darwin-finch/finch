@@ -99,7 +99,10 @@ pub fn is_unattempted_prose(source: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.starts_with('(') || trimmed.starts_with(':') {
+    // `'` opens CoLisp's quote reader-macro (`'(+ 1 2)`) and Co-Forth's
+    // symbol-literal prefix (`'foo`) -- a leading one is real syntax, not
+    // the contraction apostrophe the marker check below is looking for.
+    if trimmed.starts_with('(') || trimmed.starts_with(':') || trimmed.starts_with('\'') {
         return false;
     }
     if trimmed.contains('"') {
@@ -1054,6 +1057,18 @@ mod tests {
             !is_unattempted_prose(near_miss),
             "a quoted argument anywhere marks a real attempt, not prose: {near_miss}"
         );
+    }
+
+    #[test]
+    fn test_leading_quote_reader_macro_is_not_unattempted_prose() {
+        // `'(+ 1 2)` is CoLisp's real quote reader-macro, not a contraction
+        // apostrophe -- without the explicit leading-`'` exclusion this
+        // would have matched the "contains an apostrophe" prose marker
+        // (nothing else in it disqualifies it: no `(`/`:` at the very
+        // start, no `"` anywhere) and lost a real, if incomplete, program
+        // attempt instead of sending it to the one-shot model repair.
+        assert!(!is_unattempted_prose("'(+ 1 2)"));
+        assert!(!is_unattempted_prose("'foo"));
     }
 
     #[test]

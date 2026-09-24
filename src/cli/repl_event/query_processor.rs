@@ -529,6 +529,11 @@ async fn execute_wire_with_single_repair(
         // round-trip. Wrap the exact text it already produced as a `say`
         // effect deterministically.
         output_unit.set_complete();
+        // Always resolves Forth here in practice: is_unattempted_prose
+        // already requires `source` not to start with `(`, infer_source's
+        // sole Lisp condition. wrap_prose_as_say's Lisp arm exists for its
+        // own public contract (and is exercised directly by its unit
+        // tests), not because this call site reaches it.
         let language = finch_programs::ProgramLanguage::infer_source(&source);
         let wrapped = finch_programs::wrap_prose_as_say(&source, language);
         let wrapped_unit = output_manager.start_work_unit("VM program output");
@@ -547,7 +552,14 @@ async fn execute_wire_with_single_repair(
         {
             Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
                 effect_journal.extend(runner_effect_records(&outcome));
-                metric.repaired_successfully = !outcome.output.is_empty();
+                // Not a model repair (repair_attempted stays false on this
+                // path), so repaired_successfully must stay false too --
+                // the codebase's own invariant (src/main.rs:
+                // `repaired_successfully = repair_attempted && ...`). A
+                // deterministic wrap has no dedicated report bucket yet; a
+                // successful one is honestly uncounted here rather than
+                // misreported as a model repair that never happened,
+                // inflating the wire-adherence report's repair-success rate.
                 metric.terminal_failure = outcome.output.is_empty();
                 record_wire_metric(metrics_logger, &metric);
                 if !outcome.output.is_empty() {
@@ -572,10 +584,7 @@ async fn execute_wire_with_single_repair(
                 let wrap_detail = match other {
                     Ok(outcome) => {
                         effect_journal.extend(runner_effect_records(&outcome));
-                        format!(
-                            "say-wrapped fallback program ended as {:?}",
-                            outcome.status
-                        )
+                        format!("say-wrapped fallback program ended as {:?}", outcome.status)
                     }
                     Err(error) => format!("say-wrapped fallback program failed: {error}"),
                 };
@@ -4142,7 +4151,10 @@ mod tests {
             "```lisp\n(say \"hi\")\n```"
         );
         // No leading backtick at all: unchanged.
-        assert_eq!(strip_markdown_backtick_noise("(say \"hi\")"), "(say \"hi\")");
+        assert_eq!(
+            strip_markdown_backtick_noise("(say \"hi\")"),
+            "(say \"hi\")"
+        );
     }
 
     #[tokio::test]
@@ -4559,7 +4571,15 @@ mod tests {
             !recorded[0].repair_attempted,
             "the deterministic wrap path must not count as a model repair attempt"
         );
-        assert!(recorded[0].repaired_successfully);
+        assert!(
+            !recorded[0].repaired_successfully,
+            "repaired_successfully must imply repair_attempted (src/main.rs's \
+             own invariant: `repaired_successfully = repair_attempted && ...`); \
+             a deterministic wrap never attempted a model repair, so this must \
+             stay false even though the turn itself succeeded -- otherwise the \
+             wire-adherence report counts it as a model repair that never \
+             happened"
+        );
         assert!(!recorded[0].terminal_failure);
 
         drain_vm_events_as_event_loop(&mut event_rx);

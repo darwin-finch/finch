@@ -169,8 +169,9 @@ mod tests {
 
     #[test]
     fn test_infer_wire_source_still_rejects_a_full_markdown_fence() {
-        let error = ProgramLanguage::infer_wire_source("```lisp\n(say \"hi\")\n```")
-            .expect_err("a real triple-backtick fence must still be rejected, not silently unwrapped");
+        let error = ProgramLanguage::infer_wire_source("```lisp\n(say \"hi\")\n```").expect_err(
+            "a real triple-backtick fence must still be rejected, not silently unwrapped",
+        );
         assert!(error.to_string().contains("E-WIRE-002"));
     }
 
