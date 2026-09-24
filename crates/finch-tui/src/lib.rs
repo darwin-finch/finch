@@ -1006,6 +1006,34 @@ fn write_live_frame(
     Ok(rows)
 }
 
+fn focused_reader_viewport_lines(
+    lines: &[String],
+    width: usize,
+    height: usize,
+) -> Vec<RenderedTranscriptLine> {
+    if height == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let fitted = if lines.len() <= height {
+        lines.to_vec()
+    } else if height == 1 {
+        vec![lines[0].clone()]
+    } else {
+        let mut fitted = Vec::with_capacity(height);
+        fitted.push(lines[0].clone());
+        fitted.extend(lines[1..lines.len() - 1].iter().take(height - 2).cloned());
+        fitted.push(lines[lines.len() - 1].clone());
+        fitted
+    };
+    fitted
+        .into_iter()
+        .map(|line| RenderedTranscriptLine {
+            text: shadow_buffer::truncate_to_columns(&line, width.max(1)),
+            ..RenderedTranscriptLine::default()
+        })
+        .collect()
+}
+
 /// Lay out one live-area frame.
 ///
 /// The ViewModel is projected into a widget tree whose root column allocates
@@ -1052,7 +1080,13 @@ pub(crate) fn plan_live_frame(
     );
 
     let mut viewport_content: Vec<RenderedTranscriptLine> = Vec::new();
-    if vm.expanded_lines.is_none() {
+    if let Some(reader_lines) = vm.expanded_lines {
+        viewport_content.extend(focused_reader_viewport_lines(
+            reader_lines,
+            width,
+            rects.transcript.height,
+        ));
+    } else {
         // The conversation stays projected while a dialog card is open (#807);
         // only the expanded tool-result surface still empties the viewport.
         // A Brain can have more than one live work unit (a streamed VM program
@@ -1145,11 +1179,11 @@ pub(crate) fn plan_live_frame(
 
     // ── 3c. Separator: "──  ~/repos/finch ──────── jade-river ──" ────────────
     let separator = session_separator_line(width, vm.cwd_label, vm.session_label);
-    if frame.physical_rows(width) < height {
+    if claimed_rects.separator.height > 0 && frame.physical_rows(width) < height {
         frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
     }
 
-    // ── 4. Open dialog card, expanded tool result, or input ──────────────────
+    // ── 4. Open dialog card or input ─────────────────────────────────────────
     if vm.dialog.is_some() {
         // The card is a claimed inline region (#807): its pinned lines were
         // painted below the separator, sized to the claimed box. The dialog
@@ -1164,55 +1198,7 @@ pub(crate) fn plan_live_frame(
         frame.hitboxes = transcript_disclosure_hitboxes(&claimed, &viewport_content, width);
         return frame;
     }
-    if let Some(expanded) = vm.expanded_lines {
-        // Same budget discipline as a dialog: the surface owns what remains of
-        // the viewport and never pushes rows past it. Title and footer are
-        // preferred; the body window clips from the bottom.
-        let mut remaining = height.saturating_sub(frame.physical_rows(width));
-        match expanded.split_first() {
-            None => return frame,
-            Some((first, rest)) => {
-                let title_rows = shadow_buffer::physical_rows(first, width);
-                if title_rows <= remaining {
-                    frame.push(first.clone());
-                    remaining -= title_rows;
-                }
-                let footer = rest.last();
-                let body = rest
-                    .len()
-                    .checked_sub(1)
-                    .map(|len| &rest[..len])
-                    .unwrap_or(rest);
-                let footer_rows = footer
-                    .map(|line| shadow_buffer::physical_rows(line, width))
-                    .unwrap_or(0);
-                let reserved = if footer_rows <= remaining {
-                    footer_rows
-                } else {
-                    0
-                };
-                for line in body {
-                    let rows = shadow_buffer::physical_rows(line, width);
-                    if rows > remaining.saturating_sub(reserved) {
-                        break;
-                    }
-                    frame.push(line.clone());
-                    remaining -= rows;
-                }
-                if reserved > 0 {
-                    frame.push(footer.expect("footer present when reserved").clone());
-                }
-            }
-        }
-        // The focused surface has no editable text cursor either; park it on
-        // the final owned row like a dialog does.
-        frame.cursor_visible = false;
-        frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
-        frame.rects = view_model::FrameRects::default();
-        return frame;
-    }
-
-    frame.cursor_visible = true;
+    frame.cursor_visible = claimed_rects.composer.height > 0;
     let (cursor_row, cursor_col) = vm.input_cursor;
     let rows_before_input = frame.physical_rows(width);
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
@@ -1223,7 +1209,10 @@ pub(crate) fn plan_live_frame(
         .ghost_text
         .map(|ghost| format!("{DIM_GRAY}{ghost}{RESET}"))
         .unwrap_or_default();
-    if vm.input_lines.is_empty() {
+    if claimed_rects.composer.height == 0 {
+        // Tiny terminals can allocate every row before the composer. The
+        // claim is authoritative: do not paint invisible chrome past it.
+    } else if vm.input_lines.is_empty() {
         frame.push(format!("{prompt}{ghost}"));
     } else {
         let last = vm.input_lines.len() - 1;
@@ -1238,8 +1227,14 @@ pub(crate) fn plan_live_frame(
     // Provider/model identity sits on the left of this rule. Brain identity
     // remains on the upper separator so the two identities are not stacked.
     let rule = status_rule_line(width, vm.model_identity);
-    frame.push(format!("{DIM_GRAY}{rule}{RESET}"));
-    for line in vm.effective_status.lines() {
+    if claimed_rects.status_rule.height > 0 {
+        frame.push(format!("{DIM_GRAY}{rule}{RESET}"));
+    }
+    for line in vm
+        .effective_status
+        .lines()
+        .take(claimed_rects.status.height)
+    {
         frame.push(format!("{DIM_GRAY}{line}{RESET}"));
     }
 
@@ -1932,33 +1927,23 @@ impl TuiRenderer {
 
         let sources = self.live_frame_sources(term_width);
 
-        // The expanded tool-result surface owns the frame when open. A body
-        // that can no longer be found closes the surface before drawing.
-        let console_lines = self
-            .diagnostic_console
-            .frame(term_width, term_h.saturating_sub(1));
-        let expanded_lines = match console_lines {
-            Some(lines) => Some(lines),
-            None => match self.expanded_surface_frame(term_width, term_h.saturating_sub(1)) {
-                Some(lines) => Some(lines),
-                None => {
-                    if self.expanded_tool.is_some() {
-                        self.close_expanded_tool();
-                    }
-                    None
-                }
-            },
-        };
+        // Focused readers replace only the transcript viewport. Measure that
+        // claim with the same bottom chrome the final frame will paint, then
+        // ask the reader for exactly that many rows so its footer stays above
+        // the session separator.
+        let active_dialog = self.active_dialog.clone();
+        let expanded_lines =
+            self.focused_reader_lines(&sources, term_width, term_h, active_dialog.as_ref());
 
         // `sources` is the owned state the ViewModel borrows; the dialog and
-        // expanded surface are field borrows disjoint from the autocomplete
+        // focused reader are field borrows disjoint from the autocomplete
         // state the planner mutates.
         let frame = {
             let vm = live_view_model(
                 &sources,
                 term_width,
                 term_h,
-                self.active_dialog.as_ref(),
+                active_dialog.as_ref(),
                 expanded_lines.as_deref(),
             );
             plan_live_frame(&vm, &mut self.autocomplete_state)
@@ -3221,6 +3206,11 @@ impl TuiRenderer {
             let Some(delta) = wheel_delta(mouse.kind) else {
                 return false;
             };
+            if self.diagnostic_console.handle_wheel(delta) {
+                self.viewport_invalidated = true;
+                self.live_area_dirty = true;
+                return true;
+            }
             if self.expanded_tool.is_some() {
                 self.scroll_expanded_tool(delta);
                 return true;
@@ -3434,6 +3424,35 @@ impl TuiRenderer {
         Some(lines)
     }
 
+    /// Resolve a focused diagnostic/tool reader into the transcript claim,
+    /// never into the composer/status rows below the session separator.
+    fn focused_reader_lines(
+        &mut self,
+        sources: &LiveFrameSources,
+        width: usize,
+        height: usize,
+        dialog: Option<&Dialog>,
+    ) -> Option<Vec<String>> {
+        if !self.diagnostic_console.is_open() && self.expanded_tool.is_none() {
+            return None;
+        }
+        let placeholder = [String::new()];
+        let vm = live_view_model(sources, width, height, dialog, Some(&placeholder));
+        let reader_height = view_model::frame_rects(&view_model::claim_live_frame(&vm, None, 0, 0))
+            .transcript
+            .height;
+        if self.diagnostic_console.is_open() {
+            return self.diagnostic_console.frame(width, reader_height);
+        }
+        match self.expanded_surface_frame(width, reader_height) {
+            Some(lines) => Some(lines),
+            None => {
+                self.close_expanded_tool();
+                None
+            }
+        }
+    }
+
     pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
         let id = message.id();
         self.output_manager.add_trait_message(message);
@@ -3474,51 +3493,11 @@ impl TuiRenderer {
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
-        if self.diagnostic_console.is_open() {
-            if terminal_rows == 0 {
-                return Some((0, 0));
-            }
-            let draw_width = usize::from(width).max(1);
-            let lines = self
-                .diagnostic_console
-                .frame(draw_width, terminal_rows.saturating_sub(1))?;
-            let sources = self.live_frame_sources(draw_width);
-            let mut autocomplete = self.autocomplete_state.clone();
-            let vm = live_view_model(&sources, draw_width, terminal_rows, None, Some(&lines));
-            let frame = plan_live_frame(&vm, &mut autocomplete);
-            return Some((frame.physical_rows(draw_width), frame.cursor_row));
-        }
-        if let Some(view) = self.expanded_tool.as_ref() {
-            if terminal_rows == 0 {
-                return Some((0, 0));
-            }
-            // The surface frame is [separator, surface lines]; mirror the
-            // planner exactly so the transcript budget cannot disagree.
-            let width_us = usize::from(width).max(1);
-            let surface_rows = match self.tool_output_body(&view.row_id) {
-                Some(body) => {
-                    let lines = tool_viewport::expanded_surface_lines(
-                        &view.title,
-                        &body,
-                        view.scroll,
-                        width_us,
-                        terminal_rows.saturating_sub(1),
-                    );
-                    lines
-                        .iter()
-                        .map(|line| shadow_buffer::physical_rows(line, width_us))
-                        .sum::<usize>()
-                }
-                None => 1,
-            };
-            let rows = 1 + surface_rows;
-            return Some((rows, rows.saturating_sub(1)));
-        }
         let term_width = usize::from(width).max(1);
         let draw_width = term_width;
         let draw_height = usize::from(height);
         let sources = self.live_frame_sources(draw_width);
-        if draw_height <= 3 {
+        if draw_height <= 3 && !self.diagnostic_console.is_open() && self.expanded_tool.is_none() {
             let frame = plan_tiny_live_frame(
                 &sources.input_lines,
                 sources.input_cursor,
@@ -3532,7 +3511,14 @@ impl TuiRenderer {
         // so erase accounting can never disagree with what was painted: one
         // planner, two consumers.
         let mut autocomplete = self.autocomplete_state.clone();
-        let vm = live_view_model(&sources, draw_width, draw_height, None, None);
+        let expanded_lines = self.focused_reader_lines(&sources, draw_width, draw_height, None);
+        let vm = live_view_model(
+            &sources,
+            draw_width,
+            draw_height,
+            None,
+            expanded_lines.as_deref(),
+        );
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
@@ -6116,10 +6102,10 @@ mod tests {
         );
     }
 
-    /// The focused surface owns the whole live frame: no draft, no status, and
-    /// the hidden cursor parked on the last owned row.
+    /// A focused reader owns the transcript viewport above the session rule;
+    /// the composer and status remain below it.
     #[test]
-    fn test_expanded_surface_owns_the_live_frame() {
+    fn test_expanded_surface_owns_the_transcript_viewport() {
         let body: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
         let surface = tool_viewport::expanded_surface_lines("bash(build)", &body, 0, 80, 10);
         let input = vec!["draft must stay hidden".to_string()];
@@ -6129,23 +6115,27 @@ mod tests {
         let frame = plan_live_frame(&inputs, &mut autocomplete);
 
         let painted = frame.lines.join("\n");
+        let title = painted
+            .find("bash(build)")
+            .expect("reader title is visible");
+        let separator = painted
+            .find("~/repos/finch")
+            .expect("session separator is visible");
+        let draft = painted
+            .find("draft must stay hidden")
+            .expect("composer draft remains visible");
         assert!(
-            !painted.contains("draft must stay hidden"),
-            "INVARIANT: the expanded surface owns the viewport; the draft must not compete \
-             with it. frame:\n{painted}"
+            title < separator && separator < draft,
+            "INVARIANT: the reader must occupy the transcript above the separator, with the \
+             composer below it. frame:\n{painted}"
         );
         assert!(
-            !painted.contains("busy"),
-            "the status line is suppressed while the surface owns the frame; frame:\n{painted}"
+            painted.contains("busy"),
+            "the status line remains in its own chrome below the reader; frame:\n{painted}"
         );
         assert!(
-            !frame.cursor_visible,
-            "INVARIANT: the surface hides the editable cursor"
-        );
-        assert_eq!(
-            frame.cursor_row,
-            frame.physical_rows(80).saturating_sub(1),
-            "the hidden cursor parks on the final owned row"
+            frame.cursor_visible,
+            "the composer stays editable while a reader occupies the transcript"
         );
     }
 
@@ -6199,19 +6189,135 @@ mod tests {
         let geometry = renderer
             .live_geometry(width, height)
             .expect("geometry known with the surface open");
-        let frame_lines = renderer
-            .expanded_surface_frame(80, 23)
-            .expect("surface lines resolvable");
-        let surface_rows = frame_lines
-            .iter()
-            .map(|line| shadow_buffer::physical_rows(line, 80))
-            .sum::<usize>();
+        let draw_width = usize::from(width);
+        let draw_height = usize::from(height);
+        let sources = renderer.live_frame_sources(draw_width);
+        let lines = renderer
+            .focused_reader_lines(&sources, draw_width, draw_height, None)
+            .expect("expanded reader lines resolve");
+        let vm = live_view_model(&sources, draw_width, draw_height, None, Some(&lines));
+        let expected = plan_live_frame(&vm, &mut renderer.autocomplete_state.clone());
         assert_eq!(
             geometry,
-            (1 + surface_rows, surface_rows),
-            "INVARIANT: live_geometry matches [separator + surface rows] with the hidden \
-             cursor on the final row; geometry was {geometry:?}, surface measured \
-             {surface_rows} rows"
+            (expected.physical_rows(draw_width), expected.cursor_row),
+            "INVARIANT: geometry and paint use the same transcript-reader plan; geometry was \
+             {geometry:?}, frame was {:?}",
+            expected.lines
+        );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_expanded_tool_reader_renders_above_chrome_and_claims_wheel() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .map(|region| region.row_id.clone())
+            .expect("a painted tool-result region exists");
+        renderer.open_expanded_tool(&output_row_all);
+
+        let sources = renderer.live_frame_sources(80);
+        let lines = renderer
+            .focused_reader_lines(&sources, 80, 24, None)
+            .expect("expanded tool reader owns the transcript");
+        let vm = live_view_model(&sources, 80, 24, None, Some(&lines));
+        let frame = plan_live_frame(&vm, &mut renderer.autocomplete_state.clone());
+        let painted = frame.lines.join("\n");
+        let separator = painted
+            .find("──  ")
+            .unwrap_or_else(|| panic!("conversation separator remains visible: {painted}"));
+        assert!(
+            painted.find("bash(").is_some_and(|title| title < separator),
+            "tool output must be in the transcript above the separator: {painted}"
+        );
+        assert!(
+            painted
+                .find("lines ")
+                .is_some_and(|footer| footer < separator),
+            "the tool line-range footer must stay above the separator: {painted}"
+        );
+
+        let wheel = MouseEvent {
+            kind: event::MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            renderer.handle_mouse_to(wheel, &mut Vec::new()),
+            "an expanded tool reader must claim vertical wheel input"
+        );
+        let scrolled = renderer
+            .focused_reader_lines(&sources, 80, 24, None)
+            .expect("expanded tool reader stays open after scrolling");
+        assert_ne!(
+            lines.last(),
+            scrolled.last(),
+            "the expanded tool reader's line-range footer must update after a wheel tick: \
+             before={:?}, after={:?}",
+            lines.last(),
+            scrolled.last()
+        );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_diagnostic_console_reader_claims_wheel_above_conversation_chrome() {
+        struct ConsoleSource;
+        impl DiagnosticConsolePort for ConsoleSource {
+            fn snapshot(&self) -> DiagnosticConsoleSnapshot {
+                DiagnosticConsoleSnapshot {
+                    revision: 1,
+                    lines: (0..40).map(|index| format!("diagnostic {index}")).collect(),
+                }
+            }
+        }
+
+        let mut renderer = renderer_owning_mouse_capture();
+        renderer.set_diagnostic_console(Arc::new(ConsoleSource));
+        assert!(renderer
+            .handle_accordion_key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL,)));
+        let sources = renderer.live_frame_sources(100);
+        let before = renderer
+            .focused_reader_lines(&sources, 100, 12, None)
+            .expect("Ctrl+` opens the diagnostic reader");
+        let vm = live_view_model(&sources, 100, 12, None, Some(&before));
+        let frame = plan_live_frame(&vm, &mut renderer.autocomplete_state.clone());
+        let painted = frame.lines.join("\n");
+        let separator = painted
+            .find("──  ")
+            .unwrap_or_else(|| panic!("conversation separator remains visible: {painted}"));
+        assert!(
+            before
+                .first()
+                .is_some_and(|line| line.starts_with("Diagnostic console")),
+            "diagnostic title must be the first row, not the composer separator: {:?}",
+            before
+        );
+        assert!(
+            painted
+                .find("Diagnostic console")
+                .is_some_and(|title| title < separator),
+            "INVARIANT: diagnostics must occupy the transcript above conversation chrome: \
+             {painted}"
+        );
+
+        assert!(
+            renderer.handle_mouse_to(wheel_up(), &mut Vec::new()),
+            "an open diagnostic reader must claim vertical wheel input"
+        );
+        let after = renderer
+            .focused_reader_lines(&sources, 100, 12, None)
+            .expect("diagnostic reader stays open after scrolling");
+        assert_ne!(
+            before.last(),
+            after.last(),
+            "the pinned visible-range footer must update after a wheel tick: before={:?}, \
+             after={:?}",
+            before.last(),
+            after.last()
         );
         renderer.is_active = false;
     }

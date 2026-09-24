@@ -14,8 +14,10 @@ to draw them. The CLI owns turn timing and application decisions; the renderer o
 layout and input, and `finch-ui-model` owns pure WorkUnit projection.
 
 For the in-terminal diagnostic console, `diagnostic_console` tails bounded portions of this
-frontend's log and the daemon log, strips terminal controls, and implements the renderer-owned
-`DiagnosticConsolePort`. The renderer decides how Ctrl+` presents and scrolls that snapshot.
+frontend's local log and the local daemon-log path, strips terminal controls, and implements the
+renderer-owned `DiagnosticConsolePort`. The renderer decides how Ctrl+` presents and scrolls that
+snapshot. It is intentionally file-backed today: a daemon running on another host does not send
+its logs through this port.
 
 For an `AskUserQuestion` tool call, `repl_event::plan_handler` parses the wire request owned by
 `llm_dialogs`. A single question becomes an inline `Dialog`; multiple questions become
