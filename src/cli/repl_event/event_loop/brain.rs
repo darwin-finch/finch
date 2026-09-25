@@ -1073,12 +1073,15 @@ impl EventLoop {
         let sender = participant_display_name(&event.sender, local_machine);
         match &event.kind {
             BrainEventKind::MutationRecorded { .. } => {}
-            BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
-                format!("{} is the active environment runner", lease.subject),
-            ),
+            BrainEventKind::RunnerLeaseAcquired { lease } => {
+                self.output_manager.write_brain_event_notice(format!(
+                    "{} is the active environment runner",
+                    lease.subject
+                ))
+            }
             BrainEventKind::RunnerLeaseReleased { .. } => self
                 .output_manager
-                .write_info("environment runner disconnected"),
+                .write_brain_event_notice("environment runner disconnected"),
             BrainEventKind::RunnerHandoffRequested { handoff } => {
                 let prompt = if handoff.target_subject == self.runner_subject {
                     format!(
@@ -1088,26 +1091,29 @@ impl EventLoop {
                 } else {
                     String::new()
                 };
-                self.output_manager.write_info(format!(
+                self.output_manager.write_brain_event_notice(format!(
                     "{} requested runner handoff to {}{}",
                     handoff.requested_by, handoff.target_subject, prompt
                 ));
             }
             BrainEventKind::RunnerHandoffCompleted { lease, .. } => self
                 .output_manager
-                .write_info(format!("runner handoff completed to {}", lease.subject)),
-            BrainEventKind::RunnerHandoffCancelled { .. } => {
-                self.output_manager.write_info("runner handoff cancelled")
-            }
+                .write_brain_event_notice(format!("runner handoff completed to {}", lease.subject)),
+            BrainEventKind::RunnerHandoffCancelled { .. } => self
+                .output_manager
+                .write_brain_event_notice("runner handoff cancelled"),
             BrainEventKind::ClientAttached { subject, role, .. } => {
-                self.output_manager.write_info(format!(
+                self.output_manager.write_brain_event_notice(format!(
                     "{subject} attached as {}",
                     format!("{role:?}").to_lowercase()
                 ))
             }
-            BrainEventKind::ClientDetached { attachment_id, .. } => self
-                .output_manager
-                .write_info(format!("attachment {} disconnected", attachment_id.0)),
+            BrainEventKind::ClientDetached { attachment_id, .. } => {
+                self.output_manager.write_brain_event_notice(format!(
+                    "attachment disconnected ({})",
+                    &attachment_id.0.to_string()[..8]
+                ))
+            }
             BrainEventKind::RunStarted { run } => {
                 self.ensure_remote_brain_run_projection(run.run_id, Some(run.kind), run.status);
             }

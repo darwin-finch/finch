@@ -7750,6 +7750,230 @@ async fn peer_ipc_diagnostics_after_completed_turn_stay_off_transcript_scenario(
     );
 }
 
+/// The maintainer-corrected scope for the raw-dump transcript defect (#907):
+/// lease/attach/handoff events BELONG in the transcript on the live path, but
+/// they must arrive as structured rows — the icon-prefixed info kind every
+/// other static row uses — one row per event, ids bounded, no blank-line
+/// chrome. Run-status events keep flowing into the run-group projection and
+/// never become notice rows.
+#[tokio::test]
+async fn test_live_lease_attach_handoff_events_render_structured_info_rows() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::{
+                AttachmentId, AttachmentRole, BrainEventKind, BrainRunKind, BrainRunStatus,
+                BrainRunnerHandoff, BrainRunnerLease, ConnectionId, RunId, RunnerHandoffId,
+                RunnerLeaseId,
+            };
+
+            let mut event_loop = runner_recovery_test_event_loop();
+            let lease_id = RunnerLeaseId(uuid::Uuid::new_v4());
+            let handoff_id = RunnerHandoffId(uuid::Uuid::new_v4());
+            let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+            let run_id = RunId(uuid::Uuid::new_v4());
+            let lease = BrainRunnerLease {
+                lease_id,
+                subject: "shammah@box.local/frontend-cc388712".into(),
+                environment_generation: 1,
+                acquired_ms: 0,
+                expires_ms: 0,
+            };
+            let handoff = BrainRunnerHandoff {
+                handoff_id,
+                from_lease_id: lease_id,
+                requested_by: "peer@box.local/observer-1".into(),
+                target_subject: event_loop.runner_subject.clone(),
+                environment_generation: 1,
+                requested_ms: 0,
+                expires_ms: 0,
+            };
+            let events = vec![
+                brain_event(
+                    1,
+                    "daemon",
+                    BrainEventKind::RunnerLeaseAcquired {
+                        lease: lease.clone(),
+                    },
+                ),
+                brain_event(
+                    2,
+                    "daemon",
+                    BrainEventKind::RunnerLeaseReleased { lease_id },
+                ),
+                brain_event(
+                    3,
+                    "daemon",
+                    BrainEventKind::RunnerHandoffRequested { handoff },
+                ),
+                brain_event(
+                    4,
+                    "daemon",
+                    BrainEventKind::RunnerHandoffCompleted {
+                        handoff_id,
+                        lease: lease.clone(),
+                    },
+                ),
+                brain_event(
+                    5,
+                    "daemon",
+                    BrainEventKind::RunnerHandoffCancelled { handoff_id },
+                ),
+                brain_event(
+                    6,
+                    "daemon",
+                    BrainEventKind::ClientAttached {
+                        attachment_id,
+                        connection_id: ConnectionId::default(),
+                        subject: "alice@box.local/observer-2".into(),
+                        role: AttachmentRole::Consultant,
+                    },
+                ),
+                brain_event(
+                    7,
+                    "daemon",
+                    BrainEventKind::ClientDetached {
+                        attachment_id,
+                        connection_id: ConnectionId::default(),
+                    },
+                ),
+            ];
+            for event in &events {
+                event_loop
+                    .render_remote_brain_message(crate::brain::BrainWireMessage::Event {
+                        event: event.clone(),
+                    })
+                    .await
+                    .expect("live Brain event must dispatch through the render path");
+            }
+
+            let colors = crate::theme::ColorScheme::default();
+            let messages = event_loop.output_manager.get_messages();
+            let rendered = messages
+                .iter()
+                .map(|message| {
+                    format!(
+                        "kind={:?} content={:?} format={:?}",
+                        message.component_view().map(|view| match view {
+                            finch_ui_model::ComponentView::StaticText(text) => text.kind,
+                            other => unreachable!("unexpected view {other:?}"),
+                        }),
+                        message.content(),
+                        message.format(&colors)
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages.len(),
+                events.len(),
+                "INVARIANT: every live lease/attach/handoff event renders exactly one \
+                 transcript row with no stray blank-line chrome; rows={rendered:#?}"
+            );
+
+            let full_handoff_id = handoff_id.0.to_string();
+            let full_attachment_id = attachment_id.0.to_string();
+            let expected_payloads = [
+                "shammah@box.local/frontend-cc388712 is the active environment runner",
+                "environment runner disconnected",
+                "peer@box.local/observer-1 requested runner handoff to",
+                "runner handoff completed to shammah@box.local/frontend-cc388712",
+                "runner handoff cancelled",
+                "alice@box.local/observer-2 attached as consultant",
+                "attachment disconnected",
+            ];
+            for (message, expected) in messages.iter().zip(expected_payloads) {
+                let view = message.component_view().unwrap_or_else(|| {
+                    panic!("notice must carry a component view; rows={rendered:#?}")
+                });
+                let finch_ui_model::ComponentView::StaticText(text) = view else {
+                    panic!("notice must be a static text row; rows={rendered:#?}")
+                };
+                assert!(
+                    matches!(text.kind, finch_ui_model::StaticTextKind::Info),
+                    "INVARIANT: a lease/attach/handoff row must render as the structured \
+                     icon-prefixed info kind, not an unstructured plain dump; kind={:?} \
+                     rows={rendered:#?}",
+                    text.kind
+                );
+                let formatted = message.format(&colors);
+                assert!(
+                    formatted.contains('ℹ') && formatted.contains(expected),
+                    "INVARIANT: the info row must carry the info glyph and its payload; \
+                     expected={expected:?} formatted={formatted:?} rows={rendered:#?}"
+                );
+            }
+            let handoff_row = &messages[2];
+            assert!(
+                handoff_row.content().contains(&full_handoff_id[..8])
+                    && handoff_row.content().contains("addressed to this frontend"),
+                "the handoff row addressed to this frontend must carry the bounded id and \
+                 the accept hint; row={:?} rows={rendered:#?}",
+                handoff_row.content()
+            );
+            let detached_row = &messages[6];
+            assert!(
+                detached_row.content().contains(&full_attachment_id[..8])
+                    && !detached_row.content().contains(&full_attachment_id),
+                "INVARIANT: the detached row must render a bounded id fragment, never the \
+                 raw full UUID dump; row={:?} rows={rendered:#?}",
+                detached_row.content()
+            );
+
+            event_loop
+                .render_remote_brain_message(crate::brain::BrainWireMessage::Event {
+                    event: brain_event(
+                        8,
+                        "daemon",
+                        BrainEventKind::RunStarted {
+                            run: crate::brain::BrainRun {
+                                run_id,
+                                kind: BrainRunKind::Interactive,
+                                parent_run_id: None,
+                                request_seq: 1,
+                                initiating_attachment_id: attachment_id,
+                                initiated_by: "shammah@box.local/frontend-cc388712".into(),
+                                status: BrainRunStatus::Running,
+                                started_ms: 0,
+                                updated_ms: 0,
+                                detail: None,
+                            },
+                        },
+                    ),
+                })
+                .await
+                .expect("live run event must dispatch through the run projection");
+            let after_run = event_loop.output_manager.get_messages();
+            let notices = after_run
+                .iter()
+                .filter(|message| {
+                    message.component_view().is_some_and(|view| {
+                        matches!(
+                            view,
+                            finch_ui_model::ComponentView::StaticText(text)
+                                if matches!(text.kind, finch_ui_model::StaticTextKind::Info)
+                        )
+                    })
+                })
+                .count();
+            assert_eq!(
+                after_run.len(),
+                messages.len() + 1,
+                "INVARIANT: a run-status event keeps flowing to the run-group projection, \
+                 never a notice row; after={:?}",
+                after_run
+                    .iter()
+                    .map(|message| (message.content(), message.work_unit_head().is_some()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                notices,
+                events.len(),
+                "INVARIANT: run-status projection must not add notice rows; notices={notices} \
+                 rows={rendered:#?}"
+            );
+        })
+        .await;
+}
+
 #[test]
 fn test_resume_instruction_uses_validated_brain_name() {
     assert_eq!(
