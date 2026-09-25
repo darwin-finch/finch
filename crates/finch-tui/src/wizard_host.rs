@@ -1078,6 +1078,14 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
 #[derive(Default)]
 pub struct WizardHost {
     previous: Option<ShadowBuffer>,
+    /// The exact raw lines (with SGR bytes) the previous frame printed, keyed
+    /// by logical-line index — the row-diff below compares against these, not
+    /// against `ShadowBuffer::rows_as_text()`. `rows_as_text()` keeps only
+    /// each cell's `char` and drops style, so two frames whose visible text
+    /// is identical but whose styling differs (the active-tab marker moving
+    /// between tabs of the same name-set, #1140 follow-up) compared equal and
+    /// the tab row was silently never repainted after the first frame.
+    previous_lines: Option<Vec<String>>,
 }
 
 impl WizardHost {
@@ -1087,10 +1095,11 @@ impl WizardHost {
 
     /// Blit one frame to `out`.
     ///
-    /// The frame is rendered into a fresh shadow buffer; the previous buffer's
-    /// rows decide which logical lines are repainted. A size change or a first
-    /// frame falls back to a full clear-and-paint. The cursor is hidden: the
-    /// wizard paints its own block cursors inside text fields.
+    /// The frame is rendered into a fresh shadow buffer; a logical line is
+    /// repainted when its raw printed bytes (text *and* styling) differ from
+    /// what the previous frame printed at that index. A size change or a
+    /// first frame falls back to a full clear-and-paint. The cursor is
+    /// hidden: the wizard paints its own block cursors inside text fields.
     pub fn paint(
         &mut self,
         out: &mut impl Write,
@@ -1103,6 +1112,7 @@ impl WizardHost {
         let mut buffer = ShadowBuffer::new(width, height);
         buffer.render_lines(&frame.lines);
         let previous = self.previous.replace(buffer.clone_buffer());
+        let previous_lines = self.previous_lines.replace(frame.lines.clone());
 
         execute!(out, Hide)?;
         execute!(out, BeginSynchronizedUpdate)?;
@@ -1122,18 +1132,20 @@ impl WizardHost {
             }
         } else {
             let previous = previous.expect("checked above");
+            let previous_lines = previous_lines.unwrap_or_default();
             let rows_before = previous.rows_as_text();
-            let rows_after = buffer.rows_as_text();
-            for (line, (start, rows)) in frame.lines.iter().zip(&frame.row_spans) {
+            for (index, (line, (start, _rows))) in
+                frame.lines.iter().zip(&frame.row_spans).enumerate()
+            {
                 let start = *start;
-                let rows = *rows;
                 if start >= height {
                     break;
                 }
-                let rows = rows.min(height - start);
-                let before = rows_before.get(start..start + rows).unwrap_or(&[]);
-                let after = rows_after.get(start..start + rows).unwrap_or(&[]);
-                if before == after {
+                // Compare the exact bytes this line will print, not a
+                // style-stripped projection: a row whose text is unchanged
+                // but whose SGR run moved (e.g. the active-tab highlight)
+                // must still be repainted.
+                if previous_lines.get(index) == Some(line) {
                     continue;
                 }
                 execute!(out, crossterm::cursor::MoveTo(0, start as u16))?;
@@ -1432,6 +1444,47 @@ mod tests {
         assert!(
             after.iter().any(|row| row.contains("CHANGED two")),
             "the shadow buffer holds the new frame's visible rows; got {after:?}"
+        );
+    }
+
+    #[test]
+    fn test_host_repaints_tab_row_when_only_the_active_tab_marker_moves() {
+        // REGRESSION (#1140 follow-up, tab bar stuck on the first tab): the
+        // row-diff used to compare `ShadowBuffer::rows_as_text()`, which keeps
+        // only each cell's `char` and drops style. Two tab-row frames whose
+        // tab *names* are identical but whose active-tab marker differs (the
+        // exact shape of switching sections: same six names, the highlighted
+        // one moves) compared equal as plain text, so the tab row was never
+        // repainted past the very first frame — the terminal kept showing
+        // whichever tab was active when the wizard opened, even though the
+        // section panel below it (whose text really does change) tracked
+        // correctly. Production boundary: drives the real `WizardHost::paint`
+        // row-diff blit, not just `plan_wizard_frame`'s span construction.
+        fn view_with_active_tab(selected_tab: usize) -> WizardView {
+            WizardView {
+                title: " Finch Setup ".to_string(),
+                tab_titles: vec!["Alpha".to_string(), "Beta".to_string()],
+                selected_tab,
+                section: WizardSectionContent::plain(vec![WizardLine::plain("same content")]),
+                help: Some(WizardLine::plain("help line")),
+                card: None,
+            }
+        }
+
+        let mut sink: Vec<u8> = Vec::new();
+        let frame_a = plan_wizard_frame(&view_with_active_tab(0), 40, 8);
+        let frame_b = plan_wizard_frame(&view_with_active_tab(1), 40, 8);
+
+        let mut host = WizardHost::new();
+        host.paint(&mut sink, &frame_a, 40, 8).unwrap();
+
+        let before_second = sink.len();
+        host.paint(&mut sink, &frame_b, 40, 8).unwrap();
+        let diff = String::from_utf8_lossy(&sink[before_second..]).to_string();
+        assert!(
+            diff.contains("Beta"),
+            "the tab row must be repainted when the active-tab marker moves, \
+             even though the tab names are unchanged text; diff was: {diff:?}"
         );
     }
 

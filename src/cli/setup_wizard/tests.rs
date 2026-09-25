@@ -6988,6 +6988,81 @@ fn test_context_lines_spinner_value_is_visible_keys_adjust_and_keys_are_advertis
     assert_eq!(features_context_lines(&state), 8, "the spinner clamps at 8");
 }
 
+/// REGRESSION (#1140 follow-up, "Context lines can't be edited"): the
+/// previous spinner test drove `handle_features_input` directly, bypassing
+/// the real key-dispatch entry point (`handle_wizard_key`) a keypress
+/// actually goes through. That entry point treats bare Left/Right as a
+/// global prev/next-section shortcut (arrow keys double for Tab/Shift+Tab)
+/// and fired before the section ever saw the key, so on the real interactive
+/// path pressing ◀/▶ on the context-lines row silently changed the wizard's
+/// tab instead of the value — this is the production-boundary reproduction.
+#[test]
+fn test_context_lines_spinner_adjusts_through_real_key_dispatch_not_tab_switch() {
+    let mut state = WizardState::new(None);
+    // Reach the Features ("Settings") tab the way a user does: Tab from the
+    // first tab, not by poking `current_section` directly.
+    for _ in 0..WizardSection::all()
+        .iter()
+        .position(|s| *s == WizardSection::Features)
+        .unwrap()
+    {
+        handle_wizard_key(&mut state, key(KeyCode::Tab)).unwrap();
+    }
+    assert_eq!(state.current_section, WizardSection::Features);
+
+    // Reach the context-lines row with ↓, exactly as advertised in the
+    // footer, then via the SAME dispatcher press ◀ to adjust it.
+    for _ in 0..SETTINGS_CONTEXT_IDX {
+        handle_wizard_key(&mut state, key(KeyCode::Down)).unwrap();
+    }
+    assert_eq!(
+        features_context_lines(&state),
+        4,
+        "the default context-lines value starts at 4"
+    );
+
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    assert_eq!(
+        state.current_section,
+        WizardSection::Features,
+        "◀ on the context-lines row must adjust the spinner, not switch tabs \
+         away from Settings"
+    );
+    assert_eq!(
+        features_context_lines(&state),
+        3,
+        "◀ dispatched through handle_wizard_key must decrement the spinner, \
+         the same as calling handle_features_input directly"
+    );
+
+    handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+    assert_eq!(
+        state.current_section,
+        WizardSection::Features,
+        "▶ on the context-lines row must adjust the spinner, not switch tabs \
+         away from Settings"
+    );
+    assert_eq!(
+        features_context_lines(&state),
+        5,
+        "▶ dispatched through handle_wizard_key must increment the spinner"
+    );
+
+    // Off the spinner row, Left/Right still switch tabs (the shortcut is
+    // real, just scoped to rows that don't claim the keys themselves).
+    for _ in 0..SETTINGS_CONTEXT_IDX {
+        handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    }
+    handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+    assert_eq!(
+        state.current_section,
+        WizardSection::Review,
+        "Right must still act as the tab-navigation shortcut once the \
+         selection has moved off the context-lines row"
+    );
+}
+
 fn features_context_lines(state: &WizardState) -> usize {
     match state.sections.get(&WizardSection::Features) {
         Some(SectionState::Features {
