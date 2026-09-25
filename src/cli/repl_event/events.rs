@@ -283,6 +283,15 @@ pub enum LlmRequest {
         /// A spawned continuation waits for this durable-publication permit
         /// before it may read history or contact the provider.
         publication: Option<tokio::sync::oneshot::Receiver<()>>,
+        /// The user's own typed text, still unwritten to scrollback, for a
+        /// fresh interactive submission that wants an echo row. Committed
+        /// inside `process_query_with_tools` itself -- after memory recall's
+        /// notice, not before it -- so the visible transcript order matches
+        /// the request order (recall content is already injected *before*
+        /// the current question in the provider request; see
+        /// `inject_recall_prefix`). `None` for continuations, queued turns
+        /// that already echoed immediately, and any turn that must not echo.
+        pending_echo: Option<String>,
     },
 }
 

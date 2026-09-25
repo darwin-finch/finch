@@ -205,6 +205,7 @@ impl LlmLoop {
                     admission_ready,
                     spawned,
                     publication,
+                    pending_echo,
                 } => {
                     if let Some(ready) = admission_ready {
                         if ready.send(()).is_err() {
@@ -216,7 +217,7 @@ impl LlmLoop {
                             continue;
                         }
                     }
-                    self.spawn_query(id, text, no_tools, publication, spawned)
+                    self.spawn_query(id, text, no_tools, publication, spawned, pending_echo)
                         .await;
                 }
             }
@@ -234,6 +235,7 @@ impl LlmLoop {
         no_tools: bool,
         publication: Option<tokio::sync::oneshot::Receiver<()>>,
         spawned: Option<tokio::sync::oneshot::Sender<()>>,
+        pending_echo: Option<String>,
     ) {
         // Reset the execution graph on fresh queries (not tool continuations).
         if !query.is_empty() {
@@ -329,6 +331,7 @@ impl LlmLoop {
                 tool_call_history,
                 wire_metrics_logger,
                 persona_system_prompt,
+                pending_echo,
             )
             .await;
 

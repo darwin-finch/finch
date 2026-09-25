@@ -363,6 +363,7 @@ impl EventLoop {
                 admission_ready: None,
                 spawned: None,
                 publication: None,
+                pending_echo: None,
             })
             .is_err()
         {
