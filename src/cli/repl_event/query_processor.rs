@@ -1509,7 +1509,23 @@ pub(crate) async fn process_query_with_tools(
             // grounding through an entire multi-tool task rather than
             // losing it between continuations.
             let committed_before = memory_commitment.mirror.read().await.clone();
-            let committed_presented = present_committed(&committed_before);
+            // Do not render a committed memory whose own exchange is still
+            // sitting verbatim in `msgs` -- the model already sees it in
+            // ordinary conversation history, so re-injecting it as "durable"
+            // context is pure duplication with no recency signal behind it
+            // ("They're in the conversation history ANYWAYS. don't do
+            // that."). `committed_before` (and the staleness bookkeeping
+            // derived from it below) is left untouched: the memory is still
+            // genuinely committed, just not worth rendering again this turn
+            // while its content is already present another way.
+            let committed_to_present: Vec<crate::brain::CommittedMemoryRecord> = committed_before
+                .iter()
+                .filter(|entry| {
+                    !committed_exchange_is_verbatim_in_window(&entry.text, &msgs, &query)
+                })
+                .cloned()
+                .collect();
+            let committed_presented = present_committed(&committed_to_present);
             if let Some(stable_block) = render_presented_block(&committed_presented) {
                 inject_committed_memories_prefix(stable_block, &mut msgs);
             }
@@ -1541,12 +1557,25 @@ pub(crate) async fn process_query_with_tools(
                     // Only genuinely new, not-yet-committed recall goes in
                     // the transient trailing message -- content already
                     // represented in the stable block above is not
-                    // repeated.
+                    // repeated. Matched by rendered TEXT, not only
+                    // `node_id`: the same exchange's user/assistant halves
+                    // are separate `RoutingTree` leaves, so a fresh result
+                    // can carry the *other* half's node id than the one the
+                    // committed set remembers while rendering the identical
+                    // exchange text (`decide_committed_memories` above has
+                    // the full explanation). An id-only filter let that
+                    // reconfirmation slip through as a second, "recalled"
+                    // copy of content already shown as "committed".
                     let committed_ids: std::collections::HashSet<u64> =
                         committed_before.iter().map(|m| m.node_id).collect();
+                    let committed_texts: std::collections::HashSet<&str> =
+                        committed_before.iter().map(|m| m.text.as_str()).collect();
                     let transient: Vec<&finch_memory::RecalledMemory> = fresh
                         .iter()
-                        .filter(|r| !committed_ids.contains(&r.node_id))
+                        .filter(|r| {
+                            !committed_ids.contains(&r.node_id)
+                                && !committed_texts.contains(r.text.as_str())
+                        })
                         .collect();
                     let transient_presented = present_transient(&transient);
                     if let Some(mem_block) = render_presented_block(&transient_presented) {
@@ -2515,6 +2544,69 @@ fn display_recalled_memories(
     output_manager.write_memory_recall(format!("{count} {noun} retrieved"), rows);
 }
 
+/// Whether a committed memory's underlying exchange is already present,
+/// word for word, in `msgs` -- the messages this turn is about to send.
+///
+/// `finch_memory`'s `render_recall_entry` renders a committed record's
+/// `text` as `"user: {question}\nassistant: {answer}"` for a paired
+/// exchange, or `"{role}: {content}"` for an unpaired leaf. This recovers
+/// those same bytes, unprefixed, and checks whether the verbatim window
+/// already carries them under the matching role. A committed memory whose
+/// own turn is still in the verbatim window is redundant context injected
+/// twice for no reason -- the model already sees it as ordinary
+/// conversation history.
+///
+/// `current_query` is this call's own live turn text (`""` for a
+/// tool-continuation round trip). The caller already appended it to `msgs`
+/// as the trailing user message before this function ran (`repl.rs`'s
+/// `add_user_message` precedes dispatch), but that message is not yet
+/// answered -- it is the question being asked *right now*, not settled
+/// history -- so its presence must never by itself count as proof the
+/// exchange is "already" sitting in the window. Without this exclusion, a
+/// committed memory whose stored question happens to match the very
+/// question a user is currently re-asking would silently vanish on exactly
+/// the turn it exists to help answer
+/// (`test_committed_memory_prefix_is_byte_stable_across_turns_when_unchanged`
+/// caught this: turn 1 asks the seeded question verbatim, and the unpaired
+/// committed record -- just `"user: {question}"`, no counterpart in this
+/// test's session-less seed data -- matched turn 1's own trailing message
+/// and was wrongly dropped before any answer existed).
+fn committed_exchange_is_verbatim_in_window(
+    committed_text: &str,
+    msgs: &[crate::providers::Message],
+    current_query: &str,
+) -> bool {
+    let history: &[crate::providers::Message] = match msgs.last() {
+        Some(last)
+            if !current_query.is_empty() && last.role == "user" && last.text() == current_query =>
+        {
+            &msgs[..msgs.len() - 1]
+        }
+        _ => msgs,
+    };
+    let contains_role_text = |role: &str, needle: &str| {
+        !needle.is_empty()
+            && history
+                .iter()
+                .any(|m| m.role == role && m.text().contains(needle))
+    };
+
+    if let Some(idx) = committed_text.find("\nassistant: ") {
+        let question = committed_text[..idx]
+            .strip_prefix("user: ")
+            .unwrap_or(&committed_text[..idx]);
+        let answer = &committed_text[idx + "\nassistant: ".len()..];
+        return contains_role_text("user", question) && contains_role_text("assistant", answer);
+    }
+    if let Some(content) = committed_text.strip_prefix("user: ") {
+        return contains_role_text("user", content);
+    }
+    if let Some(content) = committed_text.strip_prefix("assistant: ") {
+        return contains_role_text("assistant", content);
+    }
+    false
+}
+
 fn present_committed(committed: &[crate::brain::CommittedMemoryRecord]) -> Vec<PresentedRecall> {
     committed
         .iter()
@@ -2614,17 +2706,28 @@ fn decide_committed_memories(
     use crate::brain::CommittedMemoryRecord;
     use std::collections::HashMap;
 
-    let fresh_by_id: HashMap<u64, &finch_memory::RecalledMemory> =
-        fresh.iter().map(|r| (r.node_id, r)).collect();
+    // Identity for "this is the same exchange reconfirmed this turn" is the
+    // exchange's rendered TEXT, not its `node_id`. `RoutingTree` stores each
+    // exchange's user half and assistant half as two separate leaves;
+    // `query_recall`'s own intra-call dedup already collapses both halves to
+    // one `RecalledMemory` keyed by whichever leaf the tree's ranking
+    // happened to return first *this* call. That representative id is not
+    // stable across turns -- a later turn's query embedding can rank the
+    // OTHER half first for the same exchange -- so matching reconfirmation
+    // on `node_id` alone let the same exchange re-join under a new id while
+    // the old id aged out under `stale_after_turns`, showing the same
+    // content once as `committed` and again as `recalled`.
+    let fresh_by_text: HashMap<&str, &finch_memory::RecalledMemory> =
+        fresh.iter().map(|r| (r.text.as_str(), r)).collect();
 
     let mut next_stale = HashMap::new();
     let mut kept: Vec<CommittedMemoryRecord> = Vec::new();
     for entry in committed {
-        match fresh_by_id.get(&entry.node_id) {
+        match fresh_by_text.get(entry.text.as_str()) {
             Some(reconfirmed) => {
-                next_stale.insert(entry.node_id, 0);
+                next_stale.insert(reconfirmed.node_id, 0);
                 kept.push(CommittedMemoryRecord {
-                    node_id: entry.node_id,
+                    node_id: reconfirmed.node_id,
                     text: reconfirmed.text.clone(),
                     score: reconfirmed.score,
                 });
@@ -2641,18 +2744,19 @@ fn decide_committed_memories(
     }
 
     // Mutated as `kept` changes, not snapshotted once: `fresh` is not
-    // structurally guaranteed to carry distinct `node_id`s (`query_recall`
-    // dedups by rendered text, not identity), so a stale snapshot could let
-    // a second occurrence of the same id re-enter the join/evict branch
-    // below and either duplicate an entry or evict an unrelated one.
-    let mut kept_ids: std::collections::HashSet<u64> = kept.iter().map(|m| m.node_id).collect();
+    // structurally guaranteed to carry distinct rendered text either, so a
+    // stale snapshot could let a second occurrence of the same exchange
+    // re-enter the join/evict branch below and either duplicate an entry or
+    // evict an unrelated one.
+    let mut kept_texts: std::collections::HashSet<String> =
+        kept.iter().map(|m| m.text.clone()).collect();
     for candidate in fresh {
-        if kept_ids.contains(&candidate.node_id) {
+        if kept_texts.contains(candidate.text.as_str()) {
             continue;
         }
         if kept.len() < max_committed {
             next_stale.insert(candidate.node_id, 0);
-            kept_ids.insert(candidate.node_id);
+            kept_texts.insert(candidate.text.clone());
             kept.push(CommittedMemoryRecord {
                 node_id: candidate.node_id,
                 text: candidate.text.clone(),
@@ -2669,8 +2773,8 @@ fn decide_committed_memories(
             if candidate.score > lowest_entry.score {
                 next_stale.remove(&kept[idx].node_id);
                 next_stale.insert(candidate.node_id, 0);
-                kept_ids.remove(&kept[idx].node_id);
-                kept_ids.insert(candidate.node_id);
+                kept_texts.remove(&kept[idx].text);
+                kept_texts.insert(candidate.text.clone());
                 kept[idx] = CommittedMemoryRecord {
                     node_id: candidate.node_id,
                     text: candidate.text.clone(),
@@ -7235,6 +7339,46 @@ mod tests {
         (Arc::new(memory), temp)
     }
 
+    /// Same seed as [`memory_system_with_seed_for_test`], but with both
+    /// halves of the exchange sharing a `session_id`. `finch_memory`'s
+    /// `counterpart_turn` (`crates/finch-memory/src/lib.rs`) only pairs a
+    /// retrieved leaf with its other half when both rows carry a matching,
+    /// non-NULL `session_id` -- exactly what a real REPL session always
+    /// sets when it calls `insert_conversation`. Tests that need to
+    /// exercise paired recall text (`"user: {q}\nassistant: {a}"`, not a
+    /// bare single-role leaf) must seed through this helper rather than
+    /// the session-less one above.
+    async fn memory_system_with_paired_seed_for_test(
+        tag: &str,
+    ) -> (Arc<finch_memory::MemorySystem>, tempfile::NamedTempFile) {
+        let temp = tempfile::NamedTempFile::new().expect("create temp memory db");
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })
+        .expect("construct test memory system");
+        let session_id = "test-session-pairing";
+        memory
+            .insert_conversation(
+                "user",
+                &format!("Where is the deploy key for the {tag} environment?"),
+                None,
+                Some(session_id),
+            )
+            .await
+            .expect("seed recall question");
+        memory
+            .insert_conversation(
+                "assistant",
+                &substantive_memory(tag),
+                None,
+                Some(session_id),
+            )
+            .await
+            .expect("seed recall answer");
+        (Arc::new(memory), temp)
+    }
+
     /// #413 production-boundary regression: recall must not mutate the
     /// current user message's bytes, so the message that gets replayed as
     /// history next turn is byte-identical to what was actually sent this
@@ -7619,10 +7763,28 @@ mod tests {
     /// invariant shape (`test_summarised_request_prefix_is_byte_stable_
     /// across_turns` above), applied to the committed recall prefix instead
     /// of the conversation summary.
+    ///
+    /// The committed entry is looked up from a separately seeded memory
+    /// system, but the two live turns run against a second, empty one --
+    /// deliberately decoupled so this turn's own fresh recall never finds
+    /// anything, isolating the byte-stability question from two other,
+    /// already-covered concerns: (1)
+    /// `committed_exchange_is_verbatim_in_window` correctly stops rendering
+    /// a committed memory once its own exchange is independently sitting
+    /// verbatim in the conversation window (covered by
+    /// `test_committed_memory_not_reinjected_when_its_exchange_is_verbatim_in_window`
+    /// above -- turn 1's own live query used to BE the committed question
+    /// verbatim, which collided with that suppression here for an unrelated
+    /// reason), and (2) a fresh recall result that happens to rank the
+    /// *other*, unpaired half of the same underlying exchange nearest for
+    /// an unrelated live query is a real but separate representative-id
+    /// wrinkle (covered by
+    /// `test_reconfirmed_exchange_under_a_different_node_id_is_not_shown_twice`),
+    /// not something this test is about either.
     #[tokio::test]
     async fn test_committed_memory_prefix_is_byte_stable_across_turns_when_unchanged() {
         let recorder = Arc::new(RecordingTurnGenerator::default());
-        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+        let (seed_memory, _seed_memory_db) = memory_system_with_seed_for_test("staging").await;
 
         // Look up the real node id/text/score the store assigns so the
         // pre-seeded committed set matches exactly what a reconfirming
@@ -7633,7 +7795,7 @@ mod tests {
         // can surface both under slightly different renderings (one paired
         // with its counterpart, one not) -- a real, separate behaviour this
         // test is not about.
-        let seeded = memory
+        let seeded = seed_memory
             .query_recall(
                 "Where is the deploy key for the staging environment?",
                 Some(1),
@@ -7653,13 +7815,30 @@ mod tests {
                 }],
             );
 
+        // Empty on purpose (see doc comment above): the live turns' own
+        // fresh recall must find nothing, so only the pre-seeded committed
+        // set drives what renders.
+        let live_temp = tempfile::NamedTempFile::new().expect("create temp live memory db");
+        let live_memory = Arc::new(
+            finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
+                db_path: live_temp.path().to_path_buf(),
+                ..Default::default()
+            })
+            .expect("construct empty live memory system"),
+        );
+
         let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
 
+        // Neither live query is the committed question's wording -- turn 1's
+        // used to be exactly that, which coincidentally re-triggered
+        // `committed_exchange_is_verbatim_in_window`'s new suppression (see
+        // doc comment above) for a reason unrelated to what this test
+        // checks.
         let turn1 = spawn_turn_with_memory(
             Arc::clone(&conversation),
-            "Where is the deploy key for the staging environment?",
+            "What's the weather forecast for tomorrow?",
             Arc::clone(&recorder) as Arc<dyn Generator>,
-            Arc::clone(&memory),
+            Arc::clone(&live_memory),
             1,
             memory_commitment.clone(),
             None,
@@ -7670,9 +7849,9 @@ mod tests {
 
         let turn2 = spawn_turn_with_memory(
             Arc::clone(&conversation),
-            "second question",
+            "second, unrelated question",
             Arc::clone(&recorder) as Arc<dyn Generator>,
-            Arc::clone(&memory),
+            Arc::clone(&live_memory),
             1,
             memory_commitment.clone(),
             None,
@@ -7721,6 +7900,204 @@ mod tests {
                 request_shape(request)
             );
         }
+    }
+
+    /// Production-boundary regression for "recalled vs committed memories
+    /// duplicate the same content": a committed memory must not be
+    /// re-injected as durable context when its own exchange is still
+    /// sitting verbatim in the conversation window the model is about to
+    /// see. The user's own diagnosis: "Why? They're in the conversation
+    /// history ANYWAYS. don't do that." Before this fix, the committed
+    /// block rendered unconditionally every turn regardless of whether the
+    /// underlying turn was still in `msgs`' verbatim tail.
+    #[tokio::test]
+    async fn test_committed_memory_not_reinjected_when_its_exchange_is_verbatim_in_window() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+
+        let seeded = memory
+            .query_recall(
+                "Where is the deploy key for the staging environment?",
+                Some(1),
+            )
+            .await
+            .expect("seed query must succeed")
+            .into_iter()
+            .next()
+            .expect("seeded memory must be recalled");
+        let memory_commitment =
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::with_committed(
+                vec![crate::brain::CommittedMemoryRecord {
+                    node_id: seeded.node_id,
+                    text: seeded.text.clone(),
+                    score: seeded.score,
+                }],
+            );
+
+        // The exchange the committed memory summarizes is ALSO sitting
+        // verbatim in ordinary conversation history -- exactly the scenario
+        // reported live.
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("Where is the deploy key for the staging environment?".to_string());
+        conversation
+            .write()
+            .await
+            .add_message(crate::providers::Message::assistant(substantive_memory(
+                "staging",
+            )));
+
+        let turn = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "what about the production key?",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            1,
+            memory_commitment,
+            None,
+        )
+        .await;
+        turn.task.await.expect("query task panicked");
+        drop(turn.events);
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1, "exactly one request must be sent");
+        let sent = &requests[0];
+        assert!(
+            sent.iter()
+                .all(|m| !m.text_content().contains("<committed_memory>")),
+            "a committed memory whose own exchange is still verbatim in the \
+             conversation window must not be re-injected as separate \
+             durable context; shape {:?}",
+            request_shape(sent)
+        );
+        assert!(
+            sent.iter().any(|m| m.role == "user"
+                && m.text_content()
+                    .contains("Where is the deploy key for the staging environment?")),
+            "the exchange itself must still genuinely be present, via \
+             ordinary verbatim history -- only the duplicate should be \
+             gone; shape {:?}",
+            request_shape(sent)
+        );
+    }
+
+    /// Production-boundary regression for "recalled vs committed memories
+    /// duplicate the same content", the second root cause: the same
+    /// exchange must not appear once as `committed` and again as
+    /// `recalled` merely because a later turn's query ranks the OTHER half
+    /// of the exchange nearest. `RoutingTree` stores the user half and the
+    /// assistant half of one exchange as two separate leaves, so two
+    /// different queries can each retrieve the same underlying exchange as
+    /// their single nearest match while reporting different `node_id`s.
+    /// Before this fix, both the committed/transient filter and
+    /// `decide_committed_memories`'s reconfirmation matched purely on
+    /// `node_id`, which is stable only within one `query_recall` call, not
+    /// across turns.
+    #[tokio::test]
+    async fn test_reconfirmed_exchange_under_a_different_node_id_is_not_shown_twice() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        // Session-scoped seed, not the plain one: pairing (`counterpart_turn`
+        // in `crates/finch-memory/src/lib.rs`) requires both halves to share
+        // a `session_id`, which is exactly what makes the two queries below
+        // resolve to the same rendered exchange text under different node
+        // ids -- a bare, session-less seed never pairs, so `by_question` and
+        // `by_answer` would retrieve two unrelated single-role leaves
+        // instead of exercising the bug this test is about.
+        let (memory, _memory_db) = memory_system_with_paired_seed_for_test("staging").await;
+
+        let by_question = memory
+            .query_recall(
+                "Where is the deploy key for the staging environment?",
+                Some(1),
+            )
+            .await
+            .expect("question-side recall must succeed")
+            .into_iter()
+            .next()
+            .expect("seeded exchange must be recalled by its question");
+        let by_answer = memory
+            .query_recall("Employee vault Finch signing item", Some(1))
+            .await
+            .expect("answer-side recall must succeed")
+            .into_iter()
+            .next()
+            .expect("seeded exchange must be recalled by its answer");
+
+        assert_eq!(
+            by_question.text, by_answer.text,
+            "both queries must retrieve the same rendered exchange; \
+             by_question={by_question:?}, by_answer={by_answer:?}"
+        );
+        assert_ne!(
+            by_question.node_id, by_answer.node_id,
+            "test fixture must exercise the actual node-id flip: the \
+             question and the answer are separate RoutingTree leaves, so \
+             the two queries must return DIFFERENT representative node ids \
+             for the same exchange; by_question={by_question:?}, \
+             by_answer={by_answer:?} -- if retrieval ranking changed such \
+             that both now resolve to the same leaf, this fixture needs \
+             different seed content to still exercise the bug"
+        );
+
+        // Turn commits the exchange under the question-half's node id.
+        let memory_commitment =
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::with_committed(
+                vec![crate::brain::CommittedMemoryRecord {
+                    node_id: by_question.node_id,
+                    text: by_question.text.clone(),
+                    score: by_question.score,
+                }],
+            );
+
+        // This turn's own query wording resolves to the ANSWER-half leaf,
+        // so this turn's fresh recall reconfirms the same exchange under
+        // the OTHER node id.
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let turn = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "Employee vault Finch signing item",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            1,
+            memory_commitment,
+            None,
+        )
+        .await;
+        turn.task.await.expect("query task panicked");
+        drop(turn.events);
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1, "exactly one request must be sent");
+        let sent = &requests[0];
+        let committed_count = sent
+            .iter()
+            .filter(|m| m.text_content().contains("<committed_memory>"))
+            .count();
+        assert_eq!(
+            committed_count,
+            1,
+            "exactly one committed-memory block must render; shape {:?}",
+            request_shape(sent)
+        );
+        let retrieved_duplicates = sent
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.text_content().contains("<retrieved_memory>")
+                    && m.text_content().contains(&by_answer.text)
+            })
+            .count();
+        assert_eq!(
+            retrieved_duplicates,
+            0,
+            "the reconfirmed exchange must not also appear in the transient \
+             recall tail merely because this turn's fresh match carries \
+             the other half's node id; shape {:?}",
+            request_shape(sent)
+        );
     }
 
     /// #940 production-boundary regression: a tool-continuation round trip
@@ -8014,6 +8391,52 @@ mod tests {
             "INVARIANT: a memory row must never carry the bounded child-viewport scroll \
              footer -- a couple of short recalled lines need no pagination chrome; \
              rendered lines were {texts:?}"
+        );
+    }
+
+    /// The user's half and the assistant's half of one stored exchange are
+    /// separate `RoutingTree` leaves (`crates/finch-memory/src/lib.rs`), so
+    /// a later turn's fresh recall can rank the OTHER half nearest and
+    /// return the identical rendered exchange text under a DIFFERENT
+    /// `node_id`. Reconfirmation must match on that text, not raw
+    /// `node_id`, or the same exchange double-commits: the old id ages
+    /// toward staleness while the new id joins as if it were unrelated.
+    #[test]
+    fn test_decide_committed_memories_reconfirms_by_text_when_node_id_differs() {
+        let mut committed_entry = committed(1, 0.5);
+        committed_entry.text = "shared exchange text".to_string();
+        let mut fresh_entry = recalled(2, 0.9);
+        fresh_entry.text = "shared exchange text".to_string();
+
+        let (kept, next_stale) =
+            decide_committed_memories(&[committed_entry], &[fresh_entry], &HashMap::new(), 8, 20);
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "the same exchange reconfirmed under a different node id must \
+             not appear as two committed entries; kept={kept:?}"
+        );
+        assert_eq!(
+            kept[0],
+            crate::brain::CommittedMemoryRecord {
+                node_id: 2,
+                text: "shared exchange text".to_string(),
+                score: 0.9,
+            },
+            "the reconfirmed entry must adopt this turn's representative \
+             node id and score; kept={kept:?}"
+        );
+        assert_eq!(
+            next_stale.get(&2),
+            Some(&0),
+            "the reconfirmed representative id must reset its staleness \
+             counter; next_stale={next_stale:?}"
+        );
+        assert!(
+            !next_stale.contains_key(&1),
+            "the old, superseded representative id must not linger in the \
+             staleness map; next_stale={next_stale:?}"
         );
     }
 }
