@@ -4848,6 +4848,48 @@ fn test_duplicate_model_profile_names_are_rejected_as_ambiguous() {
         .contains("ambiguous"));
 }
 
+#[test]
+fn test_provider_profile_resolves_by_case_insensitive_prefix() {
+    let profiles = vec![
+        claude_profile("ChatGPT Personal", "gpt-5"),
+        claude_profile("deep", "claude-opus"),
+    ];
+    assert_eq!(
+        resolve_provider_profile(&profiles, "chatgpt"),
+        Ok(0),
+        "a lowercase prefix of a multi-word name must resolve without typing the name in full"
+    );
+    assert_eq!(
+        resolve_provider_profile(&profiles, "ChatGPT"),
+        Ok(0),
+        "prefix matching is case-insensitive, matching exact-name resolution"
+    );
+    assert_eq!(
+        resolve_provider_profile(&profiles, "d"),
+        Ok(1),
+        "a single-character prefix still resolves when it is unambiguous"
+    );
+}
+
+#[test]
+fn test_provider_profile_prefix_shared_by_two_entries_is_ambiguous() {
+    let profiles = vec![
+        claude_profile("ChatGPT Personal", "gpt-5"),
+        claude_profile("ChatGPT Work", "gpt-5"),
+    ];
+    assert!(
+        resolve_provider_profile(&profiles, "chatgpt")
+            .unwrap_err()
+            .contains("ambiguous"),
+        "a prefix matching more than one profile must fail closed, not silently pick one"
+    );
+    assert_eq!(
+        resolve_provider_profile(&profiles, "chatgpt personal"),
+        Ok(0),
+        "a longer, disambiguating prefix (or the exact name) still resolves"
+    );
+}
+
 // --- streaming status bar format ---
 
 #[test]

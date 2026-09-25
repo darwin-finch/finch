@@ -178,6 +178,30 @@ pub(crate) fn resolve_provider_profile(
         ));
     }
 
+    // A case-insensitive prefix of exactly one profile name -- lets a
+    // multi-word name like "ChatGPT Personal" be selected as "/provider
+    // chatgpt" without typing it in full, while still failing closed (not
+    // silently picking one) if the prefix is shared by more than one entry.
+    let by_prefix: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry
+                .profile_name()
+                .to_ascii_lowercase()
+                .starts_with(&selector.to_ascii_lowercase())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if let [index] = by_prefix.as_slice() {
+        return Ok(*index);
+    }
+    if by_prefix.len() > 1 {
+        return Err(format!(
+            "Model name '{selector}' is ambiguous; give these profiles unique names in config"
+        ));
+    }
+
     let by_type: Vec<usize> = providers
         .iter()
         .enumerate()
