@@ -165,6 +165,29 @@ pub(super) fn is_nested_interaction_active(state: &WizardState) -> bool {
     }
 }
 
+/// True while the currently selected row consumes Left/Right itself — today
+/// only the Features section's context-lines spinner (`SETTINGS_CONTEXT_IDX`,
+/// `handle_features_input_impl`'s `KeyCode::Left`/`KeyCode::Right` arms).
+///
+/// `handle_wizard_key` treats Left/Right as a global prev/next-section
+/// shortcut so arrow keys double as Tab/Shift+Tab. That shortcut fires before
+/// `handle_section_input` ever sees the key, which made the spinner's own
+/// Left/Right handling unreachable through the real key-dispatch path even
+/// though it works fine when called directly in a test: pressing ◀/▶ on the
+/// context-lines row silently changed tabs instead of the value (the
+/// "Context lines can't be edited" report). This narrower check — unlike
+/// folding the row into `is_nested_interaction_active` — deliberately leaves
+/// Tab/Shift+Tab and Enter free to leave the row, since only Left/Right is
+/// ambiguous between "adjust the spinner" and "switch tabs".
+pub(super) fn current_row_owns_left_right(state: &WizardState) -> bool {
+    matches!(
+        state.sections.get(&WizardSection::Features),
+        Some(SectionState::Features { selected_idx, .. })
+            if state.current_section == WizardSection::Features
+                && *selected_idx == SETTINGS_CONTEXT_IDX
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WizardAction {
     Continue,
@@ -212,7 +235,7 @@ pub(super) fn handle_wizard_key(
                 state.next_section();
             }
         }
-        KeyCode::Left | KeyCode::Right if !nested => {
+        KeyCode::Left | KeyCode::Right if !nested && !current_row_owns_left_right(state) => {
             if key.code == KeyCode::Left {
                 state.prev_section();
             } else {
