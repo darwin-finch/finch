@@ -240,10 +240,23 @@ mod tests {
         }
     }
 
+    /// 30s, not a tight bound: every test using this helper runs a trivial
+    /// echo/exit fixture script that normally finishes in milliseconds, but a
+    /// loaded CI runner (this module's own sibling tests deliberately spawn
+    /// slow/concurrent subprocesses — see
+    /// `test_hanging_check_command_is_bounded_and_reports_the_timeout` and
+    /// `test_spawn_count_is_bounded_by_edits_and_runs_are_serialized`) can
+    /// push process-spawn latency far enough to intermittently trip a tight
+    /// bound, which was previously 5s (#1204: two tests here failed
+    /// intermittently in CI, passing clean on an unmodified rerun, because
+    /// the timeout path fired instead of the intended exit-code/stderr path
+    /// — a coarse liveness bound, not a correctness weakening; the one test
+    /// that actually exercises the timeout path sets its own short bound
+    /// explicitly instead of using this helper).
     fn config(sources: Vec<CheckCommandSource>) -> DiagnosticsConfig {
         DiagnosticsConfig {
             check: sources,
-            timeout_secs: 5,
+            timeout_secs: 30,
             max_output_chars: 2000,
         }
     }
