@@ -101,15 +101,17 @@ enum SayTurnState {
 }
 
 fn say_state(vm: &WorkUnitViewModel) -> SayTurnState {
-    if vm.program.lines.is_empty() {
+    if vm.status == SayTurnStatus::Completed {
+        // Status transitions win: a completed turn renders its output
+        // (however empty, #1185) and can never wear the spinner again.
+        SayTurnState::Completed
+    } else if vm.program.lines.is_empty() {
         // No producer reaches a say turn before its program is known today
         // (`begin_say_turn` carries the source); the state stays total for a
         // future producer that creates the card during model generation.
         SayTurnState::Generating
-    } else if vm.status == SayTurnStatus::Running {
-        SayTurnState::Running
     } else {
-        SayTurnState::Completed
+        SayTurnState::Running
     }
 }
 
@@ -485,6 +487,50 @@ mod tests {
                 .is_some_and(|line| *line == "(ran 1m 15s)"),
             "minutes render readably; got {:?}",
             texts(&say_turn_lines(&long))
+        );
+    }
+
+    #[test]
+    fn test_completed_turn_with_empty_program_does_not_stay_generating_forever() {
+        // INVARIANT (#1185): a wire turn whose raw source trims to "" begins
+        // a say turn with an empty program and still completes. Status
+        // transitions win over the empty-program heuristic: the completed
+        // turn renders its (empty) output region plus the `(ran Ns)`
+        // annotation, never the generating spinner. A still-running turn
+        // with no program yet keeps the generating representation.
+        let running = say_view(WorkUnitViewModel::default());
+        let running_rendered = texts(&say_turn_lines(&running));
+        assert!(
+            running_rendered[0].contains("Generating…"),
+            "a running turn with no program yet still renders the animated \
+             generating line; got {running_rendered:?}"
+        );
+
+        let completed = say_view(WorkUnitViewModel {
+            status: SayTurnStatus::Completed,
+            program: ProgramSourceVm {
+                language: "forth".into(),
+                lines: Vec::new(),
+            },
+            output: None,
+            show_program: false,
+        });
+        let lines = say_turn_lines(&completed);
+        let rendered = texts(&lines);
+        assert!(
+            !rendered.iter().any(|line| line.contains("Generating")),
+            "a completed turn must not wear the generating spinner regardless \
+             of its program being empty; got {rendered:?}"
+        );
+        assert_eq!(
+            rendered,
+            vec!["", "(ran 2s)"],
+            "the completed empty turn renders its empty output region plus the \
+             elapsed annotation; got {rendered:?}"
+        );
+        assert!(
+            lines.iter().all(|line| line.row_id.is_some()),
+            "the completed region stays the toggle hit target; got {lines:?}"
         );
     }
 
