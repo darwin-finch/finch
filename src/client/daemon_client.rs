@@ -265,6 +265,7 @@ impl DaemonClient {
         Self {
             base_url,
             client: Client::new(),
+            status_client: Client::new(),
             config: DaemonConfig::default(),
         }
     }

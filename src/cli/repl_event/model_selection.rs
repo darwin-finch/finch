@@ -485,6 +485,7 @@ mod tests {
             1,
             MockGenerator::named("local"),
             read_status,
+            |_: &str| true,
             poll_interval,
         ));
 
