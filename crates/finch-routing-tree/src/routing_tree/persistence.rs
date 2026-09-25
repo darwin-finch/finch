@@ -1,7 +1,8 @@
 //! Save/load for [`RoutingTree`] against `routing_points`/`routing_nodes`/`routing_leaf_membership`
-//! (`schema.sql`). Reuses `finch-memory`'s own established dirty-tracking discipline (mark on
-//! mutation, save only what changed, clear on hydrate) -- `RoutingTree::dirty_node_ids`/
-//! `mark_persisted` are the same shape as `MemTree::dirty_nodes`/`mark_persisted`, deliberately.
+//! (the caller's schema). Reuses the dirty-tracking discipline the mechanism was built with (mark
+//! on mutation, save only what changed, clear on hydrate) -- `RoutingTree::dirty_node_ids`/
+//! `mark_persisted` are the same shape as the memory index's earlier dirty-nodes discipline,
+//! deliberately.
 //!
 //! Canonical point content (text + embedding) is persisted separately from tree structure, in
 //! `routing_points` -- `RoutingTree` itself has no notion of text, only embeddings and structure.
@@ -11,14 +12,12 @@
 //! reconstructs it once on load rather than storing a second, derived, embedding-sized copy per
 //! leaf entry.
 //!
-//! This module is scoped to `RoutingTree` alone -- wiring it into `MemorySystem`'s own hydration
-//! state machine (the `Loading`/`Degraded`/`Ready` progression, batch-by-batch partial reads) is a
-//! separate, larger piece of work, not yet done. What's here is real, tested, and usable standalone.
+//! This module is scoped to the tree's own durable rows alone. It opens no schema and owns no
+//! hydration lifecycle: creating those tables is the caller's schema's job (in Finch,
+//! `finch-memory`'s `schema.sql`), and wiring save/load into a hydration state machine
+//! (`Loading`/`Degraded`/`Ready` progression, partial reads) belongs to the caller too.
 
-use super::{
-    normalize_in_place, projection, splitmix64_uniform_half, to_double, Node, RoutingConfig,
-    RoutingTree,
-};
+use super::{normalize_in_place, projection, to_double, Node, RoutingConfig, RoutingTree};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
@@ -46,8 +45,7 @@ fn decode_f64(bytes: &[u8]) -> Vec<f64> {
 
 /// Persist a point's canonical content. Separate from tree structure -- called once per new
 /// point, alongside (not instead of) [`save_dirty_nodes`].
-#[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
-pub(crate) fn save_point(
+pub fn save_point(
     conn: &Connection,
     point_id: usize,
     text: &str,
@@ -74,8 +72,7 @@ pub(crate) fn save_point(
     Ok(())
 }
 
-#[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
-pub(crate) fn mark_point_removed(conn: &Connection, point_id: usize) -> Result<()> {
+pub fn mark_point_removed(conn: &Connection, point_id: usize) -> Result<()> {
     conn.execute(
         "UPDATE routing_points SET removed = 1 WHERE point_id = ?1",
         params![point_id as i64],
@@ -91,7 +88,7 @@ pub(crate) fn mark_point_removed(conn: &Connection, point_id: usize) -> Result<(
 /// path simple and obviously correct. A node that just converted from leaf to decision node (or
 /// already was one) has any stale membership rows deleted unconditionally first -- harmless if
 /// there were none.
-pub(crate) fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Result<()> {
+pub fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Result<()> {
     let dirty = tree.dirty_node_ids();
     if dirty.is_empty() {
         return Ok(());
@@ -110,7 +107,7 @@ pub(crate) fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Res
 /// [`save_dirty_nodes`] wraps for standalone use, and what a caller composing a larger atomic
 /// write (point content, tree structure, and its own provenance row in ONE transaction) calls
 /// directly instead.
-pub(crate) fn write_dirty_nodes_within(
+pub fn write_dirty_nodes_within(
     tree: &RoutingTree,
     dirty: &[usize],
     conn: &Connection,
@@ -181,8 +178,7 @@ struct LoadedMembership {
 /// Rebuild a full [`RoutingTree`] from durable rows. Returns the tree plus each surviving point's
 /// `(point_id, text, importance)` -- `RoutingTree` itself has no notion of text, so the caller owns
 /// that mapping.
-#[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
-pub(crate) fn load_routing_tree(
+pub fn load_routing_tree(
     conn: &Connection,
     cfg: RoutingConfig,
     dim: usize,
@@ -363,6 +359,7 @@ pub(crate) fn load_routing_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing_tree::splitmix64_uniform_half;
 
     const DIM: usize = 16;
 
@@ -403,7 +400,7 @@ mod tests {
     #[test]
     fn test_save_then_load_round_trips_structure_and_centroids() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
 
         let points = test_corpus(20);
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
@@ -485,7 +482,7 @@ mod tests {
     #[test]
     fn test_loaded_tree_matches_original_on_adaptive_search() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
 
         let (build, heldout) = test_corpus_build_heldout(20, 5);
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
@@ -519,7 +516,7 @@ mod tests {
     #[test]
     fn test_loaded_tree_accepts_further_inserts_without_panicking() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
 
         let points = test_corpus(15);
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
@@ -555,7 +552,7 @@ mod tests {
     #[test]
     fn test_dual_insert_membership_reconstructs_correctly_after_reload() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
 
         let points = test_corpus(15);
         let mut cfg = RoutingConfig::default();
@@ -609,7 +606,7 @@ mod tests {
     #[test]
     fn test_removed_point_is_not_returned_in_metadata_after_reload() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
 
         let points = test_corpus(15);
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);

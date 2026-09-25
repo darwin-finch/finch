@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS program_registry (
     PRIMARY KEY (id, version)
 );
 
--- RoutingTree persistence (crates/finch-memory/src/routing_tree.rs) -- the sole memory index;
+-- RoutingTree persistence (the mechanism in crates/finch-routing-tree, schema owned here) --
+-- the sole memory index;
 -- it replaced tree_nodes/MemTree outright rather than migrating it. Canonical point content
 -- (text + embedding) is stored exactly once per point regardless of how many leaves reference
 -- it via dual-insert; leaf membership is a lean set of (leaf, point) pointer rows, not

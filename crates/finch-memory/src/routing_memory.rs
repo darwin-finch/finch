@@ -1,4 +1,4 @@
-//! [`RoutingMemTree`]: a `MemTree`-shaped facade over [`RoutingTree`](crate::routing_tree), so
+//! [`RoutingMemTree`]: a `MemTree`-shaped facade over [`RoutingTree`](finch_routing_tree::RoutingTree), so
 //! `MemorySystem` in `lib.rs` can hold this in place of `MemTree` with a minimal-diff call-site
 //! swap rather than a rewrite of the surrounding persistence/hydration/quality machinery (already
 //! confirmed algorithm-agnostic).
@@ -15,9 +15,8 @@
 //!   one filter that is a real content-safety decision (importance=0 / Discard is never returned)
 //!   but does not yet replicate the boost -- a disclosed simplification, not a silent drop.
 
-use crate::routing_tree::persistence as routing_persistence;
-use crate::routing_tree::{AdaptiveTopKResult, RoutingConfig, RoutingTree};
 use anyhow::Result;
+use finch_routing_tree::{load_routing_tree, AdaptiveTopKResult, RoutingConfig, RoutingTree};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
@@ -60,17 +59,12 @@ impl RoutingMemTree {
         }
     }
 
-    /// Rebuild from durable rows via `routing_tree::persistence::load_routing_tree`. `created_at`
+    /// Rebuild from durable rows via `finch_routing_tree::load_routing_tree`. `created_at`
     /// is not tracked by that function's own metadata tuple (text, importance only), so it is
     /// re-read here directly -- a second, small query rather than widening that function's return
     /// shape for one caller's own bookkeeping need.
     pub(crate) fn load(conn: &Connection, dim: usize) -> Result<Self> {
-        let (tree, points) = routing_persistence::load_routing_tree(
-            conn,
-            RoutingConfig::default(),
-            dim,
-            FIXED_SEED,
-        )?;
+        let (tree, points) = load_routing_tree(conn, RoutingConfig::default(), dim, FIXED_SEED)?;
         let mut meta = HashMap::with_capacity(points.len());
         let mut text_index = HashMap::with_capacity(points.len());
         for (point_id, text, importance) in points {

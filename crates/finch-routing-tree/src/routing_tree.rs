@@ -101,7 +101,7 @@ struct DualEntry {
     divergence_node_id: usize,
 }
 
-struct Node {
+pub(crate) struct Node {
     is_leaf: bool,
     left: Option<usize>,
     right: Option<usize>,
@@ -411,11 +411,11 @@ pub struct RoutingTree {
     dual_entries_of: Vec<Vec<DualEntry>>,
 
     /// Node ids whose persisted columns have changed since the last `mark_persisted` -- the same
-    /// dirty-tracking pattern `MemTree` already uses (mark-on-mutation, save-marked,
-    /// clear-on-hydrate), so `finch-memory`'s existing "don't rewrite the whole store on one new
-    /// memory" persistence discipline carries over unchanged in shape, even though the SQL for
+    /// dirty-tracking pattern the memory index already used (mark-on-mutation, save-marked,
+    /// clear-on-hydrate), so its existing "don't rewrite the whole store on one new memory"
+    /// persistence discipline carries over unchanged in shape, even though the SQL for
     /// this node shape is new. A single insert can dirty many ancestors at once (every node on
-    /// the path has its `real_centroid` updated) -- a real, larger fan-out than `MemTree`'s own
+    /// the path has its `real_centroid` updated) -- a real, larger fan-out than the prior
     /// per-insert dirty set, a disclosed behavioral difference, not an oversight.
     dirty: std::collections::HashSet<usize>,
 }
@@ -439,7 +439,7 @@ impl RoutingTree {
     /// Node ids whose persisted columns have changed, ascending -- a copy, not a drain, matching
     /// `MemTree::dirty_nodes`'s own safety discipline (a save that fails or is cancelled before
     /// committing leaves the marks set; the next save writes them).
-    pub(crate) fn dirty_node_ids(&self) -> Vec<usize> {
+    pub fn dirty_node_ids(&self) -> Vec<usize> {
         let mut ids: Vec<usize> = self.dirty.iter().copied().collect();
         ids.sort_unstable();
         ids
@@ -447,7 +447,7 @@ impl RoutingTree {
 
     /// Forget exactly the ids a transaction committed -- never the whole set, since another
     /// caller may have marked more nodes while this save was writing.
-    pub(crate) fn mark_persisted(&mut self, ids: &[usize]) {
+    pub fn mark_persisted(&mut self, ids: &[usize]) {
         for id in ids {
             self.dirty.remove(id);
         }
@@ -459,10 +459,6 @@ impl RoutingTree {
 
     pub(crate) fn real_centroid_raw(&self, id: usize) -> &[f64] {
         &self.nodes[id].real_centroid
-    }
-
-    pub(crate) fn spherical_mode(&self) -> bool {
-        self.cfg.spherical_mode
     }
 
     /// `(point_id, is_dual, divergence_node_id)` for every entry currently in leaf `node_id`'s

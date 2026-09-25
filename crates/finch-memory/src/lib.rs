@@ -10,7 +10,6 @@ mod memory_status;
 mod program_registry;
 mod quality;
 mod routing_memory;
-mod routing_tree;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memory_status::{caveat, count_qualifier, observed, Recall};
@@ -25,9 +24,8 @@ pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 pub type NodeId = u64;
 pub use quality::{MemoryClassifier, MemoryImportance};
 
+use finch_routing_tree::{save_point, write_dirty_nodes_within};
 use routing_memory::{PointId, RoutingMemTree};
-use routing_tree::persistence as routing_persistence;
-use routing_tree::RoutingConfig;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -1939,7 +1937,7 @@ impl MemorySystem {
         let dirty = tree.tree().dirty_node_ids();
 
         let tx = conn.unchecked_transaction()?;
-        routing_persistence::save_point(
+        save_point(
             &tx,
             point_id as usize,
             &meta.text,
@@ -1947,7 +1945,7 @@ impl MemorySystem {
             meta.importance,
             meta.created_at,
         )?;
-        routing_persistence::write_dirty_nodes_within(tree.tree(), &dirty, &tx)?;
+        write_dirty_nodes_within(tree.tree(), &dirty, &tx)?;
         // `node_id` (`memory_sources`' own column name, unchanged) now holds a `routing_points`
         // point id. Not unique: deduplicated content is one point with several source
         // conversations; `conversation_id` is the primary key, so a retry of the same turn is
@@ -2664,6 +2662,7 @@ mod tests {
     }
 
     use super::*;
+    use finch_routing_tree::{load_routing_tree, RoutingConfig, RoutingTree};
     use tempfile::NamedTempFile;
 
     struct FixedDimensionEngine {
@@ -3020,7 +3019,7 @@ mod tests {
         // above; one wrapping transaction turned minutes into well under a
         // second). One transaction for the whole seed, matching how a real
         // caller would batch a bulk load anyway.
-        let mut tree = routing_tree::RoutingTree::new(RoutingConfig::default(), dim, 7);
+        let mut tree = RoutingTree::new(RoutingConfig::default(), dim, 7);
         let mut state = 0xC0FFEE_u64;
         let clusters = 8usize;
         let tx = conn.transaction()?;
@@ -3033,7 +3032,7 @@ mod tests {
                 *slot += jitter * 0.3;
             }
             let point_id = tree.insert(embedding.clone());
-            routing_persistence::save_point(
+            save_point(
                 &tx,
                 point_id,
                 &format!("seeded point {id}"),
@@ -3047,7 +3046,7 @@ mod tests {
         // lower-level piece meant for exactly this composition, same as
         // `save_routing_insert` above uses it.
         let dirty = tree.dirty_node_ids();
-        routing_persistence::write_dirty_nodes_within(&tree, &dirty, &tx)?;
+        write_dirty_nodes_within(&tree, &dirty, &tx)?;
         tx.commit()?;
         tree.mark_persisted(&dirty);
         Ok(())
@@ -5030,7 +5029,7 @@ mod tests {
         // Direct path, built straight from the same database.
         let direct_points = {
             let conn = Connection::open(temp.path())?;
-            let (_, metadata) = routing_persistence::load_routing_tree(
+            let (_, metadata) = load_routing_tree(
                 &conn,
                 RoutingConfig::default(),
                 dim,
@@ -5496,26 +5495,15 @@ mod tests {
         let mut conn = Connection::open(db_path)?;
         let engine = TfIdfEmbedding::new();
         let dim = engine.dimension();
-        let mut tree = routing_tree::RoutingTree::new(
-            RoutingConfig::default(),
-            dim,
-            routing_memory::FIXED_SEED,
-        );
+        let mut tree = RoutingTree::new(RoutingConfig::default(), dim, routing_memory::FIXED_SEED);
         let tx = conn.transaction()?;
         for (index, (text, importance)) in leaves.iter().enumerate() {
             let embedding = engine.embed(text)?;
             let point_id = tree.insert(embedding.clone());
-            routing_persistence::save_point(
-                &tx,
-                point_id,
-                text,
-                &embedding,
-                *importance,
-                index as i64,
-            )?;
+            save_point(&tx, point_id, text, &embedding, *importance, index as i64)?;
         }
         let dirty = tree.dirty_node_ids();
-        routing_persistence::write_dirty_nodes_within(&tree, &dirty, &tx)?;
+        write_dirty_nodes_within(&tree, &dirty, &tx)?;
         tx.commit()?;
         tree.mark_persisted(&dirty);
         Ok(())

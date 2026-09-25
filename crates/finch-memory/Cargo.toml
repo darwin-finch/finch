@@ -12,6 +12,7 @@ repository = "https://github.com/darwin-finch/finch"
 anyhow = "1.0"
 chrono = "0.4"
 dirs = "5.0"
+finch-routing-tree = { path = "../finch-routing-tree" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.35", features = ["sync", "rt"] }
