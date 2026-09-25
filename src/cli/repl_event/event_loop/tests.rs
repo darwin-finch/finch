@@ -8442,3 +8442,76 @@ async fn hydrate_brain_selection_fails_closed_when_daemon_already_runs_a_differe
         "the active generator must be untouched when activation is refused"
     );
 }
+
+#[tokio::test]
+async fn provider_list_shows_each_local_entry_its_own_model_not_the_bare_local_tag() {
+    tokio::task::LocalSet::new()
+        .run_until(
+            provider_list_shows_each_local_entry_its_own_model_not_the_bare_local_tag_scenario(),
+        )
+        .await;
+}
+
+async fn provider_list_shows_each_local_entry_its_own_model_not_the_bare_local_tag_scenario() {
+    // Reproduces the reported bug: two distinct local entries (Gemma 2 9B and
+    // Qwen 2.5 3B) both rendered their trailing descriptor as the literal
+    // string "local" — `ProviderEntry::model()` is documented cloud-only and
+    // returns `None` for every `Local` variant, so `/providers` fell back to
+    // `provider_type()`, which is the same "local" tag for both, making two
+    // genuinely different models look identically labeled. The cloud entry
+    // must keep showing its real model string unaffected.
+    let gemma = provider_switch_local_entry(
+        crate::models::ModelFamily::Gemma2,
+        crate::models::ModelSize::Medium,
+    );
+    let qwen = provider_switch_local_entry(
+        crate::models::ModelFamily::Qwen2,
+        crate::models::ModelSize::Medium,
+    );
+    let chatgpt = crate::config::ProviderEntry::Openai {
+        api_key: "test-key".to_string(),
+        model: Some("gpt-5.6-sol".to_string()),
+        base_url: None,
+        chat_path: None,
+        models_path: None,
+        name: Some("ChatGPT Personal".to_string()),
+        reasoning_effort: None,
+    };
+
+    let mut event_loop =
+        super::EventLoop::new_provider_switch_test_runner(vec![gemma, chatgpt, qwen], 0, None);
+    event_loop.output_manager.disable_stdout();
+
+    event_loop
+        .handle_provider_list()
+        .await
+        .expect("listing configured providers must not error");
+
+    let messages: Vec<String> = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect();
+    let listing = messages
+        .iter()
+        .find(|message| message.contains("Configured provider entries:"))
+        .unwrap_or_else(|| panic!("expected a provider listing message; messages={messages:?}"));
+
+    assert!(
+        listing.contains("[local]") && listing.contains("Gemma 2 9b"),
+        "Gemma entry must show its own model descriptor, not the bare 'local' tag; listing={listing:?}"
+    );
+    assert!(
+        listing.contains("[local]") && listing.contains("Qwen 2.5 3B"),
+        "Qwen entry must show its own model descriptor, not the bare 'local' tag; listing={listing:?}"
+    );
+    assert!(
+        !listing.contains("· local\n") && !listing.ends_with("· local"),
+        "no line may fall back to the bare literal 'local' descriptor now that both local entries have real model info; listing={listing:?}"
+    );
+    assert!(
+        listing.contains("[cloud]") && listing.contains("ChatGPT Personal") && listing.contains("gpt-5.6-sol"),
+        "the cloud entry's real model must remain unaffected by the local-descriptor fix; listing={listing:?}"
+    );
+}

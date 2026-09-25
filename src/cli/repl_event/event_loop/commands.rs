@@ -293,13 +293,18 @@ impl EventLoop {
                 " "
             };
             let tag = if entry.is_local() { "local" } else { "cloud" };
+            let descriptor = entry
+                .model()
+                .map(str::to_string)
+                .or_else(|| entry.local_model_descriptor())
+                .unwrap_or_else(|| entry.provider_type().to_string());
             lines.push(format!(
                 "{} {}. [{}] {} · {}",
                 marker,
                 index + 1,
                 tag,
                 entry.profile_name(),
-                entry.model().unwrap_or(entry.provider_type())
+                descriptor
             ));
         }
         if self.available_providers.is_empty() {
