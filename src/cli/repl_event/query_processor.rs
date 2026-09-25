@@ -2438,12 +2438,18 @@ struct PresentedRecall {
     presentation: super::recall_gate::RecallPresentation,
 }
 
-/// Show a collapsed-by-default row for what was actually injected this turn
-/// (#8), or nothing at all when `presented` is empty -- a query with no
-/// relevant memory shows no recall row. Reuses the same
-/// `WorkUnit`/`set_activity_presentation` mechanism tool-activity rows
-/// already use, so it gets the existing accordion collapse/expand for free;
-/// no new TUI plumbing needed.
+/// Show a row for what was actually injected this turn (#8), or nothing at
+/// all when `presented` is empty -- a query with no relevant memory shows no
+/// recall row.
+///
+/// Renders through the component system (`ComponentView::MemoryRecalled`),
+/// not the legacy `WorkUnit`/`WorkRow` accordion path: a recalled memory has
+/// no input side and its content is already fully known, so it must not
+/// inherit the tool-call-shaped "Input"/"Output" disclosure or the bounded,
+/// scrollable child viewport those rows carry (`finch-tui`'s
+/// `tool_viewport.rs`) -- a couple of short lines of recalled context need no
+/// pagination chrome, and a user should never be able to scroll a memory row
+/// down to a clipped, unrecoverable view.
 fn display_recalled_memories(
     output_manager: &crate::cli::output_manager::OutputManager,
     presented: &[PresentedRecall],
@@ -2453,31 +2459,36 @@ fn display_recalled_memories(
     }
     let count = presented.len();
     let noun = if count == 1 { "memory" } else { "memories" };
-    let unit = output_manager.start_work_unit("Recalling");
-    unit.set_activity_presentation(format!("{count} {noun} retrieved"));
-    for entry in presented {
-        let tier = match entry.tier {
-            RecallTier::Committed => "committed",
-            RecallTier::Transient => "recalled",
-        };
-        let label = format!("{tier} · score {:.2} · node {}", entry.score, entry.node_id);
-        let row_idx = unit.add_row(label);
-        let summary = match &entry.presentation {
-            super::recall_gate::RecallPresentation::Raw(text) => {
-                format!("{} chars, sent raw", text.len())
+    let rows = presented
+        .iter()
+        .map(|entry| {
+            let tier = match entry.tier {
+                RecallTier::Committed => "committed",
+                RecallTier::Transient => "recalled",
+            };
+            let label = format!("{tier} · score {:.2} · node {}", entry.score, entry.node_id);
+            let summary = match &entry.presentation {
+                super::recall_gate::RecallPresentation::Raw(text) => {
+                    format!("{} chars, sent raw", text.len())
+                }
+                super::recall_gate::RecallPresentation::Summarized { summary, raw_len } => {
+                    format!("summarized from {raw_len} chars to {}", summary.len())
+                }
+            };
+            let body_lines: Vec<String> = entry
+                .presentation
+                .text()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            crate::cli::messages::MemoryRecallRow {
+                label,
+                summary,
+                body_lines,
             }
-            super::recall_gate::RecallPresentation::Summarized { summary, raw_len } => {
-                format!("summarized from {raw_len} chars to {}", summary.len())
-            }
-        };
-        let body: Vec<String> = entry
-            .presentation
-            .text()
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        unit.complete_row_with_body(row_idx, summary, body);
-    }
+        })
+        .collect();
+    output_manager.write_memory_recall(format!("{count} {noun} retrieved"), rows);
 }
 
 fn present_committed(committed: &[crate::brain::CommittedMemoryRecord]) -> Vec<PresentedRecall> {
@@ -7748,6 +7759,104 @@ mod tests {
             vec![2, 5, 9],
             "result must be sorted by node_id regardless of encounter order, so \
              rendering is deterministic across turns; ids={ids:?}"
+        );
+    }
+
+    /// Production-boundary regression for the reported bug: a memory-recall
+    /// row showed a generic tool-call "Input"/"Output" disclosure structure
+    /// with a scrollable child viewport, which makes no sense for a memory
+    /// (there is no input to a recall). Exercises the real
+    /// `display_recalled_memories` -> `OutputManager::write_memory_recall`
+    /// path (not a reimplementation) and asserts the registered message
+    /// renders through `ComponentView::MemoryRecalled`, never a
+    /// `WorkUnit`/`WorkRow` row, and that its rendered lines carry no
+    /// "Input"/"Output (" chrome.
+    #[test]
+    fn test_display_recalled_memories_renders_through_memory_component_not_work_unit() {
+        let colors = crate::theme::ColorScheme::default();
+        let output = OutputManager::new(colors);
+        output.disable_stdout();
+
+        let presented = vec![
+            PresentedRecall {
+                node_id: 4,
+                score: 0.64,
+                tier: RecallTier::Committed,
+                presentation: crate::cli::repl_event::recall_gate::present(
+                    "user: this repo I'm in (files on disk) are your harness. what do you think of it?\nassistant: I don't have direct access to your files or environment.",
+                ),
+            },
+            PresentedRecall {
+                node_id: 1,
+                score: 0.60,
+                tier: RecallTier::Transient,
+                presentation: crate::cli::repl_event::recall_gate::present(
+                    "user: Qwen, are you there?\nassistant: Qwen, I'm here.",
+                ),
+            },
+        ];
+
+        display_recalled_memories(&output, &presented);
+
+        let messages = output.get_messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one recall message per turn's presented set; got {} messages",
+            messages.len()
+        );
+        let component = messages[0].component_view().unwrap_or_else(|| {
+            panic!(
+                "a memory-recall row must render through the component system \
+                 (ComponentView::MemoryRecalled), not the legacy WorkUnit/accordion path \
+                 (component_view() returned None)"
+            )
+        });
+        let finch_ui_model::ComponentView::MemoryRecalled(view) = &component else {
+            panic!(
+                "display_recalled_memories must produce ComponentView::MemoryRecalled, not a \
+                 WorkUnit-based row; got {component:?}"
+            );
+        };
+        assert_eq!(view.header, "2 memories retrieved");
+        assert_eq!(
+            view.rows.len(),
+            2,
+            "one row per presented memory; rows={:?}",
+            view.rows
+        );
+        assert_eq!(view.rows[0].label, "committed · score 0.64 · node 4");
+        assert_eq!(
+            view.rows[1].label, "recalled · score 0.60 · node 1",
+            "the transient tier renders as \"recalled\", matching the reported UI"
+        );
+        assert!(
+            view.rows[0]
+                .body_lines
+                .iter()
+                .any(|l| l.contains("this repo I'm in")),
+            "the recalled text itself must be present, not summarized away by the \
+             component wiring; body_lines={:?}",
+            view.rows[0].body_lines
+        );
+
+        let lines = finch_ui_model::component_lines(
+            &component,
+            &finch_ui_model::ComponentStylePalette::default(),
+        );
+        let texts: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text == "Input" || text.contains("Output (")),
+            "INVARIANT: a memory row must never show the tool-call \"Input\"/\"Output (\" \
+             disclosure structure (the reported bug); rendered lines were {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("↑/↓ scroll")),
+            "INVARIANT: a memory row must never carry the bounded child-viewport scroll \
+             footer -- a couple of short recalled lines need no pagination chrome; \
+             rendered lines were {texts:?}"
         );
     }
 }

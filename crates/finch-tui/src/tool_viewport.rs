@@ -62,6 +62,30 @@ pub struct ChildViewport {
     pub scroll: usize,
     /// Total body lines observed the last time the row was projected.
     pub body_lines: usize,
+    /// The row budget (window rows, including the status row it may need)
+    /// observed the last time the row was projected. Required to decide
+    /// whether the body already fits without scrolling: `body_lines` alone
+    /// cannot answer that, since a 2-line body scrolls under a 1-row budget
+    /// but not under a 4-row one.
+    pub budget_rows: usize,
+}
+
+/// The largest legal scroll offset for a viewport whose body has
+/// `body_lines` lines under a `budget_rows` window.
+///
+/// When the whole body already fits in the budget, the window never needs to
+/// move: the max is `0`, so a scroll attempt is a no-op instead of clipping
+/// an already-fully-visible body down to a partial, footer-bearing window
+/// (the reported bug -- a 2-line body under a 4-row budget let one scroll
+/// tick hide a line with no way back). When the body does not fit, scrolling
+/// must still be able to reach the last line, so the max stays
+/// `body_lines - 1`, matching the existing long-content behavior.
+fn max_scroll(body_lines: usize, budget_rows: usize) -> usize {
+    if body_lines <= budget_rows {
+        0
+    } else {
+        body_lines.saturating_sub(1)
+    }
 }
 
 /// The cells of one bounded child viewport, in the physical coordinates of the
@@ -113,12 +137,14 @@ impl ToolViewportState {
     }
 
     /// Scroll one child viewport by `delta` lines. Clamped to the body length
-    /// observed at the last projection; returns whether anything changed.
+    /// observed at the last projection, and to `0` when that body already
+    /// fits entirely within the last observed budget (nothing to scroll to);
+    /// returns whether anything changed.
     pub fn scroll_child(&mut self, row_id: &RowId, delta: isize) -> bool {
         let Some(viewport) = self.viewports.get_mut(row_id) else {
             return false;
         };
-        let max = viewport.body_lines.saturating_sub(1);
+        let max = max_scroll(viewport.body_lines, viewport.budget_rows);
         let next = if delta < 0 {
             viewport.scroll.saturating_sub(delta.unsigned_abs())
         } else {
@@ -135,7 +161,7 @@ impl ToolViewportState {
     /// expanded surface).
     pub fn set_child_scroll(&mut self, row_id: &RowId, scroll: usize) {
         if let Some(viewport) = self.viewports.get_mut(row_id) {
-            viewport.scroll = scroll.min(viewport.body_lines.saturating_sub(1));
+            viewport.scroll = scroll.min(max_scroll(viewport.body_lines, viewport.budget_rows));
         }
     }
 
@@ -195,7 +221,8 @@ impl ToolViewportState {
         let budget_rows = budget_rows.max(1);
         let viewport = self.viewports.entry(row_id.clone()).or_default();
         viewport.body_lines = body.len();
-        viewport.scroll = viewport.scroll.min(body.len().saturating_sub(1));
+        viewport.budget_rows = budget_rows;
+        viewport.scroll = viewport.scroll.min(max_scroll(body.len(), budget_rows));
         let scroll = viewport.scroll;
         let raw_take = budget_rows.min(body.len() - scroll);
         let truncated_above = scroll > 0;
@@ -538,6 +565,75 @@ mod tests {
             0,
             "scrolling up clamps at the first line"
         );
+    }
+
+    #[test]
+    fn test_scroll_child_is_a_noop_when_the_body_already_fits_the_budget() {
+        // REGRESSION: a 2-line tool result under the 4-row default budget
+        // already fits (window() shows both lines with no truncation and no
+        // status row); a single scroll tick must not still fire and clip the
+        // view down to a partial, footer-bearing window with no way back
+        // (the reported bug: "You can scroll those lines when there's 2
+        // visible, and 2 lines. It'll allow scrolling once").
+        let (row_id, projected) = projected_tool_group(2);
+        let mut state = ToolViewportState::default();
+        let bounded = state.project(projected.clone(), 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let body = body_lines_of(&bounded)
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body,
+            vec!["      line 0".to_string(), "      line 1".to_string()],
+            "INVARIANT: a body that fits the budget renders with no truncation and no \
+             status row before any scroll; body was {body:?}"
+        );
+
+        let changed = state.scroll_child(&row_id, 1);
+        assert!(
+            !changed,
+            "INVARIANT: scrolling a viewport whose total line count ({}) is within its \
+             visible budget ({DEFAULT_TOOL_OUTPUT_ROWS}) must report no available scroll \
+             positions and be a no-op, not clip the view; scroll_child returned changed=true",
+            2
+        );
+        assert_eq!(
+            state.child_scroll(&row_id),
+            0,
+            "INVARIANT: the scroll offset must stay 0 when the body already fits the budget"
+        );
+
+        // Re-projecting after the no-op scroll attempt must still show both
+        // lines, unclipped, with no scroll-status footer.
+        let rescrolled = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let body_after = body_lines_of(&rescrolled)
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body_after,
+            vec!["      line 0".to_string(), "      line 1".to_string()],
+            "INVARIANT: after a rejected scroll attempt the window still shows the whole \
+             body with no status footer; body was {body_after:?}"
+        );
+    }
+
+    /// A viewport whose body genuinely does not fit its budget keeps its
+    /// existing scrollable behavior unchanged: this is the adjacent
+    /// long-content case `test_child_scroll_moves_the_window_within_the_bound`
+    /// and `test_scroll_up_never_goes_above_the_first_line` already cover
+    /// above, re-asserted here beside the fits-the-budget regression so the
+    /// two cases are read together.
+    #[test]
+    fn test_scroll_child_still_scrolls_when_the_body_does_not_fit_the_budget() {
+        let (row_id, projected) = projected_tool_group(40);
+        let mut state = ToolViewportState::default();
+        let _ = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        assert!(
+            state.scroll_child(&row_id, 1),
+            "a 40-line body under a 4-row budget must still be scrollable"
+        );
+        assert_eq!(state.child_scroll(&row_id), 1);
     }
 
     #[test]

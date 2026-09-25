@@ -5,10 +5,10 @@
 
 pub use finch_messages::{
     random_spinner_verb, AgentActivityView, AgentToolView, BrainParticipantMessage,
-    ComponentAction, LiveToolMessage, Message, MessageId, MessageRef, MessageStatus,
-    OperationMessage, OperationRow, OperationRowStatus, OutputVm, ProgramSourceVm, ProgressMessage,
-    SayTurnStatus, SayTurnView, StaticMessage, StaticMessageType, StreamingResponseMessage,
-    ToggleProgram, ToolExecutionMessage, UserQueryMessage, WorkRow, WorkRowPresentation,
-    WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitPresentation, WorkUnitView,
-    WorkUnitViewModel,
+    ComponentAction, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage, Message, MessageId,
+    MessageRef, MessageStatus, OperationMessage, OperationRow, OperationRowStatus, OutputVm,
+    ProgramSourceVm, ProgressMessage, SayTurnStatus, SayTurnView, StaticMessage, StaticMessageType,
+    StreamingResponseMessage, ToggleProgram, ToolExecutionMessage, UserQueryMessage, WorkRow,
+    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitPresentation,
+    WorkUnitView, WorkUnitViewModel,
 };
