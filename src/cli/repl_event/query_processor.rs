@@ -7956,6 +7956,7 @@ mod tests {
             Arc::clone(&memory),
             1,
             memory_commitment,
+            None,
         )
         .await;
         turn.task.await.expect("query task panicked");
@@ -8062,6 +8063,7 @@ mod tests {
             Arc::clone(&memory),
             1,
             memory_commitment,
+            None,
         )
         .await;
         turn.task.await.expect("query task panicked");
