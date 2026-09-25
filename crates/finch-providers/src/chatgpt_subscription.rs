@@ -1892,6 +1892,7 @@ fn parse_completed(
             "frequency_penalty",
             "presence_penalty",
             "tool_usage",
+            "access_programs",
         ],
         "terminal response",
     )?;
@@ -2332,6 +2333,37 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
             .context("ChatGPT terminal response conversation was invalid")?;
         exact_keys(conversation, &["id"], "terminal response conversation")?;
         required_identifier(conversation, "id", 256)?;
+    }
+    // `access_programs` reports which OpenAI "Cyber access program" tier
+    // resolved for this response (`{"cyber": "standard" | "daybreak_blue" |
+    // "daybreak_red"}` or null). It is a response-only field: Finch never sets
+    // `access_programs` on the request, so OpenAI reports whatever their
+    // account/project access resolves to (ordinarily "standard"). It is purely
+    // observational — it does not change output structure, tool calls, or
+    // anything Finch parses or acts on — so it is validated the same way as
+    // other small typed sub-objects here (`conversation`, `prompt_cache_options`)
+    // rather than merely allowed through unvalidated. Confirmed from the
+    // `openai-node` SDK source (PR openai/openai-node#2804, "feat(api): add
+    // Cyber access programs to Responses"), which defines the response type as
+    // `access_programs: { cyber: 'standard' | 'daybreak_blue' | 'daybreak_red' } | null`.
+    if let Some(value) = response
+        .get("access_programs")
+        .filter(|value| !value.is_null())
+    {
+        let access_programs = value
+            .as_object()
+            .context("ChatGPT terminal response access programs were invalid")?;
+        exact_keys(
+            access_programs,
+            &["cyber"],
+            "terminal response access programs",
+        )?;
+        if !matches!(
+            access_programs.get("cyber").and_then(Value::as_str),
+            Some("standard" | "daybreak_blue" | "daybreak_red")
+        ) {
+            bail!("ChatGPT terminal response access programs were invalid");
+        }
     }
     if let Some(value) = response
         .get("prompt_cache_options")

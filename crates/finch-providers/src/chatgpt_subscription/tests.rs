@@ -394,6 +394,7 @@ fn completed_sse_with_audited_passive_fields(model: &str) -> String {
                 "conversation":{"id":"conv-fixture"},
                 "moderation":{},
                 "prompt":{},
+                "access_programs":{"cyber":"standard"},
                 "top_logprobs":0,
                 "frequency_penalty":0.0,
                 "presence_penalty":0.0,
@@ -2526,6 +2527,59 @@ fn test_terminal_prompt_cache_options_and_retention_are_strict() {
                 || error.to_string().contains("unknown field")
                 || error.to_string().contains("exceeded the size limit"),
             "{case} prompt cache metadata returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn test_terminal_access_programs_field_is_recognized_and_strict() {
+    // Regression for the live blocker where OpenAI began including
+    // `access_programs` on every terminal response and Finch's allowlist
+    // rejected it outright ("contained an unknown field: \"access_programs\"").
+    // `access_programs` reports which Cyber access program tier
+    // (`standard` | `daybreak_blue` | `daybreak_red`) resolved for the
+    // response; Finch never requests a tier, so this is ordinarily
+    // `{"cyber":"standard"}`, but the check must still be strict rather than
+    // merely present-and-ignored.
+    for (case, metadata) in [
+        (
+            "standard-tier",
+            json!({"access_programs":{"cyber":"standard"}}),
+        ),
+        (
+            "daybreak-blue-tier",
+            json!({"access_programs":{"cyber":"daybreak_blue"}}),
+        ),
+        (
+            "daybreak-red-tier",
+            json!({"access_programs":{"cyber":"daybreak_red"}}),
+        ),
+        ("omitted", json!({})),
+        ("explicit-null", json!({"access_programs":null})),
+    ] {
+        validate_documented_response_metadata(metadata.as_object().unwrap()).unwrap_or_else(
+            |error| panic!("valid {case} access_programs metadata failed: {error:#}"),
+        );
+    }
+
+    for (case, metadata) in [
+        (
+            "unknown-tier-value",
+            json!({"access_programs":{"cyber":"daybreak_purple"}}),
+        ),
+        (
+            "unknown-nested-key",
+            json!({"access_programs":{"cyber":"standard","future":true}}),
+        ),
+        ("missing-cyber-key", json!({"access_programs":{}})),
+        ("non-object-value", json!({"access_programs":"standard"})),
+    ] {
+        let error = validate_documented_response_metadata(metadata.as_object().unwrap())
+            .err()
+            .unwrap_or_else(|| panic!("{case} access_programs metadata unexpectedly succeeded"));
+        assert!(
+            error.to_string().contains("invalid") || error.to_string().contains("unknown field"),
+            "{case} access_programs metadata returned an unhelpful diagnostic: {error:#}"
         );
     }
 }
