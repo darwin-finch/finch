@@ -1831,6 +1831,7 @@ pub(crate) async fn process_query_with_tools(
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
                                 error: format!("{}", e),
+                                generator_name: Some(generator.name().to_string()),
                             });
                             return;
                         }
@@ -1855,6 +1856,7 @@ pub(crate) async fn process_query_with_tools(
                         query_id,
                         error: "Provider streaming text did not match its completed content"
                             .to_string(),
+                        generator_name: Some(generator.name().to_string()),
                     });
                     return;
                 }
@@ -1931,6 +1933,7 @@ pub(crate) async fn process_query_with_tools(
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
                                 error: format!("Could not stage tool round: {error}"),
+                                generator_name: Some(generator.name().to_string()),
                             });
                             return;
                         }
@@ -2033,6 +2036,7 @@ pub(crate) async fn process_query_with_tools(
                         let _ = event_tx.send(ReplEvent::QueryFailed {
                             query_id,
                             error: error.to_string(),
+                            generator_name: Some(generator.name().to_string()),
                         });
                         return;
                     }
@@ -2198,6 +2202,7 @@ pub(crate) async fn process_query_with_tools(
                         let _ = event_tx.send(ReplEvent::QueryFailed {
                             query_id,
                             error: format!("Could not stage tool round: {error}"),
+                            generator_name: Some(generator.name().to_string()),
                         });
                         return;
                     }
@@ -2294,6 +2299,7 @@ pub(crate) async fn process_query_with_tools(
                         let _ = event_tx.send(ReplEvent::QueryFailed {
                             query_id,
                             error: error.to_string(),
+                            generator_name: Some(generator.name().to_string()),
                         });
                         return;
                     }
@@ -2343,6 +2349,7 @@ pub(crate) async fn process_query_with_tools(
             let _ = event_tx.send(ReplEvent::QueryFailed {
                 query_id,
                 error: format!("{}", e),
+                generator_name: Some(generator.name().to_string()),
             });
         }
     }

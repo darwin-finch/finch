@@ -229,6 +229,7 @@ async fn turn_failure_resolves_stuck_tool_rows_scenario() {
         .handle_event(super::ReplEvent::QueryFailed {
             query_id,
             error: error.to_string(),
+            generator_name: None,
         })
         .await
         .expect("turn-failure dispatch must succeed");
@@ -250,6 +251,86 @@ async fn turn_failure_resolves_stuck_tool_rows_scenario() {
         view.head.status,
         crate::cli::messages::MessageStatus::Failed,
         "the turn unit head must be failed; rows:\n  {report}"
+    );
+}
+
+/// A `QueryFailed` event names the generator/provider it actually ran on
+/// (when known), so the failure message is self-explanatory even when an
+/// unrelated model-switch notification lands nearby in the transcript.
+/// `None` falls back to the pre-attribution message unchanged.
+#[tokio::test]
+async fn test_query_failed_message_attributes_the_generator_when_known() {
+    tokio::task::LocalSet::new()
+        .run_until(query_failed_message_attribution_scenario())
+        .await;
+}
+
+async fn query_failed_message_attribution_scenario() {
+    use std::sync::Arc;
+
+    async fn dispatch_query_failed(
+        generator_name: Option<String>,
+    ) -> Vec<crate::cli::messages::MessageRef> {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let tempdir = tempfile::tempdir().expect("create isolated tool state");
+        let executor = crate::tools::ToolExecutor::new(
+            crate::tools::ToolRegistry::new(),
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+        let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+            generator,
+            Vec::new(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&runtime),
+        );
+        let query_id = event_loop.query_states.create_query(Vec::new()).await;
+
+        event_loop
+            .handle_event(super::ReplEvent::QueryFailed {
+                query_id,
+                error: "429 rate limit".to_string(),
+                generator_name,
+            })
+            .await
+            .expect("QueryFailed dispatch must succeed");
+
+        event_loop.output_manager.get_messages()
+    }
+
+    let attributed = dispatch_query_failed(Some("chatgpt".to_string())).await;
+    let attributed_text = attributed
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    assert!(
+        attributed_text
+            .iter()
+            .any(|text| text.contains("Query failed (chatgpt): 429 rate limit")),
+        "a QueryFailed event with a known generator must name it in the failure message; \
+         rendered={attributed_text:?}"
+    );
+
+    let unattributed = dispatch_query_failed(None).await;
+    let unattributed_text = unattributed
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    assert!(
+        unattributed_text
+            .iter()
+            .any(|text| text.contains("Query failed: 429 rate limit")),
+        "a QueryFailed event with no known generator must fall back to the unattributed \
+         message unchanged; rendered={unattributed_text:?}"
+    );
+    assert!(
+        unattributed_text
+            .iter()
+            .all(|text| !text.contains("Query failed (")),
+        "the unattributed fallback must not contain a stray provider parenthetical; \
+         rendered={unattributed_text:?}"
     );
 }
 

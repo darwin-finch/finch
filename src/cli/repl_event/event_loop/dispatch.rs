@@ -338,7 +338,11 @@ impl EventLoop {
                 }
             }
 
-            ReplEvent::QueryFailed { query_id, error } => {
+            ReplEvent::QueryFailed {
+                query_id,
+                error,
+                generator_name,
+            } => {
                 // A terminal provider failure closes publication immediately;
                 // detached #163 effects may still finish their durable audit.
                 self.conversation.write().await.abort_staged(query_id);
@@ -386,9 +390,15 @@ impl EventLoop {
                     self.query_states.set_tool_work_unit(query_id, None).await;
                 }
 
-                // Display error
-                self.output_manager
-                    .write_error(format!("Query failed: {}", error));
+                // Display error, attributed to the generator the query
+                // actually ran on when known, so the message is
+                // self-explanatory regardless of what other transcript
+                // events (e.g. an unrelated model switch) land nearby.
+                let error_message = match &generator_name {
+                    Some(name) => format!("Query failed ({name}): {error}"),
+                    None => format!("Query failed: {error}"),
+                };
+                self.output_manager.write_error(error_message);
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                     self.agent_scheduler.set_active_brain_parent(None).await;
