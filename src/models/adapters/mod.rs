@@ -8,12 +8,14 @@
 // Provider transport: Make HTTP requests to external APIs (Claude, OpenAI, etc.)
 
 pub mod deepseek;
+pub mod gemma;
 pub mod llama;
 pub mod mistral;
 pub mod phi;
 pub mod qwen;
 
 pub use deepseek::DeepSeekAdapter;
+pub use gemma::GemmaAdapter;
 pub use llama::LlamaAdapter;
 pub use mistral::MistralAdapter;
 pub use phi::PhiAdapter;
@@ -97,8 +99,7 @@ impl AdapterRegistry {
         } else if name_lower.contains("phi") {
             Box::new(PhiAdapter)
         } else if name_lower.contains("gemma") {
-            // Gemma uses similar format to Llama
-            Box::new(LlamaAdapter)
+            Box::new(GemmaAdapter)
         } else {
             // Default to ChatML format (Qwen-style) - widely supported
             tracing::warn!(
@@ -141,5 +142,10 @@ mod tests {
         // Should match DeepSeek, not Qwen
         let deepseek_qwen = AdapterRegistry::get_adapter("DeepSeek-R1-Distill-Qwen-1.5B-GGUF");
         assert_eq!(deepseek_qwen.family_name(), "DeepSeek");
+
+        // Gemma must get its own real chat-template adapter, not Llama's
+        // (Gemma has no `<|begin_of_text|>`/`<|eot_id|>` tokens in its vocab).
+        let gemma = AdapterRegistry::get_adapter("Gemma 2 9B");
+        assert_eq!(gemma.family_name(), "Gemma");
     }
 }

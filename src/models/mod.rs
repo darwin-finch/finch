@@ -22,8 +22,8 @@ mod tool_prompt; // Phase 6: Format tool definitions for model prompts
 mod unified_loader; // llama.cpp GGUF chat loader
 
 pub use adapters::{
-    AdapterRegistry, DeepSeekAdapter, GenerationConfig as AdapterGenerationConfig, LlamaAdapter,
-    LocalModelAdapter, MistralAdapter, PhiAdapter, QwenAdapter,
+    AdapterRegistry, DeepSeekAdapter, GemmaAdapter, GenerationConfig as AdapterGenerationConfig,
+    LlamaAdapter, LocalModelAdapter, MistralAdapter, PhiAdapter, QwenAdapter,
 };
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
 #[allow(deprecated)]
