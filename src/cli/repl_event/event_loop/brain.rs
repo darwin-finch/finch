@@ -1,15 +1,70 @@
 use super::*;
-// Used only by the test runner below, which is `cfg(test)`.
+// Used only by the test runners below, which are `cfg(test)`.
 #[cfg(test)]
 use crate::tools::ToolExecutor;
 
+/// A generator that never resolves, for fixtures that construct an
+/// `EventLoop` only to exercise code that must not actually generate (e.g.
+/// `/provider` switching without ever asking the session generator to
+/// produce a reply).
+#[cfg(test)]
+struct NeverCompletesGenerator;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Generator for NeverCompletesGenerator {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        std::future::pending().await
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "never-completes"
+    }
+}
+
 impl EventLoop {
+    /// Shared headless-`EventLoop` builder behind the test-only
+    /// constructors below. They differ only in which generator, tool
+    /// executor, provider list, and daemon client the scenario needs; every
+    /// other wiring (renderer, journals, scheduler, empty daemon/context
+    /// parts) is identical, so a future `EventLoop::new` parts-struct change
+    /// only needs to be mirrored here once.
     #[cfg(test)]
-    pub(crate) fn new_named_brain_test_runner(
+    #[allow(clippy::too_many_arguments)]
+    fn new_test_runner(
+        label: &str,
         generator: Arc<dyn Generator>,
         tool_definitions: Vec<ToolDefinition>,
         tool_executor: Arc<Mutex<ToolExecutor>>,
         program_runtime: Arc<crate::runtime::ProgramRuntime>,
+        available_providers: Vec<crate::config::ProviderEntry>,
+        active_index: usize,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
     ) -> Self {
         let colors = crate::theme::ColorScheme::default();
         let output_manager = Arc::new(OutputManager::new(colors.clone()));
@@ -41,15 +96,15 @@ impl EventLoop {
                 conversation: Arc::new(RwLock::new(ConversationHistory::new())),
                 active_persona: Arc::new(RwLock::new(crate::config::Persona::default())),
                 mode: Arc::new(RwLock::new(ReplMode::Normal)),
-                label: "audit-test".into(),
+                label: label.into(),
             },
             GenerationParts {
                 generator,
                 router: Arc::new(Router::new(crate::models::ThresholdRouter::new())),
                 state: Arc::new(RwLock::new(GeneratorState::NotAvailable)),
                 resolver: provider_resolver,
-                available: Vec::new(),
-                active_index: 0,
+                available: available_providers,
+                active_index,
                 default_provider: None,
                 cli_model: None,
                 cli_provider: None,
@@ -73,7 +128,7 @@ impl EventLoop {
             DaemonParts {
                 ipc_client: None,
                 ipc_error: None,
-                client: None,
+                client: daemon_client,
                 base_url: None,
             },
             ContextLimits {
@@ -90,6 +145,57 @@ impl EventLoop {
                 committed_memories,
                 memory_commitment_writer,
             },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_named_brain_test_runner(
+        generator: Arc<dyn Generator>,
+        tool_definitions: Vec<ToolDefinition>,
+        tool_executor: Arc<Mutex<ToolExecutor>>,
+        program_runtime: Arc<crate::runtime::ProgramRuntime>,
+    ) -> Self {
+        Self::new_test_runner(
+            "audit-test",
+            generator,
+            tool_definitions,
+            tool_executor,
+            program_runtime,
+            Vec::new(),
+            0,
+            None,
+        )
+    }
+
+    /// A minimal, headless event loop for exercising `/provider` switching
+    /// (`handle_provider_switch`) against a real `DaemonClient` pointed at a
+    /// test HTTP server, so `local_model_status` runs the same request path
+    /// production traffic does.
+    #[cfg(test)]
+    pub(crate) fn new_provider_switch_test_runner(
+        available_providers: Vec<crate::config::ProviderEntry>,
+        active_index: usize,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    ) -> Self {
+        let generator: Arc<dyn Generator> = Arc::new(NeverCompletesGenerator);
+        let program_runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let tempdir = tempfile::tempdir().expect("provider switch fixture: isolated tool state");
+        let tool_executor = crate::tools::ToolExecutor::new(
+            crate::tools::ToolRegistry::new(),
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("provider switch fixture: construct inert tool executor");
+        std::mem::forget(tempdir);
+        Self::new_test_runner(
+            "provider-switch-test",
+            generator,
+            Vec::new(),
+            Arc::new(Mutex::new(tool_executor)),
+            program_runtime,
+            available_providers,
+            active_index,
+            daemon_client,
         )
     }
 

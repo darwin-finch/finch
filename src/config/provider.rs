@@ -290,21 +290,75 @@ impl ProviderEntry {
         match self {
             Self::Credentialed { provider, .. } => provider.as_str().to_string(),
             Self::LegacyChatgptSubscription { .. } => "chatgpt-subscription-legacy".to_string(),
+            Self::Local { .. } => {
+                let descriptor = self
+                    .local_model_descriptor()
+                    .expect("Local variant always yields a descriptor");
+                format!(
+                    "local-{}",
+                    descriptor.to_ascii_lowercase().replace(' ', "-")
+                )
+            }
+            Self::RemoteDaemon { .. } => "remote-daemon".to_string(),
+            _ => self.provider_type().to_string(),
+        }
+    }
+
+    /// Family+size descriptor a daemon-reported local model status names when
+    /// it refers to THIS entry, e.g. `"Gemma 2 9b"` for a `Gemma2`/`Medium`
+    /// local profile. `None` for non-local variants.
+    ///
+    /// The daemon formats `LocalModelStatus::Ready`/`Loading` as this
+    /// descriptor followed by `" (<engine>; requested <target>)"`
+    /// (`load_generator_async` in `src/models/bootstrap.rs`), so compare a
+    /// daemon-reported string with [`Self::local_model_status_matches`]
+    /// rather than exact equality against this descriptor.
+    pub fn local_model_descriptor(&self) -> Option<String> {
+        match self {
             Self::Local {
                 model_family,
                 model_size,
                 ..
-            } => format!(
-                "local-{}-{}",
-                model_family.name().to_ascii_lowercase().replace(' ', "-"),
-                model_size
-                    .to_size_string(*model_family)
-                    .to_ascii_lowercase()
-                    .replace(' ', "-")
-            ),
-            Self::RemoteDaemon { .. } => "remote-daemon".to_string(),
-            _ => self.provider_type().to_string(),
+            } => Some(format!(
+                "{} {}",
+                model_family.name(),
+                model_size.to_size_string(*model_family)
+            )),
+            _ => None,
         }
+    }
+
+    /// True when a daemon-reported local model descriptor (from
+    /// `LocalModelStatus::Ready`/`Loading`) names THIS entry's model, rather
+    /// than a different local profile the daemon already had loaded from an
+    /// earlier activation.
+    ///
+    /// The daemon bootstraps exactly one local model for its whole process
+    /// lifetime — chosen once from the launch-time config and never
+    /// reloaded — so "some local model is ready" is not the same claim as
+    /// "the requested local entry is ready". Non-local entries never match.
+    pub fn local_model_status_matches(&self, reported: &str) -> bool {
+        match self.local_model_descriptor() {
+            Some(expected) => {
+                reported == expected || reported.starts_with(&format!("{expected} ("))
+            }
+            None => false,
+        }
+    }
+
+    /// Shared wording for "the daemon cannot switch to this entry because it
+    /// already has a different local model loaded and ready as `reported`".
+    ///
+    /// Every caller that discovers a [`Self::local_model_status_matches`]
+    /// mismatch (the synchronous and deferred activation paths in both
+    /// `handle_provider_switch` and `apply_effective_selection`) explains it
+    /// with this same core wording, so a future correction to it cannot
+    /// drift between call sites the way the identity check itself used to.
+    pub fn local_model_switch_blocked_message(&self, reported: &str) -> String {
+        format!(
+            "This daemon is already running {reported}; switching to {} requires restarting the daemon with that model configured",
+            self.profile_name()
+        )
     }
 
     /// Human-readable name for UI display.
@@ -814,5 +868,93 @@ credential_ref = "work"
         assert_eq!(decoded.providers[0].provider_type(), "grok");
         assert_eq!(decoded.providers[1].provider_type(), "claude");
         assert_eq!(decoded.providers[2].provider_type(), "local");
+    }
+
+    #[test]
+    fn local_model_descriptor_matches_daemon_bootstrap_formatting() {
+        let gemma = ProviderEntry::Local {
+            inference_provider: InferenceProvider::LlamaCpp,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Gemma2,
+            model_size: ModelSize::Medium,
+            model_path: None,
+            managed_artifact: None,
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(
+            gemma.local_model_descriptor().as_deref(),
+            Some("Gemma 2 9b")
+        );
+        assert_eq!(gemma.profile_name(), "local-gemma-2-9b");
+
+        let qwen = ProviderEntry::Local {
+            inference_provider: InferenceProvider::LlamaCpp,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_path: None,
+            managed_artifact: None,
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(
+            qwen.local_model_descriptor().as_deref(),
+            Some("Qwen 2.5 3B")
+        );
+        assert_eq!(qwen.profile_name(), "local-qwen-2.5-3b");
+
+        assert_eq!(
+            ProviderEntry::Claude {
+                api_key: "sk-ant-test".to_string(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: None,
+            }
+            .local_model_descriptor(),
+            None,
+            "non-local entries must never claim a local descriptor"
+        );
+    }
+
+    #[test]
+    fn local_model_status_matches_rejects_a_different_already_ready_local_model() {
+        let qwen = ProviderEntry::Local {
+            inference_provider: InferenceProvider::LlamaCpp,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_path: None,
+            managed_artifact: None,
+            enabled: true,
+            name: None,
+        };
+
+        // The daemon reports its own family+size descriptor followed by
+        // " (<engine>; requested <target>)" (see `load_generator_async` in
+        // src/models/bootstrap.rs). A caller switching to `qwen` must accept
+        // that exact shape...
+        assert!(qwen.local_model_status_matches("Qwen 2.5 3B (LlamaCpp; requested Auto)"));
+        // ...and the bare descriptor with no suffix...
+        assert!(qwen.local_model_status_matches("Qwen 2.5 3B"));
+        // ...but must reject a different model's descriptor, even with a
+        // shared word prefix, which is the bug this test guards: treating
+        // "some local model is ready" as "the requested local entry is
+        // ready" reported the wrong model's name as if the switch to Qwen
+        // had succeeded.
+        assert!(!qwen.local_model_status_matches("Gemma 2 9b (LlamaCpp; requested Auto)"));
+        assert!(!qwen.local_model_status_matches("Qwen 2.5 3B Instruct"));
+
+        assert!(
+            !ProviderEntry::Gemini {
+                api_key: "gk-test".to_string(),
+                model: None,
+                name: None,
+            }
+            .local_model_status_matches("Qwen 2.5 3B"),
+            "non-local entries must never match a reported local model status"
+        );
     }
 }
