@@ -1,0 +1,13 @@
+[package]
+name = "finch-routing-tree"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Standalone binary routing tree over embeddings — candidate-selected PCA axes via successive Hotelling deflation, dual-insert, stability-gated splitting, incremental real centroids, adaptive/beam/backtrack search, verified removal, and SQLite save/load — no Finch-crate dependencies"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+anyhow = "1.0"
+rusqlite = { version = "0.32", features = ["bundled"] }

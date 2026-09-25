@@ -42,6 +42,8 @@ CURRENT_DOCS = (
     Path("crates/finch-generation/AGENTS.md"),
     Path("crates/finch-generation/README.md"),
     Path("crates/finch-memory/AGENTS.md"),
+    Path("crates/finch-routing-tree/AGENTS.md"),
+    Path("crates/finch-routing-tree/README.md"),
     Path("crates/finch-messages/AGENTS.md"),
     Path("crates/finch-messages/README.md"),
     Path("crates/finch-ipc/AGENTS.md"),

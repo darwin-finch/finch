@@ -1828,6 +1828,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
+ "finch-routing-tree",
  "rusqlite",
  "serde",
  "tempfile",
@@ -1924,6 +1925,14 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "finch-routing-tree"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "rusqlite",
 ]
 
 [[package]]
