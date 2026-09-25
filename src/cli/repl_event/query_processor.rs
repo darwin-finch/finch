@@ -646,6 +646,9 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
+        let _ = event_tx.send(ReplEvent::VmOutputComplete {
+            output_unit: Arc::clone(&output_unit),
+        });
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -657,6 +660,9 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
+        let _ = event_tx.send(ReplEvent::VmOutputComplete {
+            output_unit: Arc::clone(&output_unit),
+        });
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -5198,6 +5204,121 @@ mod tests {
         assert!(output.get_messages().iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
             .contains("VM program repair")));
+    }
+
+    struct FailingRepairGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for FailingRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("simulated repair transport failure"))
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "failing-repair"
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_retry_transport_failure_still_notifies_the_event_loop_of_completion() {
+        // Regression for a real user report: a local-model (Gemma) turn could
+        // go completely silent -- no output, no error, no completion
+        // indicator, the UI just idled. Root cause: when the ONE corrective
+        // repair retry itself dead-ends (here, the repair `generate()` call
+        // errors; the sibling dead-end is a repair that returns tool_uses or
+        // empty text), `execute_wire_with_single_repair` completed the
+        // WorkUnit in memory via `output_unit.set_complete()` but, unlike
+        // every other return path in this function, never sent
+        // `ReplEvent::VmOutputComplete`. The event_loop dispatch handler
+        // (src/cli/repl_event/event_loop/dispatch.rs) relies on that event to
+        // resolve a pending named-Brain run's status and force a TUI redraw
+        // -- skipping it left the turn silently stuck even though the
+        // in-memory unit was actually done.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(FailingRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source.clone(),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "must have attempted exactly the one corrective repair retry"
+        );
+        assert_eq!(
+            execution.output_unit.status(),
+            MessageStatus::Complete,
+            "the in-memory WorkUnit must still reach Completed even when the \
+             repair retry itself errors; status={:?}",
+            execution.output_unit.status()
+        );
+
+        let mut vm_output_complete_events = 0;
+        let mut other_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match &event {
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    assert!(
+                        Arc::ptr_eq(output_unit, &execution.output_unit),
+                        "VmOutputComplete must carry this turn's own output_unit"
+                    );
+                    vm_output_complete_events += 1;
+                }
+                other => other_events.push(format!("{other:?}")),
+            }
+        }
+        assert_eq!(
+            vm_output_complete_events, 1,
+            "a repair retry that dead-ends on a transport error must still \
+             send exactly one ReplEvent::VmOutputComplete for the turn's \
+             output_unit -- otherwise dispatch::handle_event never resolves \
+             a pending named-Brain run or redraws the TUI, and the turn goes \
+             silent from the UI's perspective; other events seen: \
+             {other_events:?}"
+        );
     }
 
     #[test]
