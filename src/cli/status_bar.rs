@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// Types of status lines
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +92,12 @@ pub struct StatusLine {
 pub struct StatusBar {
     /// Active status lines (keyed by type)
     lines: Arc<RwLock<HashMap<StatusLineType, String>>>,
+    /// Byte/time samples for the in-progress model download, used to derive
+    /// a smoothed transfer rate and ETA. Keyed by model name alongside the
+    /// tracker so a different download (e.g. the background embedding-model
+    /// fetch replacing the chat-model fetch on the same status line) starts
+    /// a fresh rate estimate instead of blending unrelated transfers.
+    download_rate: RwLock<Option<(String, DownloadRateTracker)>>,
 }
 
 impl StatusBar {
@@ -98,6 +105,7 @@ impl StatusBar {
     pub fn new() -> Self {
         Self {
             lines: Arc::new(RwLock::new(HashMap::new())),
+            download_rate: RwLock::new(None),
         }
     }
 
@@ -366,7 +374,23 @@ impl StatusBar {
         downloaded: u64,
         total: u64,
     ) {
+        self.update_download_progress_at(model_name, percentage, downloaded, total, Instant::now());
+    }
+
+    /// Same as [`Self::update_download_progress`] but with the sample
+    /// timestamp taken explicitly rather than from the clock. Split out so
+    /// tests can drive the rate/ETA calculation with synthetic timestamps
+    /// instead of sleeping for real elapsed time.
+    fn update_download_progress_at(
+        &self,
+        model_name: impl Into<String>,
+        percentage: f64,
+        downloaded: u64,
+        total: u64,
+        at: Instant,
+    ) {
         let model_name = model_name.into();
+        let rate = self.observe_download_rate(&model_name, downloaded, at);
         let percentage = percentage.clamp(0.0, 1.0);
         let bar_width = 20;
         let filled = (percentage * bar_width as f64) as usize;
@@ -374,21 +398,47 @@ impl StatusBar {
 
         let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
 
+        let eta_suffix = rate
+            .and_then(|bytes_per_sec| {
+                format_eta_remaining(total.saturating_sub(downloaded), bytes_per_sec)
+            })
+            .map(|eta| format!(" · {eta}"))
+            .unwrap_or_default();
+
         let content = format!(
-            "Downloading {}: {} {:.1}% ({}/{})",
+            "Downloading {}: {} {:.1}% ({}/{}){}",
             model_name,
             bar,
             percentage * 100.0,
             format_download_bytes(downloaded),
-            format_download_bytes(total)
+            format_download_bytes(total),
+            eta_suffix
         );
 
         self.update_line(StatusLineType::DownloadProgress, content);
     }
 
+    /// Record a byte-count sample for the in-progress download and return
+    /// the current smoothed transfer rate, if one has been established yet.
+    /// A different `model_name` than the last observed sample resets the
+    /// tracker, since a new download's byte count and clock have no
+    /// relationship to the previous one's.
+    fn observe_download_rate(&self, model_name: &str, downloaded: u64, at: Instant) -> Option<f64> {
+        let mut state = self.download_rate.write().unwrap();
+        let tracker = match state.as_mut() {
+            Some((name, tracker)) if name == model_name => tracker,
+            _ => {
+                *state = Some((model_name.to_string(), DownloadRateTracker::new()));
+                &mut state.as_mut().unwrap().1
+            }
+        };
+        tracker.observe(at, downloaded)
+    }
+
     /// Remove the model download line after any terminal outcome.
     pub fn clear_download_progress(&self) {
         self.remove_line(&StatusLineType::DownloadProgress);
+        *self.download_rate.write().unwrap() = None;
     }
 
     /// Update operation status line
@@ -490,6 +540,78 @@ impl StatusBar {
     }
 }
 
+/// Exponential-moving-average weight applied to each newly observed
+/// instantaneous rate. Network throughput is noisy tick-to-tick; a low
+/// weight favors the established trend so the displayed ETA does not
+/// flicker between successive polls (the chat-model monitor polls every
+/// 250ms, the background embedding download every 150ms).
+const DOWNLOAD_RATE_EMA_ALPHA: f64 = 0.3;
+
+/// Derives a smoothed download rate from successive timestamped
+/// byte-count samples. The first sample only seeds state — there is no
+/// prior point to compute a rate from — so it reports no rate; each
+/// sample after that blends the newly observed instantaneous rate into an
+/// exponential moving average.
+#[derive(Debug, Clone, Default)]
+struct DownloadRateTracker {
+    last_sample: Option<(Instant, u64)>,
+    smoothed_bytes_per_sec: Option<f64>,
+}
+
+impl DownloadRateTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a `(timestamp, total-bytes-downloaded-so-far)` sample and
+    /// return the current smoothed bytes/sec, or `None` if no valid rate
+    /// has been established yet (first sample, or every sample so far has
+    /// had non-advancing time or bytes, e.g. a stalled or duplicate poll).
+    fn observe(&mut self, at: Instant, downloaded: u64) -> Option<f64> {
+        if let Some((last_at, last_downloaded)) = self.last_sample {
+            let elapsed = at.saturating_duration_since(last_at).as_secs_f64();
+            if elapsed > 0.0 && downloaded > last_downloaded {
+                let instantaneous = (downloaded - last_downloaded) as f64 / elapsed;
+                self.smoothed_bytes_per_sec = Some(match self.smoothed_bytes_per_sec {
+                    Some(prev) => {
+                        DOWNLOAD_RATE_EMA_ALPHA * instantaneous
+                            + (1.0 - DOWNLOAD_RATE_EMA_ALPHA) * prev
+                    }
+                    None => instantaneous,
+                });
+            }
+        }
+        self.last_sample = Some((at, downloaded));
+        self.smoothed_bytes_per_sec
+    }
+}
+
+/// Format remaining time as "~Xm Ys remaining" (or "~Xh Ym remaining" /
+/// "~Xs remaining"), or `None` when the rate cannot produce a sane
+/// estimate (zero, negative, non-finite).
+fn format_eta_remaining(remaining_bytes: u64, bytes_per_sec: f64) -> Option<String> {
+    if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 {
+        return None;
+    }
+    let seconds_remaining = remaining_bytes as f64 / bytes_per_sec;
+    if !seconds_remaining.is_finite() || seconds_remaining < 0.0 {
+        return None;
+    }
+
+    let total_seconds = seconds_remaining.round() as u64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let secs = total_seconds % 60;
+
+    Some(if hours > 0 {
+        format!("~{hours}h {minutes}m remaining")
+    } else if minutes > 0 {
+        format!("~{minutes}m {secs}s remaining")
+    } else {
+        format!("~{secs}s remaining")
+    })
+}
+
 fn format_download_bytes(bytes: u64) -> String {
     let megabytes = bytes as f64 / 1_000_000.0;
     // 999.95..1_000_000_000 would still round to "1000.0MB" at one decimal
@@ -535,6 +657,15 @@ impl Clone for StatusBar {
     fn clone(&self) -> Self {
         Self {
             lines: Arc::clone(&self.lines),
+            // Intentionally NOT shared with the source: each clone tracks
+            // download rate independently, matching `download_rate`'s own
+            // (non-`Arc`) field type. Every caller that drives download
+            // progress (the local-model monitor task, the background
+            // embedding-model download) clones a `StatusBar` once up front
+            // and then reuses that single clone for every sample in its
+            // loop, so the tracker still sees a consistent sample sequence;
+            // it just isn't visible from sibling clones, unlike `lines`.
+            download_rate: RwLock::new(None),
         }
     }
 }
@@ -542,6 +673,7 @@ impl Clone for StatusBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn agent_activity_status_formats_usage_and_clears_when_children_finish() {
@@ -893,6 +1025,324 @@ mod tests {
             "content={content:?}: must not display a value that rounds to a fake 1000MB"
         );
         assert!(content.contains("1.0GB/1.0GB"), "content={content:?}");
+    }
+
+    // --- DownloadRateTracker: pure rate calculation from synthetic samples ---
+
+    #[test]
+    fn test_download_rate_tracker_first_sample_reports_no_rate() {
+        let mut tracker = DownloadRateTracker::new();
+        let t0 = Instant::now();
+
+        let rate = tracker.observe(t0, 1_000_000);
+
+        assert_eq!(
+            rate, None,
+            "first sample has no prior data point to derive a rate from, got {rate:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_rate_tracker_second_sample_computes_instantaneous_rate() {
+        let mut tracker = DownloadRateTracker::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(2);
+
+        tracker.observe(t0, 1_000_000);
+        let rate = tracker.observe(t1, 3_000_000);
+
+        // 2_000_000 bytes over 2 seconds = 1_000_000 bytes/sec; with only one
+        // prior instantaneous sample the EMA has nothing to blend against yet.
+        assert_eq!(
+            rate,
+            Some(1_000_000.0),
+            "expected the raw instantaneous rate on the first blended sample, got {rate:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_rate_tracker_smooths_across_samples() {
+        let mut tracker = DownloadRateTracker::new();
+        let t0 = Instant::now();
+
+        // 1 MB/s, then a noisy 9 MB/s tick.
+        tracker.observe(t0, 0);
+        tracker.observe(t0 + Duration::from_secs(1), 1_000_000);
+        let rate = tracker
+            .observe(t0 + Duration::from_secs(2), 10_000_000)
+            .expect("third sample should produce a smoothed rate");
+
+        // EMA(alpha=0.3): 0.3 * 9_000_000 + 0.7 * 1_000_000 = 3_400_000.
+        // Must land strictly between the two instantaneous rates -- a
+        // noisy tick should not swing the estimate all the way to 9MB/s,
+        // which is what a raw two-sample rate would report.
+        assert!(
+            rate > 1_000_000.0 && rate < 9_000_000.0,
+            "smoothed rate {rate} should sit between the prior (1e6) and the noisy instantaneous \
+             rate (9e6), not track the latest tick directly"
+        );
+        let expected = 3_400_000.0;
+        assert!(
+            (rate - expected).abs() < 1.0,
+            "expected EMA(alpha=0.3) of prior 1e6 and instantaneous 9e6 to be {expected}, got {rate}"
+        );
+    }
+
+    #[test]
+    fn test_download_rate_tracker_stalled_tick_keeps_previous_rate() {
+        let mut tracker = DownloadRateTracker::new();
+        let t0 = Instant::now();
+
+        tracker.observe(t0, 0);
+        let established = tracker
+            .observe(t0 + Duration::from_secs(1), 1_000_000)
+            .expect("second sample should establish a rate");
+
+        // Same byte count, same timestamp as the prior sample: a duplicate
+        // or stalled poll must not divide by zero or erase the rate.
+        let rate = tracker.observe(t0 + Duration::from_secs(1), 1_000_000);
+
+        assert_eq!(
+            rate,
+            Some(established),
+            "a non-advancing sample (zero elapsed time and zero new bytes) must keep the last \
+             established rate ({established}) rather than reporting None or a bogus value, got {rate:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_rate_tracker_non_advancing_bytes_does_not_panic_or_go_negative() {
+        let mut tracker = DownloadRateTracker::new();
+        let t0 = Instant::now();
+
+        tracker.observe(t0, 5_000_000);
+        // Downloaded count went backwards (e.g. a restarted transfer) with
+        // time still advancing; must not underflow `downloaded - last_downloaded`.
+        let rate = tracker.observe(t0 + Duration::from_secs(1), 1_000_000);
+
+        assert_eq!(
+            rate, None,
+            "a byte count that regresses must not produce a rate (no established rate existed \
+             yet), got {rate:?}"
+        );
+    }
+
+    // --- format_eta_remaining: pure duration formatting ---
+
+    #[test]
+    fn test_format_eta_remaining_formats_minutes_and_seconds() {
+        // 5.8GB total, 550.4MB downloaded => ~5.25GB remaining at 40MB/s.
+        let remaining_bytes = 5_249_600_000u64;
+        let bytes_per_sec = 40_000_000.0;
+
+        let eta = format_eta_remaining(remaining_bytes, bytes_per_sec);
+
+        assert_eq!(
+            eta,
+            Some("~2m 11s remaining".to_string()),
+            "5,249,600,000 bytes at 40,000,000 bytes/sec = 131.24s ~= 2m 11s, got {eta:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_eta_remaining_formats_hours() {
+        let eta = format_eta_remaining(7_200_000_000, 1_000_000.0);
+
+        assert_eq!(
+            eta,
+            Some("~2h 0m remaining".to_string()),
+            "7,200,000,000 bytes at 1,000,000 bytes/sec = 7200s = 2h exactly, got {eta:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_eta_remaining_formats_seconds_only_under_a_minute() {
+        let eta = format_eta_remaining(45_000_000, 10_000_000.0);
+
+        assert_eq!(
+            eta,
+            Some("~5s remaining".to_string()),
+            "45,000,000 bytes at 10,000,000 bytes/sec = 4.5s, rounds to 5s, got {eta:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_eta_remaining_none_for_zero_or_negative_rate() {
+        assert_eq!(
+            format_eta_remaining(1_000_000, 0.0),
+            None,
+            "zero rate must not divide-by-zero into an infinite ETA"
+        );
+        assert_eq!(
+            format_eta_remaining(1_000_000, -5.0),
+            None,
+            "negative rate must not report a nonsensical negative-time ETA"
+        );
+    }
+
+    #[test]
+    fn test_format_eta_remaining_none_for_non_finite_rate() {
+        assert_eq!(
+            format_eta_remaining(1_000_000, f64::NAN),
+            None,
+            "NaN rate must not propagate into the displayed ETA"
+        );
+        assert_eq!(
+            format_eta_remaining(1_000_000, f64::INFINITY),
+            None,
+            "infinite rate must not propagate into the displayed ETA"
+        );
+    }
+
+    // --- production boundary: the assembled status line ---
+
+    #[test]
+    fn test_download_progress_first_sample_shows_no_eta() {
+        let status = StatusBar::new();
+        let t0 = Instant::now();
+
+        status.update_download_progress_at("Gemma 2 9b", 0.096, 550_400_000, 5_800_000_000, t0);
+
+        let content = &status.get_lines()[0].content;
+        assert!(
+            !content.contains("remaining"),
+            "the first sample has no prior data point to compute a rate from, so no ETA should \
+             appear yet: content={content:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_progress_appends_eta_after_second_sample() {
+        let status = StatusBar::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        // 550.4MB, then +40MB one second later => 40MB/s.
+        status.update_download_progress_at("Gemma 2 9b", 0.096, 550_400_000, 5_800_000_000, t0);
+        status.update_download_progress_at("Gemma 2 9b", 0.103, 590_400_000, 5_800_000_000, t1);
+
+        let content = status.get_lines()[0].content.clone();
+        let byte_parenthetical = format!(
+            "({}/{})",
+            format_download_bytes(590_400_000),
+            format_download_bytes(5_800_000_000)
+        );
+        let eta_pos = content
+            .find("remaining")
+            .unwrap_or_else(|| panic!("expected an ETA once a rate is known: content={content:?}"));
+        let bytes_pos = content.find(&byte_parenthetical).unwrap_or_else(|| {
+            panic!("expected the byte-count parenthetical {byte_parenthetical:?} in content={content:?}")
+        });
+        assert!(
+            eta_pos > bytes_pos,
+            "the ETA must appear after the byte-count parenthetical, not before it: \
+             content={content:?}"
+        );
+        assert!(
+            content.contains(" · "),
+            "expected the ETA to be separated from the byte-count parenthetical with \" · \": \
+             content={content:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_progress_eta_resets_when_model_name_changes() {
+        let status = StatusBar::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        status.update_download_progress_at("Gemma 2 9b", 0.5, 1_000_000, 2_000_000, t0);
+        // A different download (e.g. the background embedding-model fetch)
+        // reuses the same status line; its first sample must not inherit
+        // the previous download's rate.
+        status.update_download_progress_at("memory embeddings", 0.01, 10_000, 1_000_000, t1);
+
+        let content = &status.get_lines()[0].content;
+        assert!(
+            !content.contains("remaining"),
+            "a new download's first sample must show no ETA even though a prior, unrelated \
+             download had already established a rate: content={content:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_progress_clear_resets_rate_tracker() {
+        let status = StatusBar::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t1 + Duration::from_secs(1);
+
+        status.update_download_progress_at("Gemma 2 9b", 0.5, 1_000_000, 2_000_000, t0);
+        status.update_download_progress_at("Gemma 2 9b", 0.6, 1_200_000, 2_000_000, t1);
+        status.clear_download_progress();
+
+        // Same model name as before the clear: without a reset this would
+        // be treated as a continuing sample and could show a rate derived
+        // from a stale timestamp.
+        status.update_download_progress_at("Gemma 2 9b", 0.05, 100_000, 2_000_000, t2);
+
+        let content = &status.get_lines()[0].content;
+        assert!(
+            !content.contains("remaining"),
+            "clearing the download line must reset the rate tracker so a restarted download's \
+             first sample shows no ETA: content={content:?}"
+        );
+    }
+
+    #[test]
+    fn test_clone_shares_status_lines_but_tracks_download_rate_independently() {
+        // Regression test for a StatusBar::clone() that forgot to initialize
+        // the `download_rate` field it added, which failed to compile
+        // (E0063: missing field `download_rate` in initializer of
+        // `StatusBar`). This exercises the intended semantics now that the
+        // field is present: `lines` is `Arc`-shared (as it always was,
+        // matching every caller that clones a StatusBar to hand to a
+        // spawned monitor task and still expects the original to observe
+        // the same rendered line), while `download_rate` is deliberately
+        // NOT shared, so each clone starts its own rate estimate.
+        let status = StatusBar::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        status.update_download_progress_at("Gemma 2 9b", 0.5, 1_000_000, 2_000_000, t0);
+        status.update_download_progress_at("Gemma 2 9b", 0.6, 1_200_000, 2_000_000, t1);
+        let established_content = status.get_lines()[0].content.clone();
+        assert!(
+            established_content.contains("remaining"),
+            "the source StatusBar should have an established rate before cloning: \
+             content={established_content:?}"
+        );
+
+        let cloned = status.clone();
+        let cloned_before_update = cloned.get_lines()[0].content.clone();
+        assert_eq!(
+            cloned_before_update, established_content,
+            "lines must stay Arc-shared across clone(), so the clone should see the same \
+             rendered line the source already produced, got {cloned_before_update:?}"
+        );
+
+        // Continuing the same byte progression through the clone: since the
+        // clone's `download_rate` tracker starts empty (not shared with the
+        // source), this sample is its "first sample" and must show no ETA,
+        // even though the underlying transfer has been running for two
+        // samples already.
+        let t2 = t1 + Duration::from_secs(1);
+        cloned.update_download_progress_at("Gemma 2 9b", 0.7, 1_400_000, 2_000_000, t2);
+        let after_clone_update = cloned.get_lines()[0].content.clone();
+        assert!(
+            !after_clone_update.contains("remaining"),
+            "a clone's independent download_rate tracker has seen only one sample so far, so \
+             the shared line it just wrote must show no ETA yet: content={after_clone_update:?}"
+        );
+
+        // Because `lines` is shared, the source now observes the clone's
+        // write too (last writer wins on the shared map).
+        let source_after_clone_update = status.get_lines()[0].content.clone();
+        assert_eq!(
+            source_after_clone_update, after_clone_update,
+            "the source must observe the clone's write to the shared `lines` map, got \
+             {source_after_clone_update:?}"
+        );
     }
 
     #[test]
