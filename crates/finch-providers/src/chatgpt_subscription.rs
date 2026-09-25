@@ -56,6 +56,11 @@ const MODELS_PATH: &str = "/backend-api/codex/models";
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+// A rejected response's body may be surfaced to the user; bound how much of
+// it is echoed into an error message so a large diagnostic payload cannot
+// flood the terminal. `MAX_ERROR_BYTES` (above) only bounds what is read off
+// the wire.
+const MAX_ERROR_DETAIL_DISPLAY_BYTES: usize = 2000;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
@@ -179,19 +184,97 @@ impl fmt::Display for SubscriptionRequestedModelUnavailable {
 impl std::error::Error for SubscriptionRequestedModelUnavailable {}
 
 #[derive(Debug)]
-struct SubscriptionResponseRejected(StatusCode);
+struct SubscriptionResponseRejected {
+    status: StatusCode,
+    /// A bounded, display-safe detail extracted from the rejected response
+    /// body, when one could be safely identified. See
+    /// [`extract_error_detail`] for what is and is not surfaced.
+    detail: Option<String>,
+}
+
+impl SubscriptionResponseRejected {
+    /// `live_secret` is the caller's current access token. If a hostile or
+    /// misbehaving endpoint reflects it back inside an otherwise-safe
+    /// `error.message`, it is redacted before display — belt-and-suspenders
+    /// alongside the field whitelist in [`extract_error_detail`].
+    fn new(status: StatusCode, body: &[u8], live_secret: &str) -> Self {
+        Self {
+            status,
+            detail: extract_error_detail(body, live_secret),
+        }
+    }
+}
 
 impl fmt::Display for SubscriptionResponseRejected {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "ChatGPT subscription rejected the pinned Responses-Lite request (HTTP {}); the account entitlement or pinned protocol contract may have changed",
-            self.0
-        )
+        let detail_suffix = self
+            .detail
+            .as_deref()
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            write!(
+                formatter,
+                "ChatGPT subscription hit a rate limit (HTTP {}); wait a moment before retrying{detail_suffix}",
+                self.status
+            )
+        } else {
+            write!(
+                formatter,
+                "ChatGPT subscription rejected the pinned Responses-Lite request (HTTP {}); the account entitlement or pinned protocol contract may have changed{detail_suffix}",
+                self.status
+            )
+        }
     }
 }
 
 impl std::error::Error for SubscriptionResponseRejected {}
+
+/// Extract a bounded, display-safe detail message from a rejected response
+/// body.
+///
+/// Only the `error.message` field of a well-formed JSON error envelope (the
+/// shape OpenAI's APIs use, e.g. `{"error":{"message":"...","type":"..."}}`)
+/// is surfaced. Anything else — plain text, an unexpected JSON shape, or a
+/// parse failure — yields no detail. The response body is server-controlled
+/// (and, in a hostile-endpoint scenario, attacker-controlled) and must never
+/// be echoed verbatim into user-facing error text: this crate's invariant is
+/// that secrets never appear in error text, and a whitelisted-field
+/// extraction keeps that true even if a malicious response tried to reflect
+/// request data back.
+fn extract_error_detail(body: &[u8], live_secret: &str) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let message = value.get("error")?.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let redacted = redact_known_secret(message, live_secret);
+    Some(bounded_display_text(
+        &redacted,
+        MAX_ERROR_DETAIL_DISPLAY_BYTES,
+    ))
+}
+
+/// Strip a known live secret out of otherwise-safe display text. Defends
+/// against a hostile or compromised endpoint that reflects the caller's own
+/// access token back inside a JSON `error.message`.
+fn redact_known_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    text.replace(secret, "[redacted]")
+}
+
+fn bounded_display_text(text: &str, maximum: usize) -> String {
+    if text.len() <= maximum {
+        return text.to_string();
+    }
+    let mut end = maximum;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -676,8 +759,10 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                return Err(SubscriptionResponseRejected(status).into());
+                let body = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
+                return Err(
+                    SubscriptionResponseRejected::new(status, &body, &lease.access_token).into(),
+                );
             }
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?;

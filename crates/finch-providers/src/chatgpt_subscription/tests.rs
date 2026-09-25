@@ -4852,14 +4852,157 @@ async fn response_rejection_is_typed_clear_and_secret_free() {
     let rejection = error
         .downcast_ref::<SubscriptionResponseRejected>()
         .expect("HTTP rejection must retain its typed provider boundary");
-    assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
     let display = error.to_string();
     assert!(display.contains("HTTP 400 Bad Request"));
     assert!(display.contains("pinned protocol contract may have changed"));
+    // `attacker_body` is plain text, not the `{"error":{"message":...}}`
+    // envelope real OpenAI error responses use, so no detail is extracted
+    // from it at all — proving an arbitrary/hostile response body cannot
+    // inject text into the error message just by being present.
     assert!(!display.contains(attacker_body));
     assert!(!display.contains("account-1"));
     assert!(!display.contains("subscription-secret"));
     assert!(display.len() < 256);
+    models.assert_async().await;
+    inference.assert_async().await;
+}
+
+#[tokio::test]
+async fn rate_limit_response_produces_a_distinct_message() {
+    let mut server = mockito::Server::new_async().await;
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .with_status(200)
+        .with_body(catalog_body())
+        .create_async()
+        .await;
+    let inference = server
+        .mock("POST", RESPONSES_PATH)
+        .with_status(429)
+        .with_body("slow down")
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.to_lowercase().contains("rate limit"),
+        "a 429 must name the rate limit condition instead of the generic rejection text, got: {error}"
+    );
+    assert!(
+        !error.contains("entitlement or pinned protocol contract"),
+        "a 429 must not reuse the generic non-rate-limit wording, got: {error}"
+    );
+    models.assert_async().await;
+    inference.assert_async().await;
+}
+
+#[tokio::test]
+async fn error_detail_from_response_body_reaches_the_error_message() {
+    let mut server = mockito::Server::new_async().await;
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .with_status(200)
+        .with_body(catalog_body())
+        .create_async()
+        .await;
+    let inference = server
+        .mock("POST", RESPONSES_PATH)
+        .with_status(429)
+        .with_body(
+            json!({
+                "error": {
+                    "message": "Rate limit reached for gpt-5.6-sol; retry after 12s",
+                    "type": "rate_limit_error"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Rate limit reached for gpt-5.6-sol; retry after 12s"),
+        "OpenAI's own error detail must reach the user instead of being discarded, got: {error}"
+    );
+    models.assert_async().await;
+    inference.assert_async().await;
+}
+
+#[tokio::test]
+async fn reflected_live_secret_in_error_detail_is_redacted() {
+    let mut server = mockito::Server::new_async().await;
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .with_status(200)
+        .with_body(catalog_body())
+        .create_async()
+        .await;
+    // Simulate a hostile/misbehaving endpoint that reflects the caller's own
+    // bearer token back inside an otherwise well-formed error envelope.
+    let inference = server
+        .mock("POST", RESPONSES_PATH)
+        .with_status(429)
+        .with_body(
+            json!({
+                "error": {
+                    "message": "rejected token subscription-secret is over quota"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("subscription-secret"),
+        "the live access token must never appear in error text even if reflected back, got: {error}"
+    );
+    assert!(
+        error.contains("is over quota"),
+        "unrelated detail around the redacted secret should still surface, got: {error}"
+    );
     models.assert_async().await;
     inference.assert_async().await;
 }
