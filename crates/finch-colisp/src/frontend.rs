@@ -29,6 +29,10 @@ struct Compiler<'a> {
     /// This makes recursive and mutually-recursive calls visible without
     /// introducing an untyped placeholder into the shared vocabulary.
     predeclared: BTreeMap<String, StackSignature>,
+    /// Lowered function bodies callable by name: functions linked from earlier
+    /// submissions, then every definition compiled in this submission. A word
+    /// present here has a body and must be called through it, never re-lowered
+    /// as an inline capability request.
     functions: BTreeMap<String, Function>,
     next_lambda: u64,
     current_span: Range<usize>,
@@ -92,7 +96,7 @@ pub fn compile_lisp_with_functions(
         source,
         vocabulary: vocabulary.clone(),
         predeclared: BTreeMap::new(),
-        functions: BTreeMap::new(),
+        functions: linked_functions.clone(),
         next_lambda: 0,
         current_span: 0..source.len(),
         current_source: None,
@@ -3498,7 +3502,12 @@ impl Compiler<'_> {
                 input: concrete_signature.input.values.clone(),
                 output: concrete_signature.output.values.clone(),
             }
-        } else if signature.effects.0.len() == 1 {
+        } else if signature.effects.0.len() == 1 && !self.functions.contains_key(word) {
+            // Only a body-less core host word (for example `say`) is exactly
+            // its single capability request and may lower inline at the call
+            // site. A defined function has a lowered body and must execute
+            // through it, so the body's own pushes and stack discipline stay
+            // inside the call.
             Instruction::CapabilityRequest {
                 requirement: signature.effects.0.iter().next().unwrap().clone(),
                 input: concrete_signature.input.values.clone(),
@@ -4462,5 +4471,77 @@ mod tests {
             vec!["'(say \"quoted\")", "[1, {\"x\": \"y\"}]", "$2*x$"]
         );
         assert_eq!(crate::parse_str(source).unwrap().len(), forms.len());
+    }
+
+    #[test]
+    fn test_one_shot_define_call_lowers_call_into_the_defined_body() {
+        let source = "(begin (define (r) (say \"hello\")) (r))";
+        let module = compile_lisp("one-shot.lisp", source, Vec::new(), &core_vocabulary())
+            .expect("one-shot define-and-invoke must compile");
+        let main_instructions: Vec<_> = module.module.functions["main"]
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .collect();
+        assert!(
+            main_instructions.iter().any(|located| {
+                matches!(located.instruction, Instruction::Call { ref function } if function == "r")
+            }),
+            "main must call the defined function through its lowered body; \
+             instructions={main_instructions:?}"
+        );
+        assert!(
+            !main_instructions.iter().any(|located| {
+                matches!(located.instruction, Instruction::CapabilityRequest { .. })
+            }),
+            "a defined function's host effect must not lower inline at the call site; \
+             instructions={main_instructions:?}"
+        );
+        let say_request = module.module.functions["r"]
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .find(|located| {
+                matches!(
+                    located.instruction,
+                    Instruction::CapabilityRequest { ref requirement, .. }
+                        if requirement.capability == CapabilityKind::SessionEmit
+                )
+            })
+            .expect("the defined body carries its own say request");
+        assert_eq!(
+            say_request.origin.word.as_deref(),
+            Some("say"),
+            "the emit origin must name the body's say word, not the call-site word; \
+             origin={:?}",
+            say_request.origin
+        );
+    }
+
+    #[test]
+    fn test_bodyless_host_word_still_lowers_inline_request() {
+        let module = compile_lisp(
+            "bare.lisp",
+            "(say \"hello\")",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("bare top-level say must compile");
+        let instructions: Vec<_> = module.module.functions["main"]
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .collect();
+        assert!(
+            instructions.iter().any(|located| {
+                matches!(
+                    located.instruction,
+                    Instruction::CapabilityRequest { ref requirement, .. }
+                        if requirement.capability == CapabilityKind::SessionEmit
+                )
+            }),
+            "only a body-less core host word is exactly its single capability request and \
+             stays inline at the call site; instructions={instructions:?}"
+        );
     }
 }
