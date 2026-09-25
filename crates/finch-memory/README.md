@@ -41,3 +41,10 @@ ported from a sibling research repo's validated design (see the routing-tree cra
 provenance and what was deliberately deferred). `MemTree` and its `tree_nodes` schema are gone;
 the [agent contract](AGENTS.md) has the current invariants and the disclosed regressions the port
 carries.
+
+Every projected conversation turn is also recorded as an occurrence in a `prev`/`next` chain
+scoped to its session (`routing_occurrences`, resolved durably so the chain survives a restart).
+Retrieval uses that chain only to break a near-tie between two candidates whose raw cosine scores
+are otherwise indistinguishable, by comparing each candidate's surrounding conversation against
+the live query; it never changes retrieval order outside a near-tie. See the [agent
+contract](AGENTS.md) for the mechanism and its tests.

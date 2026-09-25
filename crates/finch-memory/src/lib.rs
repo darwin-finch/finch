@@ -25,16 +25,17 @@ pub type NodeId = u64;
 pub use quality::{MemoryClassifier, MemoryImportance};
 
 use finch_routing_tree::{save_point, write_dirty_nodes_within};
-use routing_memory::{PointId, RoutingMemTree};
+use routing_memory::{LinkNextError, Occurrence, PointId, RoutingMemTree};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 // Everything under `#[cfg(any(test, feature = "test-support"))]` from here
 // down to `pause_in_projection_sweep` (and its call sites further below) is
@@ -671,6 +672,21 @@ struct PendingConversation {
     role: String,
     content: String,
     timestamp: i64,
+    /// The session this turn belongs to, if any -- carried through so
+    /// projection can resolve the occurrence chain's `prev` (the session's
+    /// most recently projected occurrence) via `last_occurrence_uuid_for_session`.
+    /// `None` for a turn stored with no session identity, which simply never
+    /// gets a `prev`: there is nothing to chain it from.
+    session_id: Option<String>,
+}
+
+/// A new occurrence's point content, bundled so [`MemorySystem::save_routing_occurrence`] stays
+/// within clippy's default argument-count limit rather than taking each field loose.
+struct NewOccurrenceContent {
+    key_content: String,
+    embedding: Vec<f32>,
+    importance: u8,
+    created_at: i64,
 }
 
 /// The pending-projection predicate.
@@ -712,7 +728,7 @@ struct PendingConversation {
 /// `server/handlers.rs` inspects only the `Err` arm, and the other counts runs
 /// rather than rows. The boolean is a contract on a `pub` method, not a
 /// quantity anything acts on today.
-const PENDING_PROJECTION_SQL: &str = "SELECT c.id, c.role, c.content, c.timestamp
+const PENDING_PROJECTION_SQL: &str = "SELECT c.id, c.role, c.content, c.timestamp, c.session_id
      FROM conversations c
      LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
      WHERE ms.conversation_id IS NULL AND c.id IS NOT ?1
@@ -932,6 +948,12 @@ impl MemorySystem {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // WAL still serializes writers to one at a time: without a busy timeout, the second of
+        // two concurrent writers (e.g. two `RoutingMemTree::link_next` callers racing against the
+        // same db file) gets an immediate `SQLITE_BUSY` instead of waiting for the first writer's
+        // transaction to finish. A few seconds is enough for a normal single-row UPDATE/INSERT to
+        // clear without making a genuinely stuck writer hang the caller indefinitely.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(conn)
     }
 
@@ -1374,6 +1396,7 @@ impl MemorySystem {
                 role: role.to_string(),
                 content: content.to_string(),
                 timestamp,
+                session_id: session_id.map(str::to_owned),
             },
         )
         .await?;
@@ -1444,6 +1467,7 @@ impl MemorySystem {
             role,
             content,
             timestamp,
+            session_id,
         } = pending;
         let timestamp = *timestamp;
 
@@ -1453,24 +1477,39 @@ impl MemorySystem {
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
             let embedding = ctx.embedding_engine.embed(&key_content)?;
+            // The occurrence chain's `prev`, resolved durably rather than from an in-memory
+            // cache: a plain `SELECT` over `conversations`/`memory_sources`/`routing_occurrences`
+            // for this session's most recently projected occurrence, so the chain survives a
+            // restart with no rebuild step (see `last_occurrence_uuid_for_session`). A stale read
+            // under cross-process contention is expected and benign -- `link_next` below resolves
+            // it (see `save_routing_occurrence`'s doc), it is never a correctness hazard.
+            let prev = match session_id.as_deref() {
+                Some(session_id) => {
+                    let conn = ctx.db.lock().await;
+                    Self::last_occurrence_uuid_for_session(&conn, session_id)?
+                }
+                None => None,
+            };
             // Unlike `MemTree::insert_with_effect`, `RoutingTree::insert` (via `RoutingMemTree`)
             // cannot fail -- there is no aggregation pass with its own failure mode, and no
             // promotion for a partial failure to leave stranded. Nothing here mutates the tree
             // and then can error out before that mutation is accounted for.
-            let effect = {
-                let mut tree = ctx.tree.lock().await;
-                tree.insert_with_effect(key_content, embedding, importance.as_u8(), timestamp)
-            };
-            let node_id = effect.point_id;
-            // Persist the point's content, changed tree structure, and provenance row all in one
-            // transaction, so the DB stays consistent across process restarts and a retry cannot
-            // create a second semantic point for the same turn.
-            if let Err(error) = Self::save_routing_insert(
+            //
+            // Persist the occurrence row, the point's content, changed tree structure, the
+            // forward link from `prev`, and the provenance row all in one transaction, so the DB
+            // stays consistent across process restarts and a retry cannot create a second
+            // semantic point -- or a second occurrence -- for the same turn.
+            if let Err(error) = Self::save_routing_occurrence(
                 &ctx.db,
                 &ctx.tree,
-                effect.point_id,
+                NewOccurrenceContent {
+                    key_content,
+                    embedding,
+                    importance: importance.as_u8(),
+                    created_at: timestamp,
+                },
                 id.as_str(),
-                timestamp,
+                prev,
             )
             .await
             {
@@ -1533,6 +1572,7 @@ impl MemorySystem {
                     role: row.get(1)?,
                     content: row.get(2)?,
                     timestamp: row.get(3)?,
+                    session_id: row.get(4)?,
                 })
             })
             .context("Failed to read conversations pending projection")?;
@@ -1751,8 +1791,14 @@ impl MemorySystem {
         let k = top_k.unwrap_or(self.config.max_context_items);
         let query_embedding = self.embedding_engine.embed(query_text)?;
         let retrieved = {
+            // Lock ordering matches `stats()`: db before tree. `retrieve`'s neighbor-context
+            // tie-break needs both `routing_occurrences` (via `conn`) and the tree's point
+            // embeddings, so both locks are held together here for the first time in this
+            // function; keeping the same db-then-tree order everywhere in this file avoids a
+            // lock-order deadlock against any other caller that takes both.
+            let conn = self.db.lock().await;
             let tree = self.tree.lock().await;
-            tree.retrieve(&query_embedding, k)
+            tree.retrieve(&conn, &query_embedding, k)?
         };
         let min_score = self.config.min_relevance_score;
 
@@ -1902,23 +1948,46 @@ impl MemorySystem {
         })
     }
 
-    /// Persist one point's content, every routing node that changed as a result, and its
-    /// provenance row, all in a single transaction.
+    /// Mint one conversational occurrence and persist it, its point's content, every routing
+    /// node that changed as a result, an attempted forward link from `prev`, and its provenance
+    /// row, all in a single transaction.
     ///
     /// Unlike `MemTree`, there is no promotion to fix up: a point's id is permanent from the
-    /// moment `insert_with_effect` assigns it (`RoutingMemTree`'s own module doc), so a
+    /// moment `insert_occurrence` assigns it (`RoutingMemTree`'s own module doc), so a
     /// `memory_sources` row never needs to follow content to a different id after the fact.
+    ///
+    /// The occurrence's own row and its point are minted and persisted together -- unlike the
+    /// retired `insert_with_effect`/`save_routing_insert` split this replaces, which mutated the
+    /// tree first and persisted afterward, `insert_occurrence` is called *inside* this
+    /// transaction (passed `&tx`, which derefs to `&Connection`) so a rollback here undoes the
+    /// occurrence row exactly as it undoes the point row; nothing durable can name a point that
+    /// was never persisted, or an occurrence whose point wasn't.
+    ///
+    /// `prev`'s forward link is attempted with the same transaction's connection. A
+    /// [`LinkNextError::Conflict`] does NOT abort the transaction or fail this call: the new
+    /// occurrence and its point are still real and still committed, they are just not linked
+    /// from their predecessor -- a real, expected outcome of two callers racing to continue the
+    /// same session (`link_next`'s own doc), not a reason to discard work that already
+    /// succeeded. A [`LinkNextError::Sql`] is a genuine failure and aborts the transaction like
+    /// any other error here.
     ///
     /// Takes the locks rather than `&self`: the pending-projection sweep runs inside the
     /// background loader, which is spawned before `MemorySystem` exists, so it holds these
     /// `Arc`s and has no `&self`. One implementation, same locks, same order.
-    async fn save_routing_insert(
+    async fn save_routing_occurrence(
         db: &Mutex<Connection>,
         tree_lock: &Mutex<RoutingMemTree>,
-        point_id: PointId,
+        content: NewOccurrenceContent,
         conversation_id: &str,
-        indexed_at: i64,
-    ) -> Result<()> {
+        prev: Option<Uuid>,
+    ) -> Result<Occurrence> {
+        let NewOccurrenceContent {
+            key_content,
+            embedding,
+            importance,
+            created_at,
+        } = content;
+
         // Both locks, held across the whole read-write-mark cycle, and taken **db before tree**
         // because `stats` nests them in that order -- inverting here would deadlock against a
         // concurrent `stats`. Same discipline `MemTree`'s own save path used (#313): no await
@@ -1927,37 +1996,101 @@ impl MemorySystem {
         let conn = db.lock().await;
         let mut tree = tree_lock.lock().await;
 
+        let tx = conn.unchecked_transaction()?;
+        let occurrence = tree
+            .insert_occurrence(&tx, key_content, embedding, importance, created_at, prev)
+            .context("save_routing_occurrence: insert_occurrence")?;
+        let point_id = occurrence.point_id;
+
         let meta = tree
             .get_point(point_id)
             .ok_or_else(|| {
                 anyhow::anyhow!("memory: point {point_id} was just inserted but is not in the tree")
             })?
             .clone();
-        let embedding = tree.tree().embedding_of(point_id as usize).to_vec();
+        let point_embedding = tree.tree().embedding_of(point_id as usize).to_vec();
         let dirty = tree.tree().dirty_node_ids();
 
-        let tx = conn.unchecked_transaction()?;
         save_point(
             &tx,
             point_id as usize,
             &meta.text,
-            &embedding,
+            &point_embedding,
             meta.importance,
             meta.created_at,
         )?;
         write_dirty_nodes_within(tree.tree(), &dirty, &tx)?;
         // `node_id` (`memory_sources`' own column name, unchanged) now holds a `routing_points`
-        // point id. Not unique: deduplicated content is one point with several source
-        // conversations; `conversation_id` is the primary key, so a retry of the same turn is
-        // still idempotent.
+        // point id. `insert_occurrence` never dedups, so every occurrence's point is unique to
+        // it; `conversation_id` is still the primary key, so a retry of the same turn is still
+        // idempotent.
         tx.execute(
             "INSERT OR REPLACE INTO memory_sources (conversation_id, node_id, indexed_at)
              VALUES (?1, ?2, ?3)",
-            params![conversation_id, point_id as i64, indexed_at],
+            params![conversation_id, point_id as i64, created_at],
         )?;
+
+        if let Some(prev_uuid) = prev {
+            match RoutingMemTree::link_next(&tx, prev_uuid, occurrence.uuid) {
+                Ok(()) => {}
+                Err(LinkNextError::Conflict(_)) => {
+                    tracing::warn!(
+                        prev = %prev_uuid,
+                        next = %occurrence.uuid,
+                        conversation_id,
+                        "occurrence chain link lost a race to a concurrent writer; the new \
+                         occurrence and its point are still recorded, just not linked from \
+                         their predecessor"
+                    );
+                }
+                Err(LinkNextError::Sql(sql_error)) => {
+                    return Err(sql_error).context("save_routing_occurrence: link_next");
+                }
+            }
+        }
+
         tx.commit()?;
         tree.tree_mut().mark_persisted(&dirty);
-        Ok(())
+        Ok(occurrence)
+    }
+
+    /// The uuid of `session_id`'s most recently projected occurrence, or `None` when the session
+    /// has none yet -- a fresh session's first turn, or every prior turn in the session was
+    /// classifier-discarded (never became an occurrence at all).
+    ///
+    /// Derived via `conversations`/`memory_sources`/`routing_occurrences` rather than a
+    /// denormalized `session_id` column on `routing_occurrences` itself: `memory_sources.node_id`
+    /// already holds the point id an occurrence was minted for, and `conversations.session_id`
+    /// is the caller's real session identity, so this reuses columns and indexes
+    /// (`idx_conversations_session`, `idx_memory_sources_node`) that already exist instead of
+    /// keeping a second copy of session identity in sync. A durable query rather than an
+    /// in-memory "last occurrence" cache for the same reason `RoutingMemTree::load` rebuilds the
+    /// tree from `schema.sql` rows on every restart: nothing here needs its own recovery path,
+    /// because there is nothing in memory that could go stale.
+    fn last_occurrence_uuid_for_session(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Option<Uuid>> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT ro.uuid
+                 FROM conversations c
+                 JOIN memory_sources ms ON ms.conversation_id = c.id
+                 JOIN routing_occurrences ro ON ro.point_id = ms.node_id
+                 WHERE c.session_id = ?1
+                 ORDER BY c.timestamp DESC, c.id DESC
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("last_occurrence_uuid_for_session: query conversations/memory_sources/routing_occurrences")?;
+        raw.map(|uuid| {
+            Uuid::parse_str(&uuid).with_context(|| {
+                format!("last_occurrence_uuid_for_session: stored uuid {uuid:?} does not parse")
+            })
+        })
+        .transpose()
     }
 
     async fn reload_tree_from_db(&self) -> Result<()> {
@@ -2187,6 +2320,10 @@ impl MemorySystem {
             return Ok(ConversationSummaryLines::default());
         }
 
+        // Lock ordering matches `stats()`/`query_with_sources`: db before tree. `retrieve` now
+        // needs `conn` for its neighbor-context tie-break even at `top_k=1` here (a tie for the
+        // single returned slot is still a tie).
+        let conn = self.db.lock().await;
         let tree = self.tree.lock().await;
 
         // Collect every point's embedding and text -- unlike MemTree there is no root id=0 to
@@ -2221,7 +2358,7 @@ impl MemorySystem {
         for window in windows.iter().take(windows.len().saturating_sub(1)) {
             let slice: Vec<&Vec<f32>> = leaves.iter().take(*window).map(|(_, e, _)| e).collect();
             let centroid = average_embeddings(&slice);
-            if let Some((_, text, _)) = tree.retrieve(&centroid, 1).into_iter().next() {
+            if let Some((_, text, _)) = tree.retrieve(&conn, &centroid, 1)?.into_iter().next() {
                 let s = truncate_str(&text, 70);
                 if !s.trim().is_empty() && s != now_text && seen.insert(s.clone()) {
                     lines.push(s);
@@ -2784,17 +2921,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storing_identical_content_twice_succeeds() -> Result<()> {
-        // Deduplication resolves repeated content to an existing node, which
-        // the original `INSERT` into a UNIQUE `node_id` rejected outright.
-        //
-        // What this test now pins is the deduplication itself: on the base
-        // revision three inserts of one text mint three nodes, so `matching`
-        // is 3. The schema change is pinned separately by
-        // `test_repeated_content_records_every_source_conversation` — with the
-        // `INSERT OR REPLACE` used today, restoring the UNIQUE constraint
-        // would not raise an error at all, it would silently delete the
-        // earlier source row.
+    async fn test_storing_identical_content_repeatedly_creates_distinct_occurrences() -> Result<()>
+    {
+        // Historical note: on an older revision (`insert_with_effect`'s text dedup, still a
+        // tested primitive in `routing_memory.rs` but no longer reachable from this production
+        // path -- see `project_stored_conversation_inner`), three inserts of one text minted one
+        // shared node and this test asserted `matching == 1`. `project_stored_conversation_inner`
+        // now calls `insert_occurrence` instead, which never dedups by text on purpose: two
+        // occurrences of identical text are two distinct conversational moments, not the same
+        // fact restated (`RoutingMemTree::insert_occurrence`'s own doc, `AGENTS.md`). This test
+        // now pins the opposite: `matching` is 3, not 1, and storing identical content repeatedly
+        // still never fails -- the original UNIQUE-`node_id` failure mode this test was first
+        // written against is doubly gone now (`INSERT OR REPLACE` already lifted it, and every
+        // occurrence's point is unique to it regardless).
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -2825,10 +2964,21 @@ mod tests {
         );
 
         let results = memory.query_with_sources(&text, Some(5)).await?;
-        let matching = results.iter().filter(|r| r.text == text).count();
+        let matching: Vec<&MemorySearchResult> =
+            results.iter().filter(|r| r.text == text).collect();
         assert_eq!(
-            matching, 1,
-            "the repeated fact is one memory, not three; got {results:?}"
+            matching.len(),
+            3,
+            "each occurrence of the repeated fact is its own memory now, not collapsed onto one \
+             (insert_occurrence never dedups by text); got {results:?}"
+        );
+        let distinct_nodes: std::collections::HashSet<NodeId> =
+            matching.iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            distinct_nodes.len(),
+            3,
+            "each occurrence must have its own distinct point/node id, not share one; \
+             matching={matching:?}"
         );
 
         Ok(())
@@ -2836,7 +2986,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_repeated_content_records_every_source_conversation() -> Result<()> {
-        // Many conversations map to one node, so all three sources are durable.
+        // Each of the three conversations now maps to its OWN node (`insert_occurrence` never
+        // dedups by text -- see `test_storing_identical_content_repeatedly_creates_distinct_occurrences`),
+        // so all three sources are durable regardless.
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -2858,6 +3010,20 @@ mod tests {
         assert_eq!(
             sources, 3,
             "each conversation that produced the memory keeps its own source row"
+        );
+
+        let distinct_nodes: i64 = {
+            let conn = memory.db.lock().await;
+            conn.query_row(
+                "SELECT COUNT(DISTINCT node_id) FROM memory_sources",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        assert_eq!(
+            distinct_nodes, 3,
+            "each source row now points at its own node, not a shared one -- \
+             insert_occurrence never dedups by text"
         );
 
         Ok(())
@@ -3820,6 +3986,44 @@ mod tests {
         )?)
     }
 
+    /// The conversation id whose content matches exactly -- used by the occurrence-chain tests
+    /// below, which need to name a specific turn within a session that has more than one, where
+    /// `conversation_id_for_session` above (unordered over however many rows match) cannot.
+    fn conversation_id_for_content(db_path: &std::path::Path, content: &str) -> Result<String> {
+        let conn = Connection::open(db_path)?;
+        Ok(conn.query_row(
+            "SELECT id FROM conversations WHERE content = ?1",
+            [content],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// (uuid, prev_uuid, next_uuid) -- named so the occurrence-chain tests below don't repeat
+    /// clippy's `type_complexity`-triggering nested tuple type at every call site.
+    type OccurrenceRow = (String, Option<String>, Option<String>);
+
+    /// The `routing_occurrences` row for the point this conversation was projected onto, read
+    /// through a fresh connection so it reports what is durable. `None` when the conversation has
+    /// no `memory_sources` row yet, was classifier-discarded (NULL `node_id`), or -- should never
+    /// happen for anything projected through `project_stored_conversation_inner`'s production
+    /// path -- its point has no occurrence row.
+    fn occurrence_row_for_conversation(
+        db_path: &std::path::Path,
+        conversation_id: &str,
+    ) -> Result<Option<OccurrenceRow>> {
+        let conn = Connection::open(db_path)?;
+        conn.query_row(
+            "SELECT ro.uuid, ro.prev_uuid, ro.next_uuid
+             FROM memory_sources ms
+             JOIN routing_occurrences ro ON ro.point_id = ms.node_id
+             WHERE ms.conversation_id = ?1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Reproduce the #339 state and leave the store closed.
     ///
     /// One turn projected normally — which is what gives the reopened store
@@ -4251,13 +4455,15 @@ mod tests {
     ///
     /// What cancellation can and cannot split. `write_nodes` is synchronous, so
     /// a semantic leaf and its `memory_sources` row are one SQLite transaction
-    /// and cannot be split from each other. But there ARE two await points
-    /// between `tree.insert_with_effect` — which mutates the shared in-memory
-    /// tree — and that commit: `db.lock()` and `tree_lock.lock()` in
-    /// `save_all_nodes_to_db`. A cancellation landing on either leaves the tree
-    /// holding a leaf nothing durable records. An earlier version of this
-    /// comment claimed no such await point existed; it was wrong. The
-    /// conclusion survives for a reason outside `project_stored_conversation`:
+    /// and cannot be split from each other. `save_routing_occurrence` now
+    /// acquires both locks (`db.lock()`, `tree_lock.lock()`) BEFORE calling
+    /// `tree.insert_occurrence` — the tree mutation that used to happen
+    /// separately, ahead of those two awaits — so there is no longer an await
+    /// point between the mutation and the transaction it is committed in
+    /// inside that one function. A cancellation can still land between the two
+    /// lock acquisitions themselves, before any mutation has happened at all,
+    /// which is a no-op to cancel. The conclusion survives for a reason
+    /// outside `project_stored_conversation`:
     /// the only cancellation of the sweep in production is `Drop for
     /// MemorySystem` aborting the loader, and that drop tears the tree down
     /// along with the task, so the orphan leaf dies with it and nothing durable
@@ -4724,6 +4930,255 @@ mod tests {
             "nor re-point the turn at a second leaf; after_second={after_second:?}, \
              id={brain_turn_id}"
         );
+        Ok(())
+    }
+
+    /// Two consecutive turns in the same session must be linked: the second turn's own
+    /// occurrence records `prev` as the first turn's uuid, and the first turn's occurrence gets
+    /// `next` closed forward to the second by `link_next` -- both directions of the same edge,
+    /// not just one. A third turn in an UNRELATED session, inserted in between, must not affect
+    /// either: `prev` resolution is scoped by `session_id`, not "whatever occurrence was created
+    /// most recently in the whole store".
+    #[tokio::test]
+    async fn test_two_consecutive_turns_in_one_session_link_prev_and_next() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        memory
+            .insert_conversation(
+                "user",
+                &substantive("chain-turn-one"),
+                None,
+                Some("sess-chain"),
+            )
+            .await?;
+        let turn_one_id = conversation_id_for_content(temp.path(), &substantive("chain-turn-one"))?;
+        let turn_one = occurrence_row_for_conversation(temp.path(), &turn_one_id)?
+            .expect("turn one must be projected as an occurrence");
+        assert_eq!(
+            turn_one.1, None,
+            "a fresh session's first occurrence must have prev=None; got {turn_one:?}"
+        );
+        assert_eq!(
+            turn_one.2, None,
+            "turn one has no successor yet; got {turn_one:?}"
+        );
+
+        // An unrelated session's first turn, inserted in between, must not be treated as this
+        // session's predecessor by either side.
+        memory
+            .insert_conversation(
+                "user",
+                &substantive("other-session-turn"),
+                None,
+                Some("sess-other"),
+            )
+            .await?;
+        let other_id =
+            conversation_id_for_content(temp.path(), &substantive("other-session-turn"))?;
+        let other = occurrence_row_for_conversation(temp.path(), &other_id)?
+            .expect("the other session's own first turn must also be projected");
+        assert_eq!(
+            other.1, None,
+            "a different session's first occurrence must ALSO have prev=None -- prev resolution \
+             is scoped by session_id, not by store-wide recency; got {other:?}"
+        );
+
+        memory
+            .insert_conversation(
+                "assistant",
+                &substantive("chain-turn-two"),
+                None,
+                Some("sess-chain"),
+            )
+            .await?;
+        let turn_two_id = conversation_id_for_content(temp.path(), &substantive("chain-turn-two"))?;
+        let turn_two = occurrence_row_for_conversation(temp.path(), &turn_two_id)?
+            .expect("turn two must be projected as an occurrence");
+        assert_eq!(
+            turn_two.1,
+            Some(turn_one.0.clone()),
+            "turn two's own occurrence must record prev=turn one's uuid, not the unrelated \
+             session's turn; turn_one={turn_one:?}, turn_two={turn_two:?}"
+        );
+
+        let turn_one_after = occurrence_row_for_conversation(temp.path(), &turn_one_id)?
+            .expect("turn one's occurrence row must still exist");
+        assert_eq!(
+            turn_one_after.2,
+            Some(turn_two.0.clone()),
+            "turn one's occurrence must be linked forward to turn two by link_next; \
+             turn_one_after={turn_one_after:?}, turn_two={turn_two:?}"
+        );
+
+        Ok(())
+    }
+
+    /// The whole reason to resolve `prev` durably (`MemorySystem::last_occurrence_uuid_for_session`)
+    /// rather than from an in-memory "last occurrence" cache: the occurrence chain must survive a
+    /// process restart. Two turns are stored, the `MemorySystem` is dropped and a fresh one
+    /// rebuilt from the same durable database (mirroring how every other restart-survival test in
+    /// this module reopens over the same `db_path`), and a third turn in the SAME session must
+    /// link to the second turn's occurrence -- not come back with `prev=None` as it would if
+    /// chain state had lived only in memory and been silently lost at restart.
+    #[tokio::test]
+    async fn test_occurrence_chain_survives_a_process_restart() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            memory
+                .insert_conversation(
+                    "user",
+                    &substantive("restart-turn-one"),
+                    None,
+                    Some("sess-restart"),
+                )
+                .await?;
+            memory
+                .insert_conversation(
+                    "assistant",
+                    &substantive("restart-turn-two"),
+                    None,
+                    Some("sess-restart"),
+                )
+                .await?;
+        } // `memory` dropped here -- nothing about the chain lives past this point except what
+          // was durably committed.
+
+        let turn_two_id =
+            conversation_id_for_content(temp.path(), &substantive("restart-turn-two"))?;
+        let turn_two_before_restart = occurrence_row_for_conversation(temp.path(), &turn_two_id)?
+            .expect("turn two must have been projected before the restart");
+
+        let reopened = MemorySystem::new(config)?;
+        reopened
+            .insert_conversation(
+                "user",
+                &substantive("restart-turn-three"),
+                None,
+                Some("sess-restart"),
+            )
+            .await?;
+
+        let turn_three_id =
+            conversation_id_for_content(temp.path(), &substantive("restart-turn-three"))?;
+        let turn_three = occurrence_row_for_conversation(temp.path(), &turn_three_id)?
+            .expect("turn three must be projected as an occurrence after reopening");
+        assert_eq!(
+            turn_three.1,
+            Some(turn_two_before_restart.0.clone()),
+            "turn three, inserted after a fresh MemorySystem was rebuilt from the same durable \
+             database, must link to turn two's occurrence (prev=turn two's uuid) -- not come \
+             back orphaned with prev=None, which is what an in-memory-only 'last occurrence' \
+             cache would have produced after a restart; turn_two={turn_two_before_restart:?}, \
+             turn_three={turn_three:?}"
+        );
+
+        let turn_two_after_restart = occurrence_row_for_conversation(temp.path(), &turn_two_id)?
+            .expect("turn two's occurrence row must still exist after the restart");
+        assert_eq!(
+            turn_two_after_restart.2,
+            Some(turn_three.0.clone()),
+            "turn two must be linked forward to turn three by the post-restart link_next call; \
+             turn_two_after_restart={turn_two_after_restart:?}, turn_three={turn_three:?}"
+        );
+
+        Ok(())
+    }
+
+    /// `LinkNextError::Conflict` is a real, expected outcome (two writers racing to continue the
+    /// same session), not corruption -- `save_routing_occurrence` must not fail the turn that
+    /// lost the race, and must not disturb the winner's link. The race itself is proven exact-once
+    /// at the SQL layer by `RoutingMemTree::link_next`'s own hostile-concurrency test
+    /// (`routing_memory/tests.rs`); this test proves what THIS caller does with a losing result,
+    /// arranged deterministically (a rival link is written directly) rather than raced on wall
+    /// clock, per this crate's own rule against timing as a correctness oracle.
+    #[tokio::test]
+    async fn test_a_link_conflict_does_not_fail_or_corrupt_the_losing_turn() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        memory
+            .insert_conversation(
+                "user",
+                &substantive("race-turn-zero"),
+                None,
+                Some("sess-race"),
+            )
+            .await?;
+        let turn_zero_id =
+            conversation_id_for_content(temp.path(), &substantive("race-turn-zero"))?;
+        let turn_zero = occurrence_row_for_conversation(temp.path(), &turn_zero_id)?
+            .expect("turn zero must be projected as an occurrence");
+
+        // Arrange the conflict this test is about: link turn zero forward to a rival uuid before
+        // this process's own next turn gets a chance to. Its own `prev` resolution still finds
+        // turn zero (the durable lookup has no way to know about the rival), so it will attempt
+        // to link from turn zero via `link_next` and lose.
+        let rival_uuid = Uuid::new_v4();
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE routing_occurrences SET next_uuid = ?1 WHERE uuid = ?2",
+                params![rival_uuid.to_string(), turn_zero.0],
+            )?;
+        }
+
+        memory
+            .insert_conversation(
+                "assistant",
+                &substantive("race-turn-one"),
+                None,
+                Some("sess-race"),
+            )
+            .await
+            .expect("a losing link_next must not fail the turn that lost it");
+
+        let turn_one_id = conversation_id_for_content(temp.path(), &substantive("race-turn-one"))?;
+        let turn_one = occurrence_row_for_conversation(temp.path(), &turn_one_id)?.expect(
+            "the losing turn's own occurrence and point must still be recorded, not \
+                     silently dropped because its link lost",
+        );
+        assert_eq!(
+            turn_one.1,
+            Some(turn_zero.0.clone()),
+            "the losing turn's own occurrence must still record prev=turn zero's uuid even \
+             though the forward link from turn zero did not win; turn_one={turn_one:?}"
+        );
+
+        let turn_zero_after = occurrence_row_for_conversation(temp.path(), &turn_zero_id)?
+            .expect("turn zero's occurrence row must still exist");
+        assert_eq!(
+            turn_zero_after.2,
+            Some(rival_uuid.to_string()),
+            "the losing link_next call must not overwrite the rival's next_uuid on turn zero; \
+             turn_zero_after={turn_zero_after:?}"
+        );
+
+        let results = memory
+            .query_with_sources(&substantive("race-turn-one"), Some(5))
+            .await?;
+        assert!(
+            results
+                .iter()
+                .any(|r| r.text == substantive("race-turn-one")),
+            "the losing turn must still be a real, queryable memory, not corrupted or dropped; \
+             results={results:?}"
+        );
+
         Ok(())
     }
 
