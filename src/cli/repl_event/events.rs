@@ -57,6 +57,11 @@ pub enum ReplEvent {
     QueryFailed {
         query_id: Uuid,
         error: String,
+        /// The generator/provider the query actually ran on, when known at
+        /// the failure site. `None` for failures that occur before a
+        /// generator is dispatched to (e.g. local checkpoint/admission
+        /// errors), so the failure message never fabricates an attribution.
+        generator_name: Option<String>,
     },
 
     /// A tool execution completed
@@ -341,9 +346,17 @@ mod tests {
         let event = ReplEvent::QueryFailed {
             query_id: id,
             error: "network timeout".to_string(),
+            generator_name: Some("claude".to_string()),
         };
         match event {
-            ReplEvent::QueryFailed { error, .. } => assert_eq!(error, "network timeout"),
+            ReplEvent::QueryFailed {
+                error,
+                generator_name,
+                ..
+            } => {
+                assert_eq!(error, "network timeout");
+                assert_eq!(generator_name.as_deref(), Some("claude"));
+            }
             _ => panic!("Wrong variant"),
         }
     }

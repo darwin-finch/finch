@@ -325,6 +325,7 @@ impl EventLoop {
                         error: format!(
                             "Plan continuation was not sent because its checkpoint failed: {error:#}"
                         ),
+                        generator_name: None,
                     });
                     return Ok(());
                 }
@@ -360,6 +361,7 @@ impl EventLoop {
             let _ = self.event_tx.send(ReplEvent::QueryFailed {
                 query_id,
                 error: format!("Tool continuation could not be admitted: {error}"),
+                generator_name: None,
             });
             return Ok(());
         }
