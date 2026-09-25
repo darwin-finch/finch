@@ -10,8 +10,9 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
-    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    BrainParticipantMessage, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage, MessageId,
+    MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage,
+    WorkUnit,
 };
 use crate::models::ModelProgress;
 use crate::runtime::VmEffectEnvelope;
@@ -423,6 +424,16 @@ impl OutputManager {
         let msg = Arc::new(OperationMessage::new(header));
         self.add_trait_message(Arc::clone(&msg) as MessageRef);
         msg
+    }
+
+    /// Write a recalled/committed memory set for this turn: a chrome header
+    /// plus one row per memory, its identity/summary line, and the recalled
+    /// text beneath it directly -- no Input/Output split and no bounded
+    /// scrollable child viewport, since a memory has no input side and its
+    /// content is already fully known.
+    pub fn write_memory_recall(&self, header: impl Into<String>, rows: Vec<MemoryRecallRow>) {
+        let msg = Arc::new(MemoryRecalledMessage::new(header, rows));
+        self.add_trait_message(msg);
     }
 
     /// Create and register a WorkUnit for one AI generation turn.

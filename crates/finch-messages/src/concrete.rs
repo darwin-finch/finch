@@ -7,8 +7,8 @@ use super::{ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
 use finch_ui_model::{
-    LiveToolView, OperationRowView, OperationView, ProgressView, StaticTextKind, StaticTextView,
-    WorkRowStatus,
+    LiveToolView, MemoryRecallRowView, MemoryRecalledView, OperationRowView, OperationView,
+    ProgressView, StaticTextKind, StaticTextView, WorkRowStatus,
 };
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -849,6 +849,107 @@ impl Message for OperationMessage {
 
     fn status(&self) -> MessageStatus {
         *self.status.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn content(&self) -> String {
+        self.header.clone()
+    }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Tool))
+    }
+}
+
+// ============================================================================
+// MemoryRecalledMessage - One turn's recalled/committed memory set
+//
+// Appears in scrollback as:
+//   ⏺ 3 memories retrieved
+//     ⎿ committed · score 0.64 · node 4 — 138 chars, sent raw
+//     ⎿ committed · score 0.62 · node 12 — 421 chars, sent raw
+//         user: this repo I'm in (files on disk) are your harness...
+//         assistant: I don't have direct access to your files...
+//
+// Unlike OperationMessage, a recall has no running/streaming rows: every
+// memory shown is already fully decided (raw or summarized) by the time the
+// turn assembles its request, so the whole message is built once, complete,
+// from the start -- there is no add_row/complete_row lifecycle, and (unlike
+// a tool call) no input side to disclose separately from the recalled text.
+// ============================================================================
+
+/// One recalled memory's presentation: its identity line, presentation
+/// summary, and the recalled text lines shown beneath it.
+pub struct MemoryRecallRow {
+    /// Pre-formatted identity, e.g. "committed · score 0.64 · node 4".
+    pub label: String,
+    /// Pre-formatted one-line presentation summary, e.g. "138 chars, sent raw".
+    pub summary: String,
+    /// The recalled text, already split into lines.
+    pub body_lines: Vec<String>,
+}
+
+/// A recalled/committed memory set shown for one turn. Immutable once
+/// constructed: unlike a tool call, nothing about a recall streams in after
+/// the presentation decision is made.
+pub struct MemoryRecalledMessage {
+    id: MessageId,
+    header: String,
+    rows: Vec<MemoryRecallRow>,
+}
+
+impl MemoryRecalledMessage {
+    pub fn new(header: impl Into<String>, rows: Vec<MemoryRecallRow>) -> Self {
+        Self {
+            id: MessageId::new(),
+            header: header.into(),
+            rows,
+        }
+    }
+}
+
+impl Message for MemoryRecalledMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    /// The chrome header plus one row per memory, its identity/summary line,
+    /// and its recalled text -- no Input/Output split, since a memory has no
+    /// input side.
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::MemoryRecalled(MemoryRecalledView {
+            header: self.header.clone(),
+            rows: self
+                .rows
+                .iter()
+                .map(|row| MemoryRecallRowView {
+                    label: row.label.clone(),
+                    summary: row.summary.clone(),
+                    body_lines: row.body_lines.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    fn format(&self, _colors: &ColorScheme) -> String {
+        let mut result = format!("{}⏺{} {}\n", CYAN, RESET, self.header);
+        for row in &self.rows {
+            if row.summary.is_empty() {
+                result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, row.label));
+            } else {
+                result.push_str(&format!(
+                    "  {}⎿{} {} {}— {}{}\n",
+                    GRAY, RESET, row.label, GRAY_DIM, row.summary, RESET
+                ));
+            }
+            for line in &row.body_lines {
+                result.push_str(&format!("      {line}\n"));
+            }
+        }
+        result
+    }
+
+    fn status(&self) -> MessageStatus {
+        MessageStatus::Complete
     }
 
     fn content(&self) -> String {

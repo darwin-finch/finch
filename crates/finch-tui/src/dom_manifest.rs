@@ -13,9 +13,9 @@
 //! pinned by the golden-JSON test.
 
 use finch_ui_model::{
-    Axis, ComponentView, LiveToolView, MessageId, MessageStatus, OperationView, ProgressView,
-    RowId, SayTurnStatus, SayTurnView, Span, SpanColor, SpanStyle, StaticTextKind, StaticTextView,
-    Track, Widget, WorkRowStatus,
+    Axis, ComponentView, LiveToolView, MemoryRecalledView, MessageId, MessageStatus, OperationView,
+    ProgressView, RowId, SayTurnStatus, SayTurnView, Span, SpanColor, SpanStyle, StaticTextKind,
+    StaticTextView, Track, Widget, WorkRowStatus,
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -235,6 +235,7 @@ pub fn component_manifest(view: &ComponentView) -> DynamicUiNode {
         ComponentView::Progress(progress) => progress_manifest(progress),
         ComponentView::LiveTool(live_tool) => live_tool_manifest(live_tool),
         ComponentView::Operation(operation) => operation_manifest(operation),
+        ComponentView::MemoryRecalled(memory) => memory_recalled_manifest(memory),
     }
 }
 
@@ -308,6 +309,25 @@ pub fn operation_manifest(view: &OperationView) -> DynamicUiNode {
     DynamicUiNode::leaf("Operation", "")
         .with_prop("header", view.header.clone())
         .with_prop("status", manifest_status(&view.status))
+        .with_children(rows)
+}
+
+/// A recalled-memory message's manifest: chrome header plus one row per
+/// memory, its identity/summary, and the recalled text lines -- no
+/// input/output child, since a memory has no input side.
+pub fn memory_recalled_manifest(view: &MemoryRecalledView) -> DynamicUiNode {
+    let rows = view
+        .rows
+        .iter()
+        .map(|row| {
+            DynamicUiNode::leaf("MemoryRecallRow", "")
+                .with_prop("label", row.label.clone())
+                .with_prop("summary", row.summary.clone())
+                .with_prop("bodyLines", row.body_lines.clone())
+        })
+        .collect();
+    DynamicUiNode::leaf("MemoryRecalled", "")
+        .with_prop("header", view.header.clone())
         .with_children(rows)
 }
 

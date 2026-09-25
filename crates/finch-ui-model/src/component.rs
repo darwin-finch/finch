@@ -47,6 +47,15 @@ pub enum ComponentView {
     /// A grouped tool-call operation message (#1120, stage 3): chrome plus a
     /// row list with per-row status glyphs.
     Operation(OperationView),
+    /// A recalled/committed memory set for one turn: chrome plus a row per
+    /// memory, its identity line, and the recalled text itself directly
+    /// beneath it. Unlike a tool call, a memory has no input side and its
+    /// content is fully known at construction — there is nothing to page
+    /// through, so this component carries no Input/Output split and no
+    /// bounded/scrollable child viewport (the tool-result control in
+    /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolOutput`
+    /// rows only, which this component never emits).
+    MemoryRecalled(MemoryRecalledView),
 }
 
 /// The ViewModel of a [`ComponentView::StaticText`] component: the message's
@@ -113,6 +122,28 @@ pub struct OperationView {
 pub struct OperationRowView {
     pub label: String,
     pub status: WorkRowStatus,
+}
+
+/// The ViewModel of a [`ComponentView::MemoryRecalled`] component: the chrome
+/// header (e.g. "3 memories retrieved") and one row per recalled memory. The
+/// message constructs the snapshot once, from the recall decision already
+/// made for this turn — there is no running/streaming state to retain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRecalledView {
+    pub header: String,
+    pub rows: Vec<MemoryRecallRowView>,
+}
+
+/// One memory row of a [`MemoryRecalledView`]: its identity line (tier,
+/// score, node id), a one-line presentation summary (raw vs. summarized),
+/// and the recalled text itself. `body_lines` renders directly beneath the
+/// row — no separate "Input"/"Output" disclosure, since a memory has no
+/// input side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRecallRowView {
+    pub label: String,
+    pub summary: String,
+    pub body_lines: Vec<String>,
 }
 
 /// The style roles the component renderers read (stage 4, #1141).
@@ -185,6 +216,7 @@ pub fn component_lines(
         ComponentView::Progress(progress) => progress_lines(progress, palette),
         ComponentView::LiveTool(live_tool) => live_tool_lines(live_tool, palette),
         ComponentView::Operation(operation) => operation_lines(operation, palette),
+        ComponentView::MemoryRecalled(memory) => memory_recalled_lines(memory, palette),
     }
 }
 
@@ -387,6 +419,45 @@ fn static_text_lines(
             }
         })
         .collect()
+}
+
+/// A memory-recall row: chrome (`⏺ header`) then one row per memory — its
+/// identity/summary line, then the recalled text directly beneath it. Unlike
+/// [`operation_lines`], a row here has no running/complete/error status (a
+/// recalled memory is always already fully known) and its body is plain
+/// content, never a bounded/scrollable viewport — the whole point is that a
+/// couple of short lines of recalled context need no pagination chrome.
+/// Reuses the operation glyph styles: visually this is the same "grouped
+/// activity" family as a tool-call operation, just without the input side or
+/// the per-row running state.
+fn memory_recalled_lines(
+    view: &MemoryRecalledView,
+    palette: &ComponentStylePalette,
+) -> Vec<RenderedTranscriptLine> {
+    let mut lines = Vec::with_capacity(1 + view.rows.len());
+    lines.push(RenderedTranscriptLine::from_spans(vec![
+        Span::styled("\u{23fa}", palette.operation_glyph),
+        Span::plain(format!(" {}", view.header)),
+    ]));
+    for row in &view.rows {
+        let mut row_spans = vec![
+            Span::plain("  "),
+            Span::styled("\u{23bf}", palette.operation_row_glyph),
+            Span::plain(format!(" {}", row.label)),
+        ];
+        if !row.summary.is_empty() {
+            row_spans.push(Span::plain(" "));
+            row_spans.push(Span::styled(
+                format!("— {}", row.summary),
+                palette.operation_summary,
+            ));
+        }
+        lines.push(RenderedTranscriptLine::from_spans(row_spans));
+        lines.extend(row.body_lines.iter().map(|body_line| {
+            RenderedTranscriptLine::from_spans(vec![Span::plain(format!("      {body_line}"))])
+        }));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -933,6 +1004,149 @@ mod tests {
             rect.height, 2,
             "chrome + one running row claim two rows; got {rect:?}"
         );
+    }
+
+    // ── MemoryRecalled: recalled memories, no Input/Output split ────────────
+
+    fn memory_recalled_view(header: &str, rows: &[(&str, &str, &[&str])]) -> MemoryRecalledView {
+        MemoryRecalledView {
+            header: header.to_string(),
+            rows: rows
+                .iter()
+                .map(|(label, summary, body_lines)| MemoryRecallRowView {
+                    label: label.to_string(),
+                    summary: summary.to_string(),
+                    body_lines: body_lines.iter().map(|line| line.to_string()).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn memory_recalled_texts(view: &MemoryRecalledView) -> Vec<String> {
+        component_lines(&ComponentView::MemoryRecalled(view.clone()), &PALETTE)
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// INVARIANT: a recalled memory renders its identity line, its
+    /// presentation summary, and the recalled text directly — reproduces the
+    /// reported bug at the production boundary (a memory row showed a
+    /// generic tool-call "Input"/"Output" disclosure structure that makes no
+    /// sense for a memory, since there is no input to a recall). No line may
+    /// say "Input" or carry an "Output (" count header.
+    #[test]
+    fn test_memory_recalled_row_has_no_input_output_split() {
+        let view = memory_recalled_view(
+            "2 memories retrieved",
+            &[
+                (
+                    "committed · score 0.64 · node 4",
+                    "138 chars, sent raw",
+                    &[
+                        "user: this repo I'm in (files on disk) are your harness. what do you think of it?",
+                        "assistant: I don't have direct access to your files or environment.",
+                    ],
+                ),
+                (
+                    "recalled · score 0.60 · node 1",
+                    "81 chars, sent raw",
+                    &["user: Qwen, are you there?", "assistant: Qwen, I'm here."],
+                ),
+            ],
+        );
+        let texts = memory_recalled_texts(&view);
+        assert_eq!(
+            texts,
+            vec![
+                "⏺ 2 memories retrieved",
+                "  ⎿ committed · score 0.64 · node 4 — 138 chars, sent raw",
+                "      user: this repo I'm in (files on disk) are your harness. what do you think of it?",
+                "      assistant: I don't have direct access to your files or environment.",
+                "  ⎿ recalled · score 0.60 · node 1 — 81 chars, sent raw",
+                "      user: Qwen, are you there?",
+                "      assistant: Qwen, I'm here.",
+            ],
+            "chrome plus one identity+summary line and the recalled text beneath it, \
+             per memory; got {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|line| line == "Input" || line.contains("Output (")),
+            "INVARIANT: a memory row must never show the tool-call \"Input\"/\"Output (\" \
+             disclosure structure — a memory has no input side; lines were {texts:?}"
+        );
+    }
+
+    /// A memory with no recalled text (defensive: an empty presentation)
+    /// still claims its identity/summary row without a phantom empty body
+    /// line — unlike `StaticText`'s single-row furniture rule, an
+    /// [`OperationRow`]-style row with zero body lines simply claims zero
+    /// extra rows.
+    #[test]
+    fn test_memory_recalled_row_with_empty_body_claims_no_extra_rows() {
+        let view = memory_recalled_view(
+            "1 memory retrieved",
+            &[("committed · score 0.50 · node 9", "0 chars, sent raw", &[])],
+        );
+        assert_eq!(
+            memory_recalled_texts(&view),
+            vec![
+                "⏺ 1 memory retrieved",
+                "  ⎿ committed · score 0.50 · node 9 — 0 chars, sent raw",
+            ]
+        );
+    }
+
+    /// INVARIANT (#1141): a memory row's spans concatenate exactly to its
+    /// plain text, same as every other migrated component.
+    #[test]
+    fn test_memory_recalled_spans_equal_concatenated_text() {
+        let view = memory_recalled_view(
+            "1 memory retrieved",
+            &[(
+                "committed · score 0.64 · node 4",
+                "138 chars, sent raw",
+                &["user: hi", "assistant: hello"],
+            )],
+        );
+        for line in component_lines(&ComponentView::MemoryRecalled(view), &PALETTE) {
+            assert_eq!(
+                crate::spans_text(&line.spans),
+                line.text,
+                "spans must concatenate to the line's plain text; line={line:?}"
+            );
+        }
+    }
+
+    /// A memory row's body lines carry no [`NodeRole::ToolOutput`] tagging
+    /// (indeed, no role at all) and no `body_of` owner — the bounded
+    /// tool-result viewport in `finch-tui`'s `tool_viewport.rs` keys
+    /// exclusively off `role == Some(NodeRole::ToolOutput)`, so a memory row
+    /// can never be mistaken for a paginated tool result, however long its
+    /// recalled text is.
+    #[test]
+    fn test_memory_recalled_body_lines_carry_no_tool_output_role() {
+        let view = memory_recalled_view(
+            "1 memory retrieved",
+            &[(
+                "committed · score 0.64 · node 4",
+                "138 chars, sent raw",
+                &["user: hi", "assistant: hello"],
+            )],
+        );
+        for line in component_lines(&ComponentView::MemoryRecalled(view), &PALETTE) {
+            assert!(
+                line.role.is_none(),
+                "INVARIANT: a memory row must never carry a NodeRole (in particular never \
+                 ToolOutput), so the bounded tool-result viewport cannot claim it; line={line:?}"
+            );
+            assert!(
+                line.body_of.is_none(),
+                "INVARIANT: a memory row must never register a viewport owner id; line={line:?}"
+            );
+        }
     }
 
     // ── Stage 4 (#1141): styled spans, never SGR bytes ──────────────────────

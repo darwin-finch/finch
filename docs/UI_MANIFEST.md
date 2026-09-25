@@ -66,6 +66,8 @@ serializes as `{"text": "…"}`.
 | `LiveTool` | `header`, `lines`, `status` | — |
 | `Operation` | `header`, `status` | `OperationRow` |
 | `OperationRow` | `label`, `status` (`{state}`, plus `summary`/`detail` when present) | — |
+| `MemoryRecalled` | `header` | `MemoryRecallRow` |
+| `MemoryRecallRow` | `label`, `summary`, `bodyLines` | — |
 
 The engine vocabulary lowers with these element types: `Stack` (`axis`,
 per-child `track`), `Text` (`lines`), `Viewport` (`Line` children carrying

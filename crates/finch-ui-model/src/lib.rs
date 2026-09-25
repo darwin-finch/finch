@@ -20,8 +20,9 @@ mod span;
 mod work_unit;
 
 pub use component::{
-    component_lines, ComponentStylePalette, ComponentView, LiveToolView, OperationRowView,
-    OperationView, ProgressView, StaticTextKind, StaticTextView,
+    component_lines, ComponentStylePalette, ComponentView, LiveToolView, MemoryRecallRowView,
+    MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
+    StaticTextView,
 };
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,

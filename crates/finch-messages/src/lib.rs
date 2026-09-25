@@ -12,19 +12,20 @@
 use std::sync::Arc;
 
 pub use finch_ui_model::{
-    AgentActivityView, AgentToolView, ComponentView, LiveToolView, MessageId, MessageStatus,
-    OperationRowView, OperationView, OutputVm, ProgramSourceVm, ProgressView, SayTurnStatus,
-    SayTurnView, StaticTextKind, StaticTextView, WorkRowPresentation, WorkRowStatus, WorkRowView,
-    WorkUnitHead, WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
+    AgentActivityView, AgentToolView, ComponentView, LiveToolView, MemoryRecallRowView,
+    MemoryRecalledView, MessageId, MessageStatus, OperationRowView, OperationView, OutputVm,
+    ProgramSourceVm, ProgressView, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
+    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
+    WorkUnitView, WorkUnitViewModel,
 };
 
 mod concrete;
 mod work_unit;
 
 pub use concrete::{
-    BrainParticipantMessage, LiveToolMessage, OperationMessage, OperationRow, OperationRowStatus,
-    ProgressMessage, StaticMessage, StaticMessageType, StreamingResponseMessage,
-    ToolExecutionMessage, UserQueryMessage,
+    BrainParticipantMessage, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage,
+    OperationMessage, OperationRow, OperationRowStatus, ProgressMessage, StaticMessage,
+    StaticMessageType, StreamingResponseMessage, ToolExecutionMessage, UserQueryMessage,
 };
 pub use work_unit::{random_spinner_verb, ComponentAction, ToggleProgram, WorkRow, WorkUnit};
 
