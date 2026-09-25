@@ -2121,8 +2121,11 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
 /// to the turn's program. Byte identity holds by construction in every
 /// producer path (interactive typed, wire, repair — the producer passes the
 /// same source string to both units), and a mismatch suppresses nothing, so
-/// the rule can only fail toward rendering more information, never less. The
-/// canonical record keeps the raw program exactly once:
+/// the rule can only fail toward rendering more information, never less. An
+/// empty program pairs the same way (#1185): a degenerate wire turn whose
+/// source trims to "" leaves both sides empty, so the byte-exact net still
+/// matches and the legacy row for that same empty source never co-renders.
+/// The canonical record keeps the raw program exactly once:
 /// `commit_complete_messages` iterates messages without neighbour context and
 /// is untouched by this rule.
 fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
@@ -2132,9 +2135,6 @@ fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageI
             continue;
         };
         let program = view.vm.program.lines.join("\n");
-        if program.is_empty() {
-            continue;
-        }
         let Some(head) = pair[0].work_unit_head() else {
             continue;
         };
@@ -4759,7 +4759,7 @@ mod tests {
     use super::*;
     use crate::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
-    use finch_messages::{Message, MessageId, MessageRef, StaticMessage, WorkUnit};
+    use finch_messages::{Message, MessageId, MessageRef, SayTurnStatus, StaticMessage, WorkUnit};
     use finch_theme::ColorTheme;
 
     /// The messages already committed to native scrollback, in order. Tests
@@ -7019,6 +7019,168 @@ mod tests {
             staged_text.contains("hello"),
             "the say bytes spool exactly once through the canonical record; \
              staged={staged_text:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_empty_program_say_turn_consolidates_and_completes_instead_of_hanging() {
+        // INVARIANT (#1185): a wire turn whose raw source trims to "" still
+        // calls `begin_say_turn(language, "")` — a real turn with an empty
+        // program — and later completes. The completed card must render its
+        // terminal state (never the generating spinner) and the legacy
+        // `Program source` row for the same empty source must consolidate
+        // into the card, not co-render beside it. The canonical record keeps
+        // the raw program exactly once either way.
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("wire program source"));
+        source.set_program_source("forth");
+        source.set_response("");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.begin_say_turn("forth", "");
+        output.set_complete();
+        let view = output
+            .say_turn_view()
+            .expect("the degenerate turn owns a say VM");
+        assert_eq!(
+            view.vm.status,
+            SayTurnStatus::Completed,
+            "the wire completion path transitions the say VM to Completed; vm={:?}",
+            view.vm
+        );
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+        let messages = vec![source.clone() as MessageRef, output.clone() as MessageRef];
+        let projected = renderer.projected_lines(messages, 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !rendered.iter().any(|line| line.contains("Generating")),
+            "INVARIANT: the completed turn must not wear the generating \
+             spinner forever; rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("(ran ")),
+            "INVARIANT: the completed card renders its `(ran Ns)` terminal \
+             annotation even with an empty program and empty output; \
+             rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT: the legacy Program source row for the same (empty) \
+             source must not render beside the say card; rendered={rendered:?}"
+        );
+
+        // The canonical record is untouched: the raw (empty) program record
+        // still commits — the viewport rule never touches the pinned commit
+        // pipeline.
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        manager.add_trait_message(source.clone());
+        manager.add_trait_message(output.clone());
+        let plan = plan_canonical_commit(&manager.get_messages(), &HashSet::new());
+        assert!(
+            plan.emit.iter().any(|message| message.id() == source.id()),
+            "the canonical record still emits the raw program record; emit={}",
+            plan.emit
+                .iter()
+                .map(|message| message.id().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
+    fn clicking_an_unrelated_legacy_program_source_row_never_touches_the_say_turn_card() {
+        // INVARIANT (#1185): the reported click symptom rode an already-broken
+        // co-render (a permanently-generating card beside a stale legacy
+        // row), not a click-handling defect. Accordion disclosure state and
+        // component ViewModel state are stored and routed independently:
+        // clicking the legacy row toggles the legacy row's own disclosure,
+        // but must never reach the say card's `show_program` — the card
+        // keeps rendering its prose.
+        let colors = ColorScheme::default();
+        let foreign = Arc::new(WorkUnit::new("other program"));
+        foreign.set_program_source("forth");
+        foreign.set_response("(emit \"different bytes\")");
+        foreign.set_complete();
+        let say = Arc::new(WorkUnit::new("VM program output"));
+        say.set_program_output();
+        say.begin_say_turn("lisp", "(say \"hello\")");
+        say.append_response("hello");
+        say.set_complete();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+        let messages = vec![foreign.clone() as MessageRef, say.clone() as MessageRef];
+        let projected = renderer.projected_lines(messages, 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Program source")),
+            "a foreign source row keeps rendering — byte mismatch suppresses \
+             nothing; rendered={rendered:?}"
+        );
+
+        // Find the legacy header's terminal row the way the retained
+        // hit-region rebuild recounts rows, then click it.
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&projected, 0, 80);
+        let mut legacy_row = None;
+        let mut y: u16 = 0;
+        for line in &projected {
+            let rows = shadow_buffer::physical_rows(&line.text, 80) as u16;
+            if line.text.contains("Program source") {
+                legacy_row = Some(y);
+                break;
+            }
+            y += rows;
+        }
+        let legacy_row = legacy_row.expect("the legacy Program source header renders");
+        assert!(
+            renderer
+                .accordion
+                .handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left
+                    ),
+                    column: 0,
+                    row: legacy_row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+            "the legacy row is a real disclosure hit target"
+        );
+
+        // The say card is untouched: show_program stays false and the card
+        // keeps rendering its prose, never the program source.
+        let view = say.say_turn_view().expect("the say turn owns a VM");
+        assert!(
+            !view.vm.show_program,
+            "clicking the legacy row must not reach the say card's show_program; vm={:?}",
+            view.vm
+        );
+        let after = renderer.projected_lines(
+            vec![foreign.clone() as MessageRef, say.clone() as MessageRef],
+            80,
+        );
+        let after_rendered: Vec<&str> = after.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !after_rendered
+                .iter()
+                .any(|line| line.contains("(say \"hello\")")),
+            "the say card must not swap to its program source after a click on \
+             an unrelated legacy row; rendered={after_rendered:?}"
+        );
+        assert!(
+            after_rendered.iter().any(|line| line.contains("hello")),
+            "the say card keeps rendering its prose; rendered={after_rendered:?}"
         );
     }
 
