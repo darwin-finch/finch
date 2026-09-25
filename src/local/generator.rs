@@ -623,6 +623,108 @@ mod tests {
         );
     }
 
+    /// Records the exact prompt text handed to `TextGeneration::tokenize`, so
+    /// tests can assert on what the production path actually sends to the
+    /// backend rather than only on the adapter's output in isolation.
+    struct PromptCapturingBackend {
+        captured_prompt: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl TextGeneration for PromptCapturingBackend {
+        fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+            Ok(b"ok".iter().map(|byte| u32::from(*byte)).collect())
+        }
+
+        fn generate_stream(
+            &mut self,
+            input_ids: &[u32],
+            max_new_tokens: usize,
+            mut callback: TokenCallback,
+        ) -> Result<Vec<u32>> {
+            let output = self.generate(input_ids, max_new_tokens)?;
+            callback(output[0], "ok");
+            Ok(output)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+            *self.captured_prompt.lock().expect("lock captured prompt") = Some(text.to_string());
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+            let bytes = tokens.iter().map(|token| *token as u8).collect();
+            Ok(String::from_utf8(bytes)?)
+        }
+
+        fn name(&self) -> &str {
+            "Gemma 2 9B test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_gemma_configured_generator_sends_gemma_template_to_backend_not_llama() {
+        let captured_prompt = Arc::new(std::sync::Mutex::new(None));
+        let backend = PromptCapturingBackend {
+            captured_prompt: Arc::clone(&captured_prompt),
+        };
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(backend), config);
+        let shared = Arc::new(RwLock::new(model));
+        // Model name mirrors what the daemon derives for a Gemma GGUF
+        // (`display_name` in `src/models/loaders/llama_cpp.rs`): the
+        // configured family prefixed onto the file stem.
+        let generator = TemplateGenerator::with_models(
+            PatternClassifier::new(),
+            Some(Arc::clone(&shared)),
+            "Gemma 2 (gemma-2-9b-it)",
+        );
+        generator
+            .try_neural_generate_streaming("system contract", "What is 2+2?", &shared, |_, _| {})
+            .expect("Gemma-configured generator must reach the injected backend");
+
+        let prompt = captured_prompt
+            .lock()
+            .expect("lock captured prompt")
+            .clone()
+            .expect("tokenize must have been called with the formatted prompt");
+
+        assert!(
+            prompt.starts_with("<bos><start_of_turn>user\n"),
+            "Gemma's real BOS/turn markers must reach the backend, got: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("<end_of_turn>\n<start_of_turn>model\n"),
+            "Gemma's real turn-close/model-turn markers must reach the backend, got: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains("<|begin_of_text|>")
+                && !prompt.contains("<|start_header_id|>")
+                && !prompt.contains("<|eot_id|>"),
+            "Llama's special tokens don't exist in Gemma's vocabulary and must never be sent, got: {prompt:?}"
+        );
+        // The llama.cpp loader's BOS-detection heuristic
+        // (`prompt_contains_explicit_bos` in
+        // `src/models/loaders/llama_cpp.rs`) must recognize this exact
+        // `<bos>`-prefixed shape so it tells llama.cpp not to add a second,
+        // real BOS token on top of this literal one; covered directly by
+        // `explicit_chat_template_bos_disables_tokenizer_bos_insertion` in
+        // that module, which this prompt shape must stay byte-compatible with.
+    }
+
     #[test]
     #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
     fn test_local_streaming_uses_configured_gguf_backend() {

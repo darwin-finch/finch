@@ -25,7 +25,13 @@ fn backend() -> Result<&'static LlamaBackend> {
 }
 
 fn prompt_contains_explicit_bos(text: &str) -> bool {
-    text.starts_with("<|begin_of_text|>") || text.starts_with("<s>")
+    // Each of these is a chat-template adapter's literal, human-readable BOS
+    // marker: Llama 3's `<|begin_of_text|>`, Llama 2/Mistral's `<s>`, and
+    // Gemma's `<bos>`. llama.cpp's tokenizer parses special-token text in the
+    // prompt (parse_special=true in `str_to_token`) regardless of the AddBos
+    // flag, so when the adapter already wrote one of these into the prompt,
+    // AddBos must be Never or the model sees a duplicate BOS token.
+    text.starts_with("<|begin_of_text|>") || text.starts_with("<s>") || text.starts_with("<bos>")
 }
 
 fn load_model(path: &Path, allow_gpu_offload: bool) -> Result<Arc<LlamaModel>> {
@@ -315,6 +321,7 @@ mod tests {
             "<|begin_of_text|><|start_header_id|>system"
         ));
         assert!(prompt_contains_explicit_bos("<s>[INST] hello [/INST]"));
+        assert!(prompt_contains_explicit_bos("<bos><start_of_turn>user"));
         assert!(!prompt_contains_explicit_bos("<|im_start|>system"));
     }
 
@@ -325,7 +332,7 @@ mod tests {
         assert_eq!(name, "Gemma 2 (model)");
         assert_eq!(
             crate::models::AdapterRegistry::get_adapter(&name).family_name(),
-            "Llama",
+            "Gemma",
             "Gemma must use its configured family adapter, not the generic filename"
         );
         assert!(
@@ -403,6 +410,39 @@ mod tests {
             tokens.iter().filter(|token| **token == 128000).count(),
             1,
             "the explicit Llama template BOS must not be duplicated"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FINCH_TEST_GEMMA_GGUF pointing to a Gemma 2 GGUF"]
+    fn test_real_gemma_gguf_prompt_contains_one_bos_token_and_generates() {
+        let path = std::env::var("FINCH_TEST_GEMMA_GGUF").expect("set FINCH_TEST_GEMMA_GGUF");
+        let mut generator =
+            LlamaCppGenerator::load_with_offload(Path::new(&path), true, Some("Gemma 2"))
+                .expect("load Gemma GGUF");
+        let adapter = crate::models::GemmaAdapter;
+        let prompt = crate::models::LocalModelAdapter::format_chat_prompt(
+            &adapter,
+            "You are helpful.",
+            "Hello",
+        );
+        let tokens = generator.tokenize(&prompt).expect("tokenize Gemma prompt");
+        assert_eq!(
+            tokens.iter().filter(|token| **token == 2).count(),
+            1,
+            "Gemma's literal <bos> template marker must tokenize to exactly one real BOS (id 2), \
+             not zero (misrouted to Llama's <|begin_of_text|>, which Gemma's vocab doesn't have) \
+             and not two (AddBos::Always duplicating the literal <bos> already in the prompt)"
+        );
+        // This is the exact symptom this adapter fixes: a misformatted Gemma
+        // prompt plausibly samples an end-of-generation token on the very
+        // first greedy step, yielding an empty response with no error.
+        let output = generator
+            .generate(&tokens, 4)
+            .expect("Gemma GGUF generation");
+        assert!(
+            !output.is_empty(),
+            "a correctly formatted Gemma prompt must not generate zero tokens"
         );
     }
 
