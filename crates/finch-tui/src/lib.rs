@@ -2125,6 +2125,17 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
 /// canonical record keeps the raw program exactly once:
 /// `commit_complete_messages` iterates messages without neighbour context and
 /// is untouched by this rule.
+///
+/// This intentionally pairs on an empty program too (#1185): a degenerate
+/// provider turn (no text, no tool calls) produces an empty wire source, so
+/// the preceding Program-source unit's `response_text` and the say turn's
+/// `program` are both `""` — still byte-identical, still the same turn. The
+/// earlier code skipped pairing whenever the program was empty, meant to
+/// leave room for a hypothetical future producer that creates the card
+/// before its program is known; no such producer exists today, so in
+/// practice that early exit only ever fired for this degenerate turn and
+/// left its legacy `Program source` row permanently rendering beside the
+/// say card — the exact invariant this function exists to prevent.
 fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
     let mut suppressed = HashSet::new();
     for pair in messages.windows(2) {
@@ -2132,9 +2143,6 @@ fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageI
             continue;
         };
         let program = view.vm.program.lines.join("\n");
-        if program.is_empty() {
-            continue;
-        }
         let Some(head) = pair[0].work_unit_head() else {
             continue;
         };
@@ -7019,6 +7027,224 @@ mod tests {
             staged_text.contains("hello"),
             "the say bytes spool exactly once through the canonical record; \
              staged={staged_text:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_empty_program_say_turn_consolidates_and_completes_instead_of_hanging() {
+        // Regression (#1185, production-boundary reproduction of the user
+        // report): a provider turn that streams no text and no tool calls
+        // (observed with local Gemma and Qwen backends) produces an empty
+        // wire source. `begin_say_turn` still runs with that empty string,
+        // so the say-turn ViewModel's `program.lines` is an empty Vec even
+        // though the turn is real. Two bugs compounded:
+        //   1. `say_state` read the empty program as "no producer has
+        //      reached a say turn before its program is known" and rendered
+        //      the animated "Generating…" spinner forever, even once the
+        //      turn's `status` transitioned to Completed -- the completed
+        //      output (however empty) never displayed.
+        //   2. `say_turn_consolidated_source_ids` skipped pairing whenever
+        //      the program was empty, so the legacy `Program source (forth)`
+        //      disclosure row for the very same (empty) source stayed
+        //      unsuppressed and rendered permanently beside the stuck
+        //      spinner -- exactly the co-render the pinned invariant below
+        //      exists to prevent, and exactly what the user saw.
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("typed program"));
+        source.set_program_source("forth");
+        source.set_response("");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.begin_say_turn("forth", "");
+        output.set_complete();
+        let messages: Vec<MessageRef> = vec![source.clone(), output.clone()];
+
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+        let projected = renderer.projected_lines(messages, 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+
+        assert!(
+            !rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT: the legacy Program source row must not render beside the say \
+             card, even when the turn's program is degenerately empty; rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("Generating")),
+            "a Completed turn must never render the generating spinner, degenerate \
+             empty program or not -- the completion path owns the transition and it \
+             already ran; rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("(ran ")),
+            "the completed card still renders its `(ran Ns)` annotation so the turn \
+             reads as finished, not stuck; rendered={rendered:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_an_unrelated_legacy_program_source_row_never_touches_the_say_turn_card() {
+        // Regression (#1185): the user reported that clicking a `Program
+        // source` disclosure header made an adjacent say-turn's "Generating…"
+        // spinner vanish, and a second click did not bring it back. The
+        // production-boundary reproduction above shows the *usual* cause is
+        // the co-render invariant violation itself (now fixed): once two
+        // rows wear one turn, whatever happens next is undefined by
+        // construction. This test pins the complementary guarantee for the
+        // case the invariant explicitly still allows to co-render -- a
+        // legacy Program-source row for a genuinely different, mismatched
+        // program next to an in-flight say turn (`say_turn_consolidated_source_ids`
+        // "a mismatch suppresses nothing"): clicking that unrelated legacy
+        // row's real hit rect toggles only its own disclosure state and
+        // never reaches the say turn's component-owned ViewModel, in either
+        // direction, and a second click on the same rect toggles it back.
+        let colors = ColorScheme::default();
+        let foreign = Arc::new(WorkUnit::new("other program"));
+        foreign.set_program_source("forth");
+        foreign.set_response("(emit \"different bytes\")");
+        foreign.set_complete();
+        let generating = Arc::new(WorkUnit::new("VM program output"));
+        generating.set_program_output();
+        // Empty program, status left at its default Running: the in-flight
+        // "Generating…" window the user's screenshot showed.
+        generating.begin_say_turn("forth", "");
+        let messages: Vec<MessageRef> = vec![foreign.clone(), generating.clone()];
+
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+        let projected = renderer.projected_lines(messages.clone(), 80);
+        assert!(
+            projected
+                .iter()
+                .any(|line| line.text.contains("Program source")),
+            "the foreign source keeps its row: its bytes are not this turn's program, \
+             so nothing suppresses it"
+        );
+        let spinner_before = projected
+            .iter()
+            .find(|line| line.text.contains("Generating"))
+            .expect("the say turn renders its generating spinner")
+            .text
+            .clone();
+
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&projected, 0, 80);
+        let header = renderer
+            .accordion
+            .hit_regions
+            .iter()
+            .find(|region| {
+                let row = region.top as usize;
+                projected
+                    .get(row)
+                    .is_some_and(|line| line.text.contains("Program source"))
+            })
+            .cloned()
+            .expect("the foreign Program source header registers a clickable hit region");
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: header.left,
+            row: header.top,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(
+            renderer.accordion.handle_mouse(click),
+            "the foreign header must be clickable"
+        );
+        let projected_after_click = renderer.projected_lines(messages.clone(), 80);
+        assert!(
+            projected_after_click
+                .iter()
+                .any(|line| line.text.contains("different bytes")),
+            "the click opened the foreign row's own body -- proof the click landed and \
+             did something; rendered={:?}",
+            projected_after_click
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        );
+        let spinner_after_click = projected_after_click
+            .iter()
+            .find(|line| line.text.contains("Generating"))
+            .expect("the say turn still renders after an unrelated row's click")
+            .text
+            .clone();
+        assert_eq!(
+            spinner_before, spinner_after_click,
+            "clicking an unrelated legacy row must never mutate or hide the say turn's \
+             own component-owned rendering"
+        );
+        assert!(
+            generating
+                .say_turn_view()
+                .is_some_and(|view| !view.vm.show_program),
+            "the say turn's own ViewModel is untouched by a click on a different row's \
+             hit rect"
+        );
+
+        // Click the same rect again: the toggle must be idempotent on the
+        // row it actually targets, not leak into a stuck state either way.
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&projected_after_click, 0, 80);
+        let header_again = renderer
+            .accordion
+            .hit_regions
+            .iter()
+            .find(|region| {
+                let row = region.top as usize;
+                projected_after_click
+                    .get(row)
+                    .is_some_and(|line| line.text.contains("Program source"))
+            })
+            .cloned()
+            .expect("the foreign header still registers a clickable hit region");
+        assert!(
+            renderer
+                .accordion
+                .handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left
+                    ),
+                    column: header_again.left,
+                    row: header_again.top,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+            "the same header must still be clickable for the second click"
+        );
+        let projected_after_second_click = renderer.projected_lines(messages, 80);
+        assert!(
+            !projected_after_second_click
+                .iter()
+                .any(|line| line.text.contains("different bytes")),
+            "the second click closes the same row it opened -- the toggle is the row's \
+             actual state, not a stuck-open one; rendered={:?}",
+            projected_after_second_click
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        );
+        let spinner_after_second_click = projected_after_second_click
+            .iter()
+            .find(|line| line.text.contains("Generating"))
+            .expect("the say turn still renders after the second click")
+            .text
+            .clone();
+        assert_eq!(
+            spinner_before, spinner_after_second_click,
+            "two clicks on the unrelated row round-trip without ever touching the say \
+             turn's rendering"
         );
     }
 

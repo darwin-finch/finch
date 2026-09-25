@@ -101,15 +101,25 @@ enum SayTurnState {
 }
 
 fn say_state(vm: &WorkUnitViewModel) -> SayTurnState {
-    if vm.program.lines.is_empty() {
+    // The completion path transitions `status` exactly once and owns that
+    // transition (#882); it must win over the emptiness heuristic below. A
+    // degenerate provider turn -- no text, no tool calls -- produces an
+    // empty wire source, so `begin_say_turn`'s `source.lines()` is an empty
+    // Vec even though the turn is real and has already finished (#1185: a
+    // completed empty-program turn stayed "Generating…" forever, and the
+    // legacy Program-source row it should have consolidated away kept
+    // rendering beside it since the pairing rule read the same emptiness as
+    // "not yet generated"). Checking status first makes Completed reachable
+    // regardless of whether the program happened to be empty.
+    if vm.status == SayTurnStatus::Completed {
+        SayTurnState::Completed
+    } else if vm.program.lines.is_empty() {
         // No producer reaches a say turn before its program is known today
         // (`begin_say_turn` carries the source); the state stays total for a
         // future producer that creates the card during model generation.
         SayTurnState::Generating
-    } else if vm.status == SayTurnStatus::Running {
-        SayTurnState::Running
     } else {
-        SayTurnState::Completed
+        SayTurnState::Running
     }
 }
 
@@ -431,6 +441,40 @@ mod tests {
     }
 
     // ── Completed ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_completed_turn_with_empty_program_does_not_stay_generating_forever() {
+        // Regression (#1185): a degenerate provider turn (no text, no tool
+        // calls) produces an empty wire source, so `begin_say_turn`'s
+        // `source.lines()` collects to an empty Vec even though the turn
+        // really did complete. `say_state` used to check program emptiness
+        // before status, so this VM read as "Generating" forever -- the
+        // spinner never advanced past its first frame and the completed
+        // output (however empty) never rendered, matching the user report
+        // "Program source (forth)" / "Generating…" staying on screen with
+        // nothing ever displayed. Status must win: a Completed turn renders
+        // Completed regardless of whether its program happened to be empty.
+        let vm = WorkUnitViewModel {
+            status: SayTurnStatus::Completed,
+            program: ProgramSourceVm::default(),
+            output: None,
+            show_program: false,
+        };
+        let view = say_view(vm);
+        let rendered = texts(&say_turn_lines(&view));
+        assert!(
+            !rendered.iter().any(|line| line.contains("Generating")),
+            "a completed turn must never render the generating spinner, even with an \
+             empty program; got {rendered:?}"
+        );
+        assert_eq!(
+            rendered,
+            vec!["", "(ran 2s)"],
+            "a completed empty-program turn renders the completed shape (no prose, the \
+             blank separator, the elapsed annotation) exactly like any other completed \
+             turn with no output; got {rendered:?}"
+        );
+    }
 
     #[test]
     fn test_completed_state_renders_prose_then_the_ran_annotation_and_no_legacy_rows() {
