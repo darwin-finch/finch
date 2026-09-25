@@ -108,6 +108,7 @@ async fn commit_tool_round_and_continue(
             admission_ready: Some(ready_tx),
             spawned: Some(spawned_tx),
             publication: Some(publication_rx),
+            pending_echo: None,
         })
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
     tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
@@ -3151,10 +3152,14 @@ impl EventLoop {
             }
         };
 
-        // Echo query to output buffer (skip when caller already echoed)
-        if echo {
-            self.output_manager.write_user(input.clone());
-        }
+        // The echo row itself is deferred: it is written from inside
+        // `process_query_with_tools`, after memory recall's own notice
+        // commits, so the visible transcript order matches the request
+        // order (recall content is already injected *before* the current
+        // question -- see `inject_recall_prefix`). The input box itself
+        // clears independently, in the input task, so this defers only the
+        // scrollback row, not the user's felt responsiveness.
+        let pending_echo = if echo { Some(input.clone()) } else { None };
 
         // Create a new query
         let conversation_snapshot = self.conversation.read().await.snapshot();
@@ -3210,6 +3215,7 @@ impl EventLoop {
             admission_ready: None,
             spawned: None,
             publication: None,
+            pending_echo,
         });
 
         Ok(())

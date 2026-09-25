@@ -1430,6 +1430,17 @@ pub(crate) async fn process_query_with_tools(
     tool_call_history: ToolCallHistory,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
     persona_system_prompt: String,
+    // The user's own typed text for a fresh interactive submission that
+    // wants an echo row, still unwritten to scrollback. Committed here,
+    // after memory recall's own notice (`display_recalled_memories`) has
+    // already committed -- or, when there is no memory system or nothing
+    // was recalled, at the same point in the timeline that notice would
+    // have committed at -- so the visible transcript order matches the
+    // request order: recall content is already injected *before* the
+    // current question in the provider request (`inject_recall_prefix`).
+    // `None` for tool continuations, queued turns that already echoed
+    // immediately, and any turn that must not echo at all.
+    pending_echo: Option<String>,
 ) {
     tracing::debug!(
         "process_query_with_tools starting for query_id: {:?}",
@@ -1591,6 +1602,19 @@ pub(crate) async fn process_query_with_tools(
             // synchronously, right here, makes the ordering structural
             // instead.
             display_recalled_memories(output_manager.as_ref(), &presented_recall);
+        }
+        // The user's own echo row commits here -- after the memory notice
+        // above (or, when there was no memory system to consult, at the
+        // same point that notice would have committed at) -- so the visible
+        // transcript order matches the request order the model actually
+        // sees: recall content is already injected *before* the current
+        // question (`inject_recall_prefix`, `inject_committed_memories_prefix`).
+        // Synchronous, for the same structural reason `display_recalled_memories`
+        // is: ordering "before the response" only holds because nothing
+        // async separates this call from the WorkUnit created for the
+        // response a few lines below.
+        if let Some(text) = pending_echo {
+            output_manager.write_user(text);
         }
         // This execution contract is required on *every* provider inference,
         // including internal empty-query continuations after tool results.
@@ -3337,6 +3361,7 @@ mod tests {
                 Arc::new(RwLock::new(HashMap::new())),
                 None,
                 "test persona".to_string(),
+                None,
             ));
 
             Self {
@@ -6818,6 +6843,7 @@ mod tests {
     struct SummarizedTurnHarness {
         task: tokio::task::JoinHandle<()>,
         events: mpsc::UnboundedReceiver<ReplEvent>,
+        output: Arc<OutputManager>,
         _tempdir: tempfile::TempDir,
     }
 
@@ -6827,6 +6853,7 @@ mod tests {
         main_gen: Arc<dyn Generator>,
         summary_gen: Arc<dyn Generator>,
         summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
+        pending_echo: Option<String>,
     ) -> SummarizedTurnHarness {
         let colors = crate::theme::ColorScheme::default();
         let output = Arc::new(OutputManager::new(colors.clone()));
@@ -6896,10 +6923,12 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
             "test persona".to_string(),
+            pending_echo,
         ));
         SummarizedTurnHarness {
             task,
             events,
+            output,
             _tempdir: tempdir,
         }
     }
@@ -6915,6 +6944,7 @@ mod tests {
         memory_system: Arc<finch_memory::MemorySystem>,
         recall_k: usize,
         memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
+        pending_echo: Option<String>,
     ) -> SummarizedTurnHarness {
         let colors = crate::theme::ColorScheme::default();
         let output = Arc::new(OutputManager::new(colors.clone()));
@@ -6989,10 +7019,12 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
             "test persona".to_string(),
+            pending_echo,
         ));
         SummarizedTurnHarness {
             task,
             events,
+            output,
             _tempdir: tempdir,
         }
     }
@@ -7051,6 +7083,7 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&summary_gen) as Arc<dyn Generator>,
             Arc::clone(&summary_cache),
+            None,
         )
         .await;
         turn1.task.await.expect("turn 1 query task panicked");
@@ -7062,6 +7095,7 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&summary_gen) as Arc<dyn Generator>,
             Arc::clone(&summary_cache),
+            None,
         )
         .await;
         turn2.task.await.expect("turn 2 query task panicked");
@@ -7211,6 +7245,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            None,
         )
         .await;
         turn1.task.await.expect("turn 1 query task panicked");
@@ -7223,6 +7258,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            None,
         )
         .await;
         turn2.task.await.expect("turn 2 query task panicked");
@@ -7322,6 +7358,78 @@ mod tests {
         }
     }
 
+    /// Production-boundary regression for the memory-notice/echo scrollback
+    /// ordering fix. Reported complaint: the recall notice rendered *after*
+    /// the user's own echoed question, which reads as though the memory
+    /// content was inserted after the question -- but the request actually
+    /// sent to the provider already carries recall content *before* the
+    /// current question (`inject_recall_prefix`,
+    /// `inject_committed_memories_prefix`; see the `#940` request-shape
+    /// assertions above). The visible transcript must match that order.
+    ///
+    /// Before the fix, `execute_query_inner` wrote the echo row to
+    /// `OutputManager` synchronously, before the query was even dispatched
+    /// to `process_query_with_tools`, which only commits the recall notice
+    /// (`display_recalled_memories`) once the async task runs -- guaranteeing
+    /// the echo committed first regardless of whether recall found anything.
+    /// This drives the real `process_query_with_tools` path with the same
+    /// deferred `pending_echo` `execute_query_inner` now uses, and asserts
+    /// the *committed* `OutputManager` scrollback -- not just the assembled
+    /// provider request -- carries the recall notice row before the user's
+    /// own echoed question row.
+    #[tokio::test]
+    async fn test_memory_notice_commits_before_user_echo_in_scrollback() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_text = "Where is the deploy key for the staging environment?";
+
+        let turn = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            query_text,
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            3,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            Some(query_text.to_string()),
+        )
+        .await;
+        turn.task.await.expect("query task panicked");
+        drop(turn.events);
+
+        let colors = crate::theme::ColorScheme::default();
+        let messages = turn.output.get_messages();
+        let row_previews: Vec<String> = messages.iter().map(|m| m.content()).collect();
+
+        let memory_notice_idx = messages
+            .iter()
+            .position(|m| m.format(&colors).contains("retrieved"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a memory-recall notice row (\"N memories retrieved\") \
+                     in the committed scrollback; rows = {row_previews:?}"
+                )
+            });
+        let echo_idx = messages
+            .iter()
+            .position(|m| m.content() == query_text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the user's own echoed question row in the \
+                     committed scrollback; rows = {row_previews:?}"
+                )
+            });
+
+        assert!(
+            memory_notice_idx < echo_idx,
+            "the memory notice must commit to scrollback before the user's \
+             own echoed question -- recall content is already injected \
+             before the question in the request the model sees \
+             (inject_recall_prefix); memory_notice_idx = {memory_notice_idx}, \
+             echo_idx = {echo_idx}, rows = {row_previews:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_request_below_verbatim_threshold_carries_no_summary() {
         let recorder = Arc::new(RecordingTurnGenerator::default());
@@ -7339,6 +7447,7 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&summary_gen) as Arc<dyn Generator>,
             Arc::clone(&summary_cache),
+            None,
         )
         .await;
         harness.task.await.expect("query task panicked");
@@ -7362,6 +7471,51 @@ mod tests {
         assert_eq!(
             requests[0][0].role, "system",
             "system prefix must still precede the conversation; shape {shape:?}"
+        );
+    }
+
+    /// Companion to `test_memory_notice_commits_before_user_echo_in_scrollback`:
+    /// when there is no memory system to consult at all (`memory_system =
+    /// None`, the state `spawn_summarized_turn` always exercises), there is
+    /// no notice to precede -- the deferred echo must still commit promptly
+    /// on its own, and no memory-recall row must appear.
+    #[tokio::test]
+    async fn test_deferred_echo_commits_with_no_memory_system_present() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let summary_gen = Arc::new(CountingSummaryGenerator::default());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_text = "no memory system is attached to this turn";
+
+        let harness = spawn_summarized_turn(
+            Arc::clone(&conversation),
+            query_text,
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            Arc::clone(&summary_cache),
+            Some(query_text.to_string()),
+        )
+        .await;
+        harness.task.await.expect("query task panicked");
+        drop(harness.events);
+
+        let colors = crate::theme::ColorScheme::default();
+        let messages = harness.output.get_messages();
+        let row_previews: Vec<String> = messages.iter().map(|m| m.content()).collect();
+
+        assert!(
+            messages.iter().any(|m| m.content() == query_text),
+            "the user's own echoed question must still commit even with no \
+             memory system present; rows = {row_previews:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.format(&colors).contains("retrieved")),
+            "no memory-recall notice row is expected with no memory system \
+             present; rows = {row_previews:?}"
         );
     }
 
@@ -7497,6 +7651,7 @@ mod tests {
             Arc::clone(&memory),
             1,
             memory_commitment.clone(),
+            None,
         )
         .await;
         turn1.task.await.expect("turn 1 query task panicked");
@@ -7509,6 +7664,7 @@ mod tests {
             Arc::clone(&memory),
             1,
             memory_commitment.clone(),
+            None,
         )
         .await;
         turn2.task.await.expect("turn 2 query task panicked");
@@ -7601,6 +7757,7 @@ mod tests {
                 Arc::clone(&memory),
                 1,
                 memory_commitment.clone(),
+                None,
             )
             .await;
             turn.task.await.expect("continuation query task panicked");
