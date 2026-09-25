@@ -450,6 +450,80 @@ mod tests {
         assert_eq!(selection.generator().await.name(), "cloud-b");
     }
 
+    /// Hostile-timing regression: a stale poller sleeping between ticks must
+    /// notice a newer activation attempt on its very next wake and stop,
+    /// not keep issuing further `/v1/status` reads. This is the invariant
+    /// `commands.rs`'s two `activate_local_when_ready` call sites and
+    /// `cli::repl::spawn_local_model_download_monitor` all depend on to
+    /// avoid two independent pollers racing the daemon indefinitely once
+    /// one of them is superseded (the daemon-log connection-spam bug: the
+    /// download-progress monitor and the activation poller both hitting
+    /// `/v1/status` on mismatched, uncoordinated cadences).
+    #[tokio::test(start_paused = true)]
+    async fn stale_poller_notices_cancellation_within_one_poll_interval() {
+        use std::sync::atomic::AtomicUsize;
+
+        let selection = ModelSelection::new(0, MockGenerator::named("cloud"));
+        let token = selection.begin_pending(1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read_status = {
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(LocalModelStatus::Initializing)
+                }
+            }
+        };
+
+        let poll_interval = Duration::from_millis(750);
+        let poller_selection = selection.clone();
+        let handle = tokio::spawn(activate_local_when_ready(
+            poller_selection,
+            token,
+            1,
+            MockGenerator::named("local"),
+            read_status,
+            |_: &str| true,
+            poll_interval,
+        ));
+
+        // Give the spawned poller a chance to run its first status read and
+        // suspend on the inter-poll sleep before this test does anything else.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the poller should have completed exactly one status read before sleeping"
+        );
+
+        // A newer /model attempt wins while the stale poller is asleep
+        // between ticks -- this is the exact race the daemon-log spam bug
+        // needed: a poller left running with no live consumer.
+        selection.activate(2, MockGenerator::named("cloud-b")).await;
+
+        let outcome = tokio::time::timeout(poll_interval * 3, handle)
+            .await
+            .expect(
+                "the stale poller must wake and exit within one poll interval of being \
+                 superseded, not hang polling forever",
+            )
+            .expect("poller task must not panic");
+
+        assert_eq!(outcome, LocalActivationOutcome::Cancelled);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the stale poller must stop after its already-in-flight read and must not issue \
+             another `/v1/status` read once a newer activation attempt (token) has superseded \
+             it (observed {} calls)",
+            calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(selection.active_index().await, 2);
+        assert_eq!(selection.generator().await.name(), "cloud-b");
+    }
+
     #[tokio::test]
     async fn failed_local_startup_retains_previous_generator() {
         let selection = ModelSelection::new(0, MockGenerator::named("cloud"));

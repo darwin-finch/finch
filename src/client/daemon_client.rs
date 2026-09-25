@@ -52,11 +52,72 @@ impl DaemonConfig {
     }
 }
 
+/// How often a local-model bootstrap poller (activation switch, download
+/// progress bar) may hit the daemon's `/v1/status`. Every poller that
+/// watches local-model startup shares this one cadence so two independent
+/// loops never race the daemon at mismatched rates: a legacy download-progress
+/// monitor once polled every 250ms while the activation poller in
+/// `cli::repl_event::model_selection` polled every 750ms, and running both
+/// concurrently during local-model startup produced a new TCP connection
+/// roughly every 250ms (plus a synchronized double-fire every third tick),
+/// because connection pooling is disabled on the shared client (see the
+/// comment on `pool_max_idle_per_host(0)` below).
+pub(crate) const LOCAL_MODEL_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
 /// HTTP client for communicating with Shammah daemon
 pub struct DaemonClient {
     base_url: String,
     client: Client,
+    /// Separate client used only for cheap, frequent, idempotent
+    /// `/v1/status` polling (local-model bootstrap and download-progress
+    /// monitors). Connection pooling is safe to enable here even though it
+    /// stays disabled on `client`: see the comment on that field's builder.
+    status_client: Client,
     config: DaemonConfig,
+}
+
+/// Build the client used for generation and every other daemon call.
+///
+/// Connection pooling stays disabled here (`pool_max_idle_per_host(0)`).
+/// Commit 738bd718 ("fix: improve HTTP connection stability and health
+/// check reliability", 2026-02-13) disabled it after observing long
+/// (>10s) local-generation requests fail with "failed to send request"
+/// on a pooled connection that the server had apparently already closed;
+/// a fresh connection per request avoided ever reusing a stale one. That
+/// incident was never root-caused (see #74, #98 on local-model
+/// conformance), so re-enabling pooling on the client generation traffic
+/// shares is not safe to do without reproducing the original failure.
+/// Status polling does not share this hazard (see `build_status_client`).
+fn build_generation_client(
+    default_headers: header::HeaderMap,
+    timeout_seconds: u64,
+) -> Result<Client> {
+    Client::builder()
+        .default_headers(default_headers)
+        .timeout(Duration::from_secs(timeout_seconds))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(0) // Disable connection pooling; see doc comment above.
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+/// Build the client used only for `/v1/status` polling.
+///
+/// Unlike `build_generation_client`, pooling is safe here: status polls are
+/// short, frequent, idempotent GETs, never the long-running generation POSTs
+/// implicated in the 2026-02-13 incident, and a stale pooled connection on an
+/// idempotent GET is one reqwest retries transparently rather than surfacing
+/// as a user-visible failure. Keeping one idle connection per host lets
+/// repeated polls during local-model startup reuse a single TCP connection
+/// instead of opening (and logging) a new one on every tick.
+fn build_status_client(default_headers: header::HeaderMap, timeout_seconds: u64) -> Result<Client> {
+    Client::builder()
+        .default_headers(default_headers)
+        .timeout(Duration::from_secs(timeout_seconds))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(1)
+        .build()
+        .context("Failed to build status-polling HTTP client")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,19 +234,15 @@ impl DaemonClient {
             default_headers.insert(header::AUTHORIZATION, value);
         }
 
-        let client = Client::builder()
-            .default_headers(default_headers)
-            .timeout(Duration::from_secs(config.timeout_seconds))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(0) // Disable connection pooling
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = build_generation_client(default_headers.clone(), config.timeout_seconds)?;
+        let status_client = build_status_client(default_headers, config.timeout_seconds)?;
 
         info!(base_url = %base_url, "Connected to daemon");
 
         Ok(Self {
             base_url,
             client,
+            status_client,
             config,
         })
     }
@@ -208,6 +265,7 @@ impl DaemonClient {
         Self {
             base_url,
             client: Client::new(),
+            status_client: Client::new(),
             config: DaemonConfig::default(),
         }
     }
@@ -393,7 +451,7 @@ impl DaemonClient {
     /// Return the daemon's current local-model bootstrap state.
     pub async fn local_model_status(&self) -> Result<LocalModelStatus> {
         let value: serde_json::Value = self
-            .client
+            .status_client
             .get(format!("{}/v1/status", self.base_url))
             .timeout(Duration::from_secs(30))
             .send()
@@ -1239,6 +1297,7 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_daemon_config_default() {
@@ -1323,5 +1382,128 @@ mod tests {
         assert_eq!(converted[0].content.as_deref(), Some("VM wire contract"));
         assert_eq!(converted[1].role, "user");
         assert_eq!(converted[1].content.as_deref(), Some("hello"));
+    }
+
+    /// A minimal HTTP/1.1 keep-alive server that answers every request on a
+    /// connection with a fixed `/v1/status` "initializing" body and counts
+    /// distinct accepted TCP connections, so a test can assert whether a
+    /// client reused one connection across sequential requests or opened a
+    /// fresh one each time.
+    async fn spawn_counting_status_server(
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral test listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_task = Arc::clone(&accepted);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted_for_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        let mut request = Vec::new();
+                        loop {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => request.extend_from_slice(&buf[..n]),
+                            }
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let body = br#"{"generator":{"state":"initializing"}}"#;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            body.len()
+                        );
+                        if socket.write_all(head.as_bytes()).await.is_err()
+                            || socket.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepted)
+    }
+
+    /// Regression for the daemon log spamming a new TCP connection on every
+    /// `/v1/status` poll (~every 250ms) while a local model was starting:
+    /// the status-only client must reuse one pooled connection across
+    /// sequential polls instead of tearing one down and reconnecting each
+    /// time.
+    #[tokio::test]
+    async fn status_client_reuses_one_connection_across_sequential_polls() {
+        let (addr, accepted) = spawn_counting_status_server().await;
+        let client = build_status_client(header::HeaderMap::new(), 5)
+            .expect("status client builds with pooling enabled");
+        let url = format!("http://{addr}/v1/status");
+
+        for poll in 0..5 {
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("status poll {poll} failed: {error}"));
+            assert!(
+                response.status().is_success(),
+                "status poll {poll} returned {}",
+                response.status()
+            );
+            response
+                .bytes()
+                .await
+                .unwrap_or_else(|error| panic!("status poll {poll} body read failed: {error}"));
+        }
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "5 sequential /v1/status polls through the pooled status client should share one \
+             TCP connection, not open a fresh one per poll"
+        );
+    }
+
+    /// Documents the intentional divergence: the generation client keeps
+    /// pooling disabled (see `build_generation_client`'s doc comment), so it
+    /// must still open a fresh connection per request. If this test starts
+    /// failing because someone enabled pooling on the shared generation
+    /// client, that change needs the same scrutiny the 2026-02-13 incident
+    /// did, not just a description edit.
+    #[tokio::test]
+    async fn generation_client_still_opens_a_fresh_connection_per_request() {
+        let (addr, accepted) = spawn_counting_status_server().await;
+        let client =
+            build_generation_client(header::HeaderMap::new(), 5).expect("generation client builds");
+        let url = format!("http://{addr}/v1/status");
+
+        for poll in 0..3 {
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("request {poll} failed: {error}"));
+            response
+                .bytes()
+                .await
+                .unwrap_or_else(|error| panic!("request {poll} body read failed: {error}"));
+        }
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the unpooled generation client should open one connection per request"
+        );
     }
 }

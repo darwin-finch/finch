@@ -173,7 +173,7 @@ impl EventLoop {
                                 async move { client.local_model_status().await }
                             },
                             move |model: &str| pending_entry.local_model_status_matches(model),
-                            Duration::from_millis(750),
+                            crate::client::LOCAL_MODEL_STATUS_POLL_INTERVAL,
                         )
                         .await;
                         if let Some(identity) = identity_after_local_activation(
@@ -637,7 +637,7 @@ impl EventLoop {
                                 async move { client.local_model_status().await }
                             },
                             move |model: &str| pending_entry.local_model_status_matches(model),
-                            Duration::from_millis(750),
+                            crate::client::LOCAL_MODEL_STATUS_POLL_INTERVAL,
                         )
                         .await;
                         match outcome {

@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
@@ -781,7 +781,13 @@ fn spawn_local_model_download_monitor(
                     return;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Shares its cadence with the activation poller in
+            // `cli::repl_event::model_selection::activate_local_when_ready`
+            // (see that constant's doc comment): the two run independently
+            // and concurrently whenever a local model is starting, and a
+            // mismatched interval here previously made the daemon log spam a
+            // new connection roughly every 250ms instead of every 750ms.
+            tokio::time::sleep(crate::client::LOCAL_MODEL_STATUS_POLL_INTERVAL).await;
         }
     });
 }
