@@ -3987,4 +3987,193 @@ mod tests {
             .iter()
             .any(|requirement| { requirement.capability == CapabilityKind::MemoryWrite }));
     }
+
+    #[test]
+    fn test_lisp_word_defined_and_invoked_in_one_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "define-invoke.lisp",
+            "(begin (define (r) (say \"hello\")) (r))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "defining and invoking a host-effect function in one submission must complete; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hello",
+            "the invoked function's body must emit through the host; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert!(
+            runtime.functions().contains_key("r"),
+            "the defined function must persist in the runtime dictionary after a \
+             one-shot define-and-invoke submission; functions={:?}",
+            runtime.functions().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_lisp_one_shot_word_invoked_twice_emits_once_per_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "define-invoke-twice.lisp",
+            "(begin (define (r) (say \"hello\")) (r) (r))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "each invocation of a one-shot defined function must run its full body; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hellohello",
+            "two invocations must emit the body's string exactly once each; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            2,
+            "each invocation performs exactly one session.emit; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_word_calling_effectful_word_defined_in_same_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "nested-define-invoke.lisp",
+            "(begin (define (g) (say \"x\")) (define (h) (g)) (h))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "a function defined in one submission must be able to call another \
+             effectful function defined in the same submission; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "x",
+            "the inner function's body must emit through the host; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_effectful_word_emits_from_body_not_call_site() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "greet.lisp",
+            "(begin (define (greet (text : string)) (say text)) (greet \"hi\"))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "invoking a defined effectful function must execute its body; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hi",
+            "the body's say must emit the caller's string; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        let emit = result
+            .vm_side_effects
+            .last()
+            .expect("the greeting must produce one recorded session.emit");
+        assert_eq!(
+            emit.origin.word,
+            Some("say".to_string()),
+            "a defined function's host effect must be attributed to the say inside \
+             its body, not to the invocation site; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_effectful_word_invoked_from_later_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "words.lisp",
+            "(define (r) (say \"hi\"))",
+            1_000,
+        );
+        assert_eq!(
+            definition.status,
+            TypedExecutionStatus::Completed,
+            "defining an effectful function must complete; diagnostics={:?}",
+            definition.diagnostics
+        );
+        let call = runtime.execute_source(ProgramLanguage::Lisp, "call.lisp", "(r)", 1_000);
+        assert_eq!(
+            call.status,
+            TypedExecutionStatus::Completed,
+            "an effectful function persisted in the dictionary must stay callable in \
+             a later submission; diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            call.diagnostics,
+            call.vm_side_effects,
+            call.output
+        );
+        assert_eq!(
+            call.output, "hi",
+            "the later invocation must run the function's body, not re-lower it as a \
+             bare capability request; diagnostics={:?}, vm_side_effects={:?}",
+            call.diagnostics, call.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_bare_top_level_say_still_emits_once() {
+        let mut runtime = TypedRuntime::new();
+        let result =
+            runtime.execute_source(ProgramLanguage::Lisp, "bare.lisp", "(say \"hello\")", 1_000);
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "a bare top-level say must keep completing; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics,
+            result.vm_side_effects
+        );
+        assert_eq!(
+            result.output, "hello",
+            "a bare top-level say must keep emitting exactly its string; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            1,
+            "a bare top-level say performs exactly one session.emit; \
+             vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
 }
