@@ -834,7 +834,33 @@ impl Repl {
     async fn apply_legacy_selection(&mut self) -> Result<()> {
         let effective = self.legacy_effective_selection()?;
         let entry = self.available_providers[effective.provider_index].clone();
-        if !entry.is_local() {
+        if entry.is_local() {
+            // This legacy (`--raw`/`--no-tui`) path has no deferred
+            // activation state machine the way the TUI event loop's
+            // `apply_effective_selection` does, and it must not gain any
+            // new startup failure mode: not for a local model that is
+            // merely still loading, and not for a transient status-check
+            // error either — those already resulted in this branch simply
+            // proceeding before this fix, and continue to. Only the exact
+            // shape of bug this fix targets is checked here: a daemon that
+            // affirmatively reports `Ready`, but with a different local
+            // model than this entry. The daemon bootstraps exactly one
+            // local model for its whole process lifetime, so "some local
+            // model is ready" is not the same claim as "this entry's model
+            // is ready". A Brain reattaching here (`hydrate_legacy_selection`,
+            // at every startup) is exactly the case that reported this bug.
+            if let Some(client) = self.daemon_client.as_ref() {
+                if let Ok(crate::client::LocalModelStatus::Ready(model)) =
+                    client.local_model_status().await
+                {
+                    anyhow::ensure!(
+                        entry.local_model_status_matches(&model),
+                        "{}",
+                        entry.local_model_switch_blocked_message(&model)
+                    );
+                }
+            }
+        } else {
             let entry = entry
                 .with_model_overlay(effective.model.clone())
                 .with_reasoning_effort_overlay(effective.reasoning_effort);
@@ -4617,7 +4643,21 @@ impl Repl {
                 return Ok(());
             };
             match client.local_model_status().await {
-                Ok(crate::client::LocalModelStatus::Ready(_)) => {}
+                Ok(crate::client::LocalModelStatus::Ready(model)) => {
+                    // The daemon bootstraps exactly one local model for its
+                    // whole process lifetime, so "some local model is
+                    // ready" is not the same claim as "the requested entry
+                    // is ready" — e.g. it already has a different local
+                    // model loaded from an earlier activation. Fail closed
+                    // instead of persisting `new_entry`'s name while queries
+                    // keep going to this stale `model` (the reported bug:
+                    // the confirmation named the requested entry but
+                    // described, and kept serving, the wrong one).
+                    if !new_entry.local_model_status_matches(&model) {
+                        self.output_error(new_entry.local_model_switch_blocked_message(&model));
+                        return Ok(());
+                    }
+                }
                 Ok(crate::client::LocalModelStatus::Initializing)
                 | Ok(crate::client::LocalModelStatus::Downloading(_))
                 | Ok(crate::client::LocalModelStatus::Loading(_)) => {

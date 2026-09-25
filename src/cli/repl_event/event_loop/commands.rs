@@ -106,7 +106,20 @@ impl EventLoop {
                 anyhow::bail!("Local model switching requires a running Finch daemon.");
             };
             match client.local_model_status().await? {
-                crate::client::LocalModelStatus::Ready(_) => {
+                crate::client::LocalModelStatus::Ready(model) => {
+                    // The daemon bootstraps exactly one local model for its
+                    // whole process lifetime, so "some local model is ready"
+                    // is not the same claim as "this entry's model is
+                    // ready" — e.g. a Brain persisted with one local profile
+                    // reattaching to a daemon that already loaded a
+                    // different one. Fail closed instead of silently
+                    // activating a generator mislabeled with `entry`'s name
+                    // while it keeps serving `model`.
+                    anyhow::ensure!(
+                        entry.local_model_status_matches(&model),
+                        "{}",
+                        entry.local_model_switch_blocked_message(&model)
+                    );
                     let generator: Arc<dyn Generator> = Arc::new(
                         crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
                     );
@@ -136,6 +149,8 @@ impl EventLoop {
                     let output = Arc::clone(&self.output_manager);
                     let tui_renderer = Arc::clone(&self.tui_renderer);
                     let profile_name = entry.profile_name();
+                    let pending_entry = entry.clone();
+                    let outcome_entry = entry.clone();
                     output.write_info(format!(
                         "⏳ {profile_name} is still starting; {active_name} stays active until it is ready."
                     ));
@@ -157,6 +172,7 @@ impl EventLoop {
                                 let client = Arc::clone(&client);
                                 async move { client.local_model_status().await }
                             },
+                            move |model: &str| pending_entry.local_model_status_matches(model),
                             Duration::from_millis(750),
                         )
                         .await;
@@ -177,6 +193,19 @@ impl EventLoop {
                             LocalActivationOutcome::NotAvailable => output.write_error(format!(
                                 "Local model {profile_name} is not enabled in the daemon"
                             )),
+                            // The daemon's one local model slot settled on a
+                            // different model than the one this activation
+                            // was waiting for; polling further could never
+                            // converge (see WrongModel's doc comment). Reuse
+                            // the same shared wording every other mismatch
+                            // path in this fix uses, so a future correction
+                            // to it cannot miss this call site.
+                            LocalActivationOutcome::WrongModel(model) => {
+                                output.write_error(format!(
+                                    "Local model {profile_name} did not start: {}",
+                                    outcome_entry.local_model_switch_blocked_message(&model)
+                                ))
+                            }
                             LocalActivationOutcome::StatusError(error) => output.write_error(
                                 format!("Could not monitor local model {profile_name}: {error}"),
                             ),
@@ -470,7 +499,17 @@ impl EventLoop {
         };
         let entry = self.available_providers[target_index].clone();
         let active_index = self.model_selection.active_index().await;
-        if target_index == active_index
+        // Local entries never take this "already active" shortcut: it
+        // would confirm the switch without ever asking the daemon whether
+        // it is still actually serving this entry's model (e.g. the daemon
+        // could have been restarted with a different local model while
+        // this session's `active_index` went unchanged). Falling through
+        // to the `entry.is_local()` handling below re-verifies against
+        // `client.local_model_status()` the same way every other path this
+        // fix touches does, instead of trusting session-local bookkeeping
+        // that the daemon's state may no longer match.
+        if !entry.is_local()
+            && target_index == active_index
             && self.model_selection.pending_index().await.is_none()
             && self.brain_selection.model.is_none()
             && self.brain_selection.reasoning_effort.is_none()
@@ -508,7 +547,9 @@ impl EventLoop {
             };
 
             match client.local_model_status().await {
-                Ok(crate::client::LocalModelStatus::Ready(model)) => {
+                Ok(crate::client::LocalModelStatus::Ready(model))
+                    if entry.local_model_status_matches(&model) =>
+                {
                     let generator: Arc<dyn Generator> = Arc::new(
                         crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
                     );
@@ -531,6 +572,27 @@ impl EventLoop {
                         "✓ Provider {} · {} (persisted on this Brain)",
                         entry.profile_name(),
                         model
+                    ));
+                }
+                Ok(crate::client::LocalModelStatus::Ready(model)) => {
+                    // The daemon already has a DIFFERENT local model loaded
+                    // and ready — most likely from an earlier activation in
+                    // this same daemon process. The daemon bootstraps
+                    // exactly one local model for its whole process lifetime
+                    // (`load_generator_async` in src/models/bootstrap.rs
+                    // runs once from main.rs at daemon startup and is never
+                    // invoked again), so there is no request this frontend
+                    // can send to make it load `entry` instead, and routing
+                    // this into the poll-and-wait path below would loop
+                    // forever re-observing the same wrong-model `Ready`
+                    // state. Say so plainly instead of claiming a switch
+                    // that cannot happen: the prior bug here reported
+                    // success under `entry`'s name while describing (and
+                    // continuing to serve queries against) this stale
+                    // `model`.
+                    self.output_manager.write_info(format!(
+                        "⚠️  {}.",
+                        entry.local_model_switch_blocked_message(&model)
                     ));
                 }
                 Ok(crate::client::LocalModelStatus::Initializing)
@@ -562,6 +624,8 @@ impl EventLoop {
                     let selection = self.model_selection.clone();
                     let output = Arc::clone(&self.output_manager);
                     let profile_name = entry.profile_name();
+                    let pending_entry = entry.clone();
+                    let outcome_entry = entry.clone();
                     tokio::spawn(async move {
                         let outcome = activate_local_when_ready(
                             selection,
@@ -572,6 +636,7 @@ impl EventLoop {
                                 let client = Arc::clone(&client);
                                 async move { client.local_model_status().await }
                             },
+                            move |model: &str| pending_entry.local_model_status_matches(model),
                             Duration::from_millis(750),
                         )
                         .await;
@@ -588,6 +653,23 @@ impl EventLoop {
                             LocalActivationOutcome::StatusError(error) => output.write_error(
                                 format!("Could not monitor local model {profile_name}: {error}"),
                             ),
+                            // The daemon's one local model slot settled on a
+                            // different model than the one this activation
+                            // was waiting for. That can never resolve by
+                            // continuing to poll — see WrongModel's doc
+                            // comment — so this closes the pending switch
+                            // with a plain explanation instead of the
+                            // success message, matching the synchronous
+                            // already-Ready branch above. Reuse the same
+                            // shared wording every other mismatch path in
+                            // this fix uses, so a future correction to it
+                            // cannot miss this call site.
+                            LocalActivationOutcome::WrongModel(model) => {
+                                output.write_error(format!(
+                                    "Local model {profile_name} did not start: {}",
+                                    outcome_entry.local_model_switch_blocked_message(&model)
+                                ))
+                            }
                             LocalActivationOutcome::Cancelled => {}
                         }
                     });
@@ -718,13 +800,13 @@ impl EventLoop {
 /// switch succeeds (`local_identity`) and the identity that was active
 /// before the switch was attempted (`previous_identity`).
 ///
-/// `Activated` adopts the new identity. `Failed`, `NotAvailable`, and
-/// `StatusError` all mean `fail_pending` cleared the pending slot and the
-/// original generator is still serving queries, so the "active while X
-/// starts" identity set when the switch began must be reverted — otherwise
-/// the status bar keeps claiming a dead startup is still in progress.
-/// `Cancelled` means a later switch already owns the identity, so the caller
-/// must leave it alone (`None`).
+/// `Activated` adopts the new identity. `Failed`, `NotAvailable`,
+/// `StatusError`, and `WrongModel` all mean `fail_pending` cleared the
+/// pending slot and the original generator is still serving queries, so the
+/// "active while X starts" identity set when the switch began must be
+/// reverted — otherwise the status bar keeps claiming a dead startup is
+/// still in progress. `Cancelled` means a later switch already owns the
+/// identity, so the caller must leave it alone (`None`).
 fn identity_after_local_activation(
     outcome: &LocalActivationOutcome,
     local_identity: &str,
@@ -734,7 +816,8 @@ fn identity_after_local_activation(
         LocalActivationOutcome::Activated(_) => Some(local_identity.to_string()),
         LocalActivationOutcome::Failed(_)
         | LocalActivationOutcome::NotAvailable
-        | LocalActivationOutcome::StatusError(_) => Some(previous_identity.to_string()),
+        | LocalActivationOutcome::StatusError(_)
+        | LocalActivationOutcome::WrongModel(_) => Some(previous_identity.to_string()),
         LocalActivationOutcome::Cancelled => None,
     }
 }
@@ -782,6 +865,20 @@ mod local_activation_identity_tests {
     #[test]
     fn status_error_outcome_restores_the_previous_identity() {
         let outcome = LocalActivationOutcome::StatusError("daemon unreachable".to_string());
+
+        let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
+
+        assert_eq!(identity, Some("cloud".to_string()));
+    }
+
+    #[test]
+    fn wrong_model_outcome_restores_the_previous_identity() {
+        // The daemon settled Ready on a different local model than the one
+        // this activation was waiting for; the status bar must stop
+        // claiming that dead startup is still in progress, same as
+        // Failed/NotAvailable/StatusError.
+        let outcome =
+            LocalActivationOutcome::WrongModel("Gemma 2 9b (LlamaCpp; requested Auto)".to_string());
 
         let identity = identity_after_local_activation(&outcome, "local · Qwen 2.5 3B", "cloud");
 

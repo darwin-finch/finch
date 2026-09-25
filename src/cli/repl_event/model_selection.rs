@@ -118,20 +118,35 @@ pub(crate) enum LocalActivationOutcome {
     Failed(String),
     NotAvailable,
     StatusError(String),
+    /// The daemon became `Ready` while this activation was pending, but with
+    /// a different local model than the one requested. The daemon
+    /// bootstraps exactly one local model for its whole process lifetime, so
+    /// this can never converge by continuing to poll: the caller's model
+    /// never disappears once it is the daemon's `Ready` state.
+    WrongModel(String),
 }
 
 /// Poll daemon bootstrap state and atomically activate a local generator.
-pub(crate) async fn activate_local_when_ready<F, Fut>(
+///
+/// `matches_requested` decides whether a reported `Ready` model name is the
+/// one this activation was started for, not merely "some local model is
+/// ready" — a daemon that already has a different local model loaded (e.g.
+/// from an earlier activation, or from whatever its launch-time config
+/// selected) reports `Ready` for that model, which this caller must not
+/// mistake for its own request having succeeded.
+pub(crate) async fn activate_local_when_ready<F, Fut, M>(
     selection: ModelSelection,
     token: u64,
     target_index: usize,
     generator: Arc<dyn Generator>,
     mut read_status: F,
+    matches_requested: M,
     poll_interval: Duration,
 ) -> LocalActivationOutcome
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<LocalModelStatus>>,
+    M: Fn(&str) -> bool,
 {
     loop {
         if !selection.is_current(token) {
@@ -140,6 +155,13 @@ where
 
         match read_status().await {
             Ok(LocalModelStatus::Ready(model)) => {
+                if !matches_requested(&model) {
+                    return if selection.fail_pending(token).await {
+                        LocalActivationOutcome::WrongModel(model)
+                    } else {
+                        LocalActivationOutcome::Cancelled
+                    };
+                }
                 return if selection
                     .complete_pending(token, target_index, generator)
                     .await
@@ -349,6 +371,7 @@ mod tests {
             1,
             MockGenerator::named("local"),
             read_status,
+            |model: &str| model == "Qwen 3B",
             Duration::ZERO,
         )
         .await;
@@ -363,6 +386,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loading_local_model_with_a_different_ready_model_does_not_activate() {
+        // Reproduces the reported bug via the deferred/polling path: this
+        // activation is waiting for Qwen, but the daemon's one local model
+        // slot becomes Ready with Gemma instead (e.g. because Gemma, not
+        // Qwen, was the model already loading when this activation began —
+        // the daemon bootstraps exactly one local model for its whole
+        // process lifetime and never reloads a different one). Continuing
+        // to poll can never converge, since the daemon's Ready model never
+        // changes once set; this must fail closed instead of reporting
+        // "Activated" under Qwen's name with Gemma's ready descriptor.
+        let selection = ModelSelection::new(0, MockGenerator::named("cloud"));
+        let token = selection.begin_pending(1).await;
+
+        let outcome = activate_local_when_ready(
+            selection.clone(),
+            token,
+            1,
+            MockGenerator::named("local-qwen"),
+            || async {
+                Ok(LocalModelStatus::Ready(
+                    "Gemma 2 9b (LlamaCpp; requested Auto)".to_string(),
+                ))
+            },
+            |model: &str| model.starts_with("Qwen 2.5 3B"),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            LocalActivationOutcome::WrongModel("Gemma 2 9b (LlamaCpp; requested Auto)".to_string()),
+            "a Ready report for a different local model must not be treated as this activation succeeding"
+        );
+        assert_eq!(
+            selection.active_index().await,
+            0,
+            "the active generator must stay on the entry the daemon actually serves"
+        );
+        assert_eq!(selection.pending_index().await, None);
+        assert_eq!(selection.generator().await.name(), "cloud");
+    }
+
+    #[tokio::test]
     async fn newer_switch_cancels_pending_local_activation() {
         let selection = ModelSelection::new(0, MockGenerator::named("cloud-a"));
         let token = selection.begin_pending(1).await;
@@ -374,6 +440,7 @@ mod tests {
             1,
             MockGenerator::named("local"),
             || async { Ok(LocalModelStatus::Ready("Qwen 3B".to_string())) },
+            |_: &str| true,
             Duration::ZERO,
         )
         .await;
@@ -394,6 +461,7 @@ mod tests {
             1,
             MockGenerator::named("local"),
             || async { Ok(LocalModelStatus::Failed("bad weights".to_string())) },
+            |_: &str| true,
             Duration::ZERO,
         )
         .await;

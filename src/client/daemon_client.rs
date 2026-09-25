@@ -200,6 +200,18 @@ impl DaemonClient {
         DaemonConfig::from_client_config(client_config)
     }
 
+    /// Build a client pointed straight at `base_url` (e.g. a mockito
+    /// server), skipping `connect`'s health check and daemon auto-spawn.
+    /// Test-only: production callers always go through `connect`.
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: String) -> Self {
+        Self {
+            base_url,
+            client: Client::new(),
+            config: DaemonConfig::default(),
+        }
+    }
+
     /// Send a query to the daemon using OpenAI-compatible API
     ///
     /// This is the main method for CLI to send queries.

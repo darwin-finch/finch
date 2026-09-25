@@ -8009,3 +8009,271 @@ fn test_resume_instruction_rejects_hostile_brain_names() {
         );
     }
 }
+
+fn provider_switch_local_entry(
+    family: crate::models::ModelFamily,
+    size: crate::models::ModelSize,
+) -> crate::config::ProviderEntry {
+    crate::config::ProviderEntry::Local {
+        inference_provider: crate::models::InferenceProvider::LlamaCpp,
+        execution_target: crate::config::ExecutionTarget::Auto,
+        model_family: family,
+        model_size: size,
+        model_path: None,
+        managed_artifact: None,
+        enabled: true,
+        name: None,
+    }
+}
+
+#[tokio::test]
+async fn provider_switch_does_not_claim_success_when_daemon_is_ready_with_a_different_local_model()
+{
+    tokio::task::LocalSet::new()
+        .run_until(
+            provider_switch_does_not_claim_success_when_daemon_is_ready_with_a_different_local_model_scenario(),
+        )
+        .await;
+}
+
+async fn provider_switch_does_not_claim_success_when_daemon_is_ready_with_a_different_local_model_scenario(
+) {
+    // Reproduces the reported bug: the daemon already has Gemma loaded and
+    // ready (e.g. from an earlier `/provider` activation in this same
+    // process), and the user now asks to switch to Qwen — a different local
+    // profile. The daemon bootstraps exactly one local model for its whole
+    // process lifetime, so it can never actually become ready with Qwen
+    // without a restart. `handle_provider_switch` must not read "some local
+    // model is ready" as "the requested local entry is ready".
+    let mut daemon = mockito::Server::new_async().await;
+    let status_mock = daemon
+        .mock("GET", "/v1/status")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "generator": {
+                    "state": "ready",
+                    "model_size": "Gemma 2 9b (LlamaCpp; requested Auto)"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let gemma = provider_switch_local_entry(
+        crate::models::ModelFamily::Gemma2,
+        crate::models::ModelSize::Medium,
+    );
+    let qwen = provider_switch_local_entry(
+        crate::models::ModelFamily::Qwen2,
+        crate::models::ModelSize::Medium,
+    );
+    assert_eq!(gemma.profile_name(), "local-gemma-2-9b");
+    assert_eq!(qwen.profile_name(), "local-qwen-2.5-3b");
+
+    let daemon_client = Arc::new(crate::client::DaemonClient::for_test(daemon.url()));
+    let mut event_loop = super::EventLoop::new_provider_switch_test_runner(
+        vec![gemma, qwen],
+        0,
+        Some(daemon_client),
+    );
+    event_loop.output_manager.disable_stdout();
+
+    // Requesting profile 2 (Qwen, index 1) while index 0 (Gemma) is active.
+    event_loop
+        .handle_provider_switch("2".to_string())
+        .await
+        .expect("provider switch must not error even when it refuses to activate");
+
+    status_mock.assert_async().await;
+
+    let messages: Vec<String> = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains('✓') && message.contains("local-qwen-2.5-3b")),
+        "must not confirm success switching to local-qwen-2.5-3b while the daemon still serves Gemma; messages={messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message.contains("local-qwen-2.5-3b")
+            && message.contains("Gemma 2 9b (LlamaCpp; requested Auto)")
+            && message.contains("restart")),
+        "must name both the requested and already-running model and explain a restart is required; messages={messages:?}"
+    );
+    assert_eq!(
+        event_loop.model_selection.active_index().await,
+        0,
+        "the active generator must stay on the entry the daemon actually serves, not silently move to the mislabeled one"
+    );
+}
+
+#[tokio::test]
+async fn provider_switch_activates_immediately_when_daemon_is_ready_with_the_requested_local_model()
+{
+    tokio::task::LocalSet::new()
+        .run_until(
+            provider_switch_activates_immediately_when_daemon_is_ready_with_the_requested_local_model_scenario(),
+        )
+        .await;
+}
+
+async fn provider_switch_activates_immediately_when_daemon_is_ready_with_the_requested_local_model_scenario(
+) {
+    // The matching case must keep working: when the daemon's already-ready
+    // local model is genuinely the one the caller requested, the fast path
+    // still activates without waiting.
+    let mut daemon = mockito::Server::new_async().await;
+    let status_mock = daemon
+        .mock("GET", "/v1/status")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "generator": {
+                    "state": "ready",
+                    "model_size": "Qwen 2.5 3B (LlamaCpp; requested Auto)"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    // The matching path persists the new selection on the session's Brain
+    // before confirming; without this mock the PUT 404s and the confirmation
+    // is replaced by a persistence-failure warning.
+    let selection_mock = daemon
+        .mock("PUT", "/v1/brains/named/provider-switch-test/selection")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let gemma = provider_switch_local_entry(
+        crate::models::ModelFamily::Gemma2,
+        crate::models::ModelSize::Medium,
+    );
+    let qwen = provider_switch_local_entry(
+        crate::models::ModelFamily::Qwen2,
+        crate::models::ModelSize::Medium,
+    );
+
+    let daemon_client = Arc::new(crate::client::DaemonClient::for_test(daemon.url()));
+    let mut event_loop = super::EventLoop::new_provider_switch_test_runner(
+        vec![gemma, qwen],
+        0,
+        Some(daemon_client),
+    );
+    event_loop.output_manager.disable_stdout();
+
+    event_loop
+        .handle_provider_switch("2".to_string())
+        .await
+        .expect("provider switch to a matching ready local model must succeed");
+
+    status_mock.assert_async().await;
+    selection_mock.assert_async().await;
+
+    let messages: Vec<String> = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect();
+    assert!(
+        messages.iter().any(|message| message.contains('✓')
+            && message.contains("local-qwen-2.5-3b")
+            && message.contains("Qwen 2.5 3B (LlamaCpp; requested Auto)")),
+        "a genuinely matching ready local model must still confirm the switch; messages={messages:?}"
+    );
+    assert_eq!(
+        event_loop.model_selection.active_index().await,
+        1,
+        "a genuinely matching ready local model must activate immediately"
+    );
+}
+
+#[tokio::test]
+async fn hydrate_brain_selection_fails_closed_when_daemon_already_runs_a_different_local_model() {
+    tokio::task::LocalSet::new()
+        .run_until(
+            hydrate_brain_selection_fails_closed_when_daemon_already_runs_a_different_local_model_scenario(),
+        )
+        .await;
+}
+
+async fn hydrate_brain_selection_fails_closed_when_daemon_already_runs_a_different_local_model_scenario(
+) {
+    // The same wrong-model bug reachable through session startup: a Brain
+    // persisted with `local-gemma-2-9b` reattaches to a daemon whose one
+    // local model slot is already Ready with Qwen (e.g. loaded once at that
+    // daemon's own startup, unrelated to what any Brain last persisted).
+    // `hydrate_brain_selection` -> `apply_effective_selection` must not
+    // silently activate a generator labeled Gemma while the daemon keeps
+    // serving Qwen.
+    let mut daemon = mockito::Server::new_async().await;
+    let selection_mock = daemon
+        .mock("GET", "/v1/brains/named/provider-switch-test/selection")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::json!({"provider": "local-gemma-2-9b"}).to_string())
+        .create_async()
+        .await;
+    let status_mock = daemon
+        .mock("GET", "/v1/status")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "generator": {
+                    "state": "ready",
+                    "model_size": "Qwen 2.5 3B (LlamaCpp; requested Auto)"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let gemma = provider_switch_local_entry(
+        crate::models::ModelFamily::Gemma2,
+        crate::models::ModelSize::Medium,
+    );
+    let qwen = provider_switch_local_entry(
+        crate::models::ModelFamily::Qwen2,
+        crate::models::ModelSize::Medium,
+    );
+
+    let daemon_client = Arc::new(crate::client::DaemonClient::for_test(daemon.url()));
+    let mut event_loop = super::EventLoop::new_provider_switch_test_runner(
+        vec![gemma, qwen],
+        1,
+        Some(daemon_client),
+    );
+    event_loop.output_manager.disable_stdout();
+
+    let result = event_loop.hydrate_brain_selection().await;
+
+    selection_mock.assert_async().await;
+    status_mock.assert_async().await;
+    let error = result.expect_err(
+        "reattaching to a daemon already running a different local model must fail closed, not silently activate the mislabeled one",
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("local-gemma-2-9b") && message.contains("Qwen 2.5 3B"),
+        "error must name both the persisted entry and the model the daemon actually reports; message={message:?}"
+    );
+    assert_eq!(
+        event_loop.model_selection.active_index().await,
+        1,
+        "the active generator must be untouched when activation is refused"
+    );
+}
