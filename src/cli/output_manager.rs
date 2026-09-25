@@ -465,6 +465,17 @@ impl OutputManager {
         self.add_trait_message(msg);
     }
 
+    /// Write a structured runner-lease/handoff/attach notice reaching the
+    /// live transcript (#907). These rows carry the same icon-prefixed
+    /// `Info` kind as every other structured static row, instead of the
+    /// unstructured raw-string dump `write_info`'s `Plain` kind renders as.
+    /// Scoped to `render_remote_brain_event`'s lease/handoff/attach arms;
+    /// `write_info`'s existing call sites are unchanged.
+    pub fn write_brain_event_notice(&self, content: impl Into<String>) {
+        let msg = Arc::new(StaticMessage::info(content));
+        self.add_trait_message(msg);
+    }
+
     /// Get all messages (for rendering)
     pub fn get_messages(&self) -> Vec<MessageRef> {
         self.messages.read().unwrap().clone()
