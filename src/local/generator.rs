@@ -132,7 +132,7 @@ impl TemplateGenerator {
         if let Some(generator) = &self.neural_generator {
             match self.try_neural_generate_streaming(
                 &system_prompt,
-                query,
+                &query,
                 generator,
                 token_callback,
             ) {
@@ -190,7 +190,6 @@ impl TemplateGenerator {
         messages: &[crate::providers::Message],
     ) -> Result<GeneratedResponse> {
         let (system_prompt, query) = self.prompt_parts(messages)?;
-        let query = query.to_string();
         self.generate_with_system(&system_prompt, &query)
     }
 
@@ -295,21 +294,55 @@ impl TemplateGenerator {
             .format_chat_prompt(system_prompt, user_query)
     }
 
-    fn prompt_parts<'a>(
-        &self,
-        messages: &'a [crate::providers::Message],
-    ) -> Result<(String, &'a str)> {
-        let query = messages
+    fn prompt_parts(&self, messages: &[crate::providers::Message]) -> Result<(String, String)> {
+        let last_user_idx = messages
             .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .and_then(|message| {
-                message.content.iter().find_map(|block| match block {
-                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
+            .rposition(|message| message.role == "user")
+            .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
+        let current_question = messages[last_user_idx]
+            .content
+            .iter()
+            .find_map(|block| match block {
+                crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
+
+        // Recalled memory is injected as a synthetic [user(memory), assistant(ack)]
+        // pair immediately before the current question (`inject_recall_prefix`), or
+        // as the same shape at index 0 for durable committed memory
+        // (`inject_committed_memories_prefix`) -- both in
+        // `src/cli/repl_event/query_processor.rs`, both wrapped in a
+        // `<retrieved_memory>`/`<committed_memory>` tag. The rest of `messages`
+        // (ordinary conversation history) stays excluded here on purpose: this
+        // path has a tight local-model context budget and unbounded history
+        // doesn't fit it. But the UI already tells the user recalled memory is
+        // "sent raw" to the model, so silently dropping it along with the rest
+        // of history made that claim false for the local path specifically
+        // (cloud providers get the full `messages` array as-is and never had
+        // this gap). Pull just the tagged memory blocks forward into the
+        // single-turn prompt so they actually reach the model.
+        let memory_blocks: Vec<&str> = messages[..last_user_idx]
+            .iter()
+            .filter(|message| message.role == "user")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                crate::providers::ContentBlock::Text { text }
+                    if text.contains("<retrieved_memory>")
+                        || text.contains("<committed_memory>") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        let query = if memory_blocks.is_empty() {
+            current_question.to_string()
+        } else {
+            format!("{}\n\n{}", memory_blocks.join("\n\n"), current_question)
+        };
+
         let caller_system = messages
             .iter()
             .filter(|message| message.role == "system")
@@ -648,6 +681,136 @@ mod tests {
         assert_eq!(system, "FINCH VM WIRE CONTRACT");
         assert_eq!(query, "emit one raw program");
         assert!(!system.contains("helpful coding assistant"));
+    }
+
+    /// Regression for the local path silently dropping recalled memory
+    /// (`inject_recall_prefix` in `src/cli/repl_event/query_processor.rs`
+    /// inserts a synthetic `[user(memory), assistant(ack)]` pair, wrapped in
+    /// `<retrieved_memory>`, immediately before the current question). Before
+    /// this fix, `prompt_parts` took only the *last* user message, so that
+    /// pair -- neither the last user message nor a system message -- was
+    /// dropped: memory showed up in the TUI as "N memories retrieved" but
+    /// never reached the local model. This builds the exact shape
+    /// `inject_recall_prefix` produces and checks the recalled text survives
+    /// into `query`.
+    #[test]
+    fn recalled_memory_reaches_the_local_prompt_query() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user(
+                "<retrieved_memory>\n\
+                 The following is retrieved context from past sessions -- not part \
+                 of this conversation's live dialogue, and not something to reply \
+                 to or continue. Use only what actually bears on the question that \
+                 follows this block; ignore the rest.\n\n\
+                 User prefers terse commit messages without a trailer.\n\
+                 </retrieved_memory>",
+            ),
+            crate::providers::Message::assistant(
+                "Noted -- I'll factor in whatever's relevant from that before answering.",
+            ),
+            crate::providers::Message::user("what's the fib of 7?"),
+        ];
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert!(
+            query.contains("User prefers terse commit messages without a trailer."),
+            "recalled memory text must reach the local prompt query, not just the \
+             TUI's retrieval display: {query:?}"
+        );
+        assert!(
+            query.contains("what's the fib of 7?"),
+            "the current question must still be present in the composed query: {query:?}"
+        );
+    }
+
+    /// Same defect, but at the actual production boundary: the string handed
+    /// to the backend's tokenizer. A correct `query` alone is not enough if
+    /// the chat-template formatting step drops or mangles it before the
+    /// model ever sees it.
+    #[test]
+    fn recalled_memory_survives_into_the_formatted_chat_prompt_sent_to_the_backend() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user(
+                "<retrieved_memory>\n\
+                 The following is retrieved context from past sessions -- not part \
+                 of this conversation's live dialogue, and not something to reply \
+                 to or continue. Use only what actually bears on the question that \
+                 follows this block; ignore the rest.\n\n\
+                 User prefers terse commit messages without a trailer.\n\
+                 </retrieved_memory>",
+            ),
+            crate::providers::Message::assistant(
+                "Noted -- I'll factor in whatever's relevant from that before answering.",
+            ),
+            crate::providers::Message::user("what's the fib of 7?"),
+        ];
+
+        let (system_prompt, query) = generator.prompt_parts(&messages).unwrap();
+        let formatted = generator.format_chat_prompt_with_system(&system_prompt, &query);
+
+        assert!(
+            formatted.contains("User prefers terse commit messages without a trailer."),
+            "recalled memory text must reach the formatted prompt handed to the \
+             local backend's tokenizer, not just an intermediate query string: \
+             {formatted:?}"
+        );
+        assert!(
+            formatted.contains("what's the fib of 7?"),
+            "the current question must still reach the formatted prompt too: {formatted:?}"
+        );
+    }
+
+    /// Durable committed memory (`inject_committed_memories_prefix`, index 0,
+    /// `<committed_memory>` tag) must reach the local prompt the same way as
+    /// transient recall.
+    #[test]
+    fn committed_memory_reaches_the_local_prompt_query() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user(
+                "<committed_memory>\n\
+                 The following is durable retrieved context from past sessions -- \
+                 not part of this conversation's live dialogue. It applies for \
+                 the rest of this conversation, not only the next message.\n\n\
+                 Ship without Co-Authored-By trailers.\n\
+                 </committed_memory>",
+            ),
+            crate::providers::Message::assistant(
+                "Noted -- I'll keep this in mind for the rest of this conversation.",
+            ),
+            crate::providers::Message::user("draft the commit message"),
+        ];
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert!(
+            query.contains("Ship without Co-Authored-By trailers."),
+            "committed memory text must reach the local prompt query: {query:?}"
+        );
+    }
+
+    /// Ordinary conversation history (no memory tag) stays excluded from the
+    /// bounded local-model prompt -- this path's deliberate context-budget
+    /// behavior (last user message + system only) must survive the memory
+    /// fix unchanged for non-memory turns.
+    #[test]
+    fn ordinary_conversation_history_stays_excluded_from_the_local_prompt() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user("earlier unrelated turn"),
+            crate::providers::Message::assistant("earlier unrelated reply"),
+            crate::providers::Message::user("current question"),
+        ];
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert_eq!(
+            query, "current question",
+            "non-memory history must stay excluded from the bounded local prompt: {query:?}"
+        );
     }
 }
 
