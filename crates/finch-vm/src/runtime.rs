@@ -3756,6 +3756,200 @@ mod tests {
     }
 
     #[test]
+    fn test_forth_word_defined_and_invoked_in_one_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "define-invoke.forth",
+            ": r ( S -- S ! infer ) s\"hello\" say ; r",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "defining and invoking a host-effect word in one submission must complete; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hello",
+            "the invoked word's body must emit through the host; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert!(
+            runtime.functions().contains_key("r"),
+            "the defined word must persist in the runtime dictionary after a \
+             one-shot define-and-invoke submission; functions={:?}",
+            runtime.functions().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_forth_one_shot_word_invoked_twice_emits_once_per_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "define-invoke-twice.forth",
+            ": r ( S -- S ! infer ) s\"hello\" say ; r r",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "each invocation of a one-shot defined word must run its full body; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hellohello",
+            "two invocations must emit the body's string exactly once each; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            2,
+            "each invocation performs exactly one session.emit; \
+             vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_forth_word_calling_effectful_word_defined_in_same_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "nested-define-invoke.forth",
+            ": g ( S -- S ! infer ) s\"x\" say ; : h ( S -- S ! infer ) g ; h",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "a word defined in one submission must be able to call another \
+             effectful word defined in the same submission; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "x",
+            "the inner word's body must emit through the host; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_forth_effectful_word_emits_from_body_not_call_site() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "greet.forth",
+            ": greet ( S string -- S ! infer ) say ; s\"hi\" greet",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "invoking a defined effectful word must execute its body; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "hi",
+            "the word body's say must emit the caller's string; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        let emit = result
+            .vm_side_effects
+            .last()
+            .expect("the greeting must produce one recorded session.emit");
+        assert_eq!(
+            emit.origin.word,
+            Some("say".to_string()),
+            "a defined word's host effect must be attributed to the say inside \
+             its body, not to the invocation site; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_forth_one_shot_definition_failure_points_at_body_call_site() {
+        let mut runtime = TypedRuntime::new();
+        let source = ": r ( S -- S ! infer ) say ; r";
+        let result =
+            runtime.execute_source(ProgramLanguage::Forth, "error-site.forth", source, 1_000);
+        assert_eq!(result.status, TypedExecutionStatus::Failed);
+        let diagnostic = result.diagnostics.first().expect("one compile diagnostic");
+        assert_eq!(
+            diagnostic.code, "E-STACK-001",
+            "a body that underflows its host call must be rejected at \
+             verification; diagnostics={:?}",
+            result.diagnostics
+        );
+        let primary = diagnostic.primary.as_ref().expect("origin names the site");
+        assert_eq!(
+            primary.word,
+            Some("say".to_string()),
+            "the rejection must point at the failing say inside the word body, \
+             never at the trailing invocation site; source={source:?}, \
+             diagnostics={:?}",
+            result.diagnostics
+        );
+        assert!(
+            primary.span.as_ref().is_some_and(|span| {
+                span.start_byte < source.rfind('r').expect("trailing r exists")
+            }),
+            "the diagnostic byte range must fall inside the definition, not at \
+             the invocation; source={source:?}, primary={primary:?}"
+        );
+    }
+
+    #[test]
+    fn test_forth_effectful_word_invoked_from_later_submission_emits() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "words.forth",
+            ": r ( S -- S ! infer ) s\"hi\" say ;",
+            1_000,
+        );
+        assert_eq!(
+            definition.status,
+            TypedExecutionStatus::Completed,
+            "defining an effectful word must complete; diagnostics={:?}",
+            definition.diagnostics
+        );
+        let call = runtime.execute_source(ProgramLanguage::Forth, "call.forth", "r", 1_000);
+        assert_eq!(
+            call.status,
+            TypedExecutionStatus::Completed,
+            "an effectful word persisted in the dictionary must stay callable in \
+             a later submission; diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            call.diagnostics,
+            call.vm_side_effects,
+            call.output
+        );
+        assert_eq!(
+            call.output, "hi",
+            "the later invocation must run the word's body, not re-lower it as a \
+             bare capability request; diagnostics={:?}, vm_side_effects={:?}",
+            call.diagnostics, call.vm_side_effects
+        );
+    }
+
+    #[test]
     fn missing_capability_suspends_before_stack_mutation() {
         let mut runtime = TypedRuntime::new();
         let before = runtime.stack().to_vec();

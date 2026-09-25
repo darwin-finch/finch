@@ -2658,7 +2658,16 @@ fn lower_forth_ast_body_with_locals(
                             output: concrete_signature.output.values.clone(),
                         }
                     }
-                    ForthCallKind::Function if signature.effects.0.len() == 1 => {
+                    ForthCallKind::Function
+                        if signature.effects.0.len() == 1
+                            && !available_functions.contains_key(word) =>
+                    {
+                        // Only a body-less core host word (for example `say`)
+                        // is exactly its single capability request and may
+                        // lower inline at the call site. A defined word has a
+                        // lowered body and must execute through it, so the
+                        // body's own pushes and stack discipline stay inside
+                        // the call.
                         Instruction::CapabilityRequest {
                             requirement: signature.effects.0.iter().next().unwrap().clone(),
                             input: concrete_signature.input.values.clone(),
