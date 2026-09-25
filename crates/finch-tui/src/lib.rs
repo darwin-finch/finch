@@ -2546,7 +2546,7 @@ impl TuiRenderer {
             // marker by itself is not a clock: repainting it every 33 ms
             // destroys terminal-native text selection, even while Option is
             // held to bypass mouse capture.
-            if should_redraw_live_area(self.live_area_dirty) {
+            if self.live_area_should_redraw() {
                 self.erase_live_area()?;
                 self.draw_live_area()?;
                 self.live_area_dirty = false;
@@ -2606,6 +2606,23 @@ impl TuiRenderer {
             self.live_area_dirty = true;
         }
     }
+
+    /// Whether the live area's erase+draw cycle should run this tick.
+    ///
+    /// Suppressed while the reader has scrolled into history
+    /// (`transcript_scroll` away from follow mode, #1170's own deferred
+    /// half): they are not looking at the live tail, and every erase+redraw
+    /// is a fresh chance to interrupt an in-progress terminal-native
+    /// text-selection drag — the same hazard `should_redraw_live_area`
+    /// exists to bound. `live_area_dirty` is left untouched by this check —
+    /// `poll_message_changes`/`poll_status_changes` keep marking it
+    /// unconditionally regardless of scroll — so a change that lands while
+    /// the reader is away is never lost: the deferred redraw fires with
+    /// current content as soon as they return to follow mode (offset 0).
+    fn live_area_should_redraw(&self) -> bool {
+        should_redraw_live_area(self.live_area_dirty) && self.transcript_scroll.offset() == 0
+    }
+
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
         if self.viewport_invalidated {
@@ -7353,6 +7370,94 @@ mod tests {
         work.append_response("new output");
         renderer.poll_message_changes(&messages);
         assert!(renderer.live_area_dirty, "new output must repaint promptly");
+    }
+
+    /// Completes #1170's own deferred second half: the reader who has
+    /// scrolled into history is not watching the live tail, so an
+    /// erase+redraw cycle triggered by content changing at the bottom must
+    /// not fire while they are away — every such cycle is a fresh chance to
+    /// interrupt an in-progress terminal-native text-selection drag, the
+    /// hazard #1170 exists to bound. `live_area_dirty` must stay set so the
+    /// redraw is not lost, only deferred.
+    #[test]
+    fn test_live_area_redraw_suppressed_while_scrolled_into_history() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer = TuiRenderer::new_headless(Arc::clone(&output), status, colors);
+        let work = output.start_work_unit("waiting");
+
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        renderer.live_area_dirty = false;
+
+        // Reader scrolls into history: no longer watching the live tail.
+        renderer.transcript_scroll.set_offset(5);
+
+        // Content changes at the bottom while the reader is away.
+        work.append_response("new output");
+        renderer.poll_message_changes(&messages);
+        assert!(
+            renderer.live_area_dirty,
+            "poll_message_changes must keep marking dirty unconditionally \
+             regardless of scroll, or the deferred redraw has nothing left \
+             to fire once the reader returns"
+        );
+        assert!(
+            !renderer.live_area_should_redraw(),
+            "erase+redraw must stay suppressed while transcript_scroll.offset()={} \
+             (scrolled into history) even though live_area_dirty={}",
+            renderer.transcript_scroll.offset(),
+            renderer.live_area_dirty
+        );
+    }
+
+    /// The other half of the same invariant: once the reader returns to
+    /// follow mode (offset 0), the deferred redraw must fire promptly and
+    /// paint the content that changed while they were away, not a stale
+    /// snapshot from before they scrolled off.
+    #[test]
+    fn test_deferred_redraw_fires_with_latest_content_on_return_to_follow_mode() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer = TuiRenderer::new_headless(Arc::clone(&output), status, colors);
+        let work = output.start_work_unit("waiting");
+
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        renderer.live_area_dirty = false;
+
+        renderer.transcript_scroll.set_offset(5);
+        work.append_response("content that arrived while scrolled away");
+        renderer.poll_message_changes(&messages);
+        assert!(
+            !renderer.live_area_should_redraw(),
+            "sanity precondition: still suppressed while scrolled, offset={}",
+            renderer.transcript_scroll.offset()
+        );
+
+        // Reader scrolls back to the bottom.
+        renderer.transcript_scroll.set_offset(0);
+        assert!(
+            renderer.live_area_should_redraw(),
+            "the deferred redraw must fire once back at offset 0; \
+             live_area_dirty={} offset={}",
+            renderer.live_area_dirty,
+            renderer.transcript_scroll.offset()
+        );
+
+        let mut painted = Vec::new();
+        renderer
+            .draw_live_area_to(&mut painted)
+            .expect("deferred redraw paints");
+        let rendered = String::from_utf8_lossy(&painted);
+        assert!(
+            rendered.contains("content that arrived while scrolled away"),
+            "the deferred redraw must reflect the content that changed while \
+             the reader was scrolled away, not a stale pre-scroll snapshot; \
+             painted bytes: {rendered:?}"
+        );
     }
 
     /// Regression: an OperationMessage's `content()` is just its static
