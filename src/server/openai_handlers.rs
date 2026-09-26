@@ -604,18 +604,36 @@ pub async fn handle_chat_completions(
                 GeneratorState::Ready { .. } => {
                     drop(state);
 
-                    // Try local generation with tools
-                    let mut generator = server.local_generator().write().await;
-                    match generator.try_generate_from_pattern_with_tools(
-                        &internal_messages,
-                        internal_tools.clone(),
-                    ) {
-                        Ok(Some(response)) => {
+                    // Local generation is synchronous, CPU/GPU-bound work
+                    // (llama.cpp inference); run it on the blocking thread
+                    // pool so it cannot occupy this axum worker thread for
+                    // the full duration of a turn, matching the streaming
+                    // path's `spawn_blocking` in
+                    // `handle_chat_completions_streaming`. The write guard
+                    // is acquired and dropped entirely inside the blocking
+                    // closure, so it is never held across an `.await` on
+                    // this task.
+                    let server_for_blocking = Arc::clone(&server);
+                    let messages_for_blocking = internal_messages.clone();
+                    let tools_for_blocking = internal_tools.clone();
+                    let generation_result = tokio::task::spawn_blocking(move || {
+                        let handle = tokio::runtime::Handle::current();
+                        let mut generator = handle.block_on(async {
+                            server_for_blocking.local_generator().write().await
+                        });
+                        generator.try_generate_from_pattern_with_tools(
+                            &messages_for_blocking,
+                            tools_for_blocking,
+                        )
+                    })
+                    .await;
+
+                    match generation_result {
+                        Ok(Ok(Some(response))) => {
                             info!("✓ LOCAL MODEL RESPONDED");
                             (response.content_blocks, "local")
                         }
-                        Ok(None) => {
-                            drop(generator);
+                        Ok(Ok(None)) => {
                             warn!("❌ Local generation returned None, falling back to the cloud provider");
                             match forward_to_cloud(
                                 &server,
@@ -629,11 +647,27 @@ pub async fn handle_chat_completions(
                                 Err(e) => return error_response(&e.to_string(), "api_error"),
                             }
                         }
-                        Err(e) => {
-                            drop(generator);
+                        Ok(Err(e)) => {
                             warn!(
                                 "❌ Local generation error: {}, falling back to the cloud provider",
                                 e
+                            );
+                            match forward_to_cloud(
+                                &server,
+                                Some(&provider_name),
+                                internal_messages.clone(),
+                                internal_tools,
+                            )
+                            .await
+                            {
+                                Ok(blocks) => (blocks, "fallback"),
+                                Err(e2) => return error_response(&e2.to_string(), "api_error"),
+                            }
+                        }
+                        Err(join_error) => {
+                            warn!(
+                                "❌ Local generation task panicked: {}, falling back to the cloud provider",
+                                join_error
                             );
                             match forward_to_cloud(
                                 &server,
@@ -748,48 +782,73 @@ async fn handle_local_only_query(
         .map(|tools| convert_tools_to_internal(tools));
 
     // Generate directly with the same tool definitions used by cloud profiles.
+    // Local generation is synchronous, CPU/GPU-bound work (llama.cpp
+    // inference); run it on the blocking thread pool so it cannot occupy
+    // this axum worker thread for the full duration of a turn, matching the
+    // streaming path's `spawn_blocking` in `handle_chat_completions_streaming`
+    // and the `RouteDecision::Local` branch of `handle_chat_completions`. The
+    // write guard is acquired and dropped entirely inside the blocking
+    // closure, so it is never held across an `.await` on this task.
     info!("Acquiring write lock on generator...");
-    let mut generator = server.local_generator().write().await;
-    info!("Write lock acquired, starting generation...");
+    let server_for_blocking = Arc::clone(&server);
+    let generation_result = tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        let mut generator =
+            handle.block_on(async { server_for_blocking.local_generator().write().await });
+        info!("Write lock acquired, starting generation...");
+        let result =
+            generator.try_generate_from_pattern_with_tools(&internal_messages, internal_tools);
+        info!("Write lock dropped");
+        result
+    })
+    .await;
 
-    let content_blocks =
-        match generator.try_generate_from_pattern_with_tools(&internal_messages, internal_tools) {
-            Ok(Some(response)) => {
-                info!(
-                    "Generation successful, {} content blocks",
-                    response.content_blocks.len()
-                );
-                response.content_blocks
-            }
-            Ok(None) => {
-                warn!("Generation returned None");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "Local model returned no response".to_string(),
-                        "generation_failed".to_string(),
-                    )),
-                )
-                    .into_response());
-            }
-            Err(e) => {
-                // `e`'s message is already a clean, complete description
-                // (e.g. "local generation failed: GGUF prompt (1987) plus
-                // requested output (100) exceeds context (2048)" — #1234),
-                // so surface it as-is instead of re-wrapping it.
-                warn!("Local generation failed: {}", e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        e.to_string(),
-                        "generation_failed".to_string(),
-                    )),
-                )
-                    .into_response());
-            }
-        };
-    drop(generator);
-    info!("Write lock dropped");
+    let content_blocks = match generation_result {
+        Ok(Ok(Some(response))) => {
+            info!(
+                "Generation successful, {} content blocks",
+                response.content_blocks.len()
+            );
+            response.content_blocks
+        }
+        Ok(Ok(None)) => {
+            warn!("Generation returned None");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Local model returned no response".to_string(),
+                    "generation_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        Ok(Err(e)) => {
+            // `e`'s message is already a clean, complete description
+            // (e.g. "local generation failed: GGUF prompt (1987) plus
+            // requested output (100) exceeds context (2048)" — #1234),
+            // so surface it as-is instead of re-wrapping it.
+            warn!("Local generation failed: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    e.to_string(),
+                    "generation_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        Err(join_error) => {
+            warn!("Local generation task panicked: {}", join_error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Local generation task panicked".to_string(),
+                    "generation_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+    };
 
     // Convert response to OpenAI format
     info!("Converting response to OpenAI format...");
@@ -1200,6 +1259,157 @@ mod tests {
         assert_eq!(
             second_flush, " How are you?",
             "Should only return new content"
+        );
+    }
+
+    // ── #1254: local generation must not starve concurrent tokio tasks ──
+    //
+    // `handle_local_only_query` (and the `RouteDecision::Local` branch of
+    // `handle_chat_completions`) call the synchronous, CPU/GPU-bound
+    // `LocalGenerator::try_generate_from_pattern_with_tools` while holding
+    // the generator's write lock. Before the fix that call ran inline on
+    // whichever axum worker thread was handling the request instead of on
+    // `tokio::task::spawn_blocking`'s dedicated pool (the pattern the
+    // streaming path already uses in `handle_chat_completions_streaming`).
+    // On a runtime with only one worker thread -- the structural condition
+    // this test pins -- a long-running inline call captures that single
+    // thread completely: tokio's cooperative scheduler cannot poll *any*
+    // other ready task, including a trivial one, until the synchronous call
+    // returns. That is a deterministic consequence of `worker_threads = 1`,
+    // not a timing race: this test would fail every time before the fix and
+    // pass every time after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn local_only_generation_does_not_starve_concurrent_tasks() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, GeneratorModel, GeneratorState, InferenceProvider, ModelFamily,
+            ModelLoadConfig, ModelSize, TextGeneration,
+        };
+        use std::time::{Duration, Instant};
+
+        /// A `TextGeneration` backend that blocks the calling OS thread for
+        /// a fixed, generous duration -- standing in for real llama.cpp
+        /// inference, which is exactly this shape: synchronous, CPU-bound,
+        /// no internal `.await` points.
+        struct SlowBackend;
+
+        impl TextGeneration for SlowBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> anyhow::Result<Vec<u32>> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(b"ok response".iter().map(|byte| u32::from(*byte)).collect())
+            }
+
+            fn tokenize(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> anyhow::Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "slow test backend (#1254)"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(SlowBackend), config);
+        let shared_model = Arc::new(tokio::sync::RwLock::new(model));
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([7; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test(
+                "spawn-blocking-fixture.local",
+                temp.path(),
+                authority,
+            )
+            .unwrap(),
+        );
+        *server.local_generator().write().await =
+            crate::local::LocalGenerator::with_models(Some(Arc::clone(&shared_model)));
+        *server.generator_state().write().await = GeneratorState::Ready {
+            model: shared_model,
+            model_name: "slow test backend (#1254)".to_string(),
+        };
+
+        let request = ChatCompletionRequest {
+            model: "local".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stop: None,
+            tools: None,
+            local_only: Some(true),
+        };
+
+        let overall_start = Instant::now();
+        let gen_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { handle_chat_completions(State(server), Json(request)).await }
+        });
+
+        // A canary that needs several distinct scheduling turns (not just
+        // one poll) before it can finish, so it genuinely exercises the
+        // scheduler's ability to interleave work rather than completing on
+        // whichever single poll it happens to get first.
+        let canary_task = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        });
+        canary_task.await.expect("canary task panicked");
+        let canary_elapsed = overall_start.elapsed();
+
+        let response = gen_task.await.expect("generation task panicked");
+        let total_elapsed = overall_start.elapsed();
+
+        assert!(
+            response.status().is_success(),
+            "generation must succeed against the slow test backend so the timing \
+             assertions below are measuring the real call path; got status {:?}",
+            response.status()
+        );
+        assert!(
+            total_elapsed >= Duration::from_millis(250),
+            "sanity check: the slow backend sleeps 300ms per call, so the full request \
+             must take at least that long; it took {total_elapsed:?}, which suggests the \
+             backend never actually ran and this test is not exercising the real path"
+        );
+        assert!(
+            canary_elapsed < Duration::from_millis(150),
+            "INVARIANT: local generation must run on the blocking thread pool \
+             (`tokio::task::spawn_blocking`), not inline on an async worker thread, so it \
+             cannot starve sibling tokio tasks (#1254). On this single-worker-thread \
+             runtime, a canary task needing 5 scheduling turns took {canary_elapsed:?} to \
+             finish while a 300ms local-generation call was in flight -- if generation were \
+             running inline on the lone worker thread, tokio could not poll the canary at \
+             all until generation released that thread, so the canary would take roughly \
+             as long as generation itself (~300ms) instead of a few milliseconds"
         );
     }
 }
