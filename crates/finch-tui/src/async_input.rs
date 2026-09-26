@@ -1134,6 +1134,16 @@ mod tests {
                         "{why}: the first Ctrl+C on an empty draft must record \
                          an arm timestamp"
                     );
+                    // #1301: this is the application's only signal that a
+                    // confirming second press is imminent — a silent arm here
+                    // is what let two idle Ctrl+C presses exit Finch with no
+                    // warning shown at any point.
+                    assert!(
+                        renderer.ctrl_c_exit_armed(),
+                        "{why}: after the first idle Ctrl+C, ctrl_c_exit_armed() \
+                         must report true so the event loop can surface the \
+                         'press again to exit' warning before a second press lands"
+                    );
 
                     // A second Ctrl+C within the window performs the cancel
                     // Escape gives immediately.
@@ -1151,6 +1161,11 @@ mod tests {
                         renderer.ctrl_c_armed_at.is_none(),
                         "{why}: cancelling must clear the arm so a later \
                          Ctrl+C starts over"
+                    );
+                    assert!(
+                        !renderer.ctrl_c_exit_armed(),
+                        "{why}: once the confirming press has fired, the exit \
+                         warning must not remain latched"
                     );
                 }
                 ("Ctrl+V", ShortcutAuthority::ComposerShortcut) => {

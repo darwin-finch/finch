@@ -4081,6 +4081,21 @@ impl TuiRenderer {
     pub fn clear_operation_status(&self) {
         self.status_port.clear_operation();
     }
+
+    /// True while a first "nothing to clear" Ctrl+C press is still armed for
+    /// a confirming second press inside [`CTRL_C_CANCEL_WINDOW`] (#1301).
+    ///
+    /// The renderer owns `ctrl_c_armed_at`; whether a confirming press would
+    /// actually exit Finch also depends on application state (an active
+    /// query, a plan/executing overlay) this crate does not hold, so the
+    /// application reads this snapshot and decides whether to surface an
+    /// exit warning via [`Self::set_operation_status`] — mirroring how it
+    /// already reads other renderer-reported snapshots through
+    /// [`TuiStatusPort`].
+    pub fn ctrl_c_exit_armed(&self) -> bool {
+        self.ctrl_c_armed_at
+            .is_some_and(|armed| armed.elapsed() <= CTRL_C_CANCEL_WINDOW)
+    }
 }
 
 // ─── Ghost text / suggestions ─────────────────────────────────────────────────

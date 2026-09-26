@@ -18,6 +18,13 @@ lower message/UI-model contracts instead of reaching into renderer implementatio
 reads printable status/session snapshots and reports child-activity/operation updates through
 that port. Keep status ordering and status-line policy in the application; do not import
 `StatusBar` into production TUI code or add a port around pure line formatting.
+`TuiRenderer::ctrl_c_exit_armed()` is the same reporting direction for the Ctrl+C
+clear-then-cancel convention (#1301): the renderer owns `ctrl_c_armed_at` and reports only
+whether a first "nothing to clear" press is still within `CTRL_C_CANCEL_WINDOW`, since it has no
+visibility into the application state (active query, plan/executing overlay) that decides whether
+a confirming second press would exit Finch. The application polls this snapshot once per render
+tick and calls `set_operation_status`/`clear_operation_status` to keep the idle-exit warning in
+sync — see `EventLoop::sync_ctrl_c_exit_hint` in `src/cli/repl_event/event_loop/dispatch.rs`.
 `TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
 retains message identity, controls stdout, and accepts settled dialog records. Production TUI
 code must not import `OutputManager`; blit and canonical commit read its message snapshots.

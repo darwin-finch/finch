@@ -57,6 +57,12 @@ type PendingApprovalsMap = Arc<RwLock<std::collections::HashMap<Uuid, PendingToo
 
 const MAX_TERMINAL_AGENT_ROOTS: usize = 1024;
 
+/// Warning shown on the status line while an idle, empty-composer Ctrl+C
+/// press stays armed for a confirming second press that would exit Finch
+/// entirely (#1301) — matching Node's REPL convention of naming the exit
+/// gesture before the confirming keystroke lands, instead of exiting silently.
+const CTRL_C_EXIT_HINT: &str = "Press Ctrl+C again to exit Finch";
+
 fn append_pending_user_messages(
     history: &mut ConversationHistory,
     pending_user_messages: &[String],
@@ -332,6 +338,12 @@ pub struct EventLoop {
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
+
+    /// Whether the idle-Ctrl+C exit warning (`CTRL_C_EXIT_HINT`) is
+    /// currently on the status line, so the periodic tick only calls
+    /// `set_operation_status`/`clear_operation_status` on a state change
+    /// rather than every tick (#1301).
+    ctrl_c_exit_hint_shown: bool,
 
     /// User turns submitted while a provider/VM turn is active.  The legacy
     /// code overwrote `active_query_id`, leaving the earlier turn unable to
@@ -2199,6 +2211,7 @@ impl EventLoop {
             agent_scheduler,
             provider_resolver,
             active_query_id: Arc::new(RwLock::new(None)),
+            ctrl_c_exit_hint_shown: false,
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
@@ -2673,18 +2686,21 @@ impl EventLoop {
 
                     // Single mutex acquisition: read all pending TUI state in one lock.
                     // Reduces contention with spawn_input_task from 3-4 round-trips to 1 per tick.
-                    let (pending_cancel, dialog_result, pending_feedback) = {
+                    let (pending_cancel, dialog_result, pending_feedback, ctrl_c_exit_armed) = {
                         let mut tui = self.tui_renderer.lock().await;
                         (
                             std::mem::take(&mut tui.pending_cancellation),
                             tui.pending_dialog_result.take(),
                             tui.pending_feedback.take(),
+                            tui.ctrl_c_exit_armed(),
                         )
                     };
 
                     if pending_cancel {
                         let _ = self.event_tx.send(ReplEvent::CancelQuery);
                     }
+
+                    self.sync_ctrl_c_exit_hint(ctrl_c_exit_armed).await;
 
                     // Route pending dialog result (tool approval, brain question, ShowDialog oneshot, etc.)
                     if let Some(dialog_result) = dialog_result {
