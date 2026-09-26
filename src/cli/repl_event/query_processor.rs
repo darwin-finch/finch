@@ -128,6 +128,21 @@ fn has_streamed_wire_source(source: &str) -> bool {
 /// Leaves a genuine triple-backtick Markdown fence untouched;
 /// `ProgramLanguage::infer_wire_source` rejects that on its own (E-WIRE-002)
 /// before this distinction would ever matter.
+///
+/// One more shape breaks the "can only turn an always-broken submission into
+/// a potentially-working one" invariant above: a leading inline mention
+/// (`` `(fib 7)` ``) followed by unrelated real content that itself contains
+/// a later ` ```lisp ` fence -- the actual, correct program. That text does
+/// not end in a backtick (real prose or a fence usually follows), so the
+/// paired-span branch below never fires; falling through to the unconditional
+/// lone-leading strip would remove only the opening backtick and leave the
+/// inline mention's own closing backtick dangling in the middle of otherwise
+/// real content, gluing it onto what follows instead of removing it with its
+/// pair. Detect that shape first and leave the source untouched: with the
+/// leading backtick preserved, the whole string no longer parses as a
+/// self-contained Lisp form, so `infer_wire_source`'s fence-anywhere check
+/// rejects it cleanly with E-WIRE-002 instead of compiling a corrupted
+/// fragment.
 fn strip_markdown_backtick_noise(source: &str) -> String {
     let trimmed_start = source.trim_start();
     if !trimmed_start.starts_with('`') || trimmed_start.starts_with("```") {
@@ -135,6 +150,9 @@ fn strip_markdown_backtick_noise(source: &str) -> String {
     }
     let leading_ws = &source[..source.len() - trimmed_start.len()];
     let after_leading = &trimmed_start[1..];
+    if after_leading.contains("```") {
+        return source.to_string();
+    }
     let trimmed_end = after_leading.trim_end();
     let trailing_ws = &after_leading[trimmed_end.len()..];
     // A closing backtick that pairs with the one just stripped: the whole
@@ -4455,6 +4473,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strip_markdown_backtick_noise_leaves_untouched_when_real_content_later_holds_a_fence() {
+        // The untested shape that produced the reported bug: `VM wire
+        // error: error[E-LINK-002]: unknown Lisp function 'fib'` from
+        // `provider-response.lisp:1:2 | 1 | (fib 7)\``. A leading inline
+        // mention of code (`` `(fib 7)` ``) is followed by unrelated real
+        // content -- prose plus a genuine fenced program later on, holding
+        // the actual `defun`-equivalent definition the mention lacks. The
+        // text after the leading backtick does not end in a backtick (it
+        // ends in prose), so the paired-span branch never fires; falling
+        // through to the unconditional lone-leading strip would remove only
+        // the opening backtick and glue the mention's own closing backtick
+        // onto the real content that follows, corrupting it. It must be
+        // left completely untouched instead.
+        let source = "`(fib 7)`\n\nHere's a complete solution:\n\n```lisp\n\
+                       (define (fib (n : int)) : int (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+                       (say (int-to-string (fib 7)))\n```\n\nLet me know if you have more questions!";
+        assert_eq!(
+            strip_markdown_backtick_noise(source),
+            source,
+            "a leading inline mention followed by a later real fence must not be partially \
+             stripped into a corrupted blob"
+        );
+    }
+
+    #[test]
+    fn strip_markdown_backtick_noise_still_strips_prior_cases_with_no_later_fence() {
+        // Pins the new "later fence" guard to exactly the new shape: neither
+        // previously-passing case regresses when no fence follows anywhere
+        // in the response.
+        assert_eq!(
+            strip_markdown_backtick_noise("`(say \"hi\")"),
+            "(say \"hi\")",
+            "a lone leading backtick with no fence anywhere must still be stripped"
+        );
+        assert_eq!(
+            strip_markdown_backtick_noise("`(factorial 7)`"),
+            "(factorial 7)",
+            "a whole-response paired inline span with no fence anywhere must still be stripped"
+        );
+    }
+
     #[tokio::test]
     async fn a_paired_markdown_backtick_span_executes_instead_of_dangling_as_read_002() {
         // Production-boundary reproduction of the real turn: a complete,
@@ -4927,6 +4987,121 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn leading_inline_mention_then_a_later_real_fence_is_rejected_not_executed_corrupted() {
+        // Full production-boundary reproduction of the reported bug: a
+        // response shaped like a leading inline-backtick mention
+        // (`` `(fib 7)` ``) followed by unrelated real content that includes
+        // a genuine fenced program later in the string, holding the actual
+        // correct `defun`-equivalent definition the mention lacks. Before
+        // both fixes, this produced exactly:
+        //
+        //   VM wire error: error[E-LINK-002]: unknown Lisp function 'fib'
+        //    --> provider-response.lisp:1:2
+        //     |
+        //   1 | (fib 7)`
+        //     |  ^^^
+        //     = phase: linking
+        //
+        // because `strip_markdown_backtick_noise` glued the mention's own
+        // closing backtick onto the real content instead of removing it
+        // with its pair, and `ProgramLanguage::infer_wire_source` only
+        // checked for a fence at the very start of the string, so the
+        // corrupted, still-`(`-prefixed blob passed through to the compiler
+        // and failed trying to link `fib` without ever reaching its real
+        // definition inside the fence. It must instead be rejected as a
+        // whole with the structured E-WIRE-002 Markdown-fence correction.
+        //
+        // With both fixes applied, the fix in `strip_markdown_backtick_noise`
+        // deliberately leaves the leading backtick untouched for this shape
+        // (rather than trying to guess which fence to strip), so the
+        // rejected source still opens with a bare backtick rather than `(`
+        // or `:`. `is_unattempted_prose` (unmodified; out of scope for this
+        // fix) therefore classifies it as unattempted prose and routes it
+        // through the deterministic wrap-as-`say` path instead of a
+        // same-source model repair. Either path is safe: the point of both
+        // fixes is that the corrupted blob is never compiled or linked, so
+        // `fib` is never looked up and the reported E-LINK-002 transcript
+        // can no longer occur.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = raw_wire_source(
+            "`(fib 7)`\n\nHere's a complete solution:\n\n```lisp\n\
+             (define (fib (n : int)) : int (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+             (say (int-to-string (fib 7)))\n```\n\nLet me know if you have more questions!",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source.clone(),
+            Some(&metrics),
+            None,
+        )
+        .await;
+        while event_rx.try_recv().is_ok() {}
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "the whole blob opens with a bare backtick (not `(` or `:`), so it is classified \
+             as an unattempted prose-shaped reply and must never be sent back to the model as \
+             a same-source repair request"
+        );
+        assert_eq!(
+            execution.source_for_history,
+            format!("s\"\"\"{source}\"\"\" say"),
+            "the deterministic wrap must carry the exact original text as a raw output \
+             literal, not a partially-stripped or otherwise mutated blob"
+        );
+        assert_eq!(
+            execution.response, source,
+            "must never surface the real bug transcript's \
+             `error[E-LINK-002]: unknown Lisp function 'fib'`; the whole original text must \
+             come back as literal output instead; got {:?}",
+            execution.response
+        );
+        assert!(
+            !execution.response.contains("VM wire error"),
+            "the corrupted-blob failure must never reach the user-visible response; got {:?}",
+            execution.response
+        );
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = metrics.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+        assert!(!recorded[0].first_pass_valid, "recorded={:?}", recorded[0]);
+        assert_eq!(
+            recorded[0].failure_class,
+            Some(crate::metrics::WireFailureClass::MarkdownFence),
+            "the first-pass rejection must still be classified as a Markdown-fence failure, \
+             recorded={:?}",
+            recorded[0]
+        );
+        assert!(
+            !recorded[0].repair_attempted,
+            "the deterministic wrap path must not count as a model repair attempt; \
+             recorded={:?}",
+            recorded[0]
+        );
+        assert!(
+            !recorded[0].repaired_successfully,
+            "recorded={:?}",
+            recorded[0]
+        );
+        assert!(!recorded[0].terminal_failure, "recorded={:?}", recorded[0]);
     }
 
     #[tokio::test]

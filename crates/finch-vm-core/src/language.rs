@@ -109,18 +109,77 @@ impl ProgramLanguage {
     /// non-whitespace byte remains the intentionally cheap discriminator,
     /// while common non-protocol wrappers receive a useful error instead of
     /// being misreported as an unknown Co-Forth word.
+    ///
+    /// The fence check scans the whole string, not just its start: a
+    /// response can open with something that parses as a syntactically
+    /// valid, self-contained-looking form (e.g. a stray inline `` `(fib
+    /// 7)` `` mention left over from Markdown cleanup) and still carry a
+    /// real ` ```lisp ` fence later on, holding the actual program. Handing
+    /// that whole blob to the compiler executes only the leading fragment
+    /// and never reaches the real definition inside the fence, which fails
+    /// opaquely (e.g. `E-LINK-002: unknown Lisp function`) instead of
+    /// surfacing the structured Markdown-fence correction.
+    ///
+    /// The scan skips content inside a Co-Forth raw string literal
+    /// (`s"""..."""` / `"""..."""`) rather than treating any occurrence of
+    /// `` ``` `` anywhere as disqualifying: `finch_programs::wrap_prose_as_say`
+    /// deterministically re-embeds a rejected response's own literal text --
+    /// including any fence marker that text happened to contain -- inside
+    /// exactly this kind of raw string literal, and that wrapped `say`
+    /// program is legitimate code, not a Markdown-wrapped response, so it
+    /// must still compile. Without this exclusion, a rejected response whose
+    /// text contains a fence would be rejected all over again on its own
+    /// deterministic re-wrap, permanently failing instead of being echoed
+    /// back as literal output. A real top-level fence -- one not enclosed in
+    /// such a literal -- still catches the original "whole response is one
+    /// fence" case this guarded, so no prior case regresses.
     pub fn infer_wire_source(source: &str) -> Result<Self> {
         let trimmed = source.trim_start();
         if trimmed.is_empty() {
             bail!("E-WIRE-001: Finch wire response is empty; emit a Lisp or Co-Forth program")
         }
-        if trimmed.starts_with("```") {
+        if contains_unenclosed_fence(trimmed) {
             bail!(
                 "E-WIRE-002: Finch wire response must be raw Lisp/Co-Forth, not a Markdown code fence; \
                  emit s\"...\" say for user prose"
             )
         }
         Ok(Self::infer_source(trimmed))
+    }
+}
+
+/// True if `source` contains a Markdown fence marker (`` ``` ``) that is not
+/// enclosed within a Co-Forth raw string literal (`s"""..."""` /
+/// `"""..."""`). See [`ProgramLanguage::infer_wire_source`] for why the
+/// exclusion exists. Content inside an unterminated raw string literal is
+/// not scanned either -- an unterminated literal is already a distinct
+/// compile failure the parser itself reports, and any fence at its own
+/// nesting depth (this scan does not resolve depth beyond one raw-string
+/// span) is a narrower, deliberately unhandled edge case: it requires the
+/// rejected text to contain both a fence marker and a literal `"""`
+/// sequence, and the latter is already documented (`wrap_prose_as_say`) as
+/// never observed in practice on its own.
+fn contains_unenclosed_fence(source: &str) -> bool {
+    let mut rest = source;
+    loop {
+        let next_fence = rest.find("```");
+        let next_raw_open = rest.find("\"\"\"");
+        match (next_fence, next_raw_open) {
+            (None, _) => return false,
+            (Some(_), None) => return true,
+            (Some(fence_idx), Some(raw_idx)) => {
+                if fence_idx < raw_idx {
+                    return true;
+                }
+                let after_open = &rest[raw_idx + 3..];
+                match after_open.find("\"\"\"") {
+                    Some(close_idx) => rest = &after_open[close_idx + 3..],
+                    // Unterminated raw string literal: nothing after it can
+                    // be a genuine top-level fence either.
+                    None => return false,
+                }
+            }
+        }
     }
 }
 
@@ -173,6 +232,73 @@ mod tests {
             "a real triple-backtick fence must still be rejected, not silently unwrapped",
         );
         assert!(error.to_string().contains("E-WIRE-002"));
+    }
+
+    #[test]
+    fn test_infer_wire_source_rejects_a_fence_occurring_later_in_the_string() {
+        // The untested shape that produced `error[E-LINK-002]: unknown Lisp
+        // function 'fib'`: the response opens with a syntactically valid,
+        // self-contained-looking form (a leftover inline `(fib 7)` mention)
+        // but carries the real fenced program later on. Before this fix,
+        // `starts_with("```")` only looked at the very front of the string,
+        // so this whole blob passed through as plain Lisp and got handed to
+        // the compiler -- which only ever saw the leading fragment and never
+        // reached the real `defun`-equivalent definition inside the fence.
+        let source = "(fib 7)`\n\nHere's a complete solution:\n\n```lisp\n\
+                       (define (fib (n : int)) : int (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+                       (say (int-to-string (fib 7)))\n```\n\nLet me know if you have more questions!";
+        let error = ProgramLanguage::infer_wire_source(source).expect_err(
+            "a fence occurring anywhere in the response must be rejected with the structured \
+             E-WIRE-002 correction, not silently executed as a truncated Lisp fragment",
+        );
+        assert!(
+            error.to_string().contains("E-WIRE-002"),
+            "expected the Markdown-fence wire error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_infer_wire_source_accepts_a_fence_marker_enclosed_in_a_raw_string_literal() {
+        // Second-order regression this same fix must not introduce: when a
+        // rejected response is deterministically re-wrapped as literal text
+        // (`finch_programs::wrap_prose_as_say`, invoked because the source
+        // never started with `(` or `:`), the wrap re-embeds the exact
+        // rejected text -- including any fence marker it happened to
+        // contain -- inside a `s"""..."""` raw string literal. That wrapped
+        // program is legitimate `say` code, not a Markdown-wrapped response,
+        // and re-validating it with the same fence check must not reject it
+        // all over again; doing so would turn a safe, echo-the-text-back
+        // fallback into a permanent failure instead.
+        let rejected_text = "(fib 7)`\n\nHere's a complete solution:\n\n```lisp\n\
+                              (define (fib (n : int)) : int (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+                              (say (int-to-string (fib 7)))\n```\n\nLet me know if you have more questions!";
+        let wrapped = format!("s\"\"\"{rejected_text}\"\"\" say");
+        let language = ProgramLanguage::infer_wire_source(&wrapped).unwrap_or_else(|error| {
+            panic!(
+                "the wrap-as-say fallback must always compile as valid Forth, since it is the \
+                 deterministic safety net for rejected wire responses; got error: {error}, \
+                 wrapped source: {wrapped:?}"
+            )
+        });
+        assert_eq!(
+            language,
+            ProgramLanguage::Forth,
+            "the raw `s\"\"\"...\"\"\" say` wrap form is always Forth"
+        );
+    }
+
+    #[test]
+    fn test_infer_wire_source_still_accepts_plain_lisp_and_forth_with_no_fence() {
+        // No prior case regresses: ordinary wire responses that never
+        // mention a fence anywhere still resolve normally.
+        assert_eq!(
+            ProgramLanguage::infer_wire_source("(say \"hi\")").unwrap(),
+            ProgramLanguage::Lisp
+        );
+        assert_eq!(
+            ProgramLanguage::infer_wire_source("s\"hi\" say").unwrap(),
+            ProgramLanguage::Forth
+        );
     }
 
     #[test]
