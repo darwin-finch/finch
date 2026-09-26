@@ -7,15 +7,24 @@
 //! in-app replacement: it tracks a drag over the transcript, highlights the
 //! dragged range, and copies the released selection to the system clipboard.
 //!
-//! **Scope (first slice).** [`SelectionIndex`] only indexes transcript rows
-//! that occupy exactly one physical terminal row
-//! (`finch_ui_model::physical_rows(text, width) == 1`). A row produced by a
-//! wrapped multi-row logical line is not indexed, so it cannot be selected,
-//! highlighted, or copied — a drag simply has a gap there. Most transcript
-//! content (status lines, single-sentence prose, code lines, user input
-//! lines) is single-row, so this covers the common case; wrapping-aware
-//! selection is a documented follow-up rather than something this module
-//! guesses at.
+//! **Wrap-aware indexing (#1238).** A logical transcript line is never
+//! pre-wrapped by Finch: `redraw_full_viewport_inner`/`continue_full_viewport_paint`
+//! and the live frame both `Print` a line's full text followed by `\r\n`,
+//! relying entirely on the terminal's own hard wrap at exactly `width`
+//! display columns per row — the same column math `finch_ui_model::physical_rows`
+//! already counts by. Because wrapping here is a plain column split (never
+//! word-aware), [`SelectionIndex`] can index every physical row of every
+//! logical line, not only ones that fit in one row: `SelectionIndex::build`
+//! slices each line's text into `physical_rows(text, width)` column-window
+//! chunks (`split_into_physical_rows`) and indexes one [`SelectableRow`] per
+//! chunk, marking every row after the first as `continuation` of the same
+//! logical line. `selected_text` uses that flag to join a selection that
+//! spans two physical rows of one wrapped line with no separator (a
+//! contiguous run of the original text), while still inserting `\n` between
+//! two distinct logical lines — matching what a reader sees as one wrapped
+//! paragraph versus two separate lines. A row this module still cannot find
+//! an index entry for (mouse coordinates outside the transcript claim
+//! entirely) is skipped rather than guessed at.
 //!
 //! Column math (`column_to_char_index`) walks `text` char-by-char using
 //! display width, with no awareness of embedded ANSI escapes. Most
@@ -24,10 +33,14 @@
 //! raw SGR bytes directly in its `text` field (span-free, pre-formatted
 //! content — see `span_render::lower_rendered_line`'s doc comment) would
 //! have its escape bytes miscounted as display columns. That is a known,
-//! narrow gap in this first slice rather than something silently
-//! mishandled: such a line still selects and copies (whole-row column
-//! bounds are unaffected), only a partial-column boundary landing inside
-//! its escape bytes could drift.
+//! narrow gap rather than something silently mishandled: such a line still
+//! selects and copies (whole-row column bounds are unaffected), only a
+//! partial-column boundary landing inside its escape bytes could drift. The
+//! same narrow gap applies to `split_into_physical_rows`'s row-boundary
+//! placement for such a line; `SelectionIndex::build` keeps `physical_rows`
+//! (not the split's own chunk count) as the authoritative row-count per
+//! line, so a mismatch there stays confined to that one line's own slice
+//! boundaries and never drifts the row numbering of every line after it.
 //!
 //! The index is rebuilt every frame in
 //! `TuiRenderer::rebuild_transcript_hit_regions`, from the same
@@ -40,20 +53,48 @@
 
 use finch_ui_model::{char_display_width, physical_rows, RenderedTranscriptLine};
 
-/// One selectable, single-physical-row transcript line, keyed by its
-/// absolute terminal row.
+/// One selectable physical terminal row, keyed by its absolute row. `text`
+/// is exactly that row's own on-screen slice — the full logical line for a
+/// single-row line, or one column-window chunk of a wrapped line.
+/// `continuation` is true when this row is not the first physical row of its
+/// logical line, so `selected_text` knows not to insert a line break before
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectableRow {
     pub row: u16,
     pub text: String,
+    pub continuation: bool,
 }
 
 /// Per-frame snapshot of the rows currently on screen that a drag can
-/// select. See the module docs for why only single-physical-row lines are
-/// indexed.
+/// select, one entry per physical terminal row (see the module docs for how
+/// a wrapped logical line's rows are split and linked).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SelectionIndex {
     rows: Vec<SelectableRow>,
+}
+
+/// Split `text` into the column-window chunks a hard wrap at `width` display
+/// columns would produce — one chunk per physical row, in order. Mirrors
+/// `finch_ui_model::physical_rows`'s counting exactly for plain text; see the
+/// module docs for the narrow, already-documented gap on a line still
+/// carrying raw ANSI bytes.
+fn split_into_physical_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = char_display_width(ch).max(1);
+        if col + w > width && !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        current.push(ch);
+        col += w;
+    }
+    rows.push(current);
+    rows
 }
 
 impl SelectionIndex {
@@ -65,13 +106,18 @@ impl SelectionIndex {
         let mut cursor = usize::from(top);
         for line in combined {
             let rows_here = physical_rows(&line.text, width);
-            if rows_here == 1 && cursor <= usize::from(u16::MAX) {
+            let slices = split_into_physical_rows(&line.text, width);
+            for i in 0..rows_here {
+                if cursor > usize::from(u16::MAX) {
+                    break;
+                }
                 rows.push(SelectableRow {
                     row: cursor as u16,
-                    text: line.text.clone(),
+                    text: slices.get(i).cloned().unwrap_or_default(),
+                    continuation: i > 0,
                 });
+                cursor += 1;
             }
-            cursor += rows_here;
         }
         Self { rows }
     }
@@ -210,13 +256,18 @@ fn char_range(text: &str, start_col: u16, end_col: u16) -> (usize, usize) {
     (start, end)
 }
 
-/// The plain text of a finalized or in-progress selection, one line per
-/// selected row joined with `\n`. A row the index has no entry for (a hit
-/// region, chrome, or a wrapped line — see the module docs) is skipped
-/// rather than guessed at.
+/// The plain text of a finalized or in-progress selection. Two contributing
+/// rows are joined by `\n` when the later one starts a new logical line, or
+/// concatenated directly (no separator) when it is a wrap `continuation` of
+/// the same logical line as the row before it — so a selection spanning
+/// several physical rows of one wrapped paragraph copies as one contiguous
+/// run of that paragraph's text, not a fragment per row. A row the index has
+/// no entry for (mouse coordinates outside the transcript claim) is skipped
+/// rather than guessed at, and does not itself force a line break.
 pub(crate) fn selected_text(index: &SelectionIndex, selection: &TranscriptSelection) -> String {
     let (top, bottom) = selection.row_range();
-    let mut lines = Vec::new();
+    let mut out = String::new();
+    let mut first = true;
     for row in top..=bottom {
         let Some(entry) = index.row(row) else {
             continue;
@@ -225,16 +276,21 @@ pub(crate) fn selected_text(index: &SelectionIndex, selection: &TranscriptSelect
             continue;
         };
         let (start, end) = char_range(&entry.text, start_col, end_col);
-        if start >= end {
+        let piece: String = if start >= end {
             // A real row with nothing selected on it (e.g. an empty line
             // fully inside the range) still contributes a blank line, so
             // multi-line copies keep their line breaks.
-            lines.push(String::new());
-            continue;
+            String::new()
+        } else {
+            entry.text.chars().skip(start).take(end - start).collect()
+        };
+        if !first && !entry.continuation {
+            out.push('\n');
         }
-        lines.push(entry.text.chars().skip(start).take(end - start).collect());
+        out.push_str(&piece);
+        first = false;
     }
-    lines.join("\n")
+    out
 }
 
 /// Rows to paint with the highlight background for the current selection:
@@ -306,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_index_skips_wrapped_multi_row_lines() {
+    fn test_selection_index_indexes_every_physical_row_of_a_wrapped_line() {
         let combined = vec![
             line(0, "short"),
             RenderedTranscriptLine {
@@ -316,21 +372,38 @@ mod tests {
             line(0, "also short"),
         ];
         let index = SelectionIndex::build(&combined, 5, 20);
-        // Row 5 = "short" (1 row), row 6 = the 50-char line wraps to 3 rows
-        // at width 20 (not indexed), row 9 = "also short".
+        // Row 5 = "short" (1 row). The 50-char line wraps to 3 rows at width
+        // 20: rows 6-8, each its own indexed entry, rows 7-8 marked as
+        // continuations of row 6's logical line. Row 9 = "also short".
         assert_eq!(
             index.len(),
-            2,
-            "the wrapped middle line must not be indexed; got {} entries",
+            5,
+            "every physical row of the wrapped line must be indexed, not skipped; got {} entries",
             index.len()
         );
         assert_eq!(index.row(5).map(|r| r.text.as_str()), Some("short"));
         assert_eq!(
-            index.row(6),
-            None,
-            "row 6 starts the wrapped line — no entry"
+            index.row(5).map(|r| r.continuation),
+            Some(false),
+            "a single-row line's own row is never a continuation"
+        );
+        assert_eq!(
+            index.row(6).map(|r| (r.text.as_str(), r.continuation)),
+            Some(("x".repeat(20).as_str(), false)),
+            "row 6 is the wrapped line's first physical row: the first 20 x's, not a continuation"
+        );
+        assert_eq!(
+            index.row(7).map(|r| (r.text.as_str(), r.continuation)),
+            Some(("x".repeat(20).as_str(), true)),
+            "row 7 is the wrapped line's second physical row: the next 20 x's, marked continuation"
+        );
+        assert_eq!(
+            index.row(8).map(|r| (r.text.as_str(), r.continuation)),
+            Some(("x".repeat(10).as_str(), true)),
+            "row 8 is the wrapped line's remaining 10 x's, marked continuation"
         );
         assert_eq!(index.row(9).map(|r| r.text.as_str()), Some("also short"));
+        assert_eq!(index.row(9).map(|r| r.continuation), Some(false));
     }
 
     #[test]
@@ -378,6 +451,50 @@ mod tests {
             "top row keeps its tail from the anchor column (6, the space before \
              'line'); bottom row keeps its head up to and including the drag \
              column (5, the 'd' of 'second')"
+        );
+    }
+
+    /// #1238 regression: PR #1217 shipped click-drag selection with a
+    /// disclosed limitation — a wrapped multi-row logical line was not
+    /// indexed at all, so a drag through it produced a "gap" (and, over
+    /// content that is mostly wrapped, that looked to a reader like random
+    /// discontiguous fragments — full lines vanishing and only stray
+    /// single-row lines highlighting). A drag that starts partway through
+    /// one physical row of a wrapped line and ends partway through another
+    /// physical row of that *same* logical line must resolve to one
+    /// contiguous run of the source text — not two or three separate
+    /// fragments joined by spurious line breaks, and not a gap.
+    #[test]
+    fn test_selected_text_spans_multiple_physical_rows_of_one_wrapped_line_contiguously() {
+        // 45 chars of "abcdefghijklmnopqrstuvwxyz" repeating — long enough to
+        // hard-wrap into 3 physical rows at width 20 (rows of 20, 20, 5).
+        let text: String = (0..45u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let index = SelectionIndex::build(&[line(0, &text)], 5, 20);
+        assert_eq!(
+            index.len(),
+            3,
+            "a 45-char line at width 20 must occupy 3 physical rows, all indexed"
+        );
+
+        // Press at column 15 of the wrapped line's first physical row (row
+        // 5, global char 15), drag to column 2 of its third physical row
+        // (row 7, which starts at global char 40) — a selection that spans
+        // all three physical rows of the one logical line.
+        let selection = TranscriptSelection {
+            anchor: SelectionPoint { row: 5, col: 15 },
+            head: SelectionPoint { row: 7, col: 2 },
+            dragging: false,
+        };
+        let expected = &text[15..43];
+        assert_eq!(
+            selected_text(&index, &selection),
+            expected,
+            "a drag spanning all three physical rows of one wrapped line must \
+             resolve to the exact contiguous source substring {expected:?} \
+             (chars 15..43 of {text:?}), with no inserted line breaks between \
+             the wrapped rows and no missing or duplicated characters"
         );
     }
 

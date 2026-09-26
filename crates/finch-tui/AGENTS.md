@@ -196,10 +196,22 @@ released-selection behavior) and best-effort copies the text to the system clipb
 copy in `grok_auth.rs`/`chatgpt_auth.rs`; a clipboard failure never clears the selection.
 
 `SelectionIndex` (rebuilt every frame in `rebuild_transcript_hit_regions`, from the same
-`combined` `RenderedTranscriptLine`s and `plan.transcript_top` the hit regions use) only indexes
-rows that occupy exactly one physical terminal row — a wrapped multi-row logical line is not
-indexed, so a drag simply has a gap there; wrapping-aware selection is a documented follow-up, not
-something guessed at. The highlight itself lowers through the normal `Span`/`SpanStyle` path
+`combined` `RenderedTranscriptLine`s and `plan.transcript_top` the hit regions use) is wrap-aware
+(#1238): Finch never pre-wraps a logical line before printing it (`Print(text)` then `Print("\r\n")`,
+relying on the terminal's own hard wrap at exactly `width` columns), so a wrapped line's physical
+rows split at the same column boundaries `finch_ui_model::physical_rows` counts by
+(`selection::split_into_physical_rows`) and each physical row gets its own indexed
+`SelectableRow`, marked `continuation` when it is not the first row of its logical line.
+`selected_text` joins two rows of the same logical line with no separator (one contiguous run of
+the wrapped text) and joins two distinct logical lines with `\n`, so a drag through a wrapped
+paragraph copies as one clean range instead of a gap or a per-row fragment
+(`test_selected_text_spans_multiple_physical_rows_of_one_wrapped_line_contiguously` in
+`selection.rs`, `test_drag_spans_a_wrapped_multi_row_line_selects_one_contiguous_run` in
+`lib.rs` at the real mouse-handling boundary). A line still carrying raw ANSI/SGR bytes directly
+in its `text` (rather than lowered spans) keeps the same narrow, pre-existing column-counting gap
+column math already had for the single-row case — `physical_rows` stays authoritative for the
+row count per line so a mismatch there cannot drift the row numbering of any later line. The
+highlight itself lowers through the normal `Span`/`SpanStyle` path
 (`span_render::selection_highlight_style`, `lower_span`) exactly like every other transcript
 style — never raw SGR in a renderer — but paints as a small targeted overlay
 (`paint_selection_overlay`, bracketed by `SavePosition`/`RestorePosition`) after the normal frame
