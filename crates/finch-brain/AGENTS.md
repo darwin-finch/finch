@@ -47,6 +47,8 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
   `src/journal/tests.rs`; and the Cap'n Proto wire round trip in
   `every_current_brain_event_round_trips_through_capnp` in `src/ipc_codec.rs`.
 
+- **Caller naming convention, not a Brain crate concept:** `spawn_task` (`src/tools/implementations/spawn.rs` in the root crate) creates one named Brain per subagent run through this same `BrainStore`, named `sub-<generate()>` and archived via the existing `archive()` call immediately on completion unless the caller opts to keep it live. This crate does not know or enforce the `sub-` prefix or the archive-on-completion policy — both live entirely in the caller — but a future change here that alters `generate()`'s output shape or `archive()`'s semantics affects that caller too. See `src/tools/EXECUTION.md` for the caller-side policy.
+
 Nested persistence contracts: [attachment](src/attachment/AGENTS.md),
 [journal](src/journal/AGENTS.md), [projection](src/projection/AGENTS.md),
 [run](src/run/AGENTS.md), and [schedule](src/schedule/AGENTS.md).

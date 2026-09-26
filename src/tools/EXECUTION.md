@@ -16,6 +16,25 @@
 | `delegate_to_claude_code` | Delegate to the official Claude Code CLI, running as itself |
 | memory tools | Semantic memory read/write |
 
+### Sub-brains: named-Brain identity for spawned subagents (`spawn_task`)
+
+`TaskTool` (`src/tools/implementations/spawn.rs`) can be given an optional `finch_brain::BrainStore`
+via `with_brain_store`; when omitted, `spawn_task` is fully ephemeral exactly as before. When a
+store is present, every `spawn_task` invocation gets its own named Brain — `sub-<generated>`, e.g.
+`sub-quiet-hill-a13f09` — created and journaled through the same `BrainStore::push`/`archive` API
+the interactive CLI and `finch brain rm` already use. The subagent's task prompt and final
+result/error are recorded as ordinary `Prompt`/`Result` journal events (not per-tool-call detail;
+that finer-grained recording is unscoped follow-up work). By default the Brain is archived
+(`BrainStore::archive`, same as `finch brain rm` — moved to `brains-archive/`, not deleted)
+immediately after the subagent finishes, success or failure, so `finch brain ls` never fills with
+spawn noise. Passing `persist: true` in the tool input skips that auto-archive, leaving the Brain
+live and visible in `finch brain ls` under its `sub-` name. The `sub-` prefix is the only thing
+that visually separates spawn-originated Brains from interactively-created ones in `ls` output; no
+change to `ls` itself was needed or made. `TaskTool` is registered in the REPL's tool registry and
+fallback registry (`src/cli/repl.rs`) as of the provider-selection change above; nothing yet passes
+`with_brain_store` at either registration site, so sub-brains are implemented and tested but not
+yet wired to a live `BrainStore` in production (tracked as a follow-up, not a dead-code gap).
+
 ## Permission system
 
 `PermissionManager` has two roles (chosen through `PermissionManager::new` and
