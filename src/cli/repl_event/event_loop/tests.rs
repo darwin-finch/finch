@@ -7491,6 +7491,115 @@ async fn test_idle_ctrl_c_in_auto_accept_exits_finch() {
         .await;
 }
 
+/// #1301 production-boundary regression: an idle, empty-composer Ctrl+C press
+/// used to arm `ctrl_c_armed_at` in `finch-tui` with zero visible feedback —
+/// a second press within `CTRL_C_CANCEL_WINDOW` then exited Finch entirely,
+/// silently, from the state a user is most likely to hit by accident. This
+/// exercises the real chain the fix added: `TuiRenderer::ctrl_c_exit_armed()`
+/// reports the renderer's arm state, `EventLoop::sync_ctrl_c_exit_hint` folds
+/// in the application-owned "no active query, not a plan overlay" condition
+/// from the same `CancelQuery` idle branch that decides whether the second
+/// press exits, and calls `TuiRenderer::set_operation_status`, which reaches
+/// the actual status line read by `StatusBar::status_without_session`.
+#[tokio::test]
+async fn test_idle_ctrl_c_arm_shows_exit_warning_on_the_status_line() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+
+            assert!(
+                !event_loop
+                    .status_bar
+                    .status_without_session()
+                    .contains("Ctrl+C again"),
+                "no warning must be showing before any Ctrl+C press"
+            );
+
+            // Simulate the renderer reporting a live arm, as it would right
+            // after `async_input::handle_composer_shortcuts` processed the
+            // first idle Ctrl+C press on an empty composer.
+            event_loop.sync_ctrl_c_exit_hint(true).await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                status.contains("Press Ctrl+C again to exit Finch"),
+                "the first idle Ctrl+C press must surface a visible warning on \
+                 the status line before a second press can exit Finch; status={status:?}"
+            );
+
+            // The arm expiring (window lapsed) or the confirming press firing
+            // both report `ctrl_c_exit_armed() == false` on the next tick —
+            // the hint must not linger once it no longer applies.
+            event_loop.sync_ctrl_c_exit_hint(false).await;
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("Ctrl+C again"),
+                "the warning must clear once the arm is no longer live; status={status:?}"
+            );
+        })
+        .await;
+}
+
+/// The exit warning is specifically about *exiting Finch*. While a query is
+/// active, a confirming second press cancels the query instead (see
+/// `test_ctrl_c_during_query_preserves_auto_accept`) — showing "exit Finch"
+/// there would be a lie, so the hint must stay off even while the renderer
+/// reports an armed Ctrl+C.
+#[tokio::test]
+async fn test_ctrl_c_arm_with_active_query_does_not_show_exit_warning() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_id);
+
+            event_loop.sync_ctrl_c_exit_hint(true).await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("exit Finch"),
+                "an armed Ctrl+C with an active query cancels the query, not \
+                 Finch, on the confirming press — the exit warning must not \
+                 show; status={status:?}"
+            );
+        })
+        .await;
+}
+
+/// A plan/executing overlay's confirming Ctrl+C exits the overlay, not
+/// Finch (`ReplMode::is_plan_overlay`). The exit warning must not show there
+/// either, for the same "don't warn about an exit that won't happen" reason.
+#[tokio::test]
+async fn test_ctrl_c_arm_in_plan_overlay_does_not_show_exit_warning() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Planning {
+                task: "investigate #1301".to_string(),
+                plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+                created_at: chrono::Utc::now(),
+            };
+
+            event_loop.sync_ctrl_c_exit_hint(true).await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("exit Finch"),
+                "an armed Ctrl+C in a plan overlay exits the overlay, not \
+                 Finch, on the confirming press; status={status:?}"
+            );
+        })
+        .await;
+}
+
 /// AutoAccept does not inherit Planning's write restriction. The executor
 /// still runs write; the skipped dialog is the only change.
 #[tokio::test]

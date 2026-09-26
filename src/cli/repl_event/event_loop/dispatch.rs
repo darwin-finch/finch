@@ -1178,6 +1178,38 @@ impl EventLoop {
 
         Ok(())
     }
+
+    /// Keep the idle-Ctrl+C exit warning (`CTRL_C_EXIT_HINT`) in sync with
+    /// the renderer's live arm state, polled once per render tick (#1301).
+    ///
+    /// `ctrl_c_exit_armed` reports only that a first "nothing to clear"
+    /// Ctrl+C press is still within its confirming window — the renderer
+    /// does not know whether a confirming second press would actually exit
+    /// Finch. That depends on the same two conditions the `CancelQuery`
+    /// idle branch above uses to decide between "exit Finch" and "exit the
+    /// plan/executing overlay": no active query, and not a plan overlay.
+    /// Showing the hint only when both hold keeps it truthful; clearing it
+    /// on every other tick means it disappears the moment the arm expires,
+    /// the user types something else, or the second press lands — without
+    /// a separate timer, mirroring the time-boxed check `ctrl_c_should_cancel`
+    /// already performs on `ctrl_c_armed_at`.
+    pub(super) async fn sync_ctrl_c_exit_hint(&mut self, ctrl_c_exit_armed: bool) {
+        let should_show = ctrl_c_exit_armed
+            && self.active_query_id.read().await.is_none()
+            && !self.mode.read().await.is_plan_overlay();
+
+        if should_show == self.ctrl_c_exit_hint_shown {
+            return;
+        }
+        let tui = self.tui_renderer.lock().await;
+        if should_show {
+            tui.set_operation_status(CTRL_C_EXIT_HINT);
+        } else {
+            tui.clear_operation_status();
+        }
+        drop(tui);
+        self.ctrl_c_exit_hint_shown = should_show;
+    }
 }
 
 fn agent_lifecycle_task_id(event: &crate::scheduler::AgentEvent) -> Option<Uuid> {
