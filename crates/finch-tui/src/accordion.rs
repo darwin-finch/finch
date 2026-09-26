@@ -329,16 +329,24 @@ impl AccordionState {
         }
     }
 
+    /// Whether `(column, row)` lands on a plain disclosure hit region, for a
+    /// caller that needs to know before deciding whether a press should
+    /// become a text-selection drag instead of a click (#221). Read-only:
+    /// unlike `handle_mouse`, it never toggles anything.
+    pub fn hit_region_at(&self, column: u16, row: u16) -> Option<&TranscriptHitRegion> {
+        self.hit_regions.iter().find(|region| {
+            row >= region.top
+                && row <= region.bottom
+                && column >= region.left
+                && column <= region.right
+        })
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
-        let Some(region) = self.hit_regions.iter().find(|region| {
-            mouse.row >= region.top
-                && mouse.row <= region.bottom
-                && mouse.column >= region.left
-                && mouse.column <= region.right
-        }) else {
+        let Some(region) = self.hit_region_at(mouse.column, mouse.row) else {
             return false;
         };
         let row_id = region.row_id.clone();

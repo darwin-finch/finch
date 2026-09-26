@@ -131,6 +131,20 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette
 }
 
+/// The transcript drag-selection highlight (#221): bold bright white on
+/// blue, the common terminal/editor selection convention, mirroring the
+/// wizard's own selection-contrast precedent (#1140, `wizard_selected` in
+/// `wizard_host.rs`) rather than inventing a new look. A fixed colour pair,
+/// not derived from the user's `ColorScheme` — selection has no natural
+/// semantic role in that scheme, so this stays a named constant instead of
+/// a fabricated mapping. Callers lower it through the same [`lower_span`]
+/// every other transcript style uses; nothing here writes raw SGR.
+pub fn selection_highlight_style() -> SpanStyle {
+    SpanStyle::fg(SpanColor::WHITE)
+        .with_bg(SpanColor::DARK_BLUE)
+        .with_bold(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +210,20 @@ mod tests {
             Span::plain(" Generating"),
         ]);
         assert_eq!(lower_rendered_line(&styled), "\x1b[96m⏺\x1b[0m Generating");
+    }
+
+    /// The selection highlight lowers through the same span path as any
+    /// other style — a fixed bold-white-on-blue run, not a hand-written
+    /// escape sequence.
+    #[test]
+    fn test_selection_highlight_style_lowers_through_the_span_path() {
+        let span = Span::styled("hi", selection_highlight_style());
+        assert_eq!(
+            lower_span(&span),
+            "\x1b[1;97;44mhi\x1b[0m",
+            "bold bright white (97) on blue (44); got {:?}",
+            lower_span(&span)
+        );
     }
 
     /// The scheme bridge: the Dark default scheme maps the progress and
