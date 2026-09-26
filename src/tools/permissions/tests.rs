@@ -50,12 +50,20 @@ fn test_peer_cannot_restart() {
              arm is unreachable for the real tool name)"
     );
 }
+/// Empty config for constructing `TaskTool` in tests that only exercise the
+/// permission policy and never resolve a named provider.
+fn empty_config() -> std::sync::Arc<crate::config::Config> {
+    std::sync::Arc::new(crate::config::Config::new(vec![]))
+}
+
 #[test]
 fn test_peer_cannot_spawn() {
     let mgr = PermissionManager::for_peer();
     // Exercise the name the real TaskTool registers, not a literal.
-    let task_tool =
-        crate::tools::implementations::spawn::TaskTool::new(std::sync::Arc::new(NullProvider));
+    let task_tool = crate::tools::implementations::spawn::TaskTool::new(
+        std::sync::Arc::new(NullProvider),
+        empty_config(),
+    );
     let name = crate::tools::Tool::name(&task_tool);
     let input = serde_json::json!({});
     let check = mgr.check_tool_use(name, &input);
@@ -94,8 +102,10 @@ fn test_peer_hard_deny_table_names_are_declared_by_real_tool_implementations() {
     // restart/spawn/delegate-to-claude-code tools — otherwise the deny arm
     // has drifted onto an unregistered literal (unreachable in production)
     // or a registered name has lost its deny.
-    let task_tool =
-        crate::tools::implementations::spawn::TaskTool::new(std::sync::Arc::new(NullProvider));
+    let task_tool = crate::tools::implementations::spawn::TaskTool::new(
+        std::sync::Arc::new(NullProvider),
+        empty_config(),
+    );
     let workspace = tempfile::tempdir().expect("workspace for claude_code tool");
     let claude_code_tool =
         crate::tools::implementations::claude_code::ClaudeCodeDelegateTool::new(workspace.path());

@@ -1210,6 +1210,15 @@ impl Repl {
         tool_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
             tool_workspace_root.clone(),
         )));
+        // Delegate a subtask to an isolated subagent loop with its own
+        // conversation history, optionally against a named configured
+        // provider (see `/providers`) instead of the one driving this
+        // conversation. Hard-denied to peers alongside restart and
+        // delegate_to_claude_code.
+        tool_registry.register(Box::new(crate::tools::TaskTool::new(
+            claude_client.shared_provider(),
+            Arc::new(config.clone()),
+        )));
         tool_registry.register(Box::new(EditTool));
         tool_registry.register(Box::new(PatchTool));
         tool_registry.register(Box::new(WriteTool));
@@ -1378,6 +1387,10 @@ impl Repl {
                 )));
                 fallback_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
                     tool_workspace_root.clone(),
+                )));
+                fallback_registry.register(Box::new(crate::tools::TaskTool::new(
+                    claude_client.shared_provider(),
+                    Arc::new(config.clone()),
                 )));
                 fallback_registry.register(Box::new(crate::tools::SubmitProgramTool::new(
                     Arc::clone(&program_runtime),
