@@ -32,7 +32,13 @@ shared unit may be read while the event loop appends output, so preserve the exi
 snapshot discipline. A complete transcript is canonical text for copying and permanent
 scrollback; renderer disclosure may change visible rows but must not change that text. A say-turn
 component action mutates its owning ViewModel under the message lock; unmigrated rows keep the
-renderer-owned `RowId` open set. Migrated messages answer `Message::component_view` (stage 3 of
+renderer-owned `RowId` open set. `MemoryRecalledMessage` (#1235) rides the same component-owned
+disclosure pattern: `header`/`rows` are immutable once constructed, but each row's `expanded`
+flag lives in its own `RwLock<Vec<bool>>`, collapsed by default, and `ToggleMemoryRow` (addressed
+by row index through `transcript_action`/`handle_transcript_action`) flips one row's flag under
+that lock — `complete_transcript`/`format` are unaffected, so native scrollback still carries the
+full recalled text regardless of what the live viewport has collapsed. Migrated messages answer
+`Message::component_view` (stage 3 of
 docs/TUI_DESIGN.md, #1120) by constructing their component from retained state under the
 existing lock(s) — no new lock, no OutputManager ownership change; the renderer never matches
 on the message type. Say turns ride the same accessor (`ComponentView::Say`); `say_turn_view`

@@ -24,7 +24,7 @@ use crate::{
     say_turn::SayTurnView,
     span::{Span, SpanColor, SpanStyle},
     work_unit::{MessageStatus, WorkRowStatus},
-    RenderedTranscriptLine,
+    MessageId, RenderedTranscriptLine, RowId,
 };
 
 /// The component snapshot of one migrated typed message. A message type
@@ -54,7 +54,10 @@ pub enum ComponentView {
     /// through, so this component carries no Input/Output split and no
     /// bounded/scrollable child viewport (the tool-result control in
     /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolOutput`
-    /// rows only, which this component never emits).
+    /// rows only, which this component never emits). Each row's recalled
+    /// text is collapsed behind its identity/summary line by default and
+    /// expands on click (#1235), the same component-owned disclosure
+    /// mechanism the say turn's `show_program` uses.
     MemoryRecalled(MemoryRecalledView),
 }
 
@@ -127,9 +130,14 @@ pub struct OperationRowView {
 /// The ViewModel of a [`ComponentView::MemoryRecalled`] component: the chrome
 /// header (e.g. "3 memories retrieved") and one row per recalled memory. The
 /// message constructs the snapshot once, from the recall decision already
-/// made for this turn — there is no running/streaming state to retain.
+/// made for this turn — there is no running/streaming state to retain, but
+/// each row's `expanded` flag is mutable UI state the message retains behind
+/// its own lock (#1235), read fresh into this snapshot every frame.
+/// `message_id` addresses the rows' `RowId`s the same way `SayTurnView`'s
+/// does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecalledView {
+    pub message_id: MessageId,
     pub header: String,
     pub rows: Vec<MemoryRecallRowView>,
 }
@@ -137,13 +145,17 @@ pub struct MemoryRecalledView {
 /// One memory row of a [`MemoryRecalledView`]: its identity line (tier,
 /// score, node id), a one-line presentation summary (raw vs. summarized),
 /// and the recalled text itself. `body_lines` renders directly beneath the
-/// row — no separate "Input"/"Output" disclosure, since a memory has no
-/// input side.
+/// row while `expanded` — no separate "Input"/"Output" disclosure, since a
+/// memory has no input side. Collapsed (`expanded: false`) by default
+/// (#1235): the identity/summary line is always visible, and a click (or the
+/// keyboard disclosure path) reveals `body_lines`, mirroring the say turn's
+/// `show_program` toggle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecallRowView {
     pub label: String,
     pub summary: String,
     pub body_lines: Vec<String>,
+    pub expanded: bool,
 }
 
 /// The style roles the component renderers read (stage 4, #1141).
@@ -422,14 +434,25 @@ fn static_text_lines(
 }
 
 /// A memory-recall row: chrome (`⏺ header`) then one row per memory — its
-/// identity/summary line, then the recalled text directly beneath it. Unlike
-/// [`operation_lines`], a row here has no running/complete/error status (a
-/// recalled memory is always already fully known) and its body is plain
-/// content, never a bounded/scrollable viewport — the whole point is that a
-/// couple of short lines of recalled context need no pagination chrome.
-/// Reuses the operation glyph styles: visually this is the same "grouped
-/// activity" family as a tool-call operation, just without the input side or
-/// the per-row running state.
+/// identity/summary line, then the recalled text directly beneath it while
+/// that row is expanded. Unlike [`operation_lines`], a row here has no
+/// running/complete/error status (a recalled memory is always already fully
+/// known) and its body is plain content, never a bounded/scrollable viewport
+/// — the whole point is that a couple of short lines of recalled context need
+/// no pagination chrome, only a click to reveal them. Reuses the operation
+/// glyph styles: visually this is the same "grouped activity" family as a
+/// tool-call operation, just without the input side or the per-row running
+/// state.
+///
+/// Collapsed by default (#1235): a row with recalled text is a component-
+/// owned disclosure target, the same mechanism the say turn's completed
+/// output region uses — every line belonging to the row (its identity/
+/// summary line, and its body lines while expanded) carries the row's
+/// `RowId` (`path = [row index]`), `component_owned: true`, and
+/// `row_expanded` mirroring `expanded`, so a click anywhere in the row toggles
+/// it via `MemoryRecalledMessage::transcript_action` /
+/// `handle_transcript_action`. A row with no recalled text has nothing to
+/// disclose and is not a click target.
 fn memory_recalled_lines(
     view: &MemoryRecalledView,
     palette: &ComponentStylePalette,
@@ -439,7 +462,12 @@ fn memory_recalled_lines(
         Span::styled("\u{23fa}", palette.operation_glyph),
         Span::plain(format!(" {}", view.header)),
     ]));
-    for row in &view.rows {
+    for (index, row) in view.rows.iter().enumerate() {
+        let expandable = !row.body_lines.is_empty();
+        let target = expandable.then(|| RowId {
+            message_id: view.message_id,
+            path: vec![index as u32],
+        });
         let mut row_spans = vec![
             Span::plain("  "),
             Span::styled("\u{23bf}", palette.operation_row_glyph),
@@ -452,10 +480,26 @@ fn memory_recalled_lines(
                 palette.operation_summary,
             ));
         }
-        lines.push(RenderedTranscriptLine::from_spans(row_spans));
-        lines.extend(row.body_lines.iter().map(|body_line| {
-            RenderedTranscriptLine::from_spans(vec![Span::plain(format!("      {body_line}"))])
-        }));
+        lines.push(RenderedTranscriptLine {
+            row_id: target.clone(),
+            row_expanded: expandable.then_some(row.expanded),
+            component_owned: expandable,
+            ..RenderedTranscriptLine::from_spans(row_spans)
+        });
+        if expandable && row.expanded {
+            lines.extend(
+                row.body_lines
+                    .iter()
+                    .map(|body_line| RenderedTranscriptLine {
+                        row_id: target.clone(),
+                        row_expanded: Some(true),
+                        component_owned: true,
+                        ..RenderedTranscriptLine::from_spans(vec![Span::plain(format!(
+                            "      {body_line}"
+                        ))])
+                    }),
+            );
+        }
     }
     lines
 }
@@ -1008,16 +1052,25 @@ mod tests {
 
     // ── MemoryRecalled: recalled memories, no Input/Output split ────────────
 
-    fn memory_recalled_view(header: &str, rows: &[(&str, &str, &[&str])]) -> MemoryRecalledView {
+    /// `expanded` mirrors what a click on that row would leave in place: the
+    /// tuple's trailing bool is the row's `MemoryRecallRowView::expanded`.
+    fn memory_recalled_view(
+        header: &str,
+        rows: &[(&str, &str, &[&str], bool)],
+    ) -> MemoryRecalledView {
         MemoryRecalledView {
+            message_id: MessageId::new(),
             header: header.to_string(),
             rows: rows
                 .iter()
-                .map(|(label, summary, body_lines)| MemoryRecallRowView {
-                    label: label.to_string(),
-                    summary: summary.to_string(),
-                    body_lines: body_lines.iter().map(|line| line.to_string()).collect(),
-                })
+                .map(
+                    |(label, summary, body_lines, expanded)| MemoryRecallRowView {
+                        label: label.to_string(),
+                        summary: summary.to_string(),
+                        body_lines: body_lines.iter().map(|line| line.to_string()).collect(),
+                        expanded: *expanded,
+                    },
+                )
                 .collect(),
         }
     }
@@ -1030,11 +1083,12 @@ mod tests {
     }
 
     /// INVARIANT: a recalled memory renders its identity line, its
-    /// presentation summary, and the recalled text directly — reproduces the
-    /// reported bug at the production boundary (a memory row showed a
-    /// generic tool-call "Input"/"Output" disclosure structure that makes no
-    /// sense for a memory, since there is no input to a recall). No line may
-    /// say "Input" or carry an "Output (" count header.
+    /// presentation summary, and — while expanded — the recalled text
+    /// directly beneath it; reproduces the reported bug at the production
+    /// boundary (a memory row showed a generic tool-call "Input"/"Output"
+    /// disclosure structure that makes no sense for a memory, since there is
+    /// no input to a recall). No line may say "Input" or carry an
+    /// "Output (" count header.
     #[test]
     fn test_memory_recalled_row_has_no_input_output_split() {
         let view = memory_recalled_view(
@@ -1047,11 +1101,13 @@ mod tests {
                         "user: this repo I'm in (files on disk) are your harness. what do you think of it?",
                         "assistant: I don't have direct access to your files or environment.",
                     ],
+                    true,
                 ),
                 (
                     "recalled · score 0.60 · node 1",
                     "81 chars, sent raw",
                     &["user: Qwen, are you there?", "assistant: Qwen, I'm here."],
+                    true,
                 ),
             ],
         );
@@ -1067,8 +1123,8 @@ mod tests {
                 "      user: Qwen, are you there?",
                 "      assistant: Qwen, I'm here.",
             ],
-            "chrome plus one identity+summary line and the recalled text beneath it, \
-             per memory; got {texts:?}"
+            "chrome plus one identity+summary line and, while expanded, the recalled text \
+             beneath it, per memory; got {texts:?}"
         );
         assert!(
             !texts
@@ -1079,23 +1135,139 @@ mod tests {
         );
     }
 
+    /// #1235: a memory row is collapsed by default — the identity/summary
+    /// line renders, but the recalled text stays hidden until the row is
+    /// expanded. The summary line itself carries the row's `RowId`,
+    /// `component_owned: true`, and `row_expanded: Some(false)`, the same
+    /// component-owned disclosure metadata the say turn's completed output
+    /// region carries, so the transcript engine's existing click/keyboard
+    /// routing (`dispatch_component_disclosure`) picks it up unchanged.
+    #[test]
+    fn test_memory_recalled_row_collapsed_by_default_hides_recalled_text() {
+        let view = memory_recalled_view(
+            "1 memory retrieved",
+            &[(
+                "recalled · score 0.64 · node 4",
+                "138 chars, sent raw",
+                &["user: hi", "assistant: hello"],
+                false,
+            )],
+        );
+        let lines = component_lines(&ComponentView::MemoryRecalled(view.clone()), &PALETTE);
+        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "⏺ 1 memory retrieved",
+                "  ⎿ recalled · score 0.64 · node 4 — 138 chars, sent raw",
+            ],
+            "collapsed by default: the recalled text must not render until expanded; \
+             got {texts:?}"
+        );
+        let summary_line = &lines[1];
+        assert_eq!(
+            summary_line.row_id,
+            Some(RowId {
+                message_id: view.message_id,
+                path: vec![0],
+            }),
+            "the summary line is the row's disclosure hit target; line={summary_line:?}"
+        );
+        assert!(
+            summary_line.component_owned,
+            "disclosure state lives on the component ViewModel, same as the say turn \
+             (#882); line={summary_line:?}"
+        );
+        assert_eq!(
+            summary_line.row_expanded,
+            Some(false),
+            "row_expanded reports the collapsed state for assistive consumers; \
+             line={summary_line:?}"
+        );
+    }
+
+    /// #1235: the same row, expanded, renders its recalled text with every
+    /// line — summary and body alike — sharing the row's `RowId` and
+    /// `row_expanded: Some(true)`, mirroring the say turn's completed output
+    /// region where every content line is the toggle hit target.
+    #[test]
+    fn test_memory_recalled_row_expanded_reveals_recalled_text() {
+        let view = memory_recalled_view(
+            "1 memory retrieved",
+            &[(
+                "recalled · score 0.64 · node 4",
+                "138 chars, sent raw",
+                &["user: hi", "assistant: hello"],
+                true,
+            )],
+        );
+        let lines = component_lines(&ComponentView::MemoryRecalled(view.clone()), &PALETTE);
+        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "⏺ 1 memory retrieved",
+                "  ⎿ recalled · score 0.64 · node 4 — 138 chars, sent raw",
+                "      user: hi",
+                "      assistant: hello",
+            ],
+            "expanded: the recalled text renders beneath the summary line; got {texts:?}"
+        );
+        let target = RowId {
+            message_id: view.message_id,
+            path: vec![0],
+        };
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.row_id == Some(target.clone())
+                    && line.component_owned
+                    && line.row_expanded == Some(true)),
+            "every line of the expanded row — summary and body — is the same toggle hit \
+             target reporting the expanded state; lines={:?}",
+            &lines[1..]
+        );
+    }
+
     /// A memory with no recalled text (defensive: an empty presentation)
     /// still claims its identity/summary row without a phantom empty body
     /// line — unlike `StaticText`'s single-row furniture rule, an
     /// [`OperationRow`]-style row with zero body lines simply claims zero
-    /// extra rows.
+    /// extra rows. With nothing to disclose, the row is also not a click
+    /// target: no `RowId`, not component-owned, no `row_expanded`.
     #[test]
     fn test_memory_recalled_row_with_empty_body_claims_no_extra_rows() {
         let view = memory_recalled_view(
             "1 memory retrieved",
-            &[("committed · score 0.50 · node 9", "0 chars, sent raw", &[])],
+            &[(
+                "committed · score 0.50 · node 9",
+                "0 chars, sent raw",
+                &[],
+                false,
+            )],
         );
+        let lines = component_lines(&ComponentView::MemoryRecalled(view), &PALETTE);
+        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
-            memory_recalled_texts(&view),
+            texts,
             vec![
                 "⏺ 1 memory retrieved",
                 "  ⎿ committed · score 0.50 · node 9 — 0 chars, sent raw",
             ]
+        );
+        let summary_line = &lines[1];
+        assert_eq!(
+            summary_line.row_id, None,
+            "a row with nothing to disclose is not a click target; line={summary_line:?}"
+        );
+        assert!(
+            !summary_line.component_owned,
+            "a row with nothing to disclose is not component-owned; line={summary_line:?}"
+        );
+        assert_eq!(
+            summary_line.row_expanded, None,
+            "a row with nothing to disclose reports no disclosure state; \
+             line={summary_line:?}"
         );
     }
 
@@ -1109,6 +1281,7 @@ mod tests {
                 "committed · score 0.64 · node 4",
                 "138 chars, sent raw",
                 &["user: hi", "assistant: hello"],
+                true,
             )],
         );
         for line in component_lines(&ComponentView::MemoryRecalled(view), &PALETTE) {
@@ -1134,6 +1307,7 @@ mod tests {
                 "committed · score 0.64 · node 4",
                 "138 chars, sent raw",
                 &["user: hi", "assistant: hello"],
+                true,
             )],
         );
         for line in component_lines(&ComponentView::MemoryRecalled(view), &PALETTE) {

@@ -128,6 +128,18 @@ never hold component rows: they register in `AccordionState::component_regions` 
 only. Unmigrated rows (non-say WorkUnit presentations — the open stage-2 scope) keep the maps
 and the legacy projection path.
 
+`MemoryRecalledMessage` rides the same component-owned disclosure mechanism (#1235): each
+recalled-memory row's full text is collapsed behind its identity/summary line by default and
+expands on click, addressed by semantic path `[row index]` (one toggle target per row, unlike
+the say turn's single `[1]` output region). `MemoryRecalledMessage` retains one `expanded: bool`
+per row behind its own lock; `transcript_action`/`handle_transcript_action` route through
+`ToggleMemoryRow(index)`, the same opaque-`ComponentAction` pattern as `ToggleProgram`. Because a
+second component type now pins a keyboard direction (Left/Right's `want`), `dispatch_component_disclosure`'s
+already-correct-state check reads `Message::component_view` and matches on the `ComponentView`
+variant (`Say` → `show_program`, `MemoryRecalled` → the row at `row_id.path`) instead of calling
+the say-specific `say_turn_view` accessor directly — a future component-owned disclosure type
+extends this same match arm rather than inventing a second dispatch path.
+
 ## Assistant prose markdown renders in the viewport (#756)
 
 `crates/finch-ui-model/src/markdown.rs` (private) is a deliberately bounded inline-subset parser — fenced code blocks,
