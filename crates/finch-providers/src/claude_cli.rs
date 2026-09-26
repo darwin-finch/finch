@@ -903,6 +903,15 @@ printf '%s\n' \
         std::fs::write(
             &bin,
             r#"#!/bin/bash
+# Drain stdin before emitting output. The real CLI (and every other fake
+# CLI in this test module, see install_fake_claude's trailing `cat`) reads
+# its stdin; a fake that never touches stdin can run to completion and
+# close its end of the pipe before the parent's write_all/flush finishes,
+# racing `stdin.write_all(...).context("write claude CLI input")` in
+# run_turn_once into a spurious EPIPE that masks the intended CLI error
+# (issue #1274). Reading to EOF forces the parent's write-then-close to
+# happen before this script proceeds.
+cat >/dev/null
 printf '%s\n' \
   '{"type":"system","subtype":"init","session_id":"ignored","model":"claude-sonnet-5"}' \
   '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Credit balance too low"}'
