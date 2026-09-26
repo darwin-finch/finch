@@ -1401,9 +1401,33 @@ struct BrainEvent {
     mutationRecorded       @34 :BrainMutationOutcome;
     effectAuditTransition  @35 :BrainEffectAuditTransition;
     committedMemoriesReplaced @36 :BrainCommittedMemoryList;
+    contextCompacted       @37 :BrainContextCompacted;
   }
   hasMutation @32 :Bool;
   mutation    @33 :BrainMutationReceipt;
+}
+
+# Discrete local-model compaction tier (see `ContextCompactionTier` in
+# crates/finch-brain/src/journal/mod.rs). Provisional pending #1266 (sibling
+# discrete-tier compaction issue), which owns the canonical tier scheme.
+enum ContextCompactionTier {
+  verbatim          @0;
+  lightlyCompressed @1;
+  gist              @2;
+}
+
+# Durable marker (schema v16) that local-model conversation history up
+# through `coversThrough` was compacted into `tier`. Journal scaffolding only
+# (#1265) -- nothing produces this yet; see `ContextCompacted` on
+# `BrainEventKind` for the full contract.
+struct BrainContextCompacted {
+  coversThrough    @0 :UInt64;
+  tier             @1 :ContextCompactionTier;
+  digestOrSummary  @2 :Text;
+  hasProvider      @3 :Bool;
+  provider         @4 :Text;
+  hasModel         @5 :Bool;
+  model            @6 :Text;
 }
 
 struct BrainMutationOutcome {

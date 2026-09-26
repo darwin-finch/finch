@@ -1,4 +1,5 @@
 use super::*;
+use crate::ContextCompactionTier;
 use std::fs::OpenOptions;
 use std::io::Write;
 // The two shared fixtures live at module scope so the `src/server/handlers.rs`
@@ -7326,6 +7327,111 @@ fn future_effect_audit_schema_fails_closed() {
         .unwrap_err()
         .to_string()
         .contains("unsupported event schema version"));
+}
+
+/// #1265: `ContextCompacted` is durable journal scaffolding with no producer
+/// yet, so its only proof obligation is that a daemon restart replays it
+/// byte-identically off disk, exactly like every other `BrainEventKind`. This
+/// exercises the real `BrainStore` restart path (JSONL append, drop, reopen,
+/// replay), not just the in-memory journal helpers.
+#[test]
+fn test_context_compacted_event_survives_store_restart_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let pushed = store
+        .push(
+            "compaction",
+            "daemon",
+            BrainEventKind::ContextCompacted {
+                covers_through: 42,
+                tier: ContextCompactionTier::LightlyCompressed,
+                digest_or_summary: "sha256:cafef00d".into(),
+                provider: Some("local".into()),
+                model: Some("gemma-2-9b".into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        pushed.schema_version, BRAIN_EVENT_SCHEMA_VERSION,
+        "a freshly pushed event must stamp the current schema version, got {}",
+        pushed.schema_version
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted.snapshot("compaction").unwrap();
+    let replayed = snapshot
+        .events
+        .iter()
+        .find(|event| event.seq == pushed.seq)
+        .unwrap_or_else(|| {
+            panic!(
+                "restart replay dropped seq {}; events={:?}",
+                pushed.seq, snapshot.events
+            )
+        });
+    assert_eq!(
+        replayed, &pushed,
+        "ContextCompacted must replay byte-identical after a restart; before={pushed:?} after={replayed:?}"
+    );
+}
+
+/// A pre-existing journal that predates `ContextCompacted` (schema v15, no
+/// `context_compacted` tag anywhere) must still decode and replay after this
+/// schema bump -- this is a purely additive new variant, not a reinterpreted
+/// old one, so no backfill is needed, but that must be proven rather than
+/// assumed.
+#[test]
+fn test_pre_context_compacted_journal_still_replays_after_schema_bump() {
+    let temp = tempfile::tempdir().unwrap();
+    // Legacy pre-#1265 journals may predate brain_id tracking entirely; `nil`
+    // is the documented legacy sentinel `BrainState::from_events` backfills
+    // to the owning Brain's real identity while loading (see `journal/mod.rs`
+    // and `BrainState::from_events`), so it is what a genuinely old on-disk
+    // event looks like here -- a fabricated random UUID would fail the
+    // identity check below for an unrelated reason.
+    let legacy_prompt = BrainEvent {
+        schema_version: 15,
+        brain_id: BrainId::nil(),
+        seq: 1,
+        environment_generation: 1,
+        sender: "alice".into(),
+        created_ms: 1,
+        run_id: None,
+        mutation: None,
+        kind: BrainEventKind::Prompt {
+            text: "hello from before #1265".into(),
+            attached_mentions: Vec::new(),
+        },
+    };
+    std::fs::create_dir_all(temp.path().join("legacy-pre-compaction")).unwrap();
+    std::fs::write(
+        temp.path().join("legacy-pre-compaction/events.jsonl"),
+        format!("{}\n", serde_json::to_string(&legacy_prompt).unwrap()),
+    )
+    .unwrap();
+
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = store
+        .snapshot("legacy-pre-compaction")
+        .expect("a schema-v15 journal predating ContextCompacted must still load");
+    assert_eq!(
+        snapshot.events.len(),
+        1,
+        "legacy replay must recover the one pre-existing event, got {:?}",
+        snapshot.events
+    );
+    // `brain_id` is the one field a nil-sentinel legacy event does not keep
+    // byte-identical -- `BrainState::from_events` backfills it to the real
+    // owning identity while loading, same as any pre-brain_id-tracking event.
+    let expected = BrainEvent {
+        brain_id: snapshot.brain_id,
+        ..legacy_prompt
+    };
+    assert_eq!(
+        snapshot.events[0], expected,
+        "a legacy schema-v15 event must replay unchanged apart from the documented brain_id backfill"
+    );
 }
 
 /// Concurrent archive and unused-delete must not resurrect the Brain and must

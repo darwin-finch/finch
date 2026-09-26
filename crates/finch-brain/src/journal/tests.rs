@@ -48,6 +48,41 @@ fn test_prompt_attachment_round_trip_keeps_digest_and_content() {
     }
 }
 
+#[test]
+fn test_context_compacted_round_trip_keeps_tier_digest_and_provider() {
+    let kind = BrainEventKind::ContextCompacted {
+        covers_through: 17,
+        tier: ContextCompactionTier::Gist,
+        digest_or_summary: "top terms: retry, timeout, lease".into(),
+        provider: Some("local".into()),
+        model: Some("gemma-2-9b".into()),
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    let loaded: BrainEventKind = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        loaded, kind,
+        "ContextCompacted must serde round-trip byte-identical; json={json}"
+    );
+}
+
+#[test]
+fn test_context_compacted_without_provider_or_model_round_trips_and_omits_fields() {
+    let kind = BrainEventKind::ContextCompacted {
+        covers_through: 3,
+        tier: ContextCompactionTier::Verbatim,
+        digest_or_summary: "unchanged".into(),
+        provider: None,
+        model: None,
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    assert!(
+        !json.contains("provider") && !json.contains("model"),
+        "absent provider/model must be omitted, not serialized as null: {json}"
+    );
+    let loaded: BrainEventKind = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded, kind);
+}
+
 fn prompt(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
     BrainEvent {
         schema_version: BRAIN_EVENT_SCHEMA_VERSION,
@@ -63,6 +98,42 @@ fn prompt(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
             attached_mentions: Vec::new(),
         },
     }
+}
+
+#[test]
+fn test_context_compacted_event_round_trips_through_real_journal_append_and_read() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = EventJournal::new(Some(root.path().to_path_buf()));
+    let brain_id = BrainId::new();
+    let event = BrainEvent {
+        schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+        brain_id,
+        seq: 1,
+        environment_generation: 1,
+        sender: "daemon".into(),
+        created_ms: 1,
+        run_id: None,
+        mutation: None,
+        kind: BrainEventKind::ContextCompacted {
+            covers_through: 40,
+            tier: ContextCompactionTier::LightlyCompressed,
+            digest_or_summary: "sha256:0123abcd".into(),
+            provider: Some("local".into()),
+            model: Some("gemma-2-9b".into()),
+        },
+    };
+    journal.append("shared", &event).unwrap();
+
+    let reloaded = journal.read("shared").unwrap();
+    assert_eq!(
+        reloaded.len(),
+        1,
+        "expected exactly the one appended event, got {reloaded:?}"
+    );
+    assert_eq!(
+        reloaded[0], event,
+        "ContextCompacted must replay byte-identical from a real journal file"
+    );
 }
 
 #[test]

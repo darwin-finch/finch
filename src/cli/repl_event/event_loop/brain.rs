@@ -1539,6 +1539,10 @@ impl EventLoop {
             | BrainEventKind::EffectAuditTransition { .. }
             | BrainEventKind::ScheduleChanged { .. }
             | BrainEventKind::ScheduleDue { .. } => {}
+            // #1268 (TUI rendering, separate issue) owns the collapsed
+            // HR-divider widget; this is journal scaffolding only (#1265)
+            // with no producer yet, so there is nothing to render.
+            BrainEventKind::ContextCompacted { .. } => {}
         }
     }
 }

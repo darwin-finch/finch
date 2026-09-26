@@ -704,7 +704,8 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             | BrainEventKind::RunStarted { .. }
             | BrainEventKind::RunStatusChanged { .. }
             | BrainEventKind::ScheduleChanged { .. }
-            | BrainEventKind::ScheduleDue { .. } => None,
+            | BrainEventKind::ScheduleDue { .. }
+            | BrainEventKind::ContextCompacted { .. } => None,
             BrainEventKind::Program { .. }
             | BrainEventKind::Prompt { .. }
             | BrainEventKind::SpeculativePrompt { .. } => {
@@ -1455,6 +1456,7 @@ fn named_brain_provider_messages_at(
                     | BrainEventKind::RunStatusChanged { .. }
                     | BrainEventKind::ScheduleChanged { .. }
                     | BrainEventKind::ScheduleDue { .. }
+                    | BrainEventKind::ContextCompacted { .. }
             )
         })
         .take(80)
@@ -1605,7 +1607,8 @@ fn named_brain_provider_messages_at(
             | BrainEventKind::RunStarted { .. }
             | BrainEventKind::RunStatusChanged { .. }
             | BrainEventKind::ScheduleChanged { .. }
-            | BrainEventKind::ScheduleDue { .. } => Vec::new(),
+            | BrainEventKind::ScheduleDue { .. }
+            | BrainEventKind::ContextCompacted { .. } => Vec::new(),
         })
         .collect::<Vec<_>>();
 

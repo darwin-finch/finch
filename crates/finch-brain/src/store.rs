@@ -354,7 +354,8 @@ impl BrainState {
             | BrainEventKind::ToolResult { .. }
             | BrainEventKind::ApprovalRequested { .. }
             | BrainEventKind::ApprovalDecided { .. }
-            | BrainEventKind::Result { .. } => {}
+            | BrainEventKind::Result { .. }
+            | BrainEventKind::ContextCompacted { .. } => {}
             BrainEventKind::EffectRecorded {
                 request_seq,
                 execution_id,

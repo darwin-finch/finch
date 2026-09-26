@@ -451,6 +451,30 @@ fn language_from_capnp(language: finch_ipc_capnp::ProgramLanguage) -> ProgramLan
     }
 }
 
+fn context_compaction_tier_to_capnp(
+    tier: crate::ContextCompactionTier,
+) -> finch_ipc_capnp::ContextCompactionTier {
+    match tier {
+        crate::ContextCompactionTier::Verbatim => finch_ipc_capnp::ContextCompactionTier::Verbatim,
+        crate::ContextCompactionTier::LightlyCompressed => {
+            finch_ipc_capnp::ContextCompactionTier::LightlyCompressed
+        }
+        crate::ContextCompactionTier::Gist => finch_ipc_capnp::ContextCompactionTier::Gist,
+    }
+}
+
+fn context_compaction_tier_from_capnp(
+    tier: finch_ipc_capnp::ContextCompactionTier,
+) -> crate::ContextCompactionTier {
+    match tier {
+        finch_ipc_capnp::ContextCompactionTier::Verbatim => crate::ContextCompactionTier::Verbatim,
+        finch_ipc_capnp::ContextCompactionTier::LightlyCompressed => {
+            crate::ContextCompactionTier::LightlyCompressed
+        }
+        finch_ipc_capnp::ContextCompactionTier::Gist => crate::ContextCompactionTier::Gist,
+    }
+}
+
 fn run_kind_to_capnp(kind: BrainRunKind) -> finch_ipc_capnp::BrainRunKind {
     match kind {
         BrainRunKind::Interactive => finch_ipc_capnp::BrainRunKind::Interactive,
@@ -1714,6 +1738,26 @@ pub fn encode_event(
         BrainEventKind::ScheduleDue { due } => {
             encode_schedule_due(builder.init_schedule_due(), due);
         }
+        BrainEventKind::ContextCompacted {
+            covers_through,
+            tier,
+            digest_or_summary,
+            provider,
+            model,
+        } => {
+            let mut compacted = builder.init_context_compacted();
+            compacted.set_covers_through(*covers_through);
+            compacted.set_tier(context_compaction_tier_to_capnp(*tier));
+            compacted.set_digest_or_summary(digest_or_summary);
+            if let Some(provider) = provider {
+                compacted.set_has_provider(true);
+                compacted.set_provider(provider);
+            }
+            if let Some(model) = model {
+                compacted.set_has_model(true);
+                compacted.set_model(model);
+            }
+        }
     }
     Ok(())
 }
@@ -1944,6 +1988,26 @@ pub fn decode_event(
         Which::ScheduleDue(due) => BrainEventKind::ScheduleDue {
             due: decode_schedule_due(due?)?,
         },
+        Which::ContextCompacted(compacted) => {
+            let compacted = compacted?;
+            BrainEventKind::ContextCompacted {
+                covers_through: compacted.get_covers_through(),
+                tier: context_compaction_tier_from_capnp(compacted.get_tier()?),
+                digest_or_summary: text(compacted.get_digest_or_summary()?)?,
+                provider: compacted
+                    .get_has_provider()
+                    .then(|| compacted.get_provider())
+                    .transpose()?
+                    .map(text)
+                    .transpose()?,
+                model: compacted
+                    .get_has_model()
+                    .then(|| compacted.get_model())
+                    .transpose()?
+                    .map(text)
+                    .transpose()?,
+            }
+        }
     };
     Ok(BrainEvent {
         schema_version: reader.get_schema_version(),
@@ -2350,6 +2414,30 @@ mod tests {
                 request_seq: 5,
                 runtime_revision: 3,
                 checkpoint_sha256: "abc123".into(),
+            },
+            BrainEventKind::ContextCompacted {
+                covers_through: 5,
+                tier: crate::ContextCompactionTier::LightlyCompressed,
+                digest_or_summary: "sha256:deadbeef".into(),
+                provider: Some("local".into()),
+                model: Some("gemma-2-9b".into()),
+            },
+            BrainEventKind::ContextCompacted {
+                covers_through: 9,
+                tier: crate::ContextCompactionTier::Gist,
+                digest_or_summary: "first line ... last line".into(),
+                provider: None,
+                model: None,
+            },
+            // Mixed presence: `has_provider`/`has_model` must be independent
+            // wire flags, not coupled to a single "any metadata present"
+            // check.
+            BrainEventKind::ContextCompacted {
+                covers_through: 12,
+                tier: crate::ContextCompactionTier::Verbatim,
+                digest_or_summary: "unchanged so far".into(),
+                provider: Some("local".into()),
+                model: None,
             },
         ];
 
