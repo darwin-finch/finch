@@ -8,6 +8,7 @@
 // Multiple TaskTool calls in a single model response can be executed in
 // parallel by the executor (see executor.rs).
 
+use crate::brain::{BrainEventKind, BrainStore};
 use crate::config::{Config, ProviderEntry};
 use crate::providers::create_provider_profile_from_config;
 use crate::providers::{ContentBlock, Message};
@@ -135,6 +136,14 @@ pub struct TaskTool {
     max_turns: usize,
     /// Nesting depth of this instance (0 = top-level).
     depth: usize,
+    /// Optional durable Brain store. When present, every spawned subagent
+    /// gets its own named Brain (see `spawn_brain_name`) recording its task
+    /// prompt and final result; the Brain is archived immediately on
+    /// completion unless the caller sets `persist: true` (see
+    /// `sub-brains` design in `crates/finch-brain/AGENTS.md`). When absent,
+    /// spawn_task behaves exactly as before: fully ephemeral, no durable
+    /// record.
+    brain_store: Option<BrainStore>,
 }
 
 impl TaskTool {
@@ -147,6 +156,7 @@ impl TaskTool {
             description,
             max_turns: DEFAULT_MAX_TURNS,
             depth: 0,
+            brain_store: None,
         }
     }
 
@@ -155,6 +165,21 @@ impl TaskTool {
         self.max_turns = max_turns;
         self
     }
+
+    /// Give spawned subagents a durable named-Brain identity backed by
+    /// `store`. Without this call, spawn_task never touches Brain state.
+    pub fn with_brain_store(mut self, store: BrainStore) -> Self {
+        self.brain_store = Some(store);
+        self
+    }
+}
+
+/// Generate a name for a subagent's named Brain: `sub-<generated>`, e.g.
+/// `sub-quiet-hill-a13f09`. The `sub-` prefix is the visual/greppable tag
+/// that separates spawn-originated Brains from interactively-created ones
+/// in `finch brain ls` output, without requiring any change to `ls` itself.
+fn spawn_brain_name() -> String {
+    format!("sub-{}", crate::brain::generate())
 }
 
 /// Build the tool description, inlining the live list of configured
@@ -279,6 +304,10 @@ impl Tool for TaskTool {
                     "description": "Name of a configured provider profile to run this subagent \
                         against (see this tool's description for the current list, or run \
                         /providers). Omit to use the provider already driving this conversation."
+                },
+                "persist": {
+                    "type": "boolean",
+                    "description": "Keep this subagent's named Brain after it finishes instead of auto-archiving it. Default false (auto-archived, same as `finch brain rm`)."
                 }
             }),
             required: vec!["task".to_string()],
@@ -296,6 +325,7 @@ impl Tool for TaskTool {
             .unwrap_or(SubagentType::General);
 
         let background = input["background"].as_str();
+        let persist = input["persist"].as_bool().unwrap_or(false);
 
         let provider = match input["provider"].as_str() {
             Some(name) => resolve_named_provider(&self.config, name)?,
@@ -309,7 +339,36 @@ impl Tool for TaskTool {
             &task[..task.len().min(80)]
         );
 
-        let result = run_subagent(
+        // Sub-brain identity: best-effort. A journal write failure must never
+        // block the subagent from doing its job or returning an answer.
+        let brain_name = self.brain_store.as_ref().map(|_| spawn_brain_name());
+        let mut prompt_seq: Option<u64> = None;
+        if let (Some(store), Some(name)) = (&self.brain_store, &brain_name) {
+            match store.push(
+                name,
+                "spawn_task",
+                BrainEventKind::Prompt {
+                    text: task.to_string(),
+                    attached_mentions: Vec::new(),
+                },
+            ) {
+                Ok(event) => prompt_seq = Some(event.seq),
+                Err(error) => {
+                    tracing::warn!(
+                        brain = %name,
+                        "spawn_task: failed to record subagent prompt in named Brain: {error:#}"
+                    );
+                }
+            }
+        }
+
+        // Run the subagent to completion. Its outcome -- success, a
+        // TaskResult failure, or a hard provider Err -- is captured rather
+        // than propagated immediately with `?`, so the Brain record and the
+        // default archive-on-completion policy below run in every case, not
+        // only the success path. A subagent that errors out is exactly the
+        // kind of run worth having a durable record of.
+        let run_outcome: Result<TaskResult> = run_subagent(
             provider,
             Arc::clone(&self.config),
             task,
@@ -317,9 +376,43 @@ impl Tool for TaskTool {
             background,
             self.max_turns,
             self.depth,
+            self.brain_store.clone(),
         )
-        .await?;
+        .await;
 
+        if let (Some(store), Some(name)) = (&self.brain_store, &brain_name) {
+            let (output, error) = match &run_outcome {
+                Ok(result) if result.exit_code == 0 => (result.output.clone(), None),
+                Ok(result) => (result.output.clone(), Some(result.output.clone())),
+                Err(e) => (String::new(), Some(e.to_string())),
+            };
+            if let Err(push_error) = store.push(
+                name,
+                "spawn_task",
+                BrainEventKind::Result {
+                    request_seq: prompt_seq.unwrap_or(0),
+                    output,
+                    error,
+                    continuation_messages: Vec::new(),
+                    invocation_metadata: None,
+                },
+            ) {
+                tracing::warn!(
+                    brain = %name,
+                    "spawn_task: failed to record subagent result in named Brain: {push_error:#}"
+                );
+            }
+            if !persist {
+                if let Err(archive_error) = store.archive(name) {
+                    tracing::warn!(
+                        brain = %name,
+                        "spawn_task: failed to auto-archive subagent Brain: {archive_error:#}"
+                    );
+                }
+            }
+        }
+
+        let result = run_outcome?;
         if result.exit_code != 0 {
             anyhow::bail!("Task failed (exit {}): {}", result.exit_code, result.output);
         }
@@ -365,6 +458,7 @@ impl TaskResult {
 /// The subagent has no TUI, no approval prompts, and no recursion guard
 /// beyond `max_turns` and `MAX_RECURSION_DEPTH`.  Tools are executed
 /// directly without permission checks.
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     provider: Arc<dyn LlmProvider>,
     config: Arc<Config>,
@@ -373,6 +467,7 @@ async fn run_subagent(
     background: Option<&str>,
     max_turns: usize,
     depth: usize,
+    brain_store: Option<BrainStore>,
 ) -> Result<TaskResult> {
     // Build system prompt
     let mut system = subagent_type.system_prompt().to_string();
@@ -390,6 +485,7 @@ async fn run_subagent(
         Arc::clone(&provider),
         Arc::clone(&config),
         depth,
+        brain_store,
     );
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
@@ -486,6 +582,7 @@ fn build_subagent_tools(
     provider: Arc<dyn LlmProvider>,
     config: Arc<Config>,
     depth: usize,
+    brain_store: Option<BrainStore>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for &name in allowed {
@@ -503,6 +600,7 @@ fn build_subagent_tools(
                     description,
                     max_turns: DEFAULT_MAX_TURNS,
                     depth: depth + 1,
+                    brain_store: brain_store.clone(),
                 }));
             }
             _ => {}
@@ -750,6 +848,7 @@ mod tests {
             null_provider(),
             empty_config(),
             0,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
@@ -769,6 +868,7 @@ mod tests {
             null_provider(),
             empty_config(),
             0,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
@@ -785,6 +885,7 @@ mod tests {
             null_provider(),
             empty_config(),
             0,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
@@ -814,6 +915,7 @@ mod tests {
             Arc::clone(&provider),
             Arc::clone(&config),
             0,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -827,6 +929,7 @@ mod tests {
             Arc::clone(&provider),
             Arc::clone(&config),
             MAX_RECURSION_DEPTH,
+            None,
         );
         let names_at_max: Vec<&str> = tools_at_max.iter().map(|t| t.name()).collect();
         assert!(
@@ -848,6 +951,7 @@ mod tests {
                     Arc::clone(&provider),
                     Arc::clone(&config),
                     depth,
+                    None,
                 );
                 for tool in &tools {
                     assert_ne!(
@@ -884,6 +988,7 @@ mod tests {
                         None,
                         MAX_TURNS,
                         0,
+                        None,
                     )
                     .await
                 })
@@ -935,6 +1040,7 @@ mod tests {
             None,
             1,
             0,
+            None,
         )
         .await;
 
@@ -1124,5 +1230,176 @@ mod tests {
         // PEER_HARD_DENY_TOOLS and test_peer_cannot_spawn key on.
         let tool = TaskTool::new(null_provider(), empty_config());
         assert_eq!(Tool::name(&tool), "spawn_task");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Sub-brains: named-Brain identity for spawned subagents
+    // ---------------------------------------------------------------------------
+
+    fn isolated_brain_store() -> (tempfile::TempDir, BrainStore) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("brains");
+        std::fs::create_dir_all(&root).expect("create brains root");
+        let store = BrainStore::with_root("spawn-test", Some(root));
+        (temp, store)
+    }
+
+    fn spawn_test_context() -> ToolContext<'static> {
+        ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            skip_interactive_review: false,
+        }
+    }
+
+    /// Read the on-disk journal of an archived Brain (`brains-archive/<name>-<ts>/events.jsonl`).
+    /// Panics with the directory listing if exactly one archived Brain isn't found, since a
+    /// bare mismatch count is not actionable on its own.
+    fn read_sole_archived_brain_journal(store: &BrainStore) -> String {
+        let archive_root = store
+            .root()
+            .expect("isolated store has an on-disk root")
+            .parent()
+            .expect("brains root has a parent directory")
+            .join("brains-archive");
+        let entries: Vec<String> = std::fs::read_dir(&archive_root)
+            .expect("brains-archive directory must exist after an archive")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one archived sub-brain under {}; found {:?}",
+            archive_root.display(),
+            entries
+        );
+        std::fs::read_to_string(archive_root.join(&entries[0]).join("events.jsonl"))
+            .unwrap_or_else(|e| panic!("read events.jsonl for archived brain {}: {e}", entries[0]))
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_without_brain_store_leaves_no_brain_trace() {
+        // Backward-compat regression: omitting with_brain_store must behave
+        // exactly as spawn_task always has -- fully ephemeral, no Brain
+        // created at all, even though a store happens to be reachable.
+        let (_temp, store) = isolated_brain_store();
+        let provider = Arc::new(EchoProvider::new("no brain here"));
+        let tool = TaskTool::new(
+            provider as Arc<dyn crate::providers::LlmProvider>,
+            empty_config(),
+        );
+
+        let output = tool
+            .execute(json!({"task": "do a thing"}), &spawn_test_context())
+            .await
+            .expect("spawn_task without a brain store must still run and answer");
+
+        assert_eq!(output, "no brain here");
+        assert!(
+            store.list_names_unhydrated().is_empty(),
+            "no with_brain_store call means spawn_task must never touch Brain state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_with_brain_store_creates_named_brain_and_auto_archives_by_default() {
+        let (_temp, store) = isolated_brain_store();
+        let provider = Arc::new(EchoProvider::new("subagent answer"));
+        let tool = TaskTool::new(
+            provider as Arc<dyn crate::providers::LlmProvider>,
+            empty_config(),
+        )
+        .with_brain_store(store.clone());
+
+        let output = tool
+            .execute(
+                json!({"task": "summarize the repo layout"}),
+                &spawn_test_context(),
+            )
+            .await
+            .expect("spawn_task with a brain store must still return the subagent's answer");
+        assert_eq!(output, "subagent answer");
+
+        assert!(
+            store.list_names_unhydrated().is_empty(),
+            "persist defaults to false: the sub-brain must be auto-archived out of the live \
+             namespace so `finch brain ls` never fills with spawn noise"
+        );
+
+        let journal = read_sole_archived_brain_journal(&store);
+        assert!(
+            journal.contains("\"kind\":\"prompt\""),
+            "archived journal must record the subagent's task as a Prompt event: {journal}"
+        );
+        assert!(
+            journal.contains("summarize the repo layout"),
+            "archived journal must contain the exact task text: {journal}"
+        );
+        assert!(
+            journal.contains("\"kind\":\"result\""),
+            "archived journal must record the subagent's final answer as a Result event: {journal}"
+        );
+        assert!(
+            journal.contains("subagent answer"),
+            "archived journal must contain the subagent's final answer text: {journal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_persist_flag_keeps_named_brain_live() {
+        let (_temp, store) = isolated_brain_store();
+        let provider = Arc::new(EchoProvider::new("kept alive"));
+        let tool = TaskTool::new(
+            provider as Arc<dyn crate::providers::LlmProvider>,
+            empty_config(),
+        )
+        .with_brain_store(store.clone());
+
+        tool.execute(
+            json!({"task": "long research thread", "persist": true}),
+            &spawn_test_context(),
+        )
+        .await
+        .expect("spawn_task with persist:true must still succeed");
+
+        let live = store.list_names_unhydrated();
+        assert_eq!(
+            live.len(),
+            1,
+            "persist:true must leave exactly one live sub-brain visible to `finch brain ls`; got {live:?}"
+        );
+        assert!(
+            live[0].starts_with("sub-"),
+            "persisted sub-brain name must carry the `sub-` tag so it reads as spawn-originated \
+             in `finch brain ls`: {live:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_failure_is_still_recorded_before_archive() {
+        // A subagent that never produces a final answer still gets its
+        // failure recorded durably before its Brain is archived -- the
+        // record exists precisely because it's the case worth inspecting.
+        let (_temp, store) = isolated_brain_store();
+        let failing_provider: Arc<dyn crate::providers::LlmProvider> = Arc::new(NullProvider);
+        let tool = TaskTool::new(failing_provider, empty_config()).with_brain_store(store.clone());
+
+        let result = tool
+            .execute(json!({"task": "this will fail"}), &spawn_test_context())
+            .await;
+        assert!(
+            result.is_err(),
+            "NullProvider must make the subagent call fail, propagating as a tool error"
+        );
+
+        let journal = read_sole_archived_brain_journal(&store);
+        assert!(
+            journal.contains("\"kind\":\"prompt\""),
+            "the failed subagent's prompt must still be durably recorded: {journal}"
+        );
     }
 }
