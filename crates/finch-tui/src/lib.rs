@@ -1484,11 +1484,16 @@ pub struct TuiRenderer {
     /// stays highlighted and copyable until something clears it. See
     /// `selection.rs` for the invalidation rule.
     selection: Option<selection::TranscriptSelection>,
-    /// The press point of a `Down(Left)` that landed on plain transcript
-    /// text (not a hit region), kept only long enough to see whether the
-    /// next event is a `Drag` (promotes to `selection`) or an `Up` (a plain
-    /// click; nothing to select).
-    selection_press_candidate: Option<selection::SelectionPoint>,
+    /// The full `Down(Left)` event over the transcript, kept only long
+    /// enough to see what the next event is (#1239): a `Drag` promotes it
+    /// into a `selection` anchor (even when the press landed on a
+    /// disclosure/expand hit region — a real drag is always a text
+    /// selection, never a toggle), while an `Up` back at (or very near) this
+    /// same position with no intervening `Drag` replays the press as a
+    /// genuine click, including the immediate disclosure toggle a press on a
+    /// hit region used to fire — deferred here so a click-then-drag is never
+    /// mistaken for a click. See `handle_left_press`/`handle_left_release`.
+    selection_press_candidate: Option<MouseEvent>,
     /// Row → plain-text snapshot of the currently painted transcript,
     /// rebuilt every frame in `rebuild_transcript_hit_regions` so mouse
     /// handling can always resolve a drag point against what is really on
@@ -3347,67 +3352,56 @@ impl TuiRenderer {
             self.scroll_transcript_view(transcript_delta)
         } else {
             match mouse.kind {
-                // A press that lands on an interactive hit region keeps its
-                // existing click-to-toggle behavior untouched below (#221):
-                // only a press that lands on plain transcript text becomes a
-                // selection candidate, so starting a drag on a "Program
-                // source" header (say) still just toggles it, never also
-                // starts a selection underneath.
+                // A press over a disclosure/expand hit region no longer
+                // toggles immediately (#1239): every press only stashes a
+                // candidate, and `handle_left_release` decides whether the
+                // whole gesture was a click (replay the toggle) or a drag
+                // (a text selection, never a toggle).
                 MouseEventKind::Down(MouseButton::Left) => self.handle_left_press(mouse),
                 MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(mouse),
-                MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(),
+                MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(mouse),
                 _ => self.handle_accordion_mouse(mouse),
             }
         }
     }
 
-    /// Whether `(column, row)` lands on an existing click hitbox: a tool
-    /// viewport control, a component-owned disclosure row, or a legacy
-    /// accordion disclosure row. Mirrors the precedence
-    /// `handle_accordion_mouse` itself checks in, so "is this a hit region"
-    /// never disagrees with what a click there would actually do.
-    fn point_is_on_click_hitbox(&self, column: u16, row: u16) -> bool {
-        self.tool_viewports.region_at(column, row).is_some()
-            || self.accordion.component_region_at(column, row).is_some()
-            || self.accordion.hit_region_at(column, row).is_some()
-    }
-
-    /// `Down(Left)`: a press over a hit region keeps today's immediate
-    /// toggle-on-press behavior (`handle_accordion_mouse`) untouched. A press
-    /// over plain transcript text instead only stashes a selection
-    /// candidate — nothing highlights yet, so a plain click that never drags
-    /// paints nothing new. Either way, any previously finalized selection is
-    /// cleared: a new press elsewhere is exactly "the user is done reading
-    /// that selection."
+    /// `Down(Left)`: stashes the full press event and nothing else (#1239) —
+    /// no toggle, no highlight. What the gesture turns out to be is decided
+    /// later: `handle_left_drag` promotes this into a selection anchor on
+    /// the first `Drag` tick (even when the press landed on a disclosure or
+    /// tool-viewport hit region — a real drag is always a text selection,
+    /// never a toggle), while `handle_left_release` replays the press as a
+    /// click, including whatever hit-region toggle it would have fired
+    /// immediately before this fix, only if no `Drag` ever came in between.
+    /// Any previously finalized selection is cleared here regardless: a new
+    /// press elsewhere is exactly "the user is done reading that
+    /// selection."
     fn handle_left_press(&mut self, mouse: MouseEvent) -> bool {
         if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
             // A dialog owns the live area (#807); selection stays inert
-            // behind it, matching the wheel's own dialog guard above.
+            // behind it, matching the wheel's own dialog guard above, and a
+            // dialog's own controls still act on press — a dialog is never
+            // a drag-selectable transcript surface.
             return self.handle_accordion_mouse(mouse);
         }
         let had_selection = self.selection.take().is_some();
-        self.selection_press_candidate = None;
-        if !self.point_is_on_click_hitbox(mouse.column, mouse.row)
-            && self.transcript_scroll.owns(mouse.column, mouse.row)
-        {
-            self.selection_press_candidate = Some(selection::SelectionPoint {
-                row: mouse.row,
-                col: mouse.column,
-            });
-        }
-        let handled = self.handle_accordion_mouse(mouse);
+        self.selection_press_candidate = Some(mouse);
         if had_selection {
             self.viewport_invalidated = true;
             self.live_area_dirty = true;
         }
-        handled || had_selection
+        had_selection
     }
 
     /// `Drag(Left)`: promotes a pending press candidate into an active
-    /// selection on its first tick, then extends the existing selection's
-    /// head on every later tick. A drag that started on a hit region (no
-    /// candidate was stashed) is ignored, so dragging off a toggled header
-    /// never starts a selection underneath it.
+    /// selection on its first tick (provided the press landed inside the
+    /// transcript claim the selection index actually covers), then extends
+    /// the existing selection's head on every later tick. A drag that
+    /// started on a disclosure/expand hit region now also starts a
+    /// selection (#1239) instead of being ignored: once the pointer has
+    /// genuinely moved, the gesture is a text-selection drag, and the
+    /// widget the press landed on must not also toggle (`handle_left_release`
+    /// never replays a click once a selection exists).
     fn handle_left_drag(&mut self, mouse: MouseEvent) -> bool {
         let point = selection::SelectionPoint {
             row: mouse.row,
@@ -3421,8 +3415,15 @@ impl TuiRenderer {
             self.live_area_dirty = true;
             return true;
         }
-        let Some(anchor) = self.selection_press_candidate else {
+        let Some(press) = self.selection_press_candidate else {
             return false;
+        };
+        if !self.transcript_scroll.owns(press.column, press.row) {
+            return false;
+        }
+        let anchor = selection::SelectionPoint {
+            row: press.row,
+            col: press.column,
         };
         let mut fresh = selection::TranscriptSelection::new(anchor);
         fresh.extend(point);
@@ -3431,27 +3432,46 @@ impl TuiRenderer {
         true
     }
 
-    /// `Up(Left)`: finalizes an in-progress selection so it stays visible
-    /// and copyable, and best-effort copies it to the system clipboard. A
-    /// release that never actually dragged (anchor == head) leaves nothing
-    /// selected, matching a plain click.
-    fn handle_left_release(&mut self) -> bool {
-        self.selection_press_candidate = None;
-        let Some(active) = self.selection.as_mut() else {
-            return false;
-        };
-        if !active.dragging {
-            return false;
-        }
-        active.finish();
-        if active.is_empty() {
-            self.selection = None;
+    /// `Up(Left)`: decides what the whole gesture was (#1239). If a `Drag`
+    /// promoted the press into an active selection, this finalizes it
+    /// exactly as before — dragging always wins, so a drag that started on
+    /// a hit region never also toggles it — and best-effort copies the
+    /// released text to the system clipboard. Otherwise (no `Drag` ever
+    /// fired) this is a plain click: because Finch's mouse tracking only
+    /// reports `Drag` while the button is down and the pointer has actually
+    /// moved to a different terminal cell, "no `Drag` fired" and "the
+    /// release landed on the same cell as the press" are the same fact on a
+    /// character-cell grid, so comparing `(row, column)` for exact equality
+    /// is the right tolerance — no guessed pixel distance needed. A
+    /// matching release replays the press as the click that used to fire
+    /// immediately on press, including any disclosure/expand toggle.
+    fn handle_left_release(&mut self, mouse: MouseEvent) -> bool {
+        let press = self.selection_press_candidate.take();
+        if let Some(active) = self.selection.as_mut() {
+            if !active.dragging {
+                return false;
+            }
+            active.finish();
+            if active.is_empty() {
+                self.selection = None;
+                return true;
+            }
+            let text = selection::selected_text(&self.selection_index, active);
+            self.copy_selection_to_clipboard(&text);
+            self.live_area_dirty = true;
             return true;
         }
-        let text = selection::selected_text(&self.selection_index, active);
-        self.copy_selection_to_clipboard(&text);
-        self.live_area_dirty = true;
-        true
+        let Some(press) = press else {
+            return false;
+        };
+        if press.row != mouse.row || press.column != mouse.column {
+            // No selection was ever created (the press did not qualify —
+            // e.g. it landed outside the transcript claim) yet the release
+            // is not where the press was either; treat this defensively as
+            // not-a-click rather than guessing which widget the user meant.
+            return false;
+        }
+        self.handle_accordion_mouse(press)
     }
 
     /// Best-effort system clipboard copy (#221): the same `arboard` crate
@@ -5990,7 +6010,10 @@ mod tests {
     /// INVARIANT: clicking a tool result's compact window opens the focused
     /// expanded surface, and closing it restores the child scroll offset,
     /// disclosure grouping, and focus exactly as they were; the parent
-    /// scrollback state never changes through the round trip (#656).
+    /// scrollback state never changes through the round trip (#656). The
+    /// expand fires on `Up`, not `Down` (#1239): a press alone must not
+    /// expand anything, since a drag starting on the same cells has to be
+    /// free to become a text selection instead.
     #[test]
     fn test_click_expands_tool_result_and_close_restores_child_state() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
@@ -6010,15 +6033,32 @@ mod tests {
             .map(|line| (line.text.clone(), line.row_expanded))
             .collect::<Vec<_>>();
 
-        let click = MouseEvent {
+        let press = MouseEvent {
             kind: event::MouseEventKind::Down(event::MouseButton::Left),
             column: region.left,
             row: region.top,
             modifiers: KeyModifiers::NONE,
         };
+        let release = MouseEvent {
+            kind: event::MouseEventKind::Up(event::MouseButton::Left),
+            column: region.left,
+            row: region.top,
+            modifiers: KeyModifiers::NONE,
+        };
         assert!(
-            renderer.handle_mouse_to(click, &mut Vec::new()),
-            "a click on the control's cells must be claimed"
+            !renderer.handle_mouse_to(press, &mut Vec::new()),
+            "#1239: the press alone must not expand anything yet — the toggle \
+             is deferred to Up so a drag starting here can become a text \
+             selection instead"
+        );
+        assert!(
+            renderer.expanded_tool.is_none(),
+            "the compact control must not expand until the matching Up"
+        );
+        assert!(
+            renderer.handle_mouse_to(release, &mut Vec::new()),
+            "a release back at the press cell (a genuine click) must be claimed \
+             and expand the control"
         );
         let view = renderer
             .expanded_tool
@@ -12483,55 +12523,123 @@ mod selection_tests {
         );
     }
 
-    /// A press that lands on an existing disclosure hit region (a "Program
-    /// source" header, say) keeps today's immediate toggle-on-press
-    /// behavior, and a drag that starts there must not also start a text
-    /// selection underneath it (#221's coexistence rule).
-    #[test]
-    fn test_drag_starting_on_a_disclosure_header_still_toggles_and_does_not_select() {
+    /// Shared fixture for the two disclosure/mouse tests below: a completed
+    /// program-source `WorkUnit`, drawn through the real live-area pipeline
+    /// (so `transcript_scroll`'s claim and the `selection_index` are set up
+    /// exactly like production, not hand-built), plus the row its
+    /// disclosure header hit region claims and its projected `TranscriptNode`.
+    fn renderer_with_disclosure_header() -> (TuiRenderer, u16, finch_ui_model::TranscriptNode) {
         let colors = ColorScheme::default();
         let source = Arc::new(WorkUnit::new("compute"));
         source.set_program_source("forth");
         source.set_response("(emit \"hi\")");
         source.set_complete();
-        let mut renderer = TuiRenderer::new_headless(
-            Arc::new(OutputManager::new(colors.clone())),
-            Arc::new(StatusBar::new()),
-            colors,
-        );
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
         let message = source.clone() as MessageRef;
-        let projected = renderer.projected_lines(vec![message.clone()], 80);
+        output.add_trait_message(message.clone());
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut sink = Vec::new();
         renderer
-            .accordion
-            .rebuild_retained_hit_regions(&projected, 0, 80);
+            .draw_live_area_to(&mut sink)
+            .expect("initial live draw must succeed");
         let header_row = renderer
             .accordion
             .hit_regions
             .first()
             .expect("a Program source header claims a disclosure hit region")
             .top;
-        let colors_for_node = ColorScheme::default();
-        let node = view_model::try_project_for_test(message.as_ref(), &colors_for_node)
+        let node = view_model::try_project_for_test(message.as_ref(), &ColorScheme::default())
             .expect("a completed program-source WorkUnit projects a transcript node");
+        (renderer, header_row, node)
+    }
+
+    /// Regression: a plain click (`Down` then `Up` at the exact same cell,
+    /// no `Drag` in between) on a disclosure hit region must still toggle
+    /// it. #1239 defers the toggle from `Down` to `Up`, so this pins that
+    /// the ordinary click path — the overwhelming common case — keeps
+    /// working exactly as it did before the fix.
+    #[test]
+    fn test_plain_click_on_disclosure_header_still_toggles() {
+        let (mut renderer, header_row, node) = renderer_with_disclosure_header();
         let was_expanded_before = renderer.accordion.is_expanded(&node);
 
         assert!(
-            renderer.handle_mouse(left_down(header_row, 1)),
-            "the press on the header must still be handled as a toggle"
+            !renderer.handle_mouse(left_down(header_row, 1)),
+            "the press alone must not toggle anything yet — #1239 defers the \
+             toggle to Up so a subsequent drag can still win"
         );
-        renderer.handle_mouse(left_drag(header_row, 5));
-        renderer.handle_mouse(left_up(header_row, 5));
+        assert_eq!(
+            renderer.accordion.is_expanded(&node),
+            was_expanded_before,
+            "disclosure state must be unchanged immediately after Down"
+        );
 
         assert!(
-            renderer.selection.is_none(),
-            "a drag that started on a disclosure hit region must never become a \
-             text selection"
+            renderer.handle_mouse(left_up(header_row, 1)),
+            "a release back at the exact press cell must replay the click and toggle"
         );
-        let is_expanded_after = renderer.accordion.is_expanded(&node);
         assert_ne!(
-            was_expanded_before, is_expanded_after,
-            "the header's disclosure state must still flip from the press, \
-             exactly like an ordinary click"
+            renderer.accordion.is_expanded(&node),
+            was_expanded_before,
+            "a genuine click (Down and Up at the same cell, no Drag) on the \
+             header must still flip disclosure state — no regression"
+        );
+        assert!(
+            renderer.selection.is_none(),
+            "a plain click must never create a text selection"
+        );
+    }
+
+    /// #1239: a press that lands on an existing disclosure hit region,
+    /// followed by an actual `Drag`, must be treated entirely as a
+    /// text-selection drag — the widget under the press must NOT toggle,
+    /// and the drag must behave exactly like one that started over plain
+    /// transcript text. This replaces the pre-fix behavior (toggle on press,
+    /// drag ignored), which made it impossible to start a text selection
+    /// on top of any expandable row.
+    #[test]
+    fn test_drag_starting_on_a_disclosure_header_selects_and_does_not_toggle() {
+        let (mut renderer, header_row, node) = renderer_with_disclosure_header();
+        let was_expanded_before = renderer.accordion.is_expanded(&node);
+
+        assert!(
+            !renderer.handle_mouse(left_down(header_row, 1)),
+            "the press alone must not toggle anything yet"
+        );
+        assert!(
+            renderer.selection.is_none(),
+            "a press alone, before any Drag, must not create a selection"
+        );
+
+        assert!(
+            renderer.handle_mouse(left_drag(header_row, 5)),
+            "a real Drag after a press that started on a hit region must \
+             start a selection (#1239) instead of being swallowed by it"
+        );
+        let dragging = renderer
+            .selection
+            .as_ref()
+            .expect("the drag must be tracked as an in-progress selection");
+        assert!(
+            dragging.dragging,
+            "the promoted selection must still be marked dragging mid-gesture"
+        );
+
+        renderer.handle_mouse(left_up(header_row, 5));
+
+        assert_eq!(
+            renderer.accordion.is_expanded(&node),
+            was_expanded_before,
+            "a press-then-drag over the header must never toggle it (#1239): \
+             the whole gesture is a text-selection drag, not a click"
+        );
+        assert!(
+            renderer.selection.is_some(),
+            "the drag must finalize into a (possibly empty-of-indexed-text) \
+             selection rather than reverting to a toggle"
         );
     }
 

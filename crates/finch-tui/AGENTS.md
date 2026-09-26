@@ -196,16 +196,25 @@ the reader.
 
 Mouse capture is held by default (#806, above), so the terminal never gets a native click-drag
 selection — `selection.rs` is Finch's own in-app replacement, dispatched from
-`TuiRenderer::handle_mouse_to`'s non-wheel branch. A `Down(Left)` on an existing click hitbox
-(`point_is_on_click_hitbox`: a tool-viewport control, a component disclosure region, or a legacy
-accordion `hit_region_at`) keeps today's immediate toggle-on-press behavior untouched and never
-starts a selection; a `Down(Left)` anywhere else in the transcript claim only stashes a press
-candidate — nothing highlights until a `Drag(Left)` actually moves, so a plain click still selects
-nothing and a press-then-drag that started on a hit region never also selects the row underneath it.
-`Up(Left)` finalizes the selection (it stays highlighted and copyable — matching Claude Code's own
-released-selection behavior) and best-effort copies the text to the system clipboard through
-`arboard` (`copy_selection_to_clipboard`), the same crate already used for the OAuth device-code
-copy in `grok_auth.rs`/`chatgpt_auth.rs`; a clipboard failure never clears the selection.
+`TuiRenderer::handle_mouse_to`'s non-wheel branch. Every `Down(Left)` over the transcript only
+stashes the full press event (`selection_press_candidate`) — nothing highlights and nothing toggles
+yet, even over a disclosure/expand hit region (a tool-viewport control, a component disclosure
+region, or a legacy accordion `hit_region_at`). What the gesture turns out to be is decided by
+whichever event comes next (#1239, fixing the original #221 coexistence rule, which toggled a hit
+region immediately on press and could never start a selection over it): `handle_left_drag` promotes
+the press into a selection anchor on the first `Drag(Left)` tick, including one that started on a
+hit region — a real drag is always a text-selection gesture, never a toggle, once the pointer has
+actually moved to a different terminal cell — while `handle_left_release` replays the press as a
+click, firing whatever hit-region toggle used to fire immediately on press, only when `Up(Left)`
+lands back on the exact same `(row, column)` as the press with no `Drag` in between. Because mouse
+tracking only reports `Drag` while the button is down and the pointer has moved cells, "no `Drag`
+fired" and "the release is on the same cell as the press" are the same fact on a character-cell
+grid, so exact position equality is the click/drag tolerance — no fractional distance is needed.
+`Up(Left)` finalizes an in-progress selection (it stays highlighted and copyable — matching Claude
+Code's own released-selection behavior) and best-effort copies the text to the system clipboard
+through `arboard` (`copy_selection_to_clipboard`), the same crate already used for the OAuth
+device-code copy in `grok_auth.rs`/`chatgpt_auth.rs`; a clipboard failure never clears the
+selection.
 
 `SelectionIndex` (rebuilt every frame in `rebuild_transcript_hit_regions`, from the same
 `combined` `RenderedTranscriptLine`s and `plan.transcript_top` the hit regions use) is wrap-aware
