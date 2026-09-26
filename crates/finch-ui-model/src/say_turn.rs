@@ -236,6 +236,14 @@ fn running_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 /// Completed: the output prose inline (or the program source while toggled),
 /// one blank row, then the `(ran Ns)` annotation. Every content line is the
 /// toggle hit target.
+///
+/// #1259: the `(ran Ns)` annotation is the one line that renders unchanged in
+/// both states, so it carries the static chevron affordance -- collapsed
+/// `▸` (prose showing, source hidden) or expanded `▾` (source revealed) --
+/// the same convention `memory_recalled_lines` uses on a row's summary line.
+/// The whole completed region is always a toggle target (even an empty
+/// program still flips `show_program`, #1185), so the chevron always renders
+/// here, unlike a memory row with nothing to disclose.
 fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     let target = output_region(view);
     let content = if view.vm.show_program {
@@ -252,8 +260,13 @@ fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
         .map(|text| toggle_line(text, &target, view.vm.show_program))
         .collect();
     lines.push(toggle_line(String::new(), &target, view.vm.show_program));
+    let chevron = if view.vm.show_program {
+        '\u{25be}'
+    } else {
+        '\u{25b8}'
+    };
     lines.push(toggle_line(
-        format!("(ran {})", fmt_elapsed(view.elapsed.as_secs())),
+        format!("{chevron} (ran {})", fmt_elapsed(view.elapsed.as_secs())),
         &target,
         view.vm.show_program,
     ));
@@ -444,9 +457,10 @@ mod tests {
         let rendered = texts(&lines);
         assert_eq!(
             rendered,
-            vec!["hello", "", "(ran 2s)"],
-            "completed renders prose, a blank separator, then the elapsed annotation; \
-             got {rendered:?}"
+            vec!["hello", "", "\u{25b8} (ran 2s)"],
+            "completed renders prose, a blank separator, then the elapsed annotation \
+             prefixed with the #1259 collapsed chevron '▸' (the program source stays \
+             hidden); got {rendered:?}"
         );
         for line in &rendered {
             assert!(
@@ -473,8 +487,8 @@ mod tests {
         assert!(
             texts(&say_turn_lines(&quick))
                 .last()
-                .is_some_and(|line| *line == "(ran 2s)"),
-            "the annotation always renders; got {:?}",
+                .is_some_and(|line| *line == "\u{25b8} (ran 2s)"),
+            "the annotation always renders, chevron-prefixed; got {:?}",
             texts(&say_turn_lines(&quick))
         );
         let long = SayTurnView {
@@ -484,7 +498,7 @@ mod tests {
         assert!(
             texts(&say_turn_lines(&long))
                 .last()
-                .is_some_and(|line| *line == "(ran 1m 15s)"),
+                .is_some_and(|line| *line == "\u{25b8} (ran 1m 15s)"),
             "minutes render readably; got {:?}",
             texts(&say_turn_lines(&long))
         );
@@ -524,9 +538,9 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            vec!["", "(ran 2s)"],
+            vec!["", "\u{25b8} (ran 2s)"],
             "the completed empty turn renders its empty output region plus the \
-             elapsed annotation; got {rendered:?}"
+             chevron-prefixed elapsed annotation; got {rendered:?}"
         );
         assert!(
             lines.iter().all(|line| line.row_id.is_some()),
@@ -543,7 +557,7 @@ mod tests {
         let view = say_view(vm);
         let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
-        assert_eq!(rendered, vec!["", "(ran 2s)"], "got {rendered:?}");
+        assert_eq!(rendered, vec!["", "\u{25b8} (ran 2s)"], "got {rendered:?}");
         assert!(lines.iter().all(|line| line.row_id.is_some()));
     }
 
@@ -572,6 +586,14 @@ mod tests {
             lines.iter().all(|line| line.row_expanded == Some(false)),
             "row_expanded reports show_program=false for assistive consumers"
         );
+        assert!(
+            texts(&lines)
+                .last()
+                .is_some_and(|line| line.starts_with('\u{25b8}')),
+            "#1259: collapsed (source hidden), the annotation leads with the collapsed \
+             chevron '▸'; got {:?}",
+            texts(&lines)
+        );
         let hit_rects: Vec<_> = viewport_layout(say_turn_lines(&view)).hit_rects().collect();
         assert!(
             hit_rects.len() >= 3,
@@ -588,9 +610,9 @@ mod tests {
         let rendered = texts(&toggled_lines);
         assert_eq!(
             rendered,
-            vec!["(say \"hello\")", "", "(ran 2s)"],
-            "toggled on, the program source replaces the prose; the annotation stays; \
-             got {rendered:?}"
+            vec!["(say \"hello\")", "", "\u{25be} (ran 2s)"],
+            "toggled on, the program source replaces the prose; the annotation stays and \
+             its chevron flips to the #1259 expanded glyph '▾'; got {rendered:?}"
         );
         assert!(
             say_turn_lines(&toggled)
