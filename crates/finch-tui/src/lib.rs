@@ -12598,4 +12598,56 @@ mod selection_tests {
              drag through that gap would select it as well"
         );
     }
+
+    /// #1238 production-boundary regression: PR #1217 disclosed that a
+    /// wrapped multi-row logical line was not indexed at all, so a real
+    /// mouse drag through one produced a gap (and, on a screen mostly full
+    /// of wrapped content, that read as random discontiguous fragments). A
+    /// drag through the real renderer that starts on a wrapped line's first
+    /// physical row and ends on a later physical row of that same line must
+    /// resolve to one contiguous run of the line's own text end to end
+    /// through the real mouse-handling path, not two or three fragments.
+    #[test]
+    fn test_drag_spans_a_wrapped_multi_row_line_selects_one_contiguous_run() {
+        // 200 chars of "abcdefghijklmnopqrstuvwxyz" repeating hard-wraps to 3
+        // physical rows at the default 80-column headless width (80, 80, 40).
+        let text: String = (0..200u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let mut renderer = renderer_with_plain_line(&text);
+
+        let first_chunk = &text[0..80];
+        let top_row = (0..48)
+            .find(|row| {
+                renderer
+                    .selection_index
+                    .row(*row)
+                    .is_some_and(|entry| entry.text == first_chunk && !entry.continuation)
+            })
+            .unwrap_or_else(|| {
+                panic!("the wrapped line's first physical row must be indexed at #1238")
+            });
+
+        // Press at column 30 of the first physical row, drag down two rows
+        // (the line's third physical row) to column 10, release.
+        renderer.handle_mouse(left_down(top_row, 30));
+        renderer.handle_mouse(left_drag(top_row + 2, 10));
+        assert!(
+            renderer.handle_mouse(left_up(top_row + 2, 10)),
+            "release across the wrapped line's physical rows must be handled"
+        );
+
+        let released = renderer.selection.as_ref().expect(
+            "a drag spanning a wrapped line's physical rows must finalize into a selection",
+        );
+        let expected = &text[30..171];
+        let actual = selection::selected_text(&renderer.selection_index, released);
+        assert_eq!(
+            actual, expected,
+            "dragging from column 30 of the wrapped line's first physical row \
+             to column 10 of its third physical row must select the exact \
+             contiguous source range {expected:?} (chars 30..171 of the \
+             200-char line), not a discontiguous or gapped result; got {actual:?}"
+        );
+    }
 }
