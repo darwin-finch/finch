@@ -30,6 +30,22 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
 - Keep checkpoint, effect-delivery log, and Brain journal roles separate. Preserve idempotent
   receipt and terminalization behavior through disconnect, retry, and restart. Storage layout,
   credential verification, and wire compatibility are not facade-cleanup opportunities.
+- **`BrainEventKind::ContextCompacted` (schema v16, #1265) is durable journal scaffolding with no
+  producer yet** — a marker that local-model conversation history up through `covers_through` was
+  compacted into a `ContextCompactionTier` (`Verbatim` / `LightlyCompressed` / `Gist`; provisional
+  pending #1266, the sibling tiering-logic issue, which owns the canonical scheme). It is
+  audit-only: `BrainStore::apply` performs no snapshot-visible projection from it, matching how
+  `Prompt`/`ToolCall`/`Result`/etc. are handled. It is deliberately **not** named "checkpoint" —
+  that term stays reserved for `RuntimeCommitted`'s restart-recovery snapshot
+  (`checkpoint_sha256`), a different concept. Nothing appends this event yet; the compaction
+  algorithm (#1266) and the application-layer trigger that actually produces it during real
+  conversation flow (#1269) are separate, later changes. Covered by
+  `test_context_compacted_event_survives_store_restart_replay` and
+  `test_pre_context_compacted_journal_still_replays_after_schema_bump` in
+  `src/store/tests.rs`; `test_context_compacted_round_trip_keeps_tier_digest_and_provider` and
+  `test_context_compacted_event_round_trips_through_real_journal_append_and_read` in
+  `src/journal/tests.rs`; and the Cap'n Proto wire round trip in
+  `every_current_brain_event_round_trips_through_capnp` in `src/ipc_codec.rs`.
 
 Nested persistence contracts: [attachment](src/attachment/AGENTS.md),
 [journal](src/journal/AGENTS.md), [projection](src/projection/AGENTS.md),

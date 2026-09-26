@@ -20,7 +20,7 @@ pub use persist::{
     read_events, rewrite_events, scan_readonly, sync_directory, EventJournal, JournalProjection,
 };
 
-pub const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+pub const BRAIN_EVENT_SCHEMA_VERSION: u32 = 16;
 pub const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -255,6 +255,56 @@ pub enum BrainEventKind {
     ScheduleDue {
         due: BrainScheduleDue,
     },
+    /// Durable marker (schema v16) that local-model conversation history up
+    /// through `covers_through` was compacted into `tier`. This is journal
+    /// scaffolding only (#1265): nothing appends this event yet. The
+    /// discrete-tier compaction algorithm (#1266) and the application-layer
+    /// trigger that will actually produce this event during real
+    /// conversation flow (#1269) are separate, later changes. Audit-only —
+    /// `BrainStore::apply` does not project any snapshot-visible state from
+    /// it, matching how `Prompt`/`ToolCall`/etc. are handled.
+    ///
+    /// Deliberately not named "checkpoint": that term already denotes the
+    /// unrelated runtime-state restart-recovery snapshot on
+    /// `RuntimeCommitted` (`checkpoint_sha256`, see above).
+    ContextCompacted {
+        /// Last request/exchange sequence number this marker subsumes, using
+        /// the same `request_seq` numbering as `ToolCall`/`Result`/etc. to
+        /// reference "a point in the conversation".
+        covers_through: u64,
+        /// Which discrete compaction tier the covered range now sits at.
+        /// Provisional shape: the sibling tiering-logic issue (#1266) owns
+        /// the canonical tier scheme; this enum exists so the marker can
+        /// represent "which tier" cleanly for that issue's producer to
+        /// populate, without a hard dependency in either direction.
+        tier: ContextCompactionTier,
+        /// The compacted content itself, or a reference/hash to it. Which of
+        /// the two is the producer's call; this event does not mandate one
+        /// shape.
+        digest_or_summary: String,
+        /// Provider identity the compaction was sized against, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Model identity the compaction was sized against, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+}
+
+/// Discrete local-model compaction tier a `ContextCompacted` marker's covered
+/// range now sits at. Provisional: #1266 (sibling discrete-tier compaction
+/// issue) owns the canonical tier scheme and may reconcile this enum when its
+/// producer lands (#1269); the three variants here mirror the tiers #1266's
+/// own scope names (`Verbatim` -> `LightlyCompressed` -> `Gist`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionTier {
+    /// Full original text; not yet compacted.
+    Verbatim,
+    /// A fixed, cheap extractive reduction of the original text.
+    LightlyCompressed,
+    /// A short, fixed-size extractive summary of the original text.
+    Gist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

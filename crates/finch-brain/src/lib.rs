@@ -48,7 +48,7 @@ pub use ipc_codec::{
 };
 pub use journal::{
     BrainEvent, BrainEventKind, BrainId, BrainMutationOutcome, BrainMutationReceipt, BrainProgram,
-    BrainProviderSelection, CommittedMemoryRecord, PromptAttachment,
+    BrainProviderSelection, CommittedMemoryRecord, ContextCompactionTier, PromptAttachment,
 };
 pub use names::generate;
 pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};
