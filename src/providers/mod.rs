@@ -17,10 +17,11 @@ pub use factory::{
     create_providers_from_entries, ProviderGraph, ProviderProfile,
 };
 pub use finch_providers::{
-    chatgpt_required_scopes, default_cache_dir, fallback_catalog, grok_required_scopes,
-    profile_cache_identity, read_cache, refresh, refresh_with_fallback, static_fallback,
-    with_alignment, CapabilityProvenance, CapabilitySupport, CatalogAuth, CatalogSource,
-    ChatGptAuthStageError, ChatGptDeviceEndpointError, ChatGptSubscriptionProvider, ClaudeProvider,
+    chatgpt_required_scopes, claude_required_scopes, default_cache_dir, fallback_catalog,
+    grok_required_scopes, profile_cache_identity, read_cache, refresh, refresh_with_fallback,
+    static_fallback, with_alignment, CapabilityProvenance, CapabilitySupport, CatalogAuth,
+    CatalogSource, ChatGptAuthStageError, ChatGptDeviceEndpointError, ChatGptSubscriptionProvider,
+    ClaudeAuthStageError, ClaudeOAuthDialect, ClaudeProvider, ClaudeSubscriptionProvider,
     ContentBlock, ContextWindowCapability, EventProvenance, FallbackChain, GeminiProvider,
     GrokAuthStageError, GrokDeviceEndpointError, GrokJwksVerifier, GrokSubscriptionProvider,
     GrokTokenVerifier, ImageSource, InvocationMetadata, LlmProvider, Message, MessageRequest,
@@ -31,10 +32,12 @@ pub use finch_providers::{
     ProviderUsage, ReasoningCapability, SemanticTool, SessionContextConfig, StreamChunk,
     ToolAuthority, ToolBindingTable, ToolCompilePolicy, ToolOrigin, ValidatedProviderRequest,
     VerifiedGrokClaims, VerifiedOpenAiClaims, WireProtocol, WireProtocolCapability,
-    XaiGrokOAuthDialect, CHATGPT_OAUTH_PROTOCOL_REVISION, DEFAULT_CLAUDE_MODEL,
-    GROK_OAUTH_PROTOCOL_REVISION, GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER,
-    GROK_SUBSCRIPTION_BASE_URL, OPENAI_PUBLIC_CLIENT_ID, REQUIRED_TOKEN_ISSUER,
-    STATIC_FALLBACK_AS_OF, UNIVERSAL_ALIGNMENT_PROMPT, XAI_PUBLIC_CLIENT_ID,
+    XaiGrokOAuthDialect, CHATGPT_OAUTH_PROTOCOL_REVISION, CLAUDE_AUTHORIZATION_ENDPOINT,
+    CLAUDE_OAUTH_BETA_HEADER, CLAUDE_OAUTH_PROTOCOL_REVISION, CLAUDE_SUBSCRIPTION_CLIENT_ID,
+    CLAUDE_TOKEN_ENDPOINT, DEFAULT_CLAUDE_MODEL, GROK_OAUTH_PROTOCOL_REVISION,
+    GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER, GROK_SUBSCRIPTION_BASE_URL,
+    OPENAI_PUBLIC_CLIENT_ID, REQUIRED_TOKEN_ISSUER, STATIC_FALLBACK_AS_OF,
+    UNIVERSAL_ALIGNMENT_PROMPT, XAI_PUBLIC_CLIENT_ID,
 };
 
 #[cfg(test)]

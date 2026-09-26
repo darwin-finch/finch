@@ -5,7 +5,7 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `crates/finch-providers/src/`: the `LlmProvider` / `ProviderBackend` dispatch
 boundary, provider-neutral wire types and stream events, model catalog, capabilities,
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
-and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok adapters.
+and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok / Claude-subscription adapters.
 
 **Boundary:** [README.md](README.md) traces configured-provider and setup-catalog callers.
 [`src/lib.rs`](src/lib.rs) is the flat facade; every handwritten child module is private,
@@ -85,6 +85,31 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   ChatGPT transports continue to send stable, complete prefixes and rely on those services'
   implicit prompt caching; provider context caching never permits Finch to omit conversation
   messages from a stateless request.
+- **Claude subscription OAuth is opt-in and disabled by default.** `claude_oauth.rs`
+  authenticates against Anthropic using Claude Code's own OAuth client id
+  (`9d1c250a-e61b-44d9-88ed-5944d1962f5e`) — Finch has no client id of its own registered with
+  Anthropic for this surface. Reusing another application's client identity to talk to a
+  provider's own OAuth servers matches a pattern Anthropic has a **documented history of actively
+  detecting and blocking** for other third-party tools; this is real, observed enforcement
+  behavior, not a hypothetical risk. This crate itself has no `Config` and cannot gate anything,
+  so the application layer gates both entry points before any network access:
+  `require_claude_subscription_oauth_opt_in` in `src/providers/factory.rs` (provider
+  construction, re-checked on every construction because a stored credential can outlive the
+  flag being turned back off) and `require_claude_subscription_oauth_opt_in` in `src/main.rs`
+  (`finch auth login claude`). Both read `Config::features.claude_subscription_oauth_enabled`,
+  which defaults to `false` (`test_features_config_safe_defaults` in `src/config/settings.rs`
+  pins this). There is no setup-wizard entry for this provider; it is CLI-only
+  (`finch auth login|status|logout|recover claude`) by design, so a casual user does not stumble
+  into the reused-identity risk without reading the opt-in error message that names it. Anthropic
+  exposes no known public token-revocation endpoint for this client id in any source consulted
+  while building this dialect (unlike ChatGPT/Grok, which both have one); `finch auth logout
+  claude` is therefore local-only (`ClaudeAuthService::logout` in `src/cli/claude_auth.rs`) and
+  does not claim server-side revocation. The exact scope set (`claude_required_scopes` —
+  `user:profile`, `user:inference`, `user:sessions:claude_code`, `user:mcp_servers`,
+  `user:file_upload`, deliberately excluding `org:create_api_key`) and the
+  `platform.claude.com` token-endpoint origin are moderate-confidence, third-party
+  reverse-engineered protocol detail, not first-party documentation; see `claude_oauth.rs`'s
+  module doc comment for sourcing and what a live login attempt would still need to confirm.
 
 **Focused tests:**
 ```bash

@@ -91,6 +91,10 @@ pub(super) fn apply_setup_result_to_config(
         context_recall_k: new_config.features.context_recall_k,
         enable_summarization: new_config.features.enable_summarization,
         auto_compact_enabled: new_config.features.auto_compact_enabled,
+        // Not managed by the wizard (no catalog entry; CLI-only, opt-in via
+        // config.toml — see crates/finch-providers/AGENTS.md). Preserve
+        // whatever was already on disk rather than resetting it.
+        claude_subscription_oauth_enabled: new_config.features.claude_subscription_oauth_enabled,
     };
     new_config.server.mode = if result.daemon_only_mode {
         "daemon-only".to_string()

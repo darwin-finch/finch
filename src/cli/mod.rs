@@ -2,6 +2,7 @@
 // Public interface for command-line interface
 
 mod chatgpt_auth;
+mod claude_auth;
 mod commands;
 use finch_conversation as conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
@@ -30,6 +31,11 @@ pub use chatgpt_auth::{
     render_status_line as render_chatgpt_auth_status_line,
     save_named_credential as save_chatgpt_named_credential, ChatGptAuthService,
     DeviceLoginPresentation as ChatGptDeviceLoginPresentation,
+};
+pub use claude_auth::{
+    render_status_line as render_claude_auth_status_line,
+    save_named_credential as save_claude_named_credential, BrowserLoginPresentation,
+    ClaudeAuthService,
 };
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;

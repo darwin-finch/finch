@@ -32,6 +32,7 @@ pub enum CredentialProvider {
     Anthropic,
     OpenaiPlatform,
     ChatgptSubscription,
+    ClaudeSubscription,
     Xai,
     GrokSubscription,
     GeminiAiStudio,
@@ -47,6 +48,7 @@ impl CredentialProvider {
             Self::Anthropic => "anthropic",
             Self::OpenaiPlatform => "openai_platform",
             Self::ChatgptSubscription => "chatgpt_subscription",
+            Self::ClaudeSubscription => "claude_subscription",
             Self::Xai => "xai",
             Self::GrokSubscription => "grok_subscription",
             Self::GeminiAiStudio => "gemini_ai_studio",
@@ -66,6 +68,7 @@ pub enum EndpointFamily {
     AnthropicApi,
     OpenaiPlatform,
     ChatgptSubscription,
+    ClaudeSubscription,
     XaiApi,
     GrokSubscription,
     GeminiAiStudio,
@@ -308,6 +311,12 @@ const GROK_SESSION: &[CredentialKind] = &[
     CredentialKind::OauthBrowserPkce,
     CredentialKind::Bearer,
 ];
+// Claude subscription only ever authenticates through the browser
+// authorization-code+PKCE flow (Anthropic's OAuth surface has no documented
+// device-code grant for this client). `Bearer` remains accepted as the same
+// generic escape hatch the ChatGPT/Grok session lanes keep.
+const CLAUDE_SESSION: &[CredentialKind] =
+    &[CredentialKind::OauthBrowserPkce, CredentialKind::Bearer];
 
 pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor {
     match provider {
@@ -331,6 +340,17 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             kinds: CHATGPT_SESSION,
             family: EndpointFamily::ChatgptSubscription,
             standard_origin: "https://chatgpt.com",
+        },
+        CredentialProvider::ClaudeSubscription => ProviderAuthDescriptor {
+            provider,
+            issuer: "anthropic-claude",
+            kinds: CLAUDE_SESSION,
+            family: EndpointFamily::ClaudeSubscription,
+            // Subscription inference is presented as a Bearer token against the
+            // same Anthropic Messages API origin the API-key `Anthropic`
+            // provider uses; the two remain distinct `CredentialProvider`
+            // values so subscription and API-key billing never cross-bind.
+            standard_origin: "https://api.anthropic.com",
         },
         CredentialProvider::Xai => ProviderAuthDescriptor {
             provider,
@@ -648,6 +668,7 @@ mod tests {
             CredentialProvider::Anthropic,
             CredentialProvider::OpenaiPlatform,
             CredentialProvider::ChatgptSubscription,
+            CredentialProvider::ClaudeSubscription,
             CredentialProvider::Xai,
             CredentialProvider::GrokSubscription,
             CredentialProvider::GeminiAiStudio,
@@ -705,6 +726,36 @@ mod tests {
         .contains("provider mismatch"));
         assert!(validate_binding(
             CredentialProvider::OpenaiPlatform,
+            None,
+            &binding(),
+            &subscription,
+            Utc::now()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_anthropic_api_key_and_claude_subscription_never_cross_bind() {
+        let api_key = credential(CredentialProvider::Anthropic, CredentialKind::ApiKey);
+        let subscription = credential(
+            CredentialProvider::ClaudeSubscription,
+            CredentialKind::OauthBrowserPkce,
+        );
+        let error = validate_binding(
+            CredentialProvider::ClaudeSubscription,
+            None,
+            &binding(),
+            &api_key,
+            Utc::now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("provider mismatch"),
+            "API-key credentials must not bind to the Claude subscription lane: {error}"
+        );
+        assert!(validate_binding(
+            CredentialProvider::Anthropic,
             None,
             &binding(),
             &subscription,

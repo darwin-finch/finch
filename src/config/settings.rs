@@ -81,6 +81,24 @@ pub struct FeaturesConfig {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub gui_automation_permission_context: String,
+
+    /// Explicit opt-in for Claude subscription sign-in (`finch auth login
+    /// claude`): Anthropic OAuth authorization-code + PKCE against
+    /// `claude.ai`/`platform.claude.com`, authenticating a claude.ai
+    /// Pro/Max/Team subscription instead of an API key.
+    ///
+    /// Default: **false**. This reuses Claude Code's own OAuth client
+    /// identity — Finch has no client id of its own registered with
+    /// Anthropic for this surface — which matches a reused-client-identity
+    /// pattern Anthropic has a documented history of actively detecting and
+    /// blocking for other third-party tools. It is not a hypothetical risk.
+    /// Both `finch auth login claude` and constructing a configured Claude
+    /// subscription provider refuse to proceed unless this is `true`, so
+    /// enabling it is a deliberate, informed choice rather than something a
+    /// user stumbles into via a wizard. See
+    /// `crates/finch-providers/AGENTS.md` for the full rationale.
+    #[serde(default)]
+    pub claude_subscription_oauth_enabled: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -102,6 +120,7 @@ impl Default for FeaturesConfig {
             gui_automation_last_known_available: false,
             #[cfg(target_os = "macos")]
             gui_automation_permission_context: String::new(),
+            claude_subscription_oauth_enabled: false,
         }
     }
 }
@@ -1091,6 +1110,12 @@ mod tests {
         assert!(
             !f.auto_compact_enabled,
             "auto_compact_enabled must default to false (MemTree + summarization are primary)"
+        );
+        assert!(
+            !f.claude_subscription_oauth_enabled,
+            "Claude subscription OAuth must default to false: it reuses Claude Code's own \
+             client identity, a pattern Anthropic actively detects and blocks for other \
+             third-party tools; enabling it must be a deliberate opt-in, not the default"
         );
         #[cfg(target_os = "macos")]
         {
