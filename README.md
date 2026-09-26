@@ -174,6 +174,15 @@ compatibility boundary, not an OpenAI-supported third-party integration. Legacy 
 `chatgpt_subscription` configuration is rejected with migration guidance; subscription
 authentication must not be inferred from OpenAI API-key support.
 
+A hand-written `type = "claude_cli_backend"` entry drives the official `claude`
+CLI as a subscription subprocess instead of metered API billing. It is never
+offered by the setup wizard, it disables the CLI's own tools so Finch's
+permission system stays the only execution authority, and it carries real
+ToS/enforcement risk because Anthropic has enforced account suspensions
+against CLI-wrapper usage — the details and the measured wire contract are in
+[docs/MULTI_PROVIDER_CONFIG.md](docs/MULTI_PROVIDER_CONFIG.md). Configuring it
+is an explicit acceptance of that risk.
+
 ### Local inference
 
 Daemon local chat loads either a Finch-managed, pinned Hugging Face GGUF or a user-selected GGUF

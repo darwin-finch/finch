@@ -94,6 +94,29 @@ pub enum ProviderEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// The official `claude` CLI (Claude Code) driven as a subscription
+    /// subprocess: `--print --input-format stream-json --output-format
+    /// stream-json`, system prompt overridden, tools disabled. The CLI holds
+    /// its own OAuth login; Finch never touches credentials.
+    ///
+    /// WARNING: this back-ends Finch with a personal Claude.ai subscription
+    /// through the interactive CLI product. Anthropic has enforced account
+    /// suspensions against CLI-wrapper/proxy usage that disguises a
+    /// subscription-gated product as a generic backend; enabling this entry
+    /// is an explicit, informed acceptance of that risk. It is never offered
+    /// by the setup wizard and is off unless configured by hand.
+    #[serde(rename = "claude_cli_backend")]
+    ClaudeCliBackend {
+        /// Upstream model the CLI is asked to serve (`--model`). Unset means
+        /// the CLI's own measured default (claude-sonnet-5, 2026-09-25).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Path to the CLI binary; defaults to `claude` on PATH.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     Openai {
         api_key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,7 +299,8 @@ impl ProviderEntry {
             | Self::Openrouter { name, .. }
             | Self::Ollama { name, .. }
             | Self::RemoteDaemon { name, .. }
-            | Self::Local { name, .. } => name.as_deref(),
+            | Self::Local { name, .. }
+            | Self::ClaudeCliBackend { name, .. } => name.as_deref(),
         };
 
         if let Some(name) = explicit_name.filter(|name| !name.trim().is_empty()) {
@@ -290,6 +314,7 @@ impl ProviderEntry {
         match self {
             Self::Credentialed { provider, .. } => provider.as_str().to_string(),
             Self::LegacyChatgptSubscription { .. } => "chatgpt-subscription-legacy".to_string(),
+            Self::ClaudeCliBackend { .. } => "claude-cli-subscription".to_string(),
             Self::Local { .. } => {
                 let descriptor = self
                     .local_model_descriptor()
@@ -371,6 +396,9 @@ impl ProviderEntry {
                 .as_deref()
                 .unwrap_or("Unsupported legacy ChatGPT subscription"),
             Self::Claude { name, .. } => name.as_deref().unwrap_or("Claude"),
+            Self::ClaudeCliBackend { name, .. } => {
+                name.as_deref().unwrap_or("Claude CLI (subscription)")
+            }
             Self::Openai { name, .. } => name.as_deref().unwrap_or("OpenAI"),
             Self::Grok { name, .. } => name.as_deref().unwrap_or("Grok"),
             Self::Gemini { name, .. } => name.as_deref().unwrap_or("Gemini"),
@@ -390,6 +418,7 @@ impl ProviderEntry {
             Self::LegacyChatgptSubscription { .. } => "chatgpt_subscription",
             Self::Claude { .. } => "claude",
             Self::Openai { .. } => "openai",
+            Self::ClaudeCliBackend { .. } => "claude_cli",
             Self::Grok { .. } => "grok",
             Self::Gemini { .. } => "gemini",
             Self::Mistral { .. } => "mistral",
@@ -418,6 +447,7 @@ impl ProviderEntry {
             Self::Openrouter { api_key, .. } => Some(api_key.as_str()),
             Self::Credentialed { .. }
             | Self::LegacyChatgptSubscription { .. }
+            | Self::ClaudeCliBackend { .. }
             | Self::Ollama { .. }
             | Self::RemoteDaemon { .. }
             | Self::Local { .. } => None,
@@ -430,6 +460,7 @@ impl ProviderEntry {
             Self::Credentialed { model, .. } => model.as_deref(),
             Self::LegacyChatgptSubscription { model, .. } => model.as_deref(),
             Self::Claude { model, .. } => model.as_deref(),
+            Self::ClaudeCliBackend { model, .. } => model.as_deref(),
             Self::Openai { model, .. } => model.as_deref(),
             Self::Grok { model, .. } => model.as_deref(),
             Self::Gemini { model, .. } => model.as_deref(),
@@ -471,7 +502,8 @@ impl ProviderEntry {
             | Self::Gemini { model, .. }
             | Self::Mistral { model, .. }
             | Self::Groq { model, .. }
-            | Self::Openrouter { model, .. } => *model = overlay,
+            | Self::Openrouter { model, .. }
+            | Self::ClaudeCliBackend { model, .. } => *model = overlay,
             Self::Ollama { model, .. } => {
                 if let Some(value) = overlay {
                     *model = value;
@@ -539,6 +571,46 @@ mod tests {
         let toml = toml::to_string(&entry).unwrap();
         let decoded: ProviderEntry = toml::from_str(&toml).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn claude_cli_backend_toml_roundtrip_carries_all_fields_and_defaults() {
+        let entry = ProviderEntry::ClaudeCliBackend {
+            model: Some("claude-opus-4-6".to_string()),
+            binary: Some("/Users/x/.local/bin/claude".to_string()),
+            name: Some("subscription-cli".to_string()),
+        };
+        let toml = toml::to_string(&entry).unwrap();
+        let decoded: ProviderEntry = toml::from_str(&toml).unwrap();
+        assert_eq!(entry, decoded);
+
+        // Minimal hand-written form: only the type tag. Every other field
+        // must default so the entry stays off unless deliberately written.
+        let entry = toml::from_str::<ProviderEntry>(
+            r#"type = "claude_cli_backend"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            entry,
+            ProviderEntry::ClaudeCliBackend {
+                model: None,
+                binary: None,
+                name: None,
+            }
+        ));
+        assert_eq!(entry.provider_type(), "claude_cli");
+        assert!(!entry.is_local());
+        assert_eq!(
+            entry.profile_name(),
+            "claude-cli-subscription",
+            "the fallback name must name the entry's nature unambiguously"
+        );
+        assert!(entry.api_key().is_none());
+
+        // The serialized entry must never grow an api_key field.
+        let rendered = toml::to_string(&entry).unwrap();
+        assert!(!rendered.contains("api_key"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod chatgpt_oauth;
 mod chatgpt_subscription;
 #[cfg(feature = "claude")]
 mod claude;
+mod claude_cli;
 mod claude_oauth;
 #[cfg(feature = "claude_subscription")]
 mod claude_subscription;
@@ -56,6 +57,9 @@ pub use chatgpt_oauth::{
 pub use chatgpt_subscription::ChatGptSubscriptionProvider;
 #[cfg(feature = "claude")]
 pub use claude::ClaudeProvider;
+pub use claude_cli::{
+    ClaudeCliAvailability, ClaudeCliProvider, CLAUDE_CLI_DEFAULT_MODEL, CLAUDE_CLI_PROVIDER_NAME,
+};
 pub use claude_oauth::{
     claude_required_scopes, ClaudeAuthStageError, ClaudeOAuthDialect,
     CLAUDE_AUTHORIZATION_ENDPOINT, CLAUDE_OAUTH_BETA_HEADER, CLAUDE_OAUTH_PROTOCOL_REVISION,

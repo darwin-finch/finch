@@ -15,10 +15,11 @@ use crate::config::{
     ResolvedCredential,
 };
 use finch_providers::{
-    ChatGptSubscriptionProvider, ClaudeProvider, ClaudeSubscriptionProvider, GeminiProvider,
-    GrokSubscriptionProvider, OpenAIProvider,
+    ChatGptSubscriptionProvider, ClaudeCliProvider, ClaudeProvider, ClaudeSubscriptionProvider,
+    GeminiProvider, GrokSubscriptionProvider, OpenAIProvider,
 };
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
@@ -211,6 +212,20 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
                 provider = provider.with_model(m.clone());
             }
             Ok(Box::new(provider))
+        }
+        // Subscription subprocess backend: the `claude` CLI holds its own
+        // OAuth login and this entry only exists when configured by hand.
+        // The setup wizard never offers it; its ToS/enforcement risk is
+        // documented on the config variant itself.
+        ProviderEntry::ClaudeCliBackend { model, binary, .. } => {
+            let binary = binary
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("claude"));
+            Ok(Box::new(ClaudeCliProvider::with_binary(
+                binary,
+                model.clone(),
+            )))
         }
 
         ProviderEntry::Openai {
