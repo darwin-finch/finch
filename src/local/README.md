@@ -17,8 +17,16 @@ Two current callers show the boundary:
 2. The [Qwen compatibility adapter](../generators/qwen.rs) receives the application's shared
    generator handle. For a complete text turn it calls `try_generate_from_pattern` from a
    blocking task and wraps the result as a provider-independent `GeneratorResponse`. The adapter
-   owns family-specific identity, prompt/tool-output interpretation, and response metadata;
-   this module only supplies candidate text and its configured model name.
+   owns family-specific identity and response metadata; this module only supplies candidate text
+   and its configured model name.
+3. The daemon's OpenAI-compatible handler
+   ([`src/server/openai_handlers.rs`](../server/openai_handlers.rs), `handle_local_only_query` and
+   the `local_only` branch of `handle_chat_completions`) calls `try_generate_from_pattern_with_tools`
+   directly with the request's tool definitions. When tools are present, this module formats them
+   into the prompt and parses any `<tool_use>` markup the model emits back into real `tool_uses`
+   (#1276), using the same `ToolPromptFormatter`/`ToolCallParser` the Qwen adapter's own
+   tool-proposing path uses -- covering only the non-streaming daemon path; streaming tool calls
+   remain future work.
 
 The [agent contract](AGENTS.md) covers dependencies and invariants. [`mod.rs`](mod.rs) is the
 flat callable facade; method signatures and return types live in Rust source/rustdoc, not a
