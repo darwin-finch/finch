@@ -126,6 +126,21 @@ modules, including `memory_status`, are private.
   now takes `conn: &Connection`; both call sites in `lib.rs`
   (`query_with_sources`, `conversation_summary`) acquire the db lock before the tree lock, the
   same order `stats()` already used, to avoid a lock-order deadlock.
+- `counterpart_turn` (`lib.rs`, used by `query_recall`'s rendering) pairs a retrieved turn with
+  its real reply/question via that same occurrence chain, not by wall-clock proximity: for a
+  retrieved user turn it walks the turn's own occurrence `next` (the reply is whatever occurrence
+  comes right after it in the session's chain); for a retrieved assistant turn it walks `prev`.
+  This is a real request/response link, so it cannot be fooled by some other same-session,
+  opposite-role turn landing closer in time than the actual reply — the bug this replaced
+  (`ORDER BY ABS(c.timestamp - ?4) ASC` picking the nearest-in-time row regardless of whether it
+  was the real counterpart). The old nearest-timestamp query survives only as
+  `counterpart_turn_by_nearest_timestamp`, a fallback used when the retrieved turn has no
+  occurrence row at all (a legacy leaf predating occurrence chains, or a classifier-discarded
+  turn) or its occurrence exists but has no `next`/`prev` set yet (first/last turn of its chain,
+  the same documented case `RoutingMemTree::retrieve`'s tie-break above falls back on) —
+  `test_counterpart_turn_follows_occurrence_chain_not_nearest_timestamp` in `lib.rs` reproduces
+  the mis-pairing (a third, unrelated same-session turn made numerically closest in timestamp)
+  and asserts both `counterpart_turn` and `render_recall_entry` return/display the true reply.
 
 ## Focused proof
 
