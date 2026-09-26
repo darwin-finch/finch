@@ -1499,6 +1499,17 @@ pub struct TuiRenderer {
     /// handling can always resolve a drag point against what is really on
     /// screen.
     selection_index: selection::SelectionIndex,
+    /// Absolute rows the previous call to `paint_selection_overlay` painted
+    /// with the highlight background. A drag tick only sets `live_area_dirty`
+    /// (never `viewport_invalidated`, #221/#1237), so nothing else repaints a
+    /// row that drops out of the selection between two overlay calls — a
+    /// selection that grows then shrinks mid-drag (an ordinary "drag past,
+    /// then back") would otherwise leave that row's highlight background
+    /// stuck on screen until some unrelated full repaint happens to fire.
+    /// `paint_selection_overlay` diffs this set against the rows it is about
+    /// to paint and restores any row that fell out to its own plain text
+    /// first, then records the new set here.
+    previous_highlighted_rows: Vec<u16>,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -1563,6 +1574,7 @@ impl TuiRenderer {
             selection: None,
             selection_press_candidate: None,
             selection_index: selection::SelectionIndex::default(),
+            previous_highlighted_rows: Vec::new(),
         }
     }
 
@@ -1658,6 +1670,7 @@ impl TuiRenderer {
             selection: None,
             selection_press_candidate: None,
             selection_index: selection::SelectionIndex::default(),
+            previous_highlighted_rows: Vec::new(),
         })
     }
 
@@ -2003,19 +2016,52 @@ impl TuiRenderer {
     /// never guesses at content it did not just see painted. A row touched
     /// by the overlay reverts to plain text plus the highlight background —
     /// its own component styling (colours, bold) is not preserved while
-    /// selected; it returns on the next full content redraw. `SavePosition`/
-    /// `RestorePosition` bracket the writes so the composer cursor lands
-    /// exactly where the normal frame write left it.
+    /// selected; it returns on the next full content redraw.
+    ///
+    /// An ordinary drag tick (`handle_left_drag`) sets only
+    /// `live_area_dirty`, never `viewport_invalidated` — no full repaint
+    /// runs between two overlay calls while a drag is in progress (#1237's
+    /// autoscroll path is the one exception, and it forces its own full
+    /// repaint). So when a selection shrinks mid-drag (dragged past a row,
+    /// then back — an ordinary "overshoot and correct" motion), nothing
+    /// else ever repaints the row that just fell out of the selection: it
+    /// would otherwise keep the highlight background stuck on screen until
+    /// some unrelated later event happens to force a full redraw. This
+    /// function diffs the rows it is about to paint against
+    /// `self.previous_highlighted_rows` (what it painted highlighted last
+    /// call) and restores any row that dropped out to its own plain text
+    /// first, before painting the current highlight — so the visible
+    /// highlighted region always matches the logical selection, not a
+    /// superset accumulated across a drag's back-and-forth. `SavePosition`/
+    /// `RestorePosition` bracket every write here so the composer cursor
+    /// lands exactly where the normal frame write left it.
     fn paint_selection_overlay(&mut self, out: &mut impl Write) -> Result<()> {
-        let Some(active) = &self.selection else {
-            return Ok(());
+        let rows = match &self.selection {
+            Some(active) => selection::highlighted_rows(&self.selection_index, active),
+            None => Vec::new(),
         };
-        let rows = selection::highlighted_rows(&self.selection_index, active);
-        if rows.is_empty() {
+        let current_rows: Vec<u16> = rows.iter().map(|(row, _, _)| *row).collect();
+        let stale_rows: Vec<u16> = self
+            .previous_highlighted_rows
+            .iter()
+            .copied()
+            .filter(|row| !current_rows.contains(row))
+            .collect();
+        if rows.is_empty() && stale_rows.is_empty() {
+            self.previous_highlighted_rows = current_rows;
             return Ok(());
         }
-        let style = span_render::selection_highlight_style();
         execute!(out, cursor::SavePosition)?;
+        // Restore rows that fell out of the selection since the last call
+        // before painting the current highlight, so no row ever shows a
+        // highlighted background the logical selection no longer covers.
+        for row in stale_rows {
+            if let Some(entry) = self.selection_index.row(row) {
+                execute!(out, cursor::MoveTo(0, row))?;
+                execute!(out, Print(&entry.text))?;
+            }
+        }
+        let style = span_render::selection_highlight_style();
         for (row, text, (start, end)) in rows {
             let chars: Vec<char> = text.chars().collect();
             let prefix: String = chars[..start].iter().collect();
@@ -2032,6 +2078,7 @@ impl TuiRenderer {
             }
         }
         execute!(out, cursor::RestorePosition)?;
+        self.previous_highlighted_rows = current_rows;
         Ok(())
     }
 
@@ -3549,6 +3596,12 @@ impl TuiRenderer {
             active.finish();
             if active.is_empty() {
                 self.selection = None;
+                // The drag may have highlighted rows before being dragged
+                // back to a zero-width range at the anchor (an "overshoot
+                // and return to start" motion); without this, nothing
+                // schedules the redraw that clears them via
+                // `paint_selection_overlay`'s stale-row diff.
+                self.live_area_dirty = true;
                 return true;
             }
             let text = selection::selected_text(&self.selection_index, active);
@@ -3883,6 +3936,9 @@ impl TuiRenderer {
         // this clear.
         self.selection = None;
         self.selection_press_candidate = None;
+        // Every row this repaint touches is now plain again; nothing is left
+        // for `paint_selection_overlay` to restore on its next call.
+        self.previous_highlighted_rows.clear();
         let (width, height) = self
             .pending_viewport_size
             .take()
@@ -12760,6 +12816,97 @@ mod selection_tests {
         assert!(
             renderer.selection.is_none(),
             "a full viewport redraw must clear the selection"
+        );
+    }
+
+    /// Live-session regression (#1249): a drag that extends onto a second
+    /// row and then retracts back to the first — an ordinary "drag past,
+    /// then back a bit" motion, not a separate gesture — must not leave the
+    /// row it dropped stuck with a highlighted background. An ordinary drag
+    /// tick only sets `live_area_dirty` (`handle_left_drag`), never
+    /// `viewport_invalidated`, so no full viewport repaint runs between the
+    /// extend and the retract; `paint_selection_overlay` is the only thing
+    /// that ever repaints those rows while the drag is in progress, and
+    /// before this fix it painted only the rows in the *current* selection,
+    /// never revisiting a row that fell out of it. Drives real `MouseEvent`s
+    /// through `handle_mouse` and inspects the literal bytes
+    /// `draw_live_area_to` sends for the retracting frame — the actual
+    /// production paint path, not `selection.rs`'s pure functions.
+    #[test]
+    fn test_drag_retract_repaints_the_row_that_fell_out_of_the_selection_plain() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        output.add_trait_message(Arc::new(StaticMessage::plain("first line")) as MessageRef);
+        output.add_trait_message(Arc::new(StaticMessage::plain("second line")) as MessageRef);
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut initial = Vec::new();
+        renderer
+            .draw_live_area_to(&mut initial)
+            .expect("initial live draw must succeed");
+
+        let top_row = row_of(&renderer, "first line");
+        let bottom_row = row_of(&renderer, "second line");
+
+        // Press on the top row, drag down onto the bottom row: the
+        // selection now spans both rows, and painting it highlights
+        // `bottom_row`.
+        renderer.handle_mouse(left_down(top_row, 0));
+        renderer.handle_mouse(left_drag(bottom_row, 5));
+        let mut extended = Vec::new();
+        renderer
+            .draw_live_area_to(&mut extended)
+            .expect("live draw of the extended drag must succeed");
+        let bottom_move_to = format!("\x1b[{};1H", bottom_row + 1);
+        let extended_bytes = String::from_utf8_lossy(&extended).into_owned();
+        assert!(
+            extended_bytes.contains(&bottom_move_to),
+            "extending the drag onto the bottom row must paint its highlight \
+             (expected a cursor move to {bottom_move_to:?}); bytes={extended_bytes:?}"
+        );
+        assert!(
+            renderer.previous_highlighted_rows.contains(&bottom_row),
+            "the renderer must record the bottom row as painted-highlighted \
+             after the extend; recorded={:?}",
+            renderer.previous_highlighted_rows
+        );
+
+        // Retract the drag back onto the top row only, with no release in
+        // between (still the same one gesture) — the logical selection now
+        // excludes `bottom_row` entirely.
+        renderer.handle_mouse(left_drag(top_row, 3));
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("selection must still be active mid-drag");
+        let (sel_top, sel_bottom) = released.row_range();
+        assert_eq!(
+            (sel_top, sel_bottom),
+            (top_row, top_row),
+            "retracting the head back onto the top row must shrink the \
+             logical selection to that one row, excluding {bottom_row}"
+        );
+
+        let mut retracted = Vec::new();
+        renderer
+            .draw_live_area_to(&mut retracted)
+            .expect("live draw of the retracted drag must succeed");
+        let retracted_bytes = String::from_utf8_lossy(&retracted).into_owned();
+        let restore = format!("{bottom_move_to}second line");
+        assert!(
+            retracted_bytes.contains(&restore),
+            "the row that fell out of the selection must be repainted as \
+             plain text ({restore:?}) in the very frame that reflects the \
+             retract, not left with a stale highlighted background until \
+             some later unrelated redraw; bytes={retracted_bytes:?}"
+        );
+        assert!(
+            !renderer.previous_highlighted_rows.contains(&bottom_row),
+            "the renderer must stop tracking the bottom row as highlighted \
+             once it has been restored; recorded={:?}",
+            renderer.previous_highlighted_rows
         );
     }
 
