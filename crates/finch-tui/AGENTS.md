@@ -244,6 +244,24 @@ the top of `redraw_full_viewport_inner` (a new committed message, an explicit sc
 resize) — a drag still in progress is never routed through that function, so an ordinary drag tick
 never trips the clear.
 
+**Stale highlight cleanup on a shrinking drag (#1249).** An ordinary drag tick only sets
+`live_area_dirty`, never `viewport_invalidated` (see the autoscroll paragraph below for the one
+exception), so no full repaint runs between two `paint_selection_overlay` calls while a drag is in
+progress. A live-session report found that dragging past a row and then back — an ordinary
+"overshoot and correct" motion within the same gesture, not a separate click — left that row's
+highlighted background stuck on screen: the overlay only ever painted the rows in the *current*
+selection and never revisited a row that had dropped out of it, so the visible highlighted region
+could accumulate past what was actually selected. `paint_selection_overlay` now keeps
+`previous_highlighted_rows` (the absolute rows it painted highlighted last call) and diffs it
+against the rows it is about to paint: any row that fell out is restored to its own plain text
+(read back from `self.selection_index`, the same per-frame snapshot the highlight itself reads)
+before the current selection's highlight is painted. `redraw_full_viewport_inner` clears this set
+alongside `self.selection`, since a full repaint already rewrites every row it touches plain.
+`test_drag_retract_repaints_the_row_that_fell_out_of_the_selection_plain` in `src/lib.rs`'s
+`selection_tests` module drives a real extend-then-retract drag through `handle_mouse` and
+`draw_live_area_to` and asserts the retracting frame's own bytes carry the plain restoration, not
+just that the logical `TranscriptSelection` shrank.
+
 **Drag autoscroll at the viewport edge (#1237).** `handle_left_drag` checks each drag tick's point
 against `TranscriptScrollView::drag_autoscroll_delta` (`scroll_view.rs`): at or past the transcript
 claim's top or bottom edge, it scrolls one `TRANSCRIPT_WHEEL_STEP_LINES` step in that direction
