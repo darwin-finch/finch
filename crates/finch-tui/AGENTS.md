@@ -287,6 +287,53 @@ and `test_drag_past_bottom_edge_autoscrolls_and_reveals_newer_content` in `src/l
 `selection_tests` module pin the direction and the row-range extension; `test_drag_autoscroll_delta_fires_at_or_past_each_edge_only`
 in `scroll_view.rs` pins the edge geometry.
 
+**A shrinking live area invalidates a stale selection instead of repositioning the write to
+compensate for it (#1293).** `SelectionIndex` (built by `rebuild_transcript_hit_regions`, consumed
+by `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`) assumes the live area's rows are
+always `term_height - this_frame_row_count .. term_height`. That is true right after a full
+`redraw_full_viewport_inner` repaint (its `continue_full_viewport_paint` does an explicit
+`cursor::MoveTo(0, plan.transcript_top)`), but an ordinary tick's `erase_live_area` +
+`write_live_frame` cycle is otherwise purely relative: it just continues from wherever the
+*previous* tick's own row count left the terminal cursor. A frame that grows (e.g. the "/"
+completion pane opening, `+RESERVED_PANE_ROWS`) happens to re-anchor by accident — printing past
+the bottom of the terminal forces a native scroll, which is bottom-anchored by construction — but
+a frame that *shrinks* (the same pane closing) prints its smaller content from that same,
+now-too-high cursor position and nothing ever notices or corrects the resulting drift. From that
+tick on, `paint_selection_overlay` would keep targeting the row the (still logically valid, but now
+physically wrong) `SelectionIndex` reports, stamping a finalized selection's text onto whatever
+unrelated content — typically the status line — now really occupies that absolute row; a full
+repaint self-heals it only because `redraw_full_viewport_inner` re-anchors everything from scratch.
+Since growth already self-corrects, `draw_live_area_to` only needs to react to a detected *shrink*
+(this tick's row count below `self.last_live_frame_rows`, the previous tick's — not
+`self.active_rows`, which `erase_live_area` always zeroes first as part of its own, unrelated
+bookkeeping), and it reacts the same way `redraw_full_viewport_inner` already does on every full
+repaint: it clears the selection (`self.selection = None`,
+`self.previous_highlighted_rows.clear()`) rather than trying to keep it alive at a recomputed
+position. An earlier version of this fix instead recomputed and reapplied a bottom-anchored
+`cursor::MoveTo` on every size-changing tick; it was correct in isolation but a live-session
+reconnect/replay production test (`test_reconnected_completed_say_renders_the_component_card` in
+`tests/named_brain_attach.rs`) caught it corrupting the live area under rapid successive
+grow/shrink ticks, so the fix trades "a selection can survive a shrinking live area" for "a
+selection never points at geometry it no longer describes" — the actual invariant the reported bug
+and this test care about.
+`test_selection_does_not_bleed_into_status_after_completion_pane_closes` in `src/lib.rs`'s
+`selection_tests` module drives a real selection through `handle_mouse` and `draw_live_area_to`
+across an open-then-close completion-pane cycle and replays every emitted byte through `VtOracle`
+(a real VT100 parser), asserting the selection is cleared, the selected line appears in exactly one
+place, and the status row reads its own real content with no stale prefix.
+
+`write_live_frame` also unconditionally clears every physical row a logical line occupies before
+printing it, not just the row the cursor starts on. A single `Clear(ClearType::CurrentLine)` per
+logical line (matching `continue_full_viewport_paint`) is enough for the common single-row case,
+but a wrapped line's continuation row(s) are positioned by the terminal's own auto-wrap, not by an
+explicit `Print` in that loop, so `write_live_frame` walks down clearing every physical row the
+line will occupy (the same multi-row clear `write_live_area_erase` already does) before printing
+it — general robustness matching an independent review's finding, not required by the fix above
+specifically (growth still lands in rows a native scroll already handed back blank).
+`test_write_live_frame_clears_a_wrapped_lines_continuation_row_into_stale_territory` drives
+`write_live_frame` directly against `VtOracle`-seeded stale content standing in for an earlier,
+differently-sized frame.
+
 ## Dialogs are conversation widgets (#807)
 
 An open dialog is an inline card claimed by the widget tree, not a global overlay. When
