@@ -35,6 +35,18 @@ pub trait TextGeneration: Send + Sync {
     /// Get model name/description
     fn name(&self) -> &str;
 
+    /// Total context window, in tokens, this loaded model can accept
+    /// (prompt plus generated response combined).
+    ///
+    /// Backends that cannot determine a real, model-specific value return a
+    /// conservative default rather than panic; callers doing budget-aware
+    /// prompt assembly (`TemplateGenerator::prompt_parts` in
+    /// `src/local/generator.rs`) treat this as best-effort and fail open to
+    /// prior behaviour when it is unavailable.
+    fn context_length(&self) -> u32 {
+        2048
+    }
+
     /// Downcast to Any for accessing concrete type methods
     fn as_any(&self) -> &dyn std::any::Any;
 
@@ -114,6 +126,21 @@ impl GeneratorModel {
     /// Get generator backend name
     pub fn name(&self) -> &str {
         self.backend.name()
+    }
+
+    /// Total context window, in tokens, the loaded backend can accept. See
+    /// `TextGeneration::context_length` for what a conservative default
+    /// means here.
+    pub fn context_length(&self) -> u32 {
+        self.backend.context_length()
+    }
+
+    /// Encode `text` into token IDs using the loaded backend's tokenizer,
+    /// without requiring mutable access (unlike `backend_mut`). Used for
+    /// budget-aware prompt assembly that only needs to *measure* token
+    /// cost, not generate.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.backend.tokenize(text)
     }
 
     /// Get mutable access to the engine-neutral backend.
