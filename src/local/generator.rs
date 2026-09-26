@@ -18,6 +18,17 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// How many of the most recent conversation exchanges (a user/assistant
+/// pair each) `TemplateGenerator::prompt_parts` forwards ahead of the
+/// current question, on top of the current question itself. Bounded on
+/// purpose: this path's local-model context budget is much tighter than a
+/// cloud provider's, which gets the full conversation history for free.
+/// See the doc comment on `prompt_parts` (#1229) for why a fixed window
+/// rather than tag-matching is what makes spliced, untagged committed
+/// memory (`ConversationHistory::splice_synthetic_exchange`) reach a local
+/// model at all.
+const LOCAL_HISTORY_WINDOW_EXCHANGES: usize = 3;
+
 /// Response template for a pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResponseTemplate {
@@ -312,42 +323,64 @@ impl TemplateGenerator {
         // pair, wrapped in a `<retrieved_memory>` tag, immediately before the
         // current question (`inject_recall_prefix` in
         // `src/cli/repl_event/query_processor.rs`). A memory judged worth
-        // persisting is spliced into real, ordinary (untagged) conversation
-        // history instead -- once promoted, it is deliberately
-        // indistinguishable from a genuine earlier turn, so it no longer
-        // carries a tag to pull forward here; see
-        // `ordinary_conversation_history_stays_excluded_from_the_local_prompt`
-        // below and the splice-gate doc comment on
-        // `exchange_is_verbatim_in_window` in `query_processor.rs` for why
-        // that is a known, separate gap for this bounded local-model path
-        // rather than something this function's tag-forwarding covers. The
-        // rest of `messages` (ordinary conversation history) stays excluded
-        // here on purpose: this path has a tight local-model context budget
-        // and unbounded history doesn't fit it. But the UI already tells the
-        // user recalled memory is "sent raw" to the model, so silently
-        // dropping it along with the rest of history made that claim false
-        // for the local path specifically (cloud providers get the full
-        // `messages` array as-is and never had this gap). Pull just the
-        // tagged memory block forward into the single-turn prompt so it
-        // actually reaches the model.
-        let memory_blocks: Vec<&str> = messages[..last_user_idx]
+        // persisting is instead spliced into real, ordinary (untagged)
+        // conversation history (`ConversationHistory::splice_synthetic_exchange`)
+        // -- once promoted, it is deliberately indistinguishable from a
+        // genuine earlier turn, so there is no tag to match against.
+        //
+        // A prior version of this function pulled forward only messages
+        // containing the `<retrieved_memory>` tag and excluded the rest of
+        // `messages` outright, on the reasoning that this path's tight
+        // local-model context budget can't fit unbounded history. That made
+        // a spliced-but-untagged memory invisible to local models after the
+        // turn it was first recalled and shown via the tag, even though a
+        // cloud provider (which gets the full `messages` array as-is) kept
+        // seeing it for free from history (#1229). Tagging cannot be relied
+        // on to find it: by design the splice produces a message pair that
+        // is byte-for-byte the same shape as a genuine earlier turn.
+        //
+        // Fix: forward a small, fixed-size window of the most recent
+        // ordinary exchanges immediately preceding the current question,
+        // not just tagged blocks. `LOCAL_HISTORY_WINDOW_EXCHANGES` bounds
+        // this to a handful of turns -- comfortably covering both the fresh
+        // recall pair (always the exchange immediately before the question)
+        // and a splice that landed within the last few turns -- while
+        // keeping the addition small relative to the tight local-model
+        // budget. History older than the window still stays excluded, same
+        // as before.
+        let history_before_question = &messages[..last_user_idx];
+        let window_start = history_before_question
+            .len()
+            .saturating_sub(LOCAL_HISTORY_WINDOW_EXCHANGES * 2);
+        let recent_history: Vec<String> = history_before_question[window_start..]
             .iter()
-            .filter(|message| message.role == "user")
-            .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                crate::providers::ContentBlock::Text { text }
-                    if text.contains("<retrieved_memory>") =>
-                {
-                    Some(text.as_str())
+            .filter(|message| message.role == "user" || message.role == "assistant")
+            .filter_map(|message| {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        crate::providers::ContentBlock::Text { text }
+                            if !text.trim().is_empty() =>
+                        {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}: {}", message.role, text))
                 }
-                _ => None,
             })
             .collect();
 
-        let query = if memory_blocks.is_empty() {
+        let query = if recent_history.is_empty() {
             current_question.to_string()
         } else {
-            format!("{}\n\n{}", memory_blocks.join("\n\n"), current_question)
+            format!("{}\n\n{}", recent_history.join("\n\n"), current_question)
         };
 
         let caller_system = messages
@@ -872,12 +905,13 @@ mod tests {
         );
     }
 
-    /// Ordinary conversation history (no memory tag) stays excluded from the
-    /// bounded local-model prompt -- this path's deliberate context-budget
-    /// behavior (last user message + system only) must survive the memory
-    /// fix unchanged for non-memory turns.
+    /// Ordinary conversation history within `LOCAL_HISTORY_WINDOW_EXCHANGES`
+    /// now reaches the bounded local-model prompt (#1229) -- this is what
+    /// makes a spliced, untagged committed memory (see the test below)
+    /// visible without needing to tag or otherwise mark it. A single recent
+    /// exchange is well inside the window, so both turns must appear.
     #[test]
-    fn ordinary_conversation_history_stays_excluded_from_the_local_prompt() {
+    fn recent_ordinary_conversation_history_reaches_the_local_prompt() {
         let generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user("earlier unrelated turn"),
@@ -887,27 +921,72 @@ mod tests {
 
         let (_, query) = generator.prompt_parts(&messages).unwrap();
 
-        assert_eq!(
-            query, "current question",
-            "non-memory history must stay excluded from the bounded local prompt: {query:?}"
+        assert!(
+            query.contains("earlier unrelated turn") && query.contains("earlier unrelated reply"),
+            "an exchange well inside the bounded recent-history window must reach the \
+             local prompt: {query:?}"
+        );
+        assert!(
+            query.contains("current question"),
+            "the current question must still be present in the composed query: {query:?}"
         );
     }
 
-    /// Documents a known, discovered gap rather than a regression: once a
-    /// retrieved memory is spliced into real conversation history
-    /// (`ConversationHistory::splice_synthetic_exchange`,
-    /// `query_processor.rs`'s splice gate), it is deliberately an ordinary,
-    /// untagged `[user, assistant]` pair -- ordinary history stays excluded
-    /// from this bounded local-model path by design (see the test above).
-    /// The practical effect: a local model stops receiving that memory after
-    /// the turn it was first recalled and shown via `<retrieved_memory>`,
-    /// while a cloud provider (which gets the full `messages` array as-is)
-    /// keeps seeing it for free from history. Recorded here so the gap stays
-    /// visible instead of silently regressing further; closing it is a
-    /// follow-up decision (e.g. a bounded recent-history window for this
-    /// path), not something the splice change itself was meant to solve.
+    /// The window is still bounded, not unlimited history: this path's
+    /// local-model context budget is much tighter than a cloud provider's
+    /// (which gets the full `messages` array as-is), so an exchange older
+    /// than `LOCAL_HISTORY_WINDOW_EXCHANGES` must stay excluded exactly as
+    /// before this fix.
     #[test]
-    fn spliced_untagged_memory_does_not_reach_the_local_prompt() {
+    fn conversation_history_older_than_the_bounded_window_stays_excluded_from_the_local_prompt() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut messages = vec![crate::providers::Message::user(
+            "ancient turn that must fall outside the window",
+        )];
+        messages.push(crate::providers::Message::assistant(
+            "ancient reply that must fall outside the window",
+        ));
+        // Pad with enough additional exchanges to push the ancient pair
+        // outside `LOCAL_HISTORY_WINDOW_EXCHANGES`.
+        for i in 0..LOCAL_HISTORY_WINDOW_EXCHANGES {
+            messages.push(crate::providers::Message::user(format!(
+                "filler question {i}"
+            )));
+            messages.push(crate::providers::Message::assistant(format!(
+                "filler answer {i}"
+            )));
+        }
+        messages.push(crate::providers::Message::user("current question"));
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert!(
+            !query.contains("ancient turn") && !query.contains("ancient reply"),
+            "an exchange older than the bounded recent-history window must stay excluded, \
+             preserving this path's tight local-model context budget: {query:?}"
+        );
+        assert!(
+            query.contains("current question"),
+            "the current question must still be present in the composed query: {query:?}"
+        );
+    }
+
+    /// Regression for #1229: once a retrieved memory is spliced into real
+    /// conversation history (`ConversationHistory::splice_synthetic_exchange`,
+    /// `query_processor.rs`'s splice gate), it is deliberately an ordinary,
+    /// untagged `[user, assistant]` pair -- indistinguishable in shape from a
+    /// genuine earlier turn, so it cannot be found by tag-matching. Before
+    /// the bounded recent-history window fix, `prompt_parts` forwarded only
+    /// the current question plus explicitly `<retrieved_memory>`-tagged
+    /// blocks, so this spliced pair (neither) was silently dropped: a local
+    /// model stopped receiving the memory after the turn it was first
+    /// recalled and shown via the tag, while a cloud provider (which gets
+    /// the full `messages` array as-is) kept seeing it for free from
+    /// history. This builds the exact untagged shape
+    /// `splice_synthetic_exchange` produces and checks it now survives into
+    /// `query` via the bounded window.
+    #[test]
+    fn spliced_untagged_memory_reaches_the_local_prompt_via_the_bounded_history_window() {
         let generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user("Where do I keep the deploy key?"),
@@ -919,12 +998,17 @@ mod tests {
 
         let (_, query) = generator.prompt_parts(&messages).unwrap();
 
-        assert_eq!(
-            query, "hello again",
-            "a spliced, untagged exchange is ordinary history from this path's point of \
-             view and stays excluded from the bounded local prompt, exactly like any \
-             other earlier turn -- confirming this is a known consequence, not new \
-             breakage: {query:?}"
+        assert!(
+            query.contains(
+                "The deploy key lives in the Employee vault under the Finch signing item."
+            ),
+            "a spliced, untagged exchange must now reach the local prompt query the same \
+             way a tagged memory block does, not just on the turn it was first recalled: \
+             {query:?}"
+        );
+        assert!(
+            query.contains("hello again"),
+            "the current question must still be present in the composed query: {query:?}"
         );
     }
 }
