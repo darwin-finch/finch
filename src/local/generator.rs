@@ -5,6 +5,7 @@
 // Phase 3: Style transfer and quality matching
 
 use crate::local::patterns::PatternClassifier;
+use crate::local::tiered_history::{join_history_and_question, TierAssigner};
 use crate::models::GeneratorModel;
 use crate::models::{
     AdapterRegistry, LearningModel, LocalModelAdapter, ModelExpectation, ModelPrediction,
@@ -40,40 +41,6 @@ const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 100;
 /// cannot see, since it only assembles the `query` half of the prompt.
 const LOCAL_PROMPT_OVERHEAD_RESERVE: usize = 64;
 
-/// Trim `recent_history` (oldest first) so that, combined with
-/// `current_question`, the packed query stays within `budget_tokens` as
-/// measured by `count_tokens`.
-///
-/// Drops from the oldest end first: newest history and the current
-/// question itself are never dropped by this step. A current question that
-/// alone still exceeds budget is a distinct, unavoidable overflow --
-/// `LlamaCppGenerator::generate_inner`'s existing capacity check
-/// (`src/models/loaders/llama_cpp.rs`) still catches and reports it.
-fn fit_history_to_budget(
-    current_question: &str,
-    recent_history: Vec<String>,
-    budget_tokens: usize,
-    count_tokens: impl Fn(&str) -> usize,
-) -> String {
-    let mut used = count_tokens(current_question);
-    let mut included: Vec<String> = Vec::new();
-    for exchange in recent_history.into_iter().rev() {
-        let cost = count_tokens(&exchange);
-        if used.saturating_add(cost) > budget_tokens {
-            break;
-        }
-        used += cost;
-        included.push(exchange);
-    }
-    included.reverse();
-
-    if included.is_empty() {
-        current_question.to_string()
-    } else {
-        format!("{}\n\n{}", included.join("\n\n"), current_question)
-    }
-}
-
 /// Response template for a pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResponseTemplate {
@@ -96,6 +63,14 @@ pub struct TemplateGenerator {
     /// Model adapter for formatting prompts and cleaning output
     model_adapter: Box<dyn LocalModelAdapter>,
     model_name: String,
+    /// Discrete-tier compaction state for local-model history (#1266):
+    /// remembers each history entry's previously assigned compaction tier
+    /// so `prompt_parts` produces byte-stable output per tier across turns
+    /// and never un-compacts an entry. In-memory only for the life of this
+    /// generator -- not persisted across `save`/`load` (see the
+    /// `Serialize`/`Deserialize` impls below), the same way
+    /// `neural_generator` isn't.
+    tier_assigner: TierAssigner,
 }
 
 /// A response learned from Claude
@@ -168,6 +143,7 @@ impl TemplateGenerator {
             system_prompt,
             model_adapter,
             model_name: model_name.to_string(),
+            tier_assigner: TierAssigner::new(),
         }
     }
 
@@ -353,7 +329,7 @@ impl TemplateGenerator {
             .format_chat_prompt(system_prompt, user_query)
     }
 
-    fn prompt_parts(&self, messages: &[crate::providers::Message]) -> Result<(String, String)> {
+    fn prompt_parts(&mut self, messages: &[crate::providers::Message]) -> Result<(String, String)> {
         let last_user_idx = messages
             .iter()
             .rposition(|message| message.role == "user")
@@ -437,6 +413,16 @@ impl TemplateGenerator {
         // free; otherwise keep the prior unconditional-join behaviour so a
         // model that hasn't finished loading, or a momentarily contended
         // lock, doesn't fail the turn.
+        //
+        // Past this fixed-count window, history no longer survives or is
+        // dropped as an all-or-nothing block: `TierAssigner` (#1266)
+        // compacts it through discrete, stable tiers (Verbatim ->
+        // LightlyCompressed -> Gist) sized against this real budget, and
+        // remembers each entry's tier across calls so repeated turns at the
+        // same effective budget reuse byte-identical compressed history --
+        // preserving llama.cpp's own KV-cache reuse for the untouched bulk
+        // of the prompt (see `tiered_history.rs` for the full design).
+        let tier_assigner = &mut self.tier_assigner;
         let query = match self
             .neural_generator
             .as_ref()
@@ -451,7 +437,13 @@ impl TemplateGenerator {
                         .map(|tokens| tokens.len())
                         .unwrap_or_else(|_| text.split_whitespace().count())
                 };
-                fit_history_to_budget(current_question, recent_history, budget, count_tokens)
+                let compressed_history = tier_assigner.assign_and_compress(
+                    current_question,
+                    recent_history,
+                    budget,
+                    count_tokens,
+                );
+                join_history_and_question(current_question, compressed_history)
             }
             None if recent_history.is_empty() => current_question.to_string(),
             None => format!("{}\n\n{}", recent_history.join("\n\n"), current_question),
@@ -881,7 +873,7 @@ mod tests {
 
     #[test]
     fn provider_system_contract_replaces_generic_local_constitution() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message {
                 role: "system".to_string(),
@@ -911,7 +903,7 @@ mod tests {
     /// into `query`.
     #[test]
     fn recalled_memory_reaches_the_local_prompt_query() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user(
                 "<retrieved_memory>\n\
@@ -947,7 +939,7 @@ mod tests {
     /// model ever sees it.
     #[test]
     fn recalled_memory_survives_into_the_formatted_chat_prompt_sent_to_the_backend() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user(
                 "<retrieved_memory>\n\
@@ -986,7 +978,7 @@ mod tests {
     /// exchange is well inside the window, so both turns must appear.
     #[test]
     fn recent_ordinary_conversation_history_reaches_the_local_prompt() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user("earlier unrelated turn"),
             crate::providers::Message::assistant("earlier unrelated reply"),
@@ -1013,7 +1005,7 @@ mod tests {
     /// before this fix.
     #[test]
     fn conversation_history_older_than_the_bounded_window_stays_excluded_from_the_local_prompt() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let mut messages = vec![crate::providers::Message::user(
             "ancient turn that must fall outside the window",
         )];
@@ -1061,7 +1053,7 @@ mod tests {
     /// `query` via the bounded window.
     #[test]
     fn spliced_untagged_memory_reaches_the_local_prompt_via_the_bounded_history_window() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message::user("Where do I keep the deploy key?"),
             crate::providers::Message::assistant(
@@ -1086,73 +1078,22 @@ mod tests {
         );
     }
 
-    // ── Token-budget-aware history trimming ──────────────────────────────
-
-    /// Pure-logic regression for `fit_history_to_budget`: once the budget is
-    /// exceeded, the oldest candidate exchanges are dropped first, and the
-    /// current question always survives.
-    #[test]
-    fn fit_history_to_budget_drops_oldest_entries_first_once_budget_is_exceeded() {
-        let history = vec![
-            "user: ancient".to_string(),                     // 2 tokens
-            "assistant: ancient reply".to_string(),          // 3 tokens
-            "user: recent one".to_string(),                  // 3 tokens
-            "assistant: recent two words reply".to_string(), // 5 tokens
-        ];
-        let count_tokens = |text: &str| text.split_whitespace().count();
-
-        // Budget 10: current question (2) + newest two entries (5 + 3 = 8)
-        // fits exactly at 10; the next-oldest entry (3 more) would not.
-        let query = fit_history_to_budget("current question", history.clone(), 10, count_tokens);
-        assert!(
-            !query.contains("ancient"),
-            "both entries that don't fit the budget must be dropped: {query:?}"
-        );
-        assert!(
-            query.contains("recent one") && query.contains("recent two words reply"),
-            "entries that fit the budget must survive: {query:?}"
-        );
-        assert!(
-            query.contains("current question"),
-            "the current question must always survive trimming: {query:?}"
-        );
-
-        // A budget covering every entry keeps them all, oldest first.
-        let query = fit_history_to_budget("current question", history, 100, count_tokens);
-        assert!(
-            query.contains("ancient") && query.contains("recent"),
-            "a budget that comfortably covers all history must not drop anything: {query:?}"
-        );
-        assert!(
-            query.find("ancient").unwrap() < query.find("recent one").unwrap(),
-            "surviving entries must stay in chronological order: {query:?}"
-        );
-    }
-
-    /// A budget too small even for the current question alone still returns
-    /// the question -- an unavoidable single-message overflow is a distinct
-    /// failure the GGUF backend's own capacity check reports, not something
-    /// this trimming step can fix by dropping history it doesn't have.
-    #[test]
-    fn fit_history_to_budget_never_drops_the_current_question() {
-        let query = fit_history_to_budget(
-            "a question that alone exceeds the tiny budget",
-            vec!["user: some history".to_string()],
-            1,
-            |text| text.split_whitespace().count(),
-        );
-        assert_eq!(
-            query, "a question that alone exceeds the tiny budget",
-            "the current question must survive even when it alone exceeds budget: {query:?}"
-        );
-    }
+    // ── Token-budget-aware history compaction ─────────────────────────────
+    //
+    // `fit_history_to_budget`'s pure-logic drop-oldest-first and
+    // never-drop-the-current-question properties are now exercised at
+    // `TierAssigner::assign_and_compress`, which replaced it (#1266);
+    // see `tiered_history.rs`'s test module. The tests below stay at this
+    // production boundary (`prompt_parts` with a real `GeneratorModel`).
 
     /// Production-boundary regression for local generation overflowing a
     /// small model's real context window (the failure #1234 reports after
     /// the fact): with a model loaded whose real, resolved context length
-    /// leaves only a small token budget, `prompt_parts` must drop the
-    /// oldest history first rather than unconditionally joining every
-    /// candidate exchange the way it did before this fix.
+    /// leaves only a small token budget, `prompt_parts` must compact the
+    /// oldest history first (dropping it once no tier fits) rather than
+    /// unconditionally joining every candidate exchange the way it did
+    /// before #1241, and must never let the formatted prompt overflow the
+    /// model's real context window.
     #[test]
     fn prompt_parts_trims_oldest_history_to_stay_within_the_models_real_token_budget() {
         struct SmallContextBackend;
@@ -1198,7 +1139,7 @@ mod tests {
         });
         let model = GeneratorModel::from_test_backend(Box::new(SmallContextBackend), config);
         let shared = Arc::new(RwLock::new(model));
-        let generator =
+        let mut generator =
             TemplateGenerator::with_models(PatternClassifier::new(), Some(shared), "Qwen");
 
         let messages = vec![
@@ -1213,12 +1154,13 @@ mod tests {
 
         assert!(
             !query.contains("ancient"),
-            "the oldest exchange must be dropped once the model's real token budget is \
-             exceeded, not kept the way an unconditional join would keep it: {query:?}"
+            "the oldest exchange must be dropped once it doesn't fit even at the most \
+             compressed tier, not kept the way an unconditional join would keep it: {query:?}"
         );
         assert!(
-            query.contains("recent one") && query.contains("recent two words reply"),
-            "exchanges that still fit the budget must survive: {query:?}"
+            query.contains("recent"),
+            "the newest exchange must survive in some tiered form (verbatim or \
+             compressed) rather than everything being dropped: {query:?}"
         );
         assert!(
             query.contains("current question"),
@@ -1285,7 +1227,7 @@ mod tests {
         });
         let model = GeneratorModel::from_test_backend(Box::new(RoomyContextBackend), config);
         let shared = Arc::new(RwLock::new(model));
-        let generator =
+        let mut generator =
             TemplateGenerator::with_models(PatternClassifier::new(), Some(shared), "Qwen");
 
         let messages = vec![
@@ -1433,6 +1375,7 @@ impl<'de> serde::Deserialize<'de> for TemplateGenerator {
             system_prompt: Self::load_constitution(),
             model_adapter: AdapterRegistry::get_adapter("Qwen"), // Default to Qwen
             model_name: "Qwen".to_string(),
+            tier_assigner: TierAssigner::new(),
         })
     }
 }
