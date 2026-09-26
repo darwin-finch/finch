@@ -1203,6 +1203,12 @@ impl Repl {
         tool_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
             background_tasks,
         )));
+        // Delegate a coding task to the official Claude Code CLI as a
+        // distinct sub-agent, running as itself (issue: delegate to
+        // Claude Code). Hard-denied to peers alongside restart/spawn_task.
+        tool_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
+            tool_workspace_root.clone(),
+        )));
         tool_registry.register(Box::new(EditTool));
         tool_registry.register(Box::new(PatchTool));
         tool_registry.register(Box::new(WriteTool));
@@ -1368,6 +1374,9 @@ impl Repl {
                 )));
                 fallback_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
                     background_tasks,
+                )));
+                fallback_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
+                    tool_workspace_root.clone(),
                 )));
                 fallback_registry.register(Box::new(crate::tools::SubmitProgramTool::new(
                     Arc::clone(&program_runtime),

@@ -67,18 +67,42 @@ fn test_peer_cannot_spawn() {
     );
 }
 #[test]
+fn test_peer_cannot_delegate_to_claude_code() {
+    // Exercise the name the real ClaudeCodeDelegateTool registers, not a
+    // literal: delegating to the Claude Code CLI hands a second,
+    // independently-authenticated agent real file and command access, the
+    // same authority envelope spawn_task already earns a hard deny for.
+    let workspace = tempfile::tempdir().expect("workspace for claude_code tool");
+    let delegate =
+        crate::tools::implementations::claude_code::ClaudeCodeDelegateTool::new(workspace.path());
+    let name = crate::tools::Tool::name(&delegate);
+    let input = serde_json::json!({});
+    let check = PermissionManager::for_peer().check_tool_use(name, &input);
+    assert!(
+        matches!(check, PermissionCheck::Deny(_)),
+        "invariant: a peer must be hard-denied for '{name}', the tool name \
+             ClaudeCodeDelegateTool registers; got {check:?} (AskUser means the hard-deny \
+             arm is unreachable for the real tool name)"
+    );
+}
+
+#[test]
 fn test_peer_hard_deny_table_names_are_declared_by_real_tool_implementations() {
     // Conformance against the same drift class as the original defect:
     // every name in PEER_HARD_DENY_TOOLS must be a name the real Tool
     // implementations register, and the table must name exactly the
-    // restart/spawn tools — otherwise the deny arm has drifted onto an
-    // unregistered literal (unreachable in production) or a registered
-    // name has lost its deny.
+    // restart/spawn/delegate-to-claude-code tools — otherwise the deny arm
+    // has drifted onto an unregistered literal (unreachable in production)
+    // or a registered name has lost its deny.
     let task_tool =
         crate::tools::implementations::spawn::TaskTool::new(std::sync::Arc::new(NullProvider));
+    let workspace = tempfile::tempdir().expect("workspace for claude_code tool");
+    let claude_code_tool =
+        crate::tools::implementations::claude_code::ClaudeCodeDelegateTool::new(workspace.path());
     let mut declared: Vec<String> = vec![
         crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool).to_string(),
         crate::tools::Tool::name(&task_tool).to_string(),
+        crate::tools::Tool::name(&claude_code_tool).to_string(),
     ];
     declared.sort();
     let mut table: Vec<String> = PEER_HARD_DENY_TOOLS
@@ -88,16 +112,18 @@ fn test_peer_hard_deny_table_names_are_declared_by_real_tool_implementations() {
     table.sort();
     assert_eq!(
         table, declared,
-        "PEER_HARD_DENY_TOOLS must name exactly the tool names the restart \
-             and spawn Tool implementations register (declared = {declared:?}, \
-             table = {table:?})"
+        "PEER_HARD_DENY_TOOLS must name exactly the tool names the restart, \
+             spawn, and claude-code-delegation Tool implementations register \
+             (declared = {declared:?}, table = {table:?})"
     );
     // Cross-check the declared effects: a hard-denied tool must never
     // declare an autonomously-runnable effect, and the declarations must
     // reproduce exactly what the pre-#466 table computed for these
     // canonical names (restart_session → Destructive, spawn_task →
     // ExternalWrite), so the deny table and the effect declarations
-    // cannot drift apart unnoticed.
+    // cannot drift apart unnoticed. delegate_to_claude_code is a new tool,
+    // not a pre-#466 survivor, but it must declare the same ExternalWrite
+    // worst case spawn_task does — the two grant equivalent host authority.
     for (name, effect, expected) in [
         (
             crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool),
@@ -107,6 +133,11 @@ fn test_peer_hard_deny_table_names_are_declared_by_real_tool_implementations() {
         (
             crate::tools::Tool::name(&task_tool),
             crate::tools::Tool::effect(&task_tool),
+            ExecutionEffect::ExternalWrite,
+        ),
+        (
+            crate::tools::Tool::name(&claude_code_tool),
+            crate::tools::Tool::effect(&claude_code_tool),
             ExecutionEffect::ExternalWrite,
         ),
     ] {
