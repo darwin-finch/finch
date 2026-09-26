@@ -90,6 +90,48 @@ impl TranscriptScrollView {
         self.claim
     }
 
+    /// The transcript claim's visible row bounds `(top, bottom_last)` —
+    /// `bottom_last` is the last visible row, inclusive (the claim's own
+    /// `bottom()` is one past it). `None` when the claim is empty (a
+    /// dialog or a tiny frame owns nothing to scroll or clamp against).
+    pub(crate) fn visible_row_bounds(&self) -> Option<(u16, u16)> {
+        if self.claim.is_empty() {
+            return None;
+        }
+        let top = self.claim.y as u16;
+        let bottom_last = (self.claim.bottom() as u16).saturating_sub(1);
+        Some((top, bottom_last))
+    }
+
+    /// The drag-autoscroll delta for a point at `row` (#1237): `Some` with a
+    /// negative step when `row` is at or above the claim's top edge
+    /// (scrolling toward older content), a positive step when `row` is at
+    /// or below the bottom edge (including rows below the claim entirely —
+    /// the bottom chrome a drag can still reach), and `None` for an
+    /// ordinary point inside the claim or an empty claim. `step` is the
+    /// caller's own per-tick row count — production reuses
+    /// [`TRANSCRIPT_WHEEL_STEP_LINES`] so drag autoscroll and wheel
+    /// scrolling move at the same, already-established rate.
+    ///
+    /// A one-row claim (`top == bottom_last`) has no distinct top and
+    /// bottom edge — the top check is evaluated first, so that single row
+    /// always scrolls toward older content. This is a deliberate tie-break
+    /// for an already-degenerate viewport (one committed transcript row
+    /// above the bottom chrome), not a reachable case in practice: a
+    /// terminal that short already falls into `draw_live_area_to`'s
+    /// `term_h <= 3` tiny-frame path, which claims nothing at all
+    /// (`Rect::default()`, caught by the empty-claim `None` above).
+    pub(crate) fn drag_autoscroll_delta(&self, row: u16, step: usize) -> Option<isize> {
+        let (top, bottom_last) = self.visible_row_bounds()?;
+        if row <= top {
+            return Some(-(step as isize));
+        }
+        if row >= bottom_last {
+            return Some(step as isize);
+        }
+        None
+    }
+
     /// How far the view is scrolled up from the newest projected row.
     pub(crate) fn offset(&self) -> usize {
         self.offset_from_bottom
@@ -414,6 +456,74 @@ mod tests {
         assert!(
             !view.owns(0, 0),
             "a frame with no transcript claim (dialog, tiny frame) owns nothing"
+        );
+    }
+
+    #[test]
+    fn test_drag_autoscroll_delta_fires_at_or_past_each_edge_only() {
+        // INVARIANT (#1237): a drag point at or past the top/bottom edge of
+        // the transcript claim must scroll toward that edge's content; a
+        // point strictly inside the claim must not.
+        let mut view = TranscriptScrollView::new();
+        view.set_claim(Rect {
+            x: 0,
+            y: 2,
+            width: 80,
+            height: 10,
+        });
+        // Claim spans rows 2..=11 (bottom() = 12, so the last visible row is 11).
+        assert_eq!(
+            view.drag_autoscroll_delta(2, 3),
+            Some(-3),
+            "at the top edge (row 2) the delta must scroll toward older content"
+        );
+        assert_eq!(
+            view.drag_autoscroll_delta(0, 3),
+            Some(-3),
+            "past the top edge (row 0, above the claim entirely) still scrolls up"
+        );
+        assert_eq!(
+            view.drag_autoscroll_delta(11, 3),
+            Some(3),
+            "at the bottom edge (row 11, the last visible row) the delta must scroll \
+             toward newer content"
+        );
+        assert_eq!(
+            view.drag_autoscroll_delta(15, 3),
+            Some(3),
+            "past the bottom edge (row 15, into the bottom chrome) still scrolls down"
+        );
+        assert_eq!(
+            view.drag_autoscroll_delta(6, 3),
+            None,
+            "a point strictly inside the claim (row 6) must not autoscroll"
+        );
+        view.set_claim(Rect::default());
+        assert_eq!(
+            view.drag_autoscroll_delta(0, 3),
+            None,
+            "an empty claim (dialog, tiny frame) has nothing to scroll"
+        );
+    }
+
+    #[test]
+    fn test_visible_row_bounds_matches_the_claimed_rect() {
+        let mut view = TranscriptScrollView::new();
+        assert_eq!(
+            view.visible_row_bounds(),
+            None,
+            "the default (empty) claim has no visible row bounds"
+        );
+        view.set_claim(Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 4,
+        });
+        assert_eq!(
+            view.visible_row_bounds(),
+            Some((5, 8)),
+            "a 4-row claim starting at row 5 spans rows 5..=8"
         );
     }
 }
