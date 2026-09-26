@@ -1694,29 +1694,44 @@ pub(crate) async fn process_query_with_tools(
     };
     let caps = generator.capabilities();
 
+    // Create the WorkUnit for this generation turn BEFORE attempting either
+    // the streaming or non-streaming path below, and share it between both.
+    // The live area is erase-and-redraw, so the WorkUnit must exist in
+    // output_manager before the first frame — its time-driven animation
+    // stays visible during streaming, before any canonical commit.
+    //
+    // This must stay a SINGLE WorkUnit for both paths. Streaming and
+    // non-streaming used to each create their own via this same
+    // `unwrap_or_else(|| ... start_work_unit(...))` pattern; when streaming
+    // was declined or failed to start (`generate_stream_cancellable`
+    // returning `Ok(None)` or `Err(_)`, e.g. because the daemon's local SSE
+    // handler drops `tools` for tool-using turns) the code fell through to
+    // the non-streaming path, which unconditionally started a *second*
+    // WorkUnit — abandoning the first mid-transcript with its spinner stuck
+    // "in progress" forever while the second one ran to completion. Two
+    // consecutive `random_spinner_verb()` words (e.g. "Analyzing…" then
+    // "Brainstorming…") both visible and one never completing was the
+    // symptom. Computing it once here and letting both branches complete or
+    // fail this same `work_unit` makes that impossible by construction.
+    let named_brain_turn = query_states
+        .get_metadata(query_id)
+        .await
+        .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
+    let inherited_tool_unit = if query.is_empty() || named_brain_turn {
+        query_states.tool_work_unit(query_id).await
+    } else {
+        None
+    };
+    let reusing_tool_unit = inherited_tool_unit.is_some();
+    let work_unit = inherited_tool_unit.unwrap_or_else(|| {
+        let verb = crate::cli::messages::random_spinner_verb();
+        output_manager.start_work_unit(verb)
+    });
+
     // Streaming is both a provider capability and a user preference. The
     // setup wizard persists the latter in features.streaming_enabled.
     if should_stream_responses(streaming_enabled, caps.supports_streaming) {
         tracing::debug!("Generator supports streaming, attempting to stream");
-
-        // Create a WorkUnit for this generation turn BEFORE streaming begins.
-        // The live area is erase-and-redraw, so the WorkUnit must exist in
-        // output_manager before the first frame — its time-driven animation
-        // stays visible during streaming, before any canonical commit.
-        let named_brain_turn = query_states
-            .get_metadata(query_id)
-            .await
-            .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
-        let inherited_tool_unit = if query.is_empty() || named_brain_turn {
-            query_states.tool_work_unit(query_id).await
-        } else {
-            None
-        };
-        let reusing_tool_unit = inherited_tool_unit.is_some();
-        let work_unit = inherited_tool_unit.unwrap_or_else(|| {
-            let verb = crate::cli::messages::random_spinner_verb();
-            output_manager.start_work_unit(verb)
-        });
 
         let stream_start = std::time::Instant::now();
         let mut token_count: usize = 0;
@@ -2123,23 +2138,10 @@ pub(crate) async fn process_query_with_tools(
         }
     }
 
-    // Non-streaming path (for Qwen or fallback)
-    // Create WorkUnit before the blocking generate call so the animated
-    // header is visible during the wait (blit cycle runs every ~100ms).
-    let named_brain_turn = query_states
-        .get_metadata(query_id)
-        .await
-        .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
-    let inherited_tool_unit = if query.is_empty() || named_brain_turn {
-        query_states.tool_work_unit(query_id).await
-    } else {
-        None
-    };
-    let reusing_tool_unit = inherited_tool_unit.is_some();
-    let work_unit = inherited_tool_unit.unwrap_or_else(|| {
-        let verb = crate::cli::messages::random_spinner_verb();
-        output_manager.start_work_unit(verb)
-    });
+    // Non-streaming path (for Qwen or fallback). Reuses the same `work_unit`
+    // created above -- shared with the streaming attempt this query already
+    // made -- instead of starting a second one; see the comment at its
+    // creation for why that sharing matters.
     match generator
         .generate(messages.clone(), Some((*tool_definitions).clone()))
         .await
@@ -7476,6 +7478,216 @@ mod tests {
             last_user.text_content().contains("second question"),
             "turn 2 request must carry the newest query; shape {:?}",
             request_shape(&requests[1])
+        );
+    }
+
+    /// Claims streaming support (so `should_stream_responses` attempts the
+    /// streaming path and its WorkUnit) but always declines with `Ok(None)`
+    /// from `generate_stream`, then answers normally from `generate`. This
+    /// is the shape the daemon's local SSE handler actually produces for
+    /// tool-using turns: it drops `tools` and `generate_stream_cancellable`
+    /// returns `Ok(None)`, forcing the fallback to non-streaming generation
+    /// within the same turn.
+    struct StreamDeclinedGenerator;
+
+    #[async_trait::async_trait]
+    impl Generator for StreamDeclinedGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            Ok(crate::generators::GeneratorResponse {
+                text: "(say \"fallback\")".to_string(),
+                content_blocks: vec![ContentBlock::Text {
+                    text: "(say \"fallback\")".to_string(),
+                }],
+                tool_uses: vec![],
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "stream-declined".to_string(),
+                    model: "stream-declined".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPS: std::sync::OnceLock<GeneratorCapabilities> = std::sync::OnceLock::new();
+            CAPS.get_or_init(|| GeneratorCapabilities {
+                supports_streaming: true,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "stream-declined"
+        }
+    }
+
+    /// Regression test for the double-spinner bug: a turn that attempts
+    /// streaming (because `should_stream_responses` is true), receives
+    /// `Ok(None)` back from `generate_stream_cancellable`, and falls through
+    /// to the non-streaming path must complete exactly ONE WorkUnit for the
+    /// turn, not abandon a first one mid-transcript while a second takes
+    /// over. Before the fix, this produced two permanent spinner rows (e.g.
+    /// "Analyzing…" and "Brainstorming…" from `random_spinner_verb`'s
+    /// round-robin), with the first stuck `InProgress` forever.
+    #[tokio::test]
+    async fn test_stream_declined_fallback_completes_one_shared_work_unit() {
+        let generator: Arc<dyn Generator> = Arc::new(StreamDeclinedGenerator);
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("do the thing".to_string());
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let task = tokio::spawn(process_query_with_tools(
+            query_id,
+            "do the thing".to_string(),
+            event_tx,
+            Arc::clone(&generator),
+            Arc::clone(&generator),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            conversation,
+            Arc::clone(&query_states),
+            tool_coordinator,
+            Arc::clone(&runtime),
+            tui_renderer,
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            status,
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            "test-session".to_string(),
+            "/test/workspace".to_string(),
+            4,
+            20,
+            0,
+            // streaming_enabled = true: `should_stream_responses` must be
+            // true so the streaming attempt (and its WorkUnit) actually
+            // happens before `generate_stream` declines it.
+            true,
+            false,
+            false,
+            Arc::clone(&generator),
+            Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "test persona".to_string(),
+            None,
+        ));
+        task.await
+            .expect("stream-declined fallback query task panicked");
+
+        // The turn's own WorkUnit (the one `should_stream_responses` gated)
+        // completes synchronously inside `process_query_with_tools`. A
+        // *separate*, legitimately independent "VM program output" WorkUnit
+        // is also created (by design -- source and say-turn output are
+        // deliberately distinct rows) and only reaches Complete once the
+        // event loop processes its `ReplEvent::VmOutputComplete`; this test
+        // has no live event loop, so it drives that one event by hand, the
+        // same way `interactive_wire_scheduler_resumes_only_cooperative_yields`
+        // (above) does for the same reason.
+        let mut saw_streaming_complete = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::StreamingComplete { .. } => saw_streaming_complete = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_streaming_complete,
+            "the fallback turn must still emit StreamingComplete so the REPL \
+             commits the response"
+        );
+
+        let messages = output.get_messages();
+        let snapshot = || {
+            messages
+                .iter()
+                .map(|m| (m.id(), m.status(), m.content()))
+                .collect::<Vec<_>>()
+        };
+        // Before the fix, the streaming attempt's WorkUnit was abandoned
+        // (never completed or removed) when `generate_stream` returned
+        // `Ok(None)`, while the non-streaming path started a *second*,
+        // separate WorkUnit for the same turn -- three messages total here
+        // (the abandoned spinner, the completed turn, and the VM output
+        // unit), with the abandoned one stuck `InProgress` forever since
+        // nothing -- not even a live event loop -- ever completes or removes
+        // it. Sharing one WorkUnit between the two paths caps this turn at
+        // exactly two messages: the turn's own source unit and the VM
+        // output unit, both of which reach a terminal state once every
+        // event this turn actually emitted has been handled.
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected exactly one turn WorkUnit plus one VM-output WorkUnit; \
+             a third message here means the streaming attempt's WorkUnit was \
+             abandoned instead of shared with the non-streaming fallback: {:?}",
+            snapshot()
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.status() == MessageStatus::Complete),
+            "every WorkUnit for this turn must reach Complete once its known \
+             completion events have been handled; a message still InProgress \
+             here is a WorkUnit nothing will ever complete -- the abandoned- \
+             spinner symptom this test guards against: {:?}",
+            snapshot()
         );
     }
 
