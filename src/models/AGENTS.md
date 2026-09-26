@@ -60,3 +60,34 @@ query functions were deleted rather than wired, and the adapters' duplicate fami
 smoke (`local::`, `config::backend`). Run the full suite when changing a re-exported `pub`
 item. Run `python3 scripts/check_docs.py` and `python3 scripts/check_facade_boundaries.py`
 when changing the capsule or facade; do not regenerate a symbol catalog.
+
+**`LlamaCppGenerator`'s prompt `decode()` call never exceeds llama.cpp's `n_batch`.** llama.cpp
+does not chunk a `decode()` call internally: `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` in
+its `llama-context.cpp` aborts the whole process (`SIGABRT`, a C++ `abort()` no Rust code can
+catch, not a panic or `Result::Err`) if a caller ever exceeds it, taking down every session
+attached to the daemon. `src/models/loaders/llama_cpp.rs`'s `LlamaCppGenerator::generate_inner`
+evaluates a prompt across successive `decode()` calls of at most `n_batch` tokens each
+(`plan_prompt_decode_chunks`), requesting logits only on the prompt's true final token
+regardless of which chunk it lands in; this composes with the prompt-cache skip-forward, which
+only changes where chunking starts. `n_batch`/`n_ubatch` are set explicitly in
+`context_params()` (`LOCAL_N_BATCH` = 2048, `LOCAL_N_UBATCH` = 512, matching llama.cpp's own
+library defaults and `llama-server`'s pairing) rather than left to the crate default, so the
+values have a documented, intentional home. Issue #1292 traced a live production SIGABRT to
+this exact assertion: a fresh Brain's first turn (one recalled memory, ordinary conversation,
+and the tool-definitions block) produced a 7991-token prompt evaluated in one `decode()` call.
+Proof: `test_plan_prompt_decode_chunks_splits_long_prompt_into_n_batch_sized_windows`,
+`test_plan_prompt_decode_chunks_composes_with_cache_hit_skip_forward`,
+`test_only_the_prompts_true_final_token_requests_logits_across_chunk_boundaries`, and
+`test_resolve_batch_sizes_caps_both_at_a_small_context` cover the chunk-boundary and batch-size
+arithmetic without a real GGUF; the production-boundary proof against the real native
+`decode()` call is `test_real_gguf_chat_decodes_prompt_larger_than_n_batch_without_aborting`
+(`#[ignore]`-gated on `FINCH_TEST_GGUF_CHAT`, since only the real llama.cpp binding can
+reproduce or disprove a native abort).
+
+**Known gap, not covered by the above:** `neural_embedding.rs`'s `NeuralEmbeddingEngine::embed()`
+builds one unchunked `LlamaBatch` sized to the full tokenized input and calls `decode()` once,
+with no `n_batch` set explicitly and no length cap before the call. It is the same crash shape
+this invariant fixes for chat generation, just not yet fixed here: embedding text long enough to
+exceed the context's resolved batch size can hit the same native abort. Fix it the same way
+(chunk `embed()`'s `decode()` call, or cap and reject an over-length input before it) before
+claiming this invariant covers the whole capsule instead of only `LlamaCppGenerator`.

@@ -98,6 +98,49 @@ fn resolve_context_tokens(n_ctx_train: u32) -> u32 {
     }
 }
 
+/// Logical batch size (`n_batch`): the most tokens this loader will ever
+/// submit to a single llama.cpp `decode()` call. llama.cpp does not chunk a
+/// `decode()` call internally -- `GGML_ASSERT(n_tokens_all <=
+/// cparams.n_batch)` in `llama-context.cpp` aborts the whole process (a C++
+/// `abort()`, not a catchable Rust panic or `Result::Err`) if a caller ever
+/// exceeds it. Issue #1292 traced a live production SIGABRT to exactly this
+/// assertion: a fresh Brain's first turn (one recalled memory, ordinary
+/// conversation, and the tool-definitions block) produced a 7991-token
+/// prompt evaluated in one `decode()` call.
+///
+/// `generate_inner` below is the actual fix: it chunks any prompt longer
+/// than `n_batch` into successive `decode()` calls, so this constant bounds
+/// per-call memory and throughput rather than correctness -- prompts are
+/// unbounded relative to any fixed value here. 2048 is llama.cpp's own
+/// library default (`llama_context_default_params()`) and matches
+/// `llama-server`'s default logical batch size; it is set explicitly here
+/// (rather than left to the crate default) so the value has a documented,
+/// intentional home instead of an implicit one a future crate upgrade could
+/// silently change.
+const LOCAL_N_BATCH: u32 = 2048;
+
+/// Physical batch size (`n_ubatch`): the number of tokens llama.cpp actually
+/// computes over in one forward pass. llama.cpp requires `n_ubatch <=
+/// n_batch`; a single decode() call larger than `n_ubatch` is internally
+/// split into sub-batches of at most this size for compute, independent of
+/// the chunking `generate_inner` does at the `n_batch` level above. 512 is
+/// llama.cpp's own library default and matches `llama-server`'s default,
+/// keeping the per-forward-pass compute-buffer memory bounded even when
+/// `LOCAL_N_BATCH` admits a much larger logical batch.
+const LOCAL_N_UBATCH: u32 = 512;
+
+/// Resolve `(n_batch, n_ubatch)` for a context of `n_ctx` tokens, capping
+/// both at `n_ctx`. llama.cpp computes `cparams.n_batch =
+/// min(n_ctx, params.n_batch)` itself for causal models, but an unusually
+/// small trained context (below `LOCAL_N_UBATCH`) would otherwise leave
+/// `n_ubatch > n_batch`, which llama.cpp does not permit. A pure function so
+/// the clamping is unit testable without a real GGUF.
+fn resolve_batch_sizes(n_ctx: u32) -> (u32, u32) {
+    let n_batch = LOCAL_N_BATCH.min(n_ctx);
+    let n_ubatch = LOCAL_N_UBATCH.min(n_batch);
+    (n_batch, n_ubatch)
+}
+
 /// Context size to request for `model`, read from the GGUF's own trained
 /// context length (`llama_n_ctx_train`, exposed as `LlamaModel::n_ctx_train`)
 /// rather than a hardcoded value that ignores what the loaded model was
@@ -106,7 +149,11 @@ fn resolve_context_tokens(n_ctx_train: u32) -> u32 {
 /// usable context.
 fn context_params(model: &LlamaModel) -> LlamaContextParams {
     let n_ctx = resolve_context_tokens(model.n_ctx_train());
-    LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx))
+    let (n_batch, n_ubatch) = resolve_batch_sizes(n_ctx);
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(n_batch)
+        .with_n_ubatch(n_ubatch)
 }
 
 fn display_name(path: &Path, configured_family: Option<&str>) -> Result<String> {
@@ -140,6 +187,39 @@ fn reusable_prompt_tokens(cached: &[u32], requested: &[u32]) -> usize {
     } else {
         0
     }
+}
+
+/// One `decode()` call's worth of absolute prompt-token positions.
+/// `end` is exclusive. The caller submits `prompt[start..end]` with each
+/// token's llama.cpp `pos` equal to its absolute index, so splitting a
+/// prompt into chunks never changes a token's position versus evaluating it
+/// in one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeChunk {
+    start: usize,
+    end: usize,
+}
+
+/// Splits the uncached suffix `cached_tokens..total_tokens` into successive
+/// windows of at most `n_batch` tokens each, in order. llama.cpp requires a
+/// single `decode()` call's token count to fit within `n_batch`
+/// (`GGML_ASSERT(n_tokens_all <= cparams.n_batch)` in `llama-context.cpp`;
+/// see `LOCAL_N_BATCH` for why exceeding it aborts the whole process). A
+/// pure function so the chunk boundaries -- and their composition with the
+/// prompt-cache skip-forward -- are unit testable without a real GGUF.
+fn plan_prompt_decode_chunks(
+    cached_tokens: usize,
+    total_tokens: usize,
+    n_batch: usize,
+) -> Vec<DecodeChunk> {
+    let n_batch = n_batch.max(1);
+    (cached_tokens..total_tokens)
+        .step_by(n_batch)
+        .map(|start| DecodeChunk {
+            start,
+            end: (start + n_batch).min(total_tokens),
+        })
+        .collect()
 }
 
 impl LlamaCppGenerator {
@@ -221,20 +301,40 @@ impl LlamaCppGenerator {
                 .state_seq_set(&cache.state, 0)
                 .context("restore cached GGUF prompt state")?;
         }
-        let mut batch = LlamaBatch::new(capacity, 1);
-        // A cache hit always leaves a non-empty suffix. Only its final token
-        // needs logits for next-token sampling.
-        for (index, token) in prompt.iter().copied().enumerate().skip(cached_tokens) {
-            batch.add(token, index as i32, &[0], index + 1 == prompt.len())?;
-        }
+        let n_batch = usize::try_from(context.n_batch()).context("GGUF n_batch overflow")?;
+        let mut batch = LlamaBatch::new(n_batch.max(1), 1);
+        // A cache hit always leaves a non-empty suffix (see
+        // `reusable_prompt_tokens`), so `chunks` below is always non-empty.
+        let chunks = plan_prompt_decode_chunks(cached_tokens, prompt.len(), n_batch);
         tracing::debug!(
             model = %self.name,
             prompt_tokens = input_ids.len(),
             cached_prompt_tokens = cached_tokens,
             evaluated_prompt_tokens = input_ids.len() - cached_tokens,
+            n_batch,
+            decode_chunks = chunks.len(),
             "evaluating llama.cpp prompt"
         );
-        context.decode(&mut batch).context("decode GGUF prompt")?;
+        // llama.cpp requires a single decode() call's token count to fit
+        // within n_batch (see `LOCAL_N_BATCH`), so a prompt longer than
+        // n_batch is submitted across successive decode() calls. Only the
+        // prompt's true final token ever needs logits for next-token
+        // sampling, regardless of which chunk it lands in.
+        for chunk in &chunks {
+            batch.clear();
+            for absolute_index in chunk.start..chunk.end {
+                let wants_logits = absolute_index + 1 == prompt.len();
+                batch.add(
+                    prompt[absolute_index],
+                    i32::try_from(absolute_index).context("GGUF prompt position overflow")?,
+                    &[0],
+                    wants_logits,
+                )?;
+            }
+            context
+                .decode(&mut batch)
+                .context("decode GGUF prompt chunk")?;
+        }
         let state = context
             .state_seq_get(0, LlamaStateSeqFlags::empty())
             .context("snapshot GGUF prompt state")?;
@@ -388,6 +488,127 @@ mod tests {
             FALLBACK_CONTEXT_TOKENS,
             "an unknown (zero) trained length must fall back to llama.cpp's generic default, \
              not construct a zero-sized context"
+        );
+    }
+
+    /// Regression for issue #1292: with an ordinary (large) trained context,
+    /// the batch sizes must be the deliberate constants, not silently
+    /// whatever the crate's `LlamaContextParams::default()` carries.
+    #[test]
+    fn test_resolve_batch_sizes_uses_local_constants_under_context_ceiling() {
+        assert_eq!(
+            resolve_batch_sizes(8192),
+            (LOCAL_N_BATCH, LOCAL_N_UBATCH),
+            "an 8192 context must not clamp n_batch/n_ubatch below their configured constants"
+        );
+    }
+
+    /// llama.cpp computes `cparams.n_batch = min(n_ctx, params.n_batch)`
+    /// itself, but leaving `n_ubatch` unclamped for an unusually small
+    /// trained context would request `n_ubatch > n_batch`, which llama.cpp
+    /// does not permit.
+    #[test]
+    fn test_resolve_batch_sizes_caps_both_at_a_small_context() {
+        assert_eq!(
+            resolve_batch_sizes(256),
+            (256, 256),
+            "n_batch and n_ubatch must both be capped at a context (256) smaller than either \
+             configured constant (n_batch={LOCAL_N_BATCH}, n_ubatch={LOCAL_N_UBATCH})"
+        );
+    }
+
+    /// Core regression for issue #1292's chunking math: a prompt longer
+    /// than `n_batch` must be split into successive windows of at most
+    /// `n_batch` tokens, covering the uncached suffix exactly once with no
+    /// gap or overlap.
+    #[test]
+    fn test_plan_prompt_decode_chunks_splits_long_prompt_into_n_batch_sized_windows() {
+        let chunks = plan_prompt_decode_chunks(0, 1030, 512);
+        assert_eq!(
+            chunks,
+            vec![
+                DecodeChunk { start: 0, end: 512 },
+                DecodeChunk {
+                    start: 512,
+                    end: 1024
+                },
+                DecodeChunk {
+                    start: 1024,
+                    end: 1030
+                },
+            ],
+            "a 1030-token prompt over n_batch=512 must produce exactly three chunks of \
+             512, 512, and 6 tokens covering [0, 1030) with no gap or overlap: got {chunks:?}"
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.end - chunk.start <= 512,
+                "chunk {chunk:?} exceeds n_batch=512, which is exactly the native \
+                 GGML_ASSERT(n_tokens_all <= cparams.n_batch) this planner exists to satisfy"
+            );
+        }
+    }
+
+    /// The prompt-cache skip-forward (`reusable_prompt_tokens`) must compose
+    /// with chunking: only the uncached suffix is chunked, and the first
+    /// chunk starts at `cached_tokens`, not 0.
+    #[test]
+    fn test_plan_prompt_decode_chunks_composes_with_cache_hit_skip_forward() {
+        let chunks = plan_prompt_decode_chunks(300, 1300, 512);
+        assert_eq!(
+            chunks,
+            vec![
+                DecodeChunk {
+                    start: 300,
+                    end: 812
+                },
+                DecodeChunk {
+                    start: 812,
+                    end: 1300
+                },
+            ],
+            "chunking a cache hit (300 cached of 1300 total) must start at the cached \
+             boundary, not re-evaluate already-cached tokens from 0: got {chunks:?}"
+        );
+    }
+
+    /// A prompt no longer than `n_batch` must still produce exactly one
+    /// chunk (the pre-fix, single-decode() behaviour for a small prompt).
+    #[test]
+    fn test_plan_prompt_decode_chunks_prompt_under_n_batch_is_a_single_chunk() {
+        assert_eq!(
+            plan_prompt_decode_chunks(0, 10, 512),
+            vec![DecodeChunk { start: 0, end: 10 }],
+            "a 10-token prompt under n_batch=512 must not be split"
+        );
+    }
+
+    /// Exactly one absolute token position -- the prompt's true final token
+    /// -- must ever request logits, and it must fall in the last chunk
+    /// regardless of how many chunks the prompt was split into. This is the
+    /// property `generate_inner` relies on for `batch.n_tokens() - 1` to
+    /// index the right logits after the loop.
+    #[test]
+    fn test_only_the_prompts_true_final_token_requests_logits_across_chunk_boundaries() {
+        let total_tokens = 1030;
+        let chunks = plan_prompt_decode_chunks(0, total_tokens, 512);
+        let logit_positions: Vec<usize> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.start..chunk.end)
+            .filter(|absolute_index| absolute_index + 1 == total_tokens)
+            .collect();
+        assert_eq!(
+            logit_positions,
+            vec![total_tokens - 1],
+            "exactly one absolute position (the prompt's last token, {}) may request logits; \
+             got {logit_positions:?} across chunks {chunks:?}",
+            total_tokens - 1
+        );
+        let last_chunk = chunks.last().expect("chunks must be non-empty");
+        assert!(
+            (last_chunk.start..last_chunk.end).contains(&(total_tokens - 1)),
+            "the logits-requesting position must fall in the last chunk {last_chunk:?}, \
+             not an earlier one"
         );
     }
 
@@ -584,5 +805,57 @@ mod tests {
         let prompt = generator.tokenize("Hello").expect("tokenize");
         let output = generator.generate(&prompt, 4).expect("CPU GGUF generation");
         assert!(!output.is_empty(), "CPU GGUF generation must emit tokens");
+    }
+
+    /// Production-boundary regression for issue #1292: before this fix, a
+    /// prompt longer than `n_batch` submitted its entire uncached suffix to
+    /// one `decode()` call, which aborts the whole process with llama.cpp's
+    /// native `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` (`SIGABRT`, not
+    /// a catchable Rust panic or `Result::Err`) -- confirmed live against
+    /// this exact assertion with a 3000-token prompt before the chunking fix
+    /// landed. `plan_prompt_decode_chunks` and `resolve_batch_sizes` above
+    /// cover the chunking and batch-size arithmetic in isolation; only this
+    /// test drives the real `LlamaCppGenerator::generate` entry point
+    /// against the real native `decode()` call the abort came from, with a
+    /// prompt deliberately built to exceed `LOCAL_N_BATCH` regardless of
+    /// future tuning of that constant.
+    #[test]
+    #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
+    fn test_real_gguf_chat_decodes_prompt_larger_than_n_batch_without_aborting() {
+        let path = std::env::var("FINCH_TEST_GGUF_CHAT").expect("set FINCH_TEST_GGUF_CHAT");
+        let mut generator = LlamaCppGenerator::load_with_offload(Path::new(&path), true, None)
+            .expect("load GGUF chat");
+        let seed = generator
+            .tokenize("The quick brown fox jumps over the lazy dog and keeps running. ")
+            .expect("tokenize seed phrase");
+        assert!(
+            !seed.is_empty(),
+            "seed phrase must tokenize to at least one token"
+        );
+        // Repeat the seed (past its own leading BOS token) until the prompt
+        // is comfortably past LOCAL_N_BATCH, so this exercises the chunked
+        // decode path rather than the unrelated context-size guard.
+        let target_len = usize::try_from(LOCAL_N_BATCH).expect("LOCAL_N_BATCH fits usize") + 500;
+        let mut tokens = Vec::with_capacity(target_len);
+        tokens.push(seed[0]);
+        while tokens.len() < target_len {
+            tokens.extend(seed.iter().skip(1).copied());
+        }
+        tokens.truncate(target_len);
+        assert!(
+            tokens.len() > usize::try_from(LOCAL_N_BATCH).expect("LOCAL_N_BATCH fits usize"),
+            "test prompt ({}) must exceed LOCAL_N_BATCH ({LOCAL_N_BATCH}) to exercise chunking",
+            tokens.len()
+        );
+
+        let output = generator
+            .generate(&tokens, 4)
+            .expect("a prompt longer than n_batch must decode across chunked calls, not abort");
+        assert!(
+            !output.is_empty(),
+            "a real chat GGUF must emit at least one token for a valid, chunked prompt \
+             (prompt_tokens={}, n_batch={LOCAL_N_BATCH})",
+            tokens.len()
+        );
     }
 }
