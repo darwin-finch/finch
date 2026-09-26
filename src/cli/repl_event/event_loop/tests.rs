@@ -6810,6 +6810,175 @@ async fn test_pending_user_message_without_tools_drains_on_streaming_complete() 
         .await;
 }
 
+type ObservedLlmQueryWithEcho = (Uuid, String, Vec<crate::providers::Message>, Option<String>);
+
+/// Like `observe_llm_queries`, but also captures `pending_echo` -- the value
+/// `process_query_with_tools` uses to defer a query's scrollback echo until
+/// after its own memory-recall notice commits
+/// (`test_memory_notice_commits_before_user_echo_in_scrollback`). Needed to
+/// prove the queued-turn drain now supplies that same deferral contract
+/// instead of hardcoding `None` after an already-written eager echo.
+fn observe_llm_queries_with_echo(
+    event_loop: &mut EventLoop,
+) -> tokio::sync::mpsc::UnboundedReceiver<ObservedLlmQueryWithEcho> {
+    let conversation = Arc::clone(&event_loop.conversation);
+    let mut llm_rx = event_loop
+        .llm_rx
+        .take()
+        .expect("test fixture must observe LlmRequest before the worker starts");
+    let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(LlmRequest::Query {
+            id,
+            text,
+            admission,
+            admission_ready,
+            spawned,
+            publication,
+            pending_echo,
+            ..
+        }) = llm_rx.recv().await
+        {
+            if let Some(ready) = admission_ready {
+                let _ = ready.send(());
+            }
+            if let Some(admission) = admission {
+                if admission.await.is_err() {
+                    continue;
+                }
+            }
+            let snapshot = conversation.read().await.get_messages();
+            if let Some(spawned) = spawned {
+                let _ = spawned.send(());
+            }
+            if let Some(publication) = publication {
+                if publication.await.is_err() {
+                    continue;
+                }
+            }
+            let _ = observed_tx.send((id, text, snapshot, pending_echo));
+        }
+    });
+    observed_rx
+}
+
+/// Regression for the queued-turn echo/recall-notice ordering bug (companion
+/// to #1194, which fixed only the fresh-query path). A user turn submitted
+/// while another turn is still actively generating (no tool round in
+/// flight, so `finalize_tool_execution`'s merge does not apply) takes the
+/// `pending_queries` branch in `execute_query_inner`. Before this fix, that
+/// branch wrote the scrollback echo synchronously at queue time, then
+/// re-dispatched the same text as a brand-new query -- with its own memory
+/// recall -- only once the active turn's `StreamingComplete` fired later.
+/// The already-committed echo could never be reordered behind that new
+/// turn's own recall notice, reproducing #1194's exact defect through the
+/// queue instead of the fresh-query path #1194 patched.
+///
+/// This drives the real queueing/drain path through `EventLoop::handle_event`
+/// end to end (not a `process_query_with_tools` helper) and checks the two
+/// places the fix touches: (1) queuing a turn behind an active generation
+/// must not commit its echo to `OutputManager` early, and (2) once
+/// `StreamingComplete` promotes the queued turn to a new query, that
+/// query's `LlmRequest::Query::pending_echo` must carry the queued text --
+/// the same deferred-echo contract
+/// `test_memory_notice_commits_before_user_echo_in_scrollback` proves is
+/// recall-notice-safe in `process_query_with_tools` -- instead of the `None`
+/// this path hardcoded before the fix.
+#[tokio::test]
+async fn test_queued_turn_defers_echo_like_fresh_query_before_streaming_complete() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries_with_echo(&mut event_loop);
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "first turn".to_string(),
+                })
+                .await
+                .expect("the first user turn must start a query");
+            let first_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("the no-tools query must own active_query_id");
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "queued while generating".to_string(),
+                })
+                .await
+                .expect("a second turn during Processing must queue, not double-generate");
+
+            let queued_before_drain = output.get_messages();
+            assert!(
+                !queued_before_drain
+                    .iter()
+                    .any(|m| m.content() == "queued while generating"),
+                "queuing a turn behind an active generation must not commit its echo to \
+                 scrollback yet -- an eager echo here cannot later be reordered behind \
+                 that turn's own memory-recall notice once it is promoted to a new query; \
+                 rows={:?}",
+                queued_before_drain
+                    .iter()
+                    .map(|m| m.content())
+                    .collect::<Vec<_>>()
+            );
+
+            let first = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                .await
+                .expect("the first turn must dispatch LlmRequest::Query")
+                .expect("the LLM request channel must stay open");
+            assert_eq!(first.0, first_id);
+            assert_eq!(first.1, "first turn");
+
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id: first_id,
+                    full_response: "first reply".to_string(),
+                })
+                .await
+                .expect("no-tools StreamingComplete must drain pending_queries");
+
+            let second_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("draining pending on StreamingComplete must start the queued turn");
+            assert_ne!(
+                second_id, first_id,
+                "the queued turn is a new query, not a continuation of the finished one"
+            );
+
+            let second =
+                tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                    .await
+                    .expect("StreamingComplete must start the queued turn as LlmRequest::Query")
+                    .expect("the LLM request channel must stay open for the drained turn");
+            assert_eq!(second.0, second_id);
+            assert_eq!(second.1, "queued while generating");
+            assert_eq!(
+                second.3,
+                Some("queued while generating".to_string()),
+                "the queued turn promoted to a new query must carry pending_echo so \
+                 process_query_with_tools defers the scrollback echo until after its own \
+                 memory-recall notice commits, exactly like a fresh query; observed={second:?}"
+            );
+
+            assert!(
+                !output
+                    .get_messages()
+                    .iter()
+                    .any(|m| m.content() == "queued while generating"),
+                "the event loop must hand the echo text to process_query_with_tools via \
+                 pending_echo rather than committing it itself; a row here would mean the \
+                 eager write is still happening"
+            );
+        })
+        .await;
+}
+
 /// Cancel must not leave queued text to re-fire after a later turn completes
 /// (#463: queued turn must not execute out of order after cancel).
 #[tokio::test]

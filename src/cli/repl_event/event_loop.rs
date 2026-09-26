@@ -3139,6 +3139,22 @@ impl EventLoop {
         }
     }
 
+    /// Write the scrollback echo for queued turns being merged onto an
+    /// in-flight tool round's continuation (`finalize_tool_execution`).
+    ///
+    /// This drain never starts a new query or runs memory recall -- it is
+    /// the same turn continuing -- so there is no recall notice this echo
+    /// could land after, and writing it immediately (rather than deferring,
+    /// as the fresh-query and promoted-to-new-turn drains must) is safe.
+    /// Entries queued with `echo = false` (e.g. chat-only pushes) stay silent.
+    fn write_pending_echoes(&self, pending: &[(String, bool, bool)]) {
+        for (text, echo, _chat_only) in pending {
+            if *echo {
+                self.output_manager.write_user(text.clone());
+            }
+        }
+    }
+
     /// Execute a query with echo (used by /run where the query hasn't been displayed yet).
     async fn execute_query(&mut self, input: String) -> Result<()> {
         self.execute_query_inner(input, true, false).await
@@ -3180,13 +3196,27 @@ impl EventLoop {
 
         // One interactive Brain owns a single ordered conversation and VM
         // revision. Queue later user turns rather than racing both through the
-        // same mutable state. Preserve the input's normal echo semantics now,
-        // then start it without a second echo after the active turn commits.
+        // same mutable state.
+        //
+        // The echo itself must NOT be written here. This turn may later be
+        // drained one of two ways: merged as extra text onto an in-flight
+        // tool round's continuation (`finalize_tool_execution`, no new query
+        // and no memory recall -- an immediate echo there is safe and is
+        // written at that drain site), or promoted to a genuinely new turn
+        // once the active turn fully completes (`execute_query_inner` called
+        // again with `active_query_id` cleared). The second case runs its own
+        // memory recall and, like any fresh query, must commit that recall
+        // notice before its echo (`pending_echo` below) -- so writing the
+        // echo eagerly here, before it is even known which drain applies,
+        // reproduced the ordering bug #1194 fixed for the fresh-query path
+        // (recall notice landing after an already-committed echo). Preserving
+        // `echo` on the queued tuple instead of hardcoding `false` lets the
+        // eventual `execute_query_inner` re-entry defer it the normal way.
+        // The input box clears independently of this scrollback row (see the
+        // `pending_echo` comment below), so deferring it here costs no felt
+        // responsiveness.
         if self.active_query_id.read().await.is_some() {
-            if echo {
-                self.output_manager.write_user(input.clone());
-            }
-            self.pending_queries.push_back((input, false, chat_only));
+            self.pending_queries.push_back((input, echo, chat_only));
             return Ok(());
         }
 
