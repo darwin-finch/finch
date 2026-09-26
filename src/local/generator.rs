@@ -29,6 +29,51 @@ use tokio::sync::RwLock;
 /// model at all.
 const LOCAL_HISTORY_WINDOW_EXCHANGES: usize = 3;
 
+/// Token budget reserved for the model's generated response. Mirrors the
+/// `max_new_tokens` this module actually requests from the backend
+/// (`try_neural_generate`, `try_neural_generate_streaming`) so the prompt
+/// budget below never counts on room the response itself will consume.
+const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 100;
+
+/// Token budget reserved for chat-template markers, the system prompt, and
+/// a small safety margin -- rendering overhead that `prompt_parts` itself
+/// cannot see, since it only assembles the `query` half of the prompt.
+const LOCAL_PROMPT_OVERHEAD_RESERVE: usize = 64;
+
+/// Trim `recent_history` (oldest first) so that, combined with
+/// `current_question`, the packed query stays within `budget_tokens` as
+/// measured by `count_tokens`.
+///
+/// Drops from the oldest end first: newest history and the current
+/// question itself are never dropped by this step. A current question that
+/// alone still exceeds budget is a distinct, unavoidable overflow --
+/// `LlamaCppGenerator::generate_inner`'s existing capacity check
+/// (`src/models/loaders/llama_cpp.rs`) still catches and reports it.
+fn fit_history_to_budget(
+    current_question: &str,
+    recent_history: Vec<String>,
+    budget_tokens: usize,
+    count_tokens: impl Fn(&str) -> usize,
+) -> String {
+    let mut used = count_tokens(current_question);
+    let mut included: Vec<String> = Vec::new();
+    for exchange in recent_history.into_iter().rev() {
+        let cost = count_tokens(&exchange);
+        if used.saturating_add(cost) > budget_tokens {
+            break;
+        }
+        used += cost;
+        included.push(exchange);
+    }
+    included.reverse();
+
+    if included.is_empty() {
+        current_question.to_string()
+    } else {
+        format!("{}\n\n{}", included.join("\n\n"), current_question)
+    }
+}
+
 /// Response template for a pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResponseTemplate {
@@ -377,10 +422,36 @@ impl TemplateGenerator {
             })
             .collect();
 
-        let query = if recent_history.is_empty() {
-            current_question.to_string()
-        } else {
-            format!("{}\n\n{}", recent_history.join("\n\n"), current_question)
+        // The fixed exchange-count window above bounds *how many* exchanges
+        // are candidates, but not their size: three long exchanges (long
+        // code pastes, verbose answers) can still overflow a small model's
+        // real context window on their own (the failure #1234 reports after
+        // the fact). Trim further against an actual token budget derived
+        // from the loaded model's real context length
+        // (`GeneratorModel::context_length`, itself resolved from the
+        // GGUF's trained length in `src/models/loaders/llama_cpp.rs` rather
+        // than a hardcoded default) when a model is loaded and its lock is
+        // free; otherwise keep the prior unconditional-join behaviour so a
+        // model that hasn't finished loading, or a momentarily contended
+        // lock, doesn't fail the turn.
+        let query = match self
+            .neural_generator
+            .as_ref()
+            .and_then(|generator| generator.try_read().ok())
+        {
+            Some(generator) => {
+                let budget = (generator.context_length() as usize)
+                    .saturating_sub(LOCAL_RESPONSE_TOKEN_RESERVE + LOCAL_PROMPT_OVERHEAD_RESERVE);
+                let count_tokens = |text: &str| {
+                    generator
+                        .tokenize(text)
+                        .map(|tokens| tokens.len())
+                        .unwrap_or_else(|_| text.split_whitespace().count())
+                };
+                fit_history_to_budget(current_question, recent_history, budget, count_tokens)
+            }
+            None if recent_history.is_empty() => current_question.to_string(),
+            None => format!("{}\n\n{}", recent_history.join("\n\n"), current_question),
         };
 
         let caller_system = messages
@@ -1008,6 +1079,227 @@ mod tests {
         );
         assert!(
             query.contains("hello again"),
+            "the current question must still be present in the composed query: {query:?}"
+        );
+    }
+
+    // ── Token-budget-aware history trimming ──────────────────────────────
+
+    /// Pure-logic regression for `fit_history_to_budget`: once the budget is
+    /// exceeded, the oldest candidate exchanges are dropped first, and the
+    /// current question always survives.
+    #[test]
+    fn fit_history_to_budget_drops_oldest_entries_first_once_budget_is_exceeded() {
+        let history = vec![
+            "user: ancient".to_string(),                     // 2 tokens
+            "assistant: ancient reply".to_string(),          // 3 tokens
+            "user: recent one".to_string(),                  // 3 tokens
+            "assistant: recent two words reply".to_string(), // 5 tokens
+        ];
+        let count_tokens = |text: &str| text.split_whitespace().count();
+
+        // Budget 10: current question (2) + newest two entries (5 + 3 = 8)
+        // fits exactly at 10; the next-oldest entry (3 more) would not.
+        let query = fit_history_to_budget("current question", history.clone(), 10, count_tokens);
+        assert!(
+            !query.contains("ancient"),
+            "both entries that don't fit the budget must be dropped: {query:?}"
+        );
+        assert!(
+            query.contains("recent one") && query.contains("recent two words reply"),
+            "entries that fit the budget must survive: {query:?}"
+        );
+        assert!(
+            query.contains("current question"),
+            "the current question must always survive trimming: {query:?}"
+        );
+
+        // A budget covering every entry keeps them all, oldest first.
+        let query = fit_history_to_budget("current question", history, 100, count_tokens);
+        assert!(
+            query.contains("ancient") && query.contains("recent"),
+            "a budget that comfortably covers all history must not drop anything: {query:?}"
+        );
+        assert!(
+            query.find("ancient").unwrap() < query.find("recent one").unwrap(),
+            "surviving entries must stay in chronological order: {query:?}"
+        );
+    }
+
+    /// A budget too small even for the current question alone still returns
+    /// the question -- an unavoidable single-message overflow is a distinct
+    /// failure the GGUF backend's own capacity check reports, not something
+    /// this trimming step can fix by dropping history it doesn't have.
+    #[test]
+    fn fit_history_to_budget_never_drops_the_current_question() {
+        let query = fit_history_to_budget(
+            "a question that alone exceeds the tiny budget",
+            vec!["user: some history".to_string()],
+            1,
+            |text| text.split_whitespace().count(),
+        );
+        assert_eq!(
+            query, "a question that alone exceeds the tiny budget",
+            "the current question must survive even when it alone exceeds budget: {query:?}"
+        );
+    }
+
+    /// Production-boundary regression for local generation overflowing a
+    /// small model's real context window (the failure #1234 reports after
+    /// the fact): with a model loaded whose real, resolved context length
+    /// leaves only a small token budget, `prompt_parts` must drop the
+    /// oldest history first rather than unconditionally joining every
+    /// candidate exchange the way it did before this fix.
+    #[test]
+    fn prompt_parts_trims_oldest_history_to_stay_within_the_models_real_token_budget() {
+        struct SmallContextBackend;
+
+        impl TextGeneration for SmallContextBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                Ok(Vec::new())
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok((0..text.split_whitespace().count() as u32).collect())
+            }
+
+            fn decode_tokens(&self, _tokens: &[u32]) -> Result<String> {
+                Ok(String::new())
+            }
+
+            fn name(&self) -> &str {
+                "small-context-test-model"
+            }
+
+            fn context_length(&self) -> u32 {
+                // reserve (164) + budget (10), chosen so only the two most
+                // recent history messages below fit.
+                174
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Qwen2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(SmallContextBackend), config);
+        let shared = Arc::new(RwLock::new(model));
+        let generator =
+            TemplateGenerator::with_models(PatternClassifier::new(), Some(shared), "Qwen");
+
+        let messages = vec![
+            crate::providers::Message::user("ancient"),
+            crate::providers::Message::assistant("ancient reply"),
+            crate::providers::Message::user("recent one"),
+            crate::providers::Message::assistant("recent two words reply"),
+            crate::providers::Message::user("current question"),
+        ];
+
+        let (system_prompt, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert!(
+            !query.contains("ancient"),
+            "the oldest exchange must be dropped once the model's real token budget is \
+             exceeded, not kept the way an unconditional join would keep it: {query:?}"
+        );
+        assert!(
+            query.contains("recent one") && query.contains("recent two words reply"),
+            "exchanges that still fit the budget must survive: {query:?}"
+        );
+        assert!(
+            query.contains("current question"),
+            "the current question must always survive trimming: {query:?}"
+        );
+
+        // The real invariant this fix protects: the formatted prompt plus
+        // the reserved response budget must fit inside the model's real
+        // context window, instead of silently overflowing it.
+        let formatted = generator.format_chat_prompt_with_system(&system_prompt, &query);
+        let prompt_tokens = formatted.split_whitespace().count();
+        assert!(
+            prompt_tokens + LOCAL_RESPONSE_TOKEN_RESERVE <= 174,
+            "formatted prompt ({prompt_tokens} tokens) plus the reserved response budget \
+             ({LOCAL_RESPONSE_TOKEN_RESERVE}) must fit inside the model's real context \
+             window (174 tokens), not overflow it: {formatted:?}"
+        );
+    }
+
+    /// When the model's real context window comfortably covers every
+    /// candidate exchange, trimming must not discard anything it doesn't
+    /// need to -- this fix bounds the prompt, it doesn't gratuitously
+    /// shrink it.
+    #[test]
+    fn prompt_parts_keeps_full_history_when_the_models_real_budget_covers_it() {
+        struct RoomyContextBackend;
+
+        impl TextGeneration for RoomyContextBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                Ok(Vec::new())
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok((0..text.split_whitespace().count() as u32).collect())
+            }
+
+            fn decode_tokens(&self, _tokens: &[u32]) -> Result<String> {
+                Ok(String::new())
+            }
+
+            fn name(&self) -> &str {
+                "roomy-context-test-model"
+            }
+
+            fn context_length(&self) -> u32 {
+                8192
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Qwen2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(RoomyContextBackend), config);
+        let shared = Arc::new(RwLock::new(model));
+        let generator =
+            TemplateGenerator::with_models(PatternClassifier::new(), Some(shared), "Qwen");
+
+        let messages = vec![
+            crate::providers::Message::user("earlier unrelated turn"),
+            crate::providers::Message::assistant("earlier unrelated reply"),
+            crate::providers::Message::user("current question"),
+        ];
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert!(
+            query.contains("earlier unrelated turn") && query.contains("earlier unrelated reply"),
+            "a roomy real context budget must not drop history a fixed-count window would \
+             already have kept: {query:?}"
+        );
+        assert!(
+            query.contains("current question"),
             "the current question must still be present in the composed query: {query:?}"
         );
     }

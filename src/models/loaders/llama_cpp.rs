@@ -59,8 +59,54 @@ fn load_model(path: &Path, allow_gpu_offload: bool) -> Result<Arc<LlamaModel>> {
     Ok(Arc::new(model))
 }
 
-fn context_params() -> LlamaContextParams {
-    LlamaContextParams::default().with_n_ctx(NonZeroU32::new(2048))
+/// llama.cpp's own generic default, used only when a model's trained
+/// context length cannot be determined (`n_ctx_train()` returning `0`,
+/// which the C API otherwise never does for a valid GGUF).
+const FALLBACK_CONTEXT_TOKENS: u32 = 2048;
+
+/// Ceiling on the context window this loader will ever request from
+/// llama.cpp, independent of how large a model's own trained context is.
+///
+/// llama.cpp allocates the KV cache for the *entire* requested `n_ctx` up
+/// front, and that allocation scales linearly with context length
+/// regardless of how much of it a given conversation actually uses. Some
+/// GGUFs (long-context Llama/Qwen variants in particular) are trained for
+/// context lengths in the tens or low hundreds of thousands of tokens;
+/// unconditionally requesting a model's full trained length risks
+/// exhausting memory on the CPU-only, non-GPU-offload hardware this
+/// in-process backend targets (local routing and provider parity remain
+/// experimental: Issues #74, #98). 8192 is chosen because it exactly
+/// matches Gemma 2 9B's trained length -- the motivating case for this fix
+/// -- and comfortably covers ordinary coding-assistant turns without the
+/// multi-gigabyte KV cache a 32K+ context would allocate on CPU. Revisit
+/// this once a config knob exists, or once the vendored
+/// `LlamaModelParams::fit_params` VRAM-fitting API is wired up for a
+/// memory-aware CPU path.
+const MAX_LOCAL_CONTEXT_TOKENS: u32 = 8192;
+
+/// Resolve the context window to request from a model's own trained
+/// length, capped at `MAX_LOCAL_CONTEXT_TOKENS` and falling back to
+/// llama.cpp's generic default only if the trained length is unknown.
+///
+/// A pure function (no model I/O) so its clamping behaviour is unit
+/// testable without loading a real GGUF.
+fn resolve_context_tokens(n_ctx_train: u32) -> u32 {
+    if n_ctx_train == 0 {
+        FALLBACK_CONTEXT_TOKENS
+    } else {
+        n_ctx_train.min(MAX_LOCAL_CONTEXT_TOKENS)
+    }
+}
+
+/// Context size to request for `model`, read from the GGUF's own trained
+/// context length (`llama_n_ctx_train`, exposed as `LlamaModel::n_ctx_train`)
+/// rather than a hardcoded value that ignores what the loaded model was
+/// actually trained for. Gemma 2 9B, for example, is trained for 8192
+/// tokens; a fixed 2048 silently discarded three quarters of its real
+/// usable context.
+fn context_params(model: &LlamaModel) -> LlamaContextParams {
+    let n_ctx = resolve_context_tokens(model.n_ctx_train());
+    LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx))
 }
 
 fn display_name(path: &Path, configured_family: Option<&str>) -> Result<String> {
@@ -137,7 +183,7 @@ impl LlamaCppGenerator {
         let backend = backend()?;
         let mut context = self
             .model
-            .new_context(backend, context_params())
+            .new_context(backend, context_params(&self.model))
             .context("create llama.cpp generation context")?;
         let capacity = usize::try_from(context.n_ctx()).context("GGUF context size overflow")?;
         if input_ids.len().saturating_add(max_new_tokens) > capacity {
@@ -277,6 +323,10 @@ impl TextGeneration for LlamaCppGenerator {
         &self.name
     }
 
+    fn context_length(&self) -> u32 {
+        resolve_context_tokens(self.model.n_ctx_train())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -297,6 +347,48 @@ mod tests {
                 .err()
                 .expect("missing GGUF must fail");
         assert!(error.to_string().contains("does not exist"), "{error:#}");
+    }
+
+    /// Regression for the hardcoded `n_ctx=2048`: a model trained for a
+    /// longer context (Gemma 2 9B's real 8192) must get that length, not
+    /// llama.cpp's generic default, as long as it fits under the memory
+    /// ceiling.
+    #[test]
+    fn test_resolve_context_tokens_uses_model_trained_length_when_under_ceiling() {
+        assert_eq!(
+            resolve_context_tokens(8192),
+            8192,
+            "Gemma 2 9B's real trained context (8192) must be used verbatim, not \
+             discarded down to llama.cpp's generic 2048 default"
+        );
+        assert_eq!(
+            resolve_context_tokens(4096),
+            4096,
+            "a model trained for 4096 must not be clamped down to the old 2048 default"
+        );
+    }
+
+    /// Some GGUFs (long-context Llama/Qwen variants) train for far more
+    /// tokens than a CPU-only KV cache should unconditionally allocate.
+    #[test]
+    fn test_resolve_context_tokens_caps_very_long_trained_models_at_the_memory_ceiling() {
+        assert_eq!(
+            resolve_context_tokens(131_072),
+            MAX_LOCAL_CONTEXT_TOKENS,
+            "a 128K-trained model must be capped at the memory ceiling, not requested in full"
+        );
+    }
+
+    /// `llama_n_ctx_train` should never return 0 for a valid GGUF, but the
+    /// resolver must not construct a zero-sized context if it somehow does.
+    #[test]
+    fn test_resolve_context_tokens_falls_back_when_trained_length_is_unknown() {
+        assert_eq!(
+            resolve_context_tokens(0),
+            FALLBACK_CONTEXT_TOKENS,
+            "an unknown (zero) trained length must fall back to llama.cpp's generic default, \
+             not construct a zero-sized context"
+        );
     }
 
     #[test]
@@ -338,6 +430,42 @@ mod tests {
         assert!(
             !name.contains("/private"),
             "model name must not leak its path"
+        );
+    }
+
+    /// Production-boundary regression for the hardcoded `n_ctx=2048`: loads a
+    /// real GGUF and checks the context this loader actually constructs
+    /// reflects that model's own trained length (capped at
+    /// `MAX_LOCAL_CONTEXT_TOKENS`), not llama.cpp's generic default -- the
+    /// unit tests above cover the clamping arithmetic in isolation, but only
+    /// this exercises `LlamaModel::n_ctx_train()` and `LlamaContextParams`
+    /// construction against the real native binding.
+    #[test]
+    #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
+    fn test_real_gguf_context_size_reflects_model_trained_length_not_hardcoded_default() {
+        let path = std::env::var("FINCH_TEST_GGUF_CHAT").expect("set FINCH_TEST_GGUF_CHAT");
+        let generator = LlamaCppGenerator::load_with_offload(Path::new(&path), true, None)
+            .expect("load GGUF chat");
+        let trained = generator.model.n_ctx_train();
+        let expected = resolve_context_tokens(trained);
+        assert_ne!(
+            expected, 0,
+            "resolve_context_tokens must never resolve to a zero-sized context; trained={trained}"
+        );
+        let params = context_params(&generator.model);
+        assert_eq!(
+            params.n_ctx(),
+            NonZeroU32::new(expected),
+            "LlamaContextParams must carry this model's real (trained, capped) context \
+             length, not llama.cpp's generic 2048 default; trained={trained}, expected={expected}, \
+             got={:?}",
+            params.n_ctx()
+        );
+        assert_eq!(
+            generator.context_length(),
+            expected,
+            "TextGeneration::context_length() must report the same resolved value used to \
+             construct the generation context, so budget-aware callers see the truth"
         );
     }
 
