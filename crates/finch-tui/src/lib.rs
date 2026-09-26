@@ -23,7 +23,7 @@ use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
+    execute, queue,
     style::{Attribute, Color, Print, SetAttribute, SetForegroundColor},
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
@@ -993,7 +993,44 @@ fn write_live_frame(
         if index > 0 {
             execute!(out, Print("\r\n"))?;
         }
-        execute!(out, Print(line))?;
+        // Clear every physical row this line will occupy before printing
+        // into it, not just the row the cursor starts on (an independent
+        // review's finding on #1293's fix): a wrapped line's continuation
+        // row(s) are positioned by the terminal's own auto-wrap, not by an
+        // explicit `Print` in this loop, so a single
+        // `Clear(ClearType::CurrentLine)` never reaches them. Matches
+        // `write_live_area_erase`'s own multi-row clear: walk down clearing
+        // each row the line will occupy, then back up to where `Print`
+        // (relying on the terminal's own wrap) expects to start.
+        //
+        // `execute!` flushes on every call (each is a real write syscall on
+        // the production `io::Stdout` this eventually writes to), and this
+        // loop runs once per line, every render tick — a live-ticking
+        // component (a running turn's elapsed-time display, a streaming
+        // reply) can retrigger it dozens of times a second, so the common,
+        // single physical row case stays exactly as cheap as
+        // `continue_full_viewport_paint`'s per-line clear — one `execute!`
+        // combining the clear and the print — and only a genuinely wrapped
+        // line pays for the multi-row walk, which itself uses `queue!` to
+        // defer every intermediate command to the one trailing `execute!`
+        // flush.
+        let line_rows = shadow_buffer::physical_rows(line, terminal_width).max(1);
+        if line_rows <= 1 {
+            execute!(out, Clear(ClearType::CurrentLine), Print(line))?;
+        } else {
+            for row_in_line in 0..line_rows {
+                queue!(out, Clear(ClearType::CurrentLine))?;
+                if row_in_line + 1 < line_rows {
+                    queue!(out, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+                }
+            }
+            execute!(
+                out,
+                cursor::MoveUp((line_rows - 1) as u16),
+                cursor::MoveToColumn(0),
+                Print(line)
+            )?;
+        }
     }
     let rows = frame.physical_rows(terminal_width);
     if rows == 0 {
@@ -1400,6 +1437,16 @@ pub struct TuiRenderer {
     // newest frame instead of replaying intermediate relative repairs.
     pending_viewport_size: Option<(u16, u16)>,
 
+    // The physical row count `draw_live_area_to` last actually painted with
+    // (set alongside `active_rows`, but — unlike `active_rows` — never reset
+    // by `erase_live_area`, which zeroes `active_rows` before every ordinary
+    // draw as part of its own, unrelated bookkeeping). Comparing this
+    // tick's row count against this value is how `draw_live_area_to`
+    // detects a shrinking live area and invalidates a stale selection
+    // (#1293) — comparing against the always-just-reset `active_rows`
+    // instead would make that comparison true on almost every tick.
+    last_live_frame_rows: usize,
+
     // A terminal resize lets the emulator reflow bytes that Finch previously
     // drew, so the old live-area origin is no longer recoverable with MoveUp.
     // The next render clears and rebuilds the complete visible viewport using
@@ -1581,6 +1628,7 @@ impl TuiRenderer {
             history_draft: None,
             active_rows: 0,
             pending_viewport_size: None,
+            last_live_frame_rows: 0,
             viewport_invalidated: false,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
@@ -1671,6 +1719,7 @@ impl TuiRenderer {
 
             active_rows: 0,
             pending_viewport_size: None,
+            last_live_frame_rows: 0,
             viewport_invalidated: false,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
@@ -2012,6 +2061,7 @@ impl TuiRenderer {
             self.flush_attention_bell(out)?;
             out.flush()?;
             self.active_rows = rows;
+            self.last_live_frame_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
             self.accordion
                 .rebuild_retained_hit_regions(&[], 0, term_width);
@@ -2044,12 +2094,62 @@ impl TuiRenderer {
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
+        // A shrinking live area (#1293) invalidates any active selection
+        // instead of repositioning the write to compensate for it.
+        //
+        // `rebuild_transcript_hit_regions` (below) builds `SelectionIndex`
+        // assuming the live area's absolute rows are always
+        // `term_height - this_frame's_row_count .. term_height` — true
+        // immediately after a full `redraw_full_viewport_inner` repaint
+        // (which does an explicit `cursor::MoveTo(0, plan.transcript_top)`),
+        // but never re-verified on an ordinary tick. `write_live_frame`
+        // otherwise just continues from wherever `erase_live_area` (based on
+        // the *previous* frame's own row count) left the terminal cursor: a
+        // growing frame overflows the bottom and a native terminal scroll
+        // happens to re-bottom-anchor everything for free, but a shrinking
+        // frame (e.g. the "/" completion pane closing) simply lands higher
+        // on the physical screen than the formula assumes, and nothing ever
+        // notices or corrects the resulting drift. From that tick on,
+        // `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`
+        // would target whatever `row` the (now physically wrong)
+        // `SelectionIndex` reports, stamping stale selected text onto
+        // unrelated content — typically the status line, once its row
+        // happens to fall where the drift says old transcript content still
+        // lives.
+        //
+        // An earlier version of this fix instead recomputed and reapplied a
+        // bottom-anchored `cursor::MoveTo` on every size-changing tick, so
+        // physical and assumed geometry could never diverge. That is
+        // correct in isolation, but a live-session regression (traced
+        // through a reconnect/replay production test, `named_brain_attach`)
+        // showed it corrupting the live area under rapid successive
+        // grow/shrink ticks — the interaction with `erase_live_area`'s own,
+        // separately-tracked relative bookkeeping was not fully understood
+        // and the risk of shipping a half-diagnosed repositioning fix
+        // outweighed fixing the narrower, better-understood problem: a
+        // selection surviving into geometry it no longer describes. Since
+        // growth always self-corrects (the paragraph above), only a
+        // detected *shrink* needs to act, and clearing the selection here
+        // is exactly the same invalidation `redraw_full_viewport_inner`
+        // already performs on every full repaint (any full repaint clears
+        // it) — extended to cover the one case a full repaint does not run
+        // for. `self.last_live_frame_rows` (not `self.active_rows`, which
+        // `erase_live_area` always zeroes just before this function runs as
+        // part of its own, unrelated bookkeeping) is the previous tick's
+        // row count.
+        let this_frame_rows = frame.physical_rows(term_width.max(1));
+        if this_frame_rows < self.last_live_frame_rows && self.selection.is_some() {
+            self.selection = None;
+            self.selection_press_candidate = None;
+            self.previous_highlighted_rows.clear();
+        }
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
         self.flush_attention_bell(out)?;
         out.flush()?;
 
         self.active_rows = rows;
+        self.last_live_frame_rows = rows;
         self.cursor_row_from_top = frame.cursor_row;
         self.rebuild_transcript_hit_regions(&frame, rows, term_width, term_h);
         self.paint_selection_overlay(out)?;
@@ -13338,6 +13438,289 @@ mod selection_tests {
             "the renderer must stop tracking the bottom row as highlighted \
              once it has been restored; recorded={:?}",
             renderer.previous_highlighted_rows
+        );
+    }
+
+    /// Live-session regression (#1293): a released selection over a short
+    /// conversation's transcript line survived a completion-pane open (grows
+    /// `live_rows`) followed by a close (shrinks it back), then bled its
+    /// stale, still-highlighted text onto a status-bar row that had nothing
+    /// to do with the original selection.
+    ///
+    /// Root cause: `draw_live_area_to`'s ordinary per-tick paint resumes
+    /// printing from wherever the *previous* tick's purely-relative
+    /// `erase_live_area` + `write_live_frame` cycle happened to leave the
+    /// terminal cursor, while `rebuild_transcript_hit_regions`'s
+    /// `SelectionIndex` independently assumes the live area is always
+    /// bottom-anchored (`live_top == term_height - live_rows`). Those two
+    /// notions of "where is row N" agree only right after a full
+    /// `redraw_full_viewport_inner` repaint (whose `cursor::MoveTo(0,
+    /// plan.transcript_top)` is the only place that ever syncs them). A
+    /// completion pane *opening* (`live_rows` growing) happens to
+    /// re-synchronize the two by accident — printing past the bottom of the
+    /// terminal forces a native scroll that is, by construction, always
+    /// bottom-anchored — but a pane *closing* (`live_rows` shrinking) prints
+    /// its smaller frame from the same (now too-high) cursor position and
+    /// nothing ever notices the resulting drift. From that tick on,
+    /// `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)` stamps
+    /// the finalized selection's text at the row the (still-selectable,
+    /// still bottom-anchored-by-formula) `SelectionIndex` reports, which no
+    /// longer has anything to do with what `write_live_frame` actually,
+    /// physically painted there this tick.
+    ///
+    /// The fix reacts to a detected shrink by clearing the selection
+    /// (`self.selection = None`, `self.previous_highlighted_rows.clear()`)
+    /// instead of forcing physical and assumed geometry to agree with an
+    /// explicit `cursor::MoveTo`. An earlier version of this fix took the
+    /// `MoveTo` approach; it was correct in isolation but, verified against
+    /// a live-session reconnect/replay production test
+    /// (`test_reconnected_completed_say_renders_the_component_card` in
+    /// `tests/named_brain_attach.rs`), corrupted the live area under rapid
+    /// successive grow/shrink ticks. Since growth always self-corrects (the
+    /// paragraph above), only a shrink needs to act, and dropping the
+    /// selection is exactly the same invalidation `redraw_full_viewport_inner`
+    /// already performs on every full repaint, extended to the one case a
+    /// full repaint does not cover. This means a selection does not survive
+    /// a shrinking live area with its highlight intact — a real UX
+    /// narrowing versus the `MoveTo` approach — but the row it pointed at is
+    /// never stamped with stale content, which is the actual invariant this
+    /// test (and the reported bug) cares about.
+    ///
+    /// This test drives the real `TuiRenderer` methods a live session uses —
+    /// `handle_mouse`, `draw_live_area_to`, `update_ghost_text` (opening the
+    /// `/` completion pane exactly as typing `/` does) — and replays every
+    /// byte it emits through `VtOracle`, a real VT100 parser (`vte`), the
+    /// same production-boundary technique `test_vt_oracle_*` already use
+    /// elsewhere in this file. It seeds the one precondition a real terminal
+    /// session guarantees before any selectable content exists — that a
+    /// prior commit's `redraw_full_viewport_inner` has already bottom-
+    /// anchored the live area via its own absolute `cursor::MoveTo` — by
+    /// placing the emulator's cursor at the row `viewport_redraw_plan` would
+    /// compute and resetting the renderer's own relative bookkeeping to
+    /// match (`active_rows`/`cursor_row_from_top = 0`, exactly what
+    /// `redraw_full_viewport_inner` leaves behind); every draw after that
+    /// goes through the unmodified, real `erase_live_area` +
+    /// `draw_live_area_to` pairing production always uses.
+    #[test]
+    fn test_selection_does_not_bleed_into_status_after_completion_pane_closes() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        output
+            .add_trait_message(Arc::new(StaticMessage::plain("Hi there, Shammah!")) as MessageRef);
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+
+        // Learn this frame's live_top (a probe draw; its own bytes and
+        // bookkeeping are discarded) so the emulator's cursor can be seeded
+        // exactly where a real `redraw_full_viewport_inner` commit would
+        // have absolutely repositioned it.
+        let mut probe = Vec::new();
+        renderer
+            .draw_live_area_to(&mut probe)
+            .expect("probe live draw must succeed");
+        let (_claim_top, claim_bottom) = renderer
+            .transcript_scroll
+            .visible_row_bounds()
+            .expect("a real frame must claim a non-empty transcript rect");
+        let live_top = claim_bottom + 1;
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        term.feed(format!("\x1b[{};1H", live_top + 1).as_bytes());
+
+        let mut initial = Vec::new();
+        renderer
+            .draw_live_area_to(&mut initial)
+            .expect("initial live draw must succeed");
+        term.feed(&initial);
+        assert_eq!(
+            term.row(9),
+            "",
+            "sanity: with only one short message, the properly bottom-anchored \
+             transcript tail must sit directly above the live area, leaving \
+             the unused rows above it blank; got {:?}\n{}",
+            term.row(9),
+            term.diagnostic()
+        );
+
+        let row = row_of(&renderer, "Hi there, Shammah!");
+        renderer.handle_mouse(left_down(row, 0));
+        renderer.handle_mouse(left_drag(row, 19));
+        assert!(
+            renderer.handle_mouse(left_up(row, 19)),
+            "release must finalize the drag into a selection"
+        );
+        assert!(renderer.selection.is_some(), "selection must be finalized");
+
+        // Erase + redraw to show the finalized highlight, exactly as
+        // `flush_output_safe`'s `live_area_should_redraw` branch does.
+        let mut erase = Vec::new();
+        write_live_area_erase(
+            &mut erase,
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+        )
+        .expect("erase before the release draw must succeed");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        term.feed(&erase);
+        let mut after_release = Vec::new();
+        renderer
+            .draw_live_area_to(&mut after_release)
+            .expect("draw after release must succeed");
+        term.feed(&after_release);
+        assert_eq!(
+            term.row(row as usize),
+            "Hi there, Shammah!",
+            "sanity: the selected line must still read correctly right after release"
+        );
+
+        // Open the "/" completion pane: `live_rows` grows by
+        // `autocomplete_widget::RESERVED_PANE_ROWS`.
+        renderer.input_textarea.insert_str("/");
+        renderer.update_ghost_text();
+        let mut erase = Vec::new();
+        write_live_area_erase(
+            &mut erase,
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+        )
+        .expect("erase before the open draw must succeed");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        term.feed(&erase);
+        let mut after_open = Vec::new();
+        renderer
+            .draw_live_area_to(&mut after_open)
+            .expect("draw after opening the pane must succeed");
+        term.feed(&after_open);
+
+        // Close it again: `live_rows` shrinks back to idle.
+        renderer.input_textarea.delete_char();
+        renderer.update_ghost_text();
+        let mut erase = Vec::new();
+        write_live_area_erase(
+            &mut erase,
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+        )
+        .expect("erase before the close draw must succeed");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        term.feed(&erase);
+        let mut after_close = Vec::new();
+        renderer
+            .draw_live_area_to(&mut after_close)
+            .expect("draw after closing the pane must succeed");
+        term.feed(&after_close);
+
+        assert!(
+            renderer.selection.is_none(),
+            "the fix's actual mechanism: a detected shrink (the completion \
+             pane closing) must have cleared the selection rather than \
+             leaving it pointing at now-uncertain geometry"
+        );
+
+        // The selected line must be visible in exactly one place — directly
+        // above the live area, the same physical row `write_live_frame`
+        // actually painted it at this tick — and every other row,
+        // especially the status line, must be exactly what this tick
+        // painted there, not a leftover fragment of the old selection.
+        let occurrences: Vec<usize> = (0..24)
+            .filter(|&r| term.row(r).contains("Hi there, Shammah!"))
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "the selected line must appear exactly once after the pane \
+             closes, not duplicated onto a stale row; occurrences={occurrences:?}\n{}",
+            term.diagnostic()
+        );
+        // The fix clears a survived selection on a detected shrink rather
+        // than forcing the live area to stay glued to the terminal's true
+        // bottom row (see this test's doc comment): a shrinking live area
+        // is free to end up higher on the physical screen than before,
+        // exactly as it already could pre-#1293, so the status line is
+        // located by its own content rather than assumed to sit at the
+        // last row.
+        let status_row = term.find_row("Tab complete").unwrap_or_else(|| {
+            panic!(
+                "the idle status line must be on screen somewhere;\n{}",
+                term.diagnostic()
+            )
+        });
+        assert_eq!(
+            term.row(status_row),
+            "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel",
+            "the idle status line must read its real content with no stale \
+             selected-text prefix bleeding in from the row the selection used \
+             to occupy before the completion pane opened and closed;\n{}",
+            term.diagnostic()
+        );
+    }
+
+    /// Code-review follow-up on #1293's fix: `write_live_frame`'s per-line
+    /// `Clear(ClearType::CurrentLine)` only ever reaches the physical row the
+    /// cursor is *on*, not a wrapped logical line's continuation row(s),
+    /// which the terminal's own auto-wrap positions rather than an explicit
+    /// `Print` in that loop. The bottom-anchoring fix above means a growing
+    /// frame's `cursor::MoveTo` can now claim rows `erase_live_area` never
+    /// touched (previously the native-scroll overflow path handed back
+    /// blank rows for free); if one of those newly-claimed rows is a wrapped
+    /// line's continuation row, only clearing the logical line's *first*
+    /// physical row would leave that row's stale tail — from whatever a
+    /// differently-sized earlier frame put there — visible past the new,
+    /// shorter content.
+    ///
+    /// This drives `write_live_frame` directly (the same technique
+    /// `test_vt_oracle_bottom_anchored_dialog_paint_repaint_and_close_stay_in_owned_rows`
+    /// uses elsewhere in this file), pre-seeding the target rows with long
+    /// stale content — standing in for that earlier, differently-sized
+    /// frame — then repositioning with the same absolute `cursor::MoveTo`
+    /// `draw_live_area_to` now issues before painting a frame whose one
+    /// logical line wraps to two physical rows with a short second row.
+    #[test]
+    fn test_write_live_frame_clears_a_wrapped_lines_continuation_row_into_stale_territory() {
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        // Seed two full rows of stale 'x's at absolute rows 5-6, standing in
+        // for whatever an earlier, differently-sized frame painted there —
+        // content `erase_live_area` (driven by a *different* previous
+        // frame's own row count) never touches.
+        term.feed(format!("\x1b[6;1H{}\r\n{}", "x".repeat(80), "x".repeat(80)).as_bytes());
+
+        // One logical line: "a" * 84 wraps to two physical rows at width 80
+        // (80 + 4). The bottom-anchoring `cursor::MoveTo` in
+        // `draw_live_area_to` lands this frame at row 5 the same way; here
+        // it is issued directly to isolate the wrap-clearing behavior from
+        // that bottom-anchoring computation (covered by the test above).
+        let frame = LiveFrame {
+            lines: vec!["a".repeat(84)],
+            cursor_visible: true,
+            ..LiveFrame::default()
+        };
+        let mut bytes = Vec::new();
+        execute!(bytes, cursor::MoveTo(0, 5)).unwrap();
+        write_live_frame(&mut bytes, &frame, 80).unwrap();
+        term.feed(&bytes);
+
+        assert_eq!(
+            term.row(5),
+            "a".repeat(80),
+            "sanity: the wrapped line's first physical row must be fully overwritten;\n{}",
+            term.diagnostic()
+        );
+        assert_eq!(
+            term.row(6),
+            "aaaa",
+            "the wrapped line's continuation row (positioned by the \
+             terminal's own auto-wrap, not an explicit Print in \
+             write_live_frame's loop) must show exactly its own 4-character \
+             tail, not that tail followed by leftover 'x's from the stale \
+             content seeded at this row;\n{}",
+            term.diagnostic()
         );
     }
 
