@@ -1,6 +1,6 @@
 // Claude generator implementation
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::context::{collect_instructions, InstructionSources};
+use crate::models::{ToolCallParser, ToolPromptFormatter};
 use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
@@ -146,6 +147,93 @@ impl ClaudeGenerator {
         build_system_prompt(self.cwd.as_deref(), self.instructions.text())
     }
 
+    /// Whether `tools` would need the prompt-injection fold: the provider
+    /// declares no native tool-calling capability and a non-empty tool set
+    /// was requested. The single predicate both `split_tools_for_capability`
+    /// (which request shape to build) and `requires_prompt_injected_tools`
+    /// (whether streaming can be used at all) key off, so the two decisions
+    /// cannot drift apart.
+    fn needs_prompt_injection(tools: &Option<Vec<ToolDefinition>>, client: &ClaudeClient) -> bool {
+        tools.as_ref().is_some_and(|tools| !tools.is_empty()) && !client.supports_tools()
+    }
+
+    /// Split requested tools into native `request.tools` (when the
+    /// configured provider can execute function-calling itself) or prompt
+    /// text to fold into the system prompt instead (when it cannot -- e.g.
+    /// the Claude CLI subscription backend, run with `--tools ""` so the
+    /// model executes nothing on its own authority). This is the same fold
+    /// `LocalGenerator::inject_tool_definitions` performs for local models
+    /// via the shared [`ToolPromptFormatter`] (issue #1276); doing it here
+    /// keeps `finch-providers` free of tool-execution and root-crate
+    /// dependencies while still letting a non-native-tool-calling transport
+    /// participate in Finch's own `ToolLoop` (issue #1303).
+    fn split_tools_for_capability(
+        &self,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> (Option<Vec<ToolDefinition>>, Option<String>) {
+        if !Self::needs_prompt_injection(&tools, &self.client) {
+            return (tools, None);
+        }
+        let tools = tools.expect("needs_prompt_injection confirmed a non-empty tool set");
+        (
+            None,
+            Some(ToolPromptFormatter::format_tools_for_prompt(&tools)),
+        )
+    }
+
+    /// Whether `tools` would need the prompt-injection fold above. Streaming
+    /// cannot support that fold: the `<tool_use>` markup must be stripped
+    /// from the complete response before any of it is safe to show, so a
+    /// turn that needs it must go through the buffered [`Generator::generate`]
+    /// path instead (the same restriction `QwenGenerator` accepts for local
+    /// tool-markup proposals, which also declares `supports_streaming:
+    /// false`).
+    fn requires_prompt_injected_tools(&self, tools: &Option<Vec<ToolDefinition>>) -> bool {
+        Self::needs_prompt_injection(tools, &self.client)
+    }
+
+    /// Parse `<tool_use>` markup a prompt-injected-tools turn produced back
+    /// into real [`ToolUse`] values, mirroring
+    /// `LocalGenerator::try_generate_from_pattern_with_tools`'s use of the
+    /// same [`ToolCallParser`] (issue #1276/#1303). A no-op when the model
+    /// did not call any tool.
+    fn parse_prompt_injected_tool_calls(response: GeneratorResponse) -> Result<GeneratorResponse> {
+        if !ToolCallParser::has_tool_calls(&response.text) {
+            return Ok(response);
+        }
+        let GeneratorResponse {
+            text: raw_text,
+            metadata,
+            ..
+        } = response;
+        let parsed = ToolCallParser::parse(&raw_text).with_context(|| {
+            format!(
+                "failed to parse prompt-injected tool-call markup from provider output: {raw_text}"
+            )
+        })?;
+        let text = ToolCallParser::extract_text(&raw_text);
+        let mut content_blocks = Vec::new();
+        if !text.is_empty() {
+            content_blocks.push(ContentBlock::Text { text: text.clone() });
+        }
+        for call in &parsed {
+            content_blocks.push(ContentBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+        }
+        Ok(GeneratorResponse {
+            text,
+            content_blocks,
+            tool_uses: parsed,
+            metadata: ResponseMetadata {
+                stop_reason: Some("tool_use".to_string()),
+                ..metadata
+            },
+        })
+    }
+
     /// Convert Claude MessageResponse to unified GeneratorResponse
     fn convert_to_unified(&self, response: crate::claude::MessageResponse) -> GeneratorResponse {
         let text = response
@@ -200,13 +288,23 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GeneratorResponse> {
-        let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
-        if let Some(tools) = tools {
+        let (native_tools, tool_prompt) = self.split_tools_for_capability(tools);
+        let mut system_prompt = self.system_prompt();
+        if let Some(tool_prompt) = &tool_prompt {
+            system_prompt.push_str(tool_prompt);
+        }
+        let mut request = MessageRequest::with_context(messages).with_system(system_prompt);
+        if let Some(tools) = native_tools {
             request = request.with_tools(tools);
         }
 
         let response = self.client.send_message(&request).await?;
-        Ok(self.convert_to_unified(response))
+        let response = self.convert_to_unified(response);
+        if tool_prompt.is_some() {
+            Self::parse_prompt_injected_tool_calls(response)
+        } else {
+            Ok(response)
+        }
     }
 
     async fn generate_stream(
@@ -214,6 +312,12 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        if self.requires_prompt_injected_tools(&tools) {
+            // The caller (`process_query_with_tools`) falls back to the
+            // buffered `generate` path on `Ok(None)`, the same way it does
+            // for local models that cannot stream a tool-markup proposal.
+            return Ok(None);
+        }
         let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
@@ -229,6 +333,9 @@ impl Generator for ClaudeGenerator {
         tools: Option<Vec<ToolDefinition>>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        if self.requires_prompt_injected_tools(&tools) {
+            return Ok(None);
+        }
         let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
@@ -423,6 +530,269 @@ mod tests {
         assert!(
             root < capsule,
             "the nested capsule must follow (and so refine) the root instructions:\n{system}"
+        );
+    }
+
+    /// Shared capability declaration for the two fixtures below: streaming
+    /// supported, tool calls unsupported, matching
+    /// `finch_providers::ClaudeCliProvider`'s real declaration (`--tools
+    /// ""`, issue #1303).
+    #[cfg(unix)]
+    fn no_native_tools_capabilities(
+        name: &str,
+        model: &str,
+    ) -> crate::providers::ModelCapabilities {
+        use crate::providers::{CapabilitySupport, ModelCapabilities, ReasoningCapability};
+        ModelCapabilities::static_metadata(
+            name,
+            model,
+            "2026-09-26",
+            "test fixture",
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-09-26", "test fixture"),
+            Some(100_000),
+            Some(10_000),
+            None,
+        )
+    }
+
+    /// Declares streaming supported but tool calls unsupported, and panics
+    /// from *both* `ProviderBackend` methods: this fixture proves the
+    /// capability check in `ClaudeGenerator::generate_stream_cancellable`
+    /// short-circuits before anything is sent for a tool-bearing turn, not
+    /// merely that the returned value happens to look like `None`.
+    #[cfg(unix)]
+    struct PanicsIfSentNoNativeToolsProvider;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for PanicsIfSentNoNativeToolsProvider {
+        async fn send_message_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<crate::providers::ProviderResponse> {
+            unreachable!("a tool-bearing turn must decline before sending anything")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+            unreachable!("a tool-bearing turn must decline to stream before sending anything")
+        }
+
+        fn name(&self) -> &str {
+            "no-native-tools-panics-if-sent"
+        }
+
+        fn default_model(&self) -> &str {
+            "no-native-tools-panics-if-sent-model"
+        }
+
+        fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
+            no_native_tools_capabilities(self.name(), model)
+        }
+    }
+
+    /// Declares the same no-native-tools capability but actually streams,
+    /// so a turn that never asked for tools can be proven to stream
+    /// normally against this same class of provider.
+    #[cfg(unix)]
+    struct StreamsWhenNoToolsAreRequestedProvider;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for StreamsWhenNoToolsAreRequestedProvider {
+        async fn send_message_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<crate::providers::ProviderResponse> {
+            unreachable!("this fixture only drives the streaming path")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+            let (tx, rx) = mpsc::channel(1);
+            let _ = tx
+                .send(Ok(crate::providers::StreamChunk::ContentBlockComplete(
+                    ContentBlock::Text {
+                        text: "ok".to_string(),
+                    },
+                )))
+                .await;
+            Ok(rx)
+        }
+
+        fn name(&self) -> &str {
+            "no-native-tools-streams"
+        }
+
+        fn default_model(&self) -> &str {
+            "no-native-tools-streams-model"
+        }
+
+        fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
+            no_native_tools_capabilities(self.name(), model)
+        }
+    }
+
+    #[cfg(unix)]
+    fn no_native_tool_definitions() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: crate::tools::ToolInputSchema::simple(vec![(
+                "file_path",
+                "Path to read",
+            )]),
+        }]
+    }
+
+    /// Regression for issue #1303: before the fix, `ClaudeGenerator` attached
+    /// Finch's default tool set to `ProviderRequest::tools` unconditionally,
+    /// so any provider that declares tool calls `Unsupported` (real example:
+    /// `finch_providers::ClaudeCliProvider`, run with `--tools ""` by design)
+    /// hit `ModelCapabilities::validate_request`'s tool-calls gate on the
+    /// very first turn -- including plain queries that never asked for a
+    /// tool, because Finch always attaches at least its own default tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_bearing_turn_against_a_non_native_tool_provider_skips_streaming() {
+        let provider = Arc::new(PanicsIfSentNoNativeToolsProvider);
+        let client = Arc::new(ClaudeClient::with_shared_provider(provider));
+        let generator = ClaudeGenerator::new_in(client, None, None);
+
+        let with_tools = generator
+            .generate_stream_cancellable(
+                vec![Message::user("hi")],
+                Some(no_native_tool_definitions()),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the capability check itself must not error");
+        assert!(
+            with_tools.is_none(),
+            "a provider without native tool calls must decline to stream a tool-bearing turn \
+             (Ok(None)) so the caller's existing streaming-unavailable fallback in \
+             process_query_with_tools drives it through the buffered generate() path, which can \
+             fold tools into the prompt and parse <tool_use> markup back out; streaming a raw \
+             request.tools attachment would instead hit validate_request's tool-calls gate"
+        );
+        // `provider` never panicked reaching this point, proving the
+        // short-circuit ran before either ProviderBackend method could be
+        // invoked -- not merely that the eventual result looked like None.
+    }
+
+    /// Companion to the regression above: declining to stream must be
+    /// specific to tool-bearing turns against a non-native-tool-calling
+    /// provider, not a blanket regression for this provider's
+    /// otherwise-supported streaming capability.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_without_tools_still_streams_against_a_non_native_tool_provider() {
+        let provider = Arc::new(StreamsWhenNoToolsAreRequestedProvider);
+        let client = Arc::new(ClaudeClient::with_shared_provider(provider));
+        let generator = ClaudeGenerator::new_in(client, None, None);
+
+        let without_tools = generator
+            .generate_stream_cancellable(
+                vec![Message::user("hi")],
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("a turn without tools must still be able to stream");
+        assert!(
+            without_tools.is_some(),
+            "a turn that never requested tools must still stream against a provider whose only \
+             unsupported capability is native tool calls"
+        );
+    }
+
+    /// Installs a fake `claude` executable (mirrors the fixture pattern in
+    /// `finch_providers::claude_cli::tests::install_fake_claude`) that emits
+    /// a canned assistant turn whose text is `<tool_use>` markup for the
+    /// `read` tool, in the wire shape measured against the real CLI.
+    #[cfg(unix)]
+    fn install_fake_claude_emitting_tool_use(dir: &std::path::Path) -> PathBuf {
+        let bin = dir.join("fake-claude-tool-use");
+        let script = r#"#!/bin/bash
+SID=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session-id" ] || [ "$prev" = "--resume" ]; then SID="$a"; fi
+  prev="$a"
+done
+cat >/dev/null
+printf '%s\n' \
+  '{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}' \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_tool_1","role":"assistant","content":[{"type":"text","text":"<tool_use>\n<name>read</name>\n<parameters>{\"file_path\": \"/tmp/x.txt\"}</parameters>\n</tool_use>"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
+  '{"type":"result","subtype":"success","is_error":false,"result":"<tool_use>\n<name>read</name>\n<parameters>{\"file_path\": \"/tmp/x.txt\"}</parameters>\n</tool_use>","stop_reason":"end_turn"}'
+"#;
+        std::fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// Production-boundary regression for issue #1303, driven through the
+    /// real `finch_providers::ClaudeCliProvider` transport (a fake `claude`
+    /// binary stands in for the real CLI, same fixture pattern that crate's
+    /// own tests use) rather than a same-crate mock: a tool-bearing request
+    /// must not hit `ModelCapabilities::validate_request`'s tool-calls gate,
+    /// and a `<tool_use>`-shaped CLI response must round-trip into a real
+    /// `ToolUse` Finch's `ToolLoop` can execute -- not merely "not rejected".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_cli_backend_folds_tools_into_the_prompt_and_round_trips_tool_use() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let binary = install_fake_claude_emitting_tool_use(temp.path());
+        let provider: Arc<dyn crate::providers::LlmProvider> = Arc::new(
+            finch_providers::ClaudeCliProvider::with_binary(binary, None),
+        );
+        let client = Arc::new(ClaudeClient::with_shared_provider(provider));
+        let generator = ClaudeGenerator::new_in(client, None, None);
+
+        let response = generator
+            .generate(
+                vec![Message::user("please read /tmp/x.txt")],
+                Some(no_native_tool_definitions()),
+            )
+            .await
+            .expect(
+                "a tool-bearing request must not hit ModelCapabilities::validate_request's \
+                 tool-calls gate; ClaudeCliProvider declares tool calls Unsupported by design \
+                 (--tools \"\") and ClaudeGenerator must fold them into the prompt instead of \
+                 attaching ProviderRequest::tools (#1303)",
+            );
+
+        assert_eq!(
+            response.tool_uses.len(),
+            1,
+            "the fake CLI's <tool_use> markup must parse back into a real ToolUse the ToolLoop \
+             can execute, not be silently dropped: tool_uses={:?} text={:?}",
+            response.tool_uses,
+            response.text
+        );
+        assert_eq!(
+            response.tool_uses[0].name, "read",
+            "the parsed ToolUse must carry the exact tool name the CLI's <tool_use> markup named: {:?}",
+            response.tool_uses[0]
+        );
+        assert_eq!(
+            response.tool_uses[0].input["file_path"], "/tmp/x.txt",
+            "the parsed ToolUse must carry the exact parameters the CLI's <tool_use> markup gave: {:?}",
+            response.tool_uses[0]
+        );
+        assert!(
+            !response.text.contains("<tool_use>"),
+            "the surfaced text must have tool-call markup stripped, matching \
+             LocalGenerator::try_generate_from_pattern_with_tools's behavior: {:?}",
+            response.text
         );
     }
 }
