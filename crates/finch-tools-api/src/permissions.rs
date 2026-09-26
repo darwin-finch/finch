@@ -283,23 +283,20 @@ pub const VM_DISCOVERY_TOOLS: &[&str] = &[
 /// Registered tool names a peer is hard-denied regardless of configuration.
 ///
 /// Keyed on the names the `Tool` implementations register — `restart_session`
-/// (`implementations/restart.rs`), `spawn_task` (`implementations/spawn.rs`),
-/// and `delegate_to_claude_code` (`implementations/claude_code.rs`) — not on
-/// unregistered literals, so a rename cannot silently strand the deny arm
-/// (the regression that made `test_peer_cannot_restart` and
-/// `test_peer_cannot_spawn` pass while proving nothing). `delegate_to_claude_code`
-/// grants a second, independently-authenticated agent real file and command
-/// access on the host, the same authority envelope `spawn_task` already
-/// earns a hard deny for — a peer must not be able to hand that authority to
-/// another agent any more than it can spawn one of Finch's own or restart the
-/// session. Peer agent coordination (`spawn_agent`, `await_agent`,
-/// `poll_agent`, `cancel_agent`) is scheduler-local and enforces task-tree
-/// ownership itself, so those names stay on [`PEER_SILENT_ALLOW_TOOLS`].
+/// (`implementations/restart.rs`) and `spawn_task` (`implementations/spawn.rs`)
+/// — not on unregistered literals, so a rename cannot silently strand the deny
+/// arm (the regression that made `test_peer_cannot_restart` and
+/// `test_peer_cannot_spawn` pass while proving nothing). `spawn_task` grants a
+/// second agent real file and command access on the host, the same authority
+/// envelope `restart_session` denies for — a peer must not be able to hand
+/// that authority to another agent any more than it can restart the session.
+/// Peer agent coordination (`spawn_agent`, `await_agent`, `poll_agent`,
+/// `cancel_agent`) is scheduler-local and enforces task-tree ownership
+/// itself, so those names stay on [`PEER_SILENT_ALLOW_TOOLS`].
 ///
 /// Every entry must be a name some `Tool` registers or an alias key;
 /// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
-pub const PEER_HARD_DENY_TOOLS: &[&str] =
-    &["restart_session", "spawn_task", "delegate_to_claude_code"];
+pub const PEER_HARD_DENY_TOOLS: &[&str] = &["restart_session", "spawn_task"];
 
 /// Registered tool names a peer may invoke silently, without an approval
 /// dialog: read-only examination plus scheduler-local agent control.

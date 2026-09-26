@@ -29,8 +29,8 @@ pub use implementations::spawn::TaskTool;
 pub use implementations::{
     AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool, AnsibleTool,
     AskUserQuestionTool, BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool,
-    ClaudeCodeDelegateTool, CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
-    FindCodeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
+    CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool, FindCodeTool,
+    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
     InspectMemoryTool, InspectProgramTool, InspectVmWordTool, InspectWordTool, LLMDelegationTool,
     ListRecentTool, PatchTool, PresentPlanTool, ReadTool, RemoveMemoryTool, RestartTool,
     SearchMemoryTool, SearchVmVocabularyTool, SearchVocabularyTool, SearchWordTool,
