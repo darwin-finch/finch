@@ -106,10 +106,45 @@ fn provider_native_tool_repair_hint(diagnostic: &str, language: &str) -> String 
     )
 }
 
+/// One-line correction appended to a repair request when the rejected
+/// submission was classified as Markdown wrapping (`WireFailureClass::MarkdownFence`)
+/// rather than any other compile/link failure. Reuses the same coarse,
+/// source-free classification aggregate conformance reporting already relies
+/// on (`classify_wire_failure`) instead of re-deriving fence detection here:
+/// that classification is true precisely when the diagnostic code is
+/// `E-WIRE-002` or the rejected source itself still opens with a `` ``` ``
+/// fence marker (`crates/finch-vm/src/lib.rs`) -- exactly the two ways
+/// `ProgramLanguage::infer_wire_source` and `strip_markdown_backtick_noise`
+/// (`src/cli/repl_event/query_processor.rs`) leave a fenced submission
+/// unstripped and reject it.
+///
+/// Without this, a model that wraps its program in backticks gets no better
+/// information on its repair attempt than on its first: the raw diagnostic
+/// alone does not say backticks are never required syntax, so nothing stops
+/// it from re-wrapping the retry the same way. This reproduces a live
+/// failure (issue #1230): a local model (Gemma) concluded a backtick was
+/// required, then kept re-wrapping its Lisp/Forth submissions in backticks
+/// across multiple turns, hitting this exact rejection repeatedly because
+/// the repair prompt never corrected the misconception.
+fn markdown_wrapping_repair_hint(
+    rejected_source: &str,
+    diagnostic: &str,
+    language: &str,
+) -> String {
+    if classify_wire_failure(rejected_source, diagnostic) != WireFailureClass::MarkdownFence {
+        return String::new();
+    }
+    format!(
+        "\n\nNote: do not wrap your program in backticks or Markdown code fences; submit raw \
+         {language} source directly."
+    )
+}
+
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     let language = ProgramLanguage::infer_source(rejected_source).as_str();
     let tool_call_hint = provider_native_tool_repair_hint(diagnostic, language);
+    let markdown_hint = markdown_wrapping_repair_hint(rejected_source, diagnostic, language);
     format!(
         "E-WIRE-001. You do not communicate with the human directly; every byte of your text output is Finch VM input. \
          The preceding Finch VM wire program was rejected before execution. \
@@ -118,7 +153,7 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
          Re-emit exactly one complete raw Finch {language} ProgramSubmission; do not use Markdown, prose, labels, or tools. \
          User-visible text must be produced by an output effect inside that program.\n\n\
          Rejected source:\n---\n{rejected_source}\n---\n\
-         Diagnostic:\n{diagnostic}{tool_call_hint}"
+         Diagnostic:\n{diagnostic}{tool_call_hint}{markdown_hint}"
     )
 }
 
@@ -1592,6 +1627,56 @@ mod tests {
         assert!(
             !typo_request.contains("provider-native tool call"),
             "an ordinary unlinked word must not get the tool-call reminder: {typo_request}"
+        );
+    }
+
+    #[test]
+    fn test_wire_repair_tells_a_markdown_wrapped_submission_not_to_use_backticks() {
+        // Reproduces the reported bug (issue #1230): a local model (Gemma) wrongly concluded a
+        // backtick was required syntax and kept re-wrapping its Lisp/Forth submissions in
+        // Markdown across turns, hitting this same E-WIRE-002 rejection repeatedly because the
+        // repair round only echoed the raw diagnostic back and never corrected the misconception.
+        let fenced_source = "```lisp\n(say \"hi\")\n```";
+        let diagnostic = "E-WIRE-002: Finch wire response must be raw Lisp/Co-Forth, not a \
+            Markdown code fence; emit s\"...\" say for user prose";
+        let request = wire_repair_request(fenced_source, diagnostic);
+        assert!(
+            request.contains(
+                "do not wrap your program in backticks or Markdown code fences; submit raw"
+            ),
+            "repair prompt must explicitly correct the backtick misconception: {request}"
+        );
+
+        // The `strip_markdown_backtick_noise` "leave untouched because it contains a later
+        // fence" path (src/cli/repl_event/query_processor.rs) also surfaces as E-WIRE-002 with
+        // a source that still opens on a bare word, not a fence marker; the hint keys off the
+        // diagnostic code (via `classify_wire_failure`), not solely the source's leading bytes.
+        let later_fence_source = "search_word\n```\n(say \"hi\")\n```";
+        let later_fence_request = wire_repair_request(later_fence_source, diagnostic);
+        assert!(
+            later_fence_request.contains("do not wrap your program in backticks"),
+            "a later, unenclosed fence must still get the correction: {later_fence_request}"
+        );
+    }
+
+    #[test]
+    fn test_wire_repair_omits_markdown_hint_for_an_ordinary_rejection() {
+        // Negative case: an ordinary compile/link failure with no Markdown wrapping in sight
+        // must not get the backtick correction -- it stays targeted to
+        // `WireFailureClass::MarkdownFence`, not appended to every repair prompt.
+        let diagnostic =
+            "error[E-LINK-002]: unknown Co-Forth word 'dupp'\n  = hint: did you mean `dup`?";
+        let request = wire_repair_request("dupp", diagnostic);
+        assert!(
+            !request.contains("Markdown code fences"),
+            "an ordinary unlinked-word rejection must not get the markdown-wrapping hint: {request}"
+        );
+
+        let prose_diagnostic = "E-LINK-002: unknown Co-Forth word";
+        let prose_request = wire_repair_request("Hello!", prose_diagnostic);
+        assert!(
+            !prose_request.contains("Markdown code fences"),
+            "raw prose with no fence must not get the markdown-wrapping hint: {prose_request}"
         );
     }
 
