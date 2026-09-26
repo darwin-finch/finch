@@ -3402,18 +3402,41 @@ impl TuiRenderer {
     /// genuinely moved, the gesture is a text-selection drag, and the
     /// widget the press landed on must not also toggle (`handle_left_release`
     /// never replays a click once a selection exists).
+    ///
+    /// A tick whose point sits at or past the transcript viewport's top or
+    /// bottom edge autoscrolls instead of just extending the head at that
+    /// fixed screen row (#1237): see [`Self::autoscroll_transcript_drag`].
     fn handle_left_drag(&mut self, mouse: MouseEvent) -> bool {
         let point = selection::SelectionPoint {
             row: mouse.row,
             col: mouse.column,
         };
-        if let Some(active) = self.selection.as_mut() {
-            if !active.dragging {
-                return false;
+        let dragging = self
+            .selection
+            .as_ref()
+            .is_some_and(|active| active.dragging);
+        if dragging {
+            let step = scroll_view::TRANSCRIPT_WHEEL_STEP_LINES;
+            if self
+                .transcript_scroll
+                .drag_autoscroll_delta(point.row, step)
+                .is_some()
+            {
+                self.autoscroll_transcript_drag(point);
+            } else {
+                let active = self
+                    .selection
+                    .as_mut()
+                    .expect("dragging was just read as true from this same selection");
+                active.extend(point);
             }
-            active.extend(point);
             self.live_area_dirty = true;
             return true;
+        }
+        if self.selection.is_some() {
+            // A selection exists but is no longer dragging (already
+            // finalized); a Drag event here has nothing to extend.
+            return false;
         }
         let Some(press) = self.selection_press_candidate else {
             return false;
@@ -3430,6 +3453,70 @@ impl TuiRenderer {
         self.selection = Some(fresh);
         self.live_area_dirty = true;
         true
+    }
+
+    /// Scroll the transcript one step toward `point`'s edge and keep the
+    /// active drag selection extending into whatever that scroll just
+    /// revealed (#1237).
+    ///
+    /// Selection rows are absolute terminal rows (`selection.rs`'s module
+    /// docs), and the only thing that actually moves content under a fixed
+    /// row is a full viewport repaint — but `redraw_full_viewport_inner`
+    /// unconditionally clears `self.selection` ("any full repaint clears
+    /// it", since it normally has no idea what a selection's rows still
+    /// mean after content moves under them). So this stashes the live
+    /// selection before forcing that repaint, then restores it afterward
+    /// with the anchor's row shifted by exactly how far the offset actually
+    /// moved — `offset_after - offset_before`, which is also how paint-time
+    /// quantization (not enough history to honor the full requested step,
+    /// or a wrapped line that can't be cut) naturally reduces the
+    /// compensation to whatever really scrolled. The result is clamped to
+    /// the claim's own visible rows: once the original anchor's tracked
+    /// position would land outside the viewport (a long autoscroll drag
+    /// pushed it off the opposite edge), pinning it to that edge keeps the
+    /// row range's boundary resolvable through the freshly rebuilt
+    /// `selection_index` instead of naming a row nothing occupies —
+    /// matching this module's existing "skip what the index has no entry
+    /// for" rule rather than inventing content-addressed tracking. The head
+    /// is simply re-extended to `point`: unchanged in screen terms, it
+    /// resolves through the post-scroll index to whichever newly-revealed
+    /// content now sits at the edge.
+    fn autoscroll_transcript_drag(&mut self, point: selection::SelectionPoint) {
+        let step = scroll_view::TRANSCRIPT_WHEEL_STEP_LINES;
+        let Some(delta) = self
+            .transcript_scroll
+            .drag_autoscroll_delta(point.row, step)
+        else {
+            return;
+        };
+        let offset_before = self.transcript_scroll.offset();
+        let saved = self.selection.take();
+        if !self.scroll_transcript_view(delta) {
+            // Already at the follow-mode bound (dragging past the bottom
+            // edge with nothing newer left to reveal): nothing moved, so
+            // just extend the head like an ordinary drag tick.
+            self.selection = saved;
+            if let Some(active) = self.selection.as_mut() {
+                active.extend(point);
+            }
+            return;
+        }
+        if let Err(error) = self.redraw_full_viewport() {
+            tracing::debug!(%error, "transcript drag autoscroll: full-viewport redraw failed");
+        }
+        let offset_after = self.transcript_scroll.offset();
+        let compensation = offset_after as i64 - offset_before as i64;
+        let Some(mut restored) = saved else {
+            return;
+        };
+        let mut anchor_row = i64::from(restored.anchor.row) + compensation;
+        anchor_row = match self.transcript_scroll.visible_row_bounds() {
+            Some((top, bottom_last)) => anchor_row.clamp(i64::from(top), i64::from(bottom_last)),
+            None => anchor_row.clamp(0, i64::from(u16::MAX)),
+        };
+        restored.anchor.row = anchor_row as u16;
+        restored.extend(point);
+        self.selection = Some(restored);
     }
 
     /// `Up(Left)`: decides what the whole gesture was (#1239). If a `Drag`
@@ -12756,6 +12843,197 @@ mod selection_tests {
              to column 10 of its third physical row must select the exact \
              contiguous source range {expected:?} (chars 30..171 of the \
              200-char line), not a discontiguous or gapped result; got {actual:?}"
+        );
+    }
+
+    /// A renderer with `count` single-row `StaticMessage` lines, numbered
+    /// oldest (`line 00`, added first) to newest, painted at the default
+    /// headless terminal size — enough lines to overflow the visible
+    /// transcript claim so follow mode hides the oldest ones above it.
+    fn renderer_with_numbered_lines(count: usize) -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        for i in 0..count {
+            output.add_trait_message(
+                Arc::new(StaticMessage::plain(format!("line {i:02}"))) as MessageRef
+            );
+        }
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut sink = Vec::new();
+        renderer
+            .draw_live_area_to(&mut sink)
+            .expect("initial live draw must succeed");
+        renderer
+    }
+
+    /// #1237: dragging to (and holding at) the transcript viewport's top
+    /// edge must autoscroll toward older content on every tick, and the
+    /// selection must extend to cover a line that was off-screen, above the
+    /// follow-mode window, before the drag started — driven through the
+    /// real `handle_mouse` dispatch and paint path, like the tests above.
+    #[test]
+    fn test_drag_past_top_edge_autoscrolls_and_reveals_older_content() {
+        let mut renderer = renderer_with_numbered_lines(40);
+
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            0,
+            "sanity: the transcript starts in follow mode"
+        );
+        assert!(
+            (0..64).all(|row| {
+                renderer
+                    .selection_index
+                    .row(row)
+                    .map(|entry| entry.text.as_str())
+                    != Some("line 00")
+            }),
+            "sanity: 40 lines must overflow the 80x24 headless terminal so the \
+             oldest line starts off-screen, above the follow-mode window"
+        );
+
+        let (top, _bottom_last) = renderer
+            .transcript_scroll
+            .visible_row_bounds()
+            .expect("a real frame must claim a non-empty transcript rect");
+        let start_row = top + 3;
+
+        renderer.handle_mouse(left_down(start_row, 0));
+        assert!(
+            renderer.handle_mouse(left_drag(start_row, 2)),
+            "the first drag tick must start the selection"
+        );
+
+        // Hold the drag at the top edge: each tick must scroll one more step
+        // toward older content, never backward, until "line 00" is revealed
+        // and falls inside the selection's row range. This stops as soon as
+        // that happens rather than running a fixed tick count: scrolling
+        // this far up eventually exhausts all 40 lines' worth of history and
+        // hides everything (a pre-existing, unrelated `scroll_window_split`
+        // property — offset counts rows hidden from the newest end, with no
+        // ceiling of its own), so continuing to drag past the reveal would
+        // scroll straight past it again.
+        let mut last_offset = renderer.transcript_scroll.offset();
+        let mut revealed = false;
+        for tick in 0..60 {
+            renderer.handle_mouse(left_drag(top, 0));
+            let offset = renderer.transcript_scroll.offset();
+            assert!(
+                offset >= last_offset,
+                "tick {tick}: dragging at the top edge must scroll toward older \
+                 content, never backward; offset went from {last_offset} to {offset}"
+            );
+            last_offset = offset;
+            let selection = renderer
+                .selection
+                .as_ref()
+                .expect("the selection must survive an autoscroll tick");
+            assert!(
+                selection.dragging,
+                "tick {tick}: the selection must still be an in-progress drag — the \
+                 scroll-triggered repaints must not have cleared it"
+            );
+            let (sel_top, sel_bottom) = selection.row_range();
+            if (sel_top..=sel_bottom).any(|row| {
+                renderer
+                    .selection_index
+                    .row(row)
+                    .map(|entry| entry.text.as_str())
+                    == Some("line 00")
+            }) {
+                revealed = true;
+                break;
+            }
+        }
+        assert!(
+            last_offset > 0,
+            "dragging past the top edge must have scrolled the view"
+        );
+        assert!(
+            revealed,
+            "drag-autoscroll must extend the selection to cover content that was \
+             off-screen before the drag within 60 ticks; final scroll offset {last_offset}"
+        );
+    }
+
+    /// #1237: dragging to (and holding at) the transcript viewport's bottom
+    /// edge, while already scrolled into history, must autoscroll toward
+    /// newer content on every tick, and the selection must extend to cover
+    /// the newest line — off-screen below the viewport before the drag.
+    #[test]
+    fn test_drag_past_bottom_edge_autoscrolls_and_reveals_newer_content() {
+        let mut renderer = renderer_with_numbered_lines(40);
+
+        // Scroll deep into history first (more than the content actually
+        // has, so it quantizes to the real maximum) and repaint at that
+        // scrolled position through the same production path a real scroll
+        // uses, so the newest line starts off-screen below the viewport.
+        renderer.transcript_scroll.set_offset(200);
+        renderer
+            .redraw_full_viewport_inner(false)
+            .expect("scrolled redraw must succeed");
+        assert!(
+            (0..64).all(|row| {
+                renderer
+                    .selection_index
+                    .row(row)
+                    .map(|entry| entry.text.as_str())
+                    != Some("line 39")
+            }),
+            "sanity: scrolling into history must push the newest line off-screen \
+             below the viewport"
+        );
+        let offset_after_setup = renderer.transcript_scroll.offset();
+        assert!(
+            offset_after_setup > 0,
+            "sanity: the view must actually be scrolled into history"
+        );
+
+        let (_top, bottom_last) = renderer
+            .transcript_scroll
+            .visible_row_bounds()
+            .expect("a real frame must claim a non-empty transcript rect");
+        let start_row = bottom_last.saturating_sub(3);
+
+        renderer.handle_mouse(left_down(start_row, 0));
+        assert!(
+            renderer.handle_mouse(left_drag(start_row, 2)),
+            "the first drag tick must start the selection"
+        );
+
+        let mut last_offset = renderer.transcript_scroll.offset();
+        for tick in 0..40 {
+            renderer.handle_mouse(left_drag(bottom_last, 0));
+            let offset = renderer.transcript_scroll.offset();
+            assert!(
+                offset <= last_offset,
+                "tick {tick}: dragging at the bottom edge must scroll toward newer \
+                 content, never backward; offset went from {last_offset} to {offset}"
+            );
+            last_offset = offset;
+        }
+
+        let selection = renderer
+            .selection
+            .as_ref()
+            .expect("the selection must survive the autoscroll ticks");
+        let (sel_top, sel_bottom) = selection.row_range();
+        let revealed_row = (sel_top..=sel_bottom).find(|row| {
+            renderer
+                .selection_index
+                .row(*row)
+                .map(|entry| entry.text.as_str())
+                == Some("line 39")
+        });
+        assert!(
+            revealed_row.is_some(),
+            "drag-autoscroll toward the bottom must extend the selection to cover \
+             content that was off-screen before the drag; row range is \
+             {sel_top}..={sel_bottom}, offset went from {offset_after_setup} to \
+             {last_offset}"
         );
     }
 }

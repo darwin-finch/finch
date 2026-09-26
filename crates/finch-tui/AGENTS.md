@@ -244,6 +244,24 @@ the top of `redraw_full_viewport_inner` (a new committed message, an explicit sc
 resize) — a drag still in progress is never routed through that function, so an ordinary drag tick
 never trips the clear.
 
+**Drag autoscroll at the viewport edge (#1237).** `handle_left_drag` checks each drag tick's point
+against `TranscriptScrollView::drag_autoscroll_delta` (`scroll_view.rs`): at or past the transcript
+claim's top or bottom edge, it scrolls one `TRANSCRIPT_WHEEL_STEP_LINES` step in that direction
+instead of just extending the head at that fixed screen row — the same per-tick step the wheel
+already uses, reused rather than inventing a second scroll-speed constant. Because
+`redraw_full_viewport_inner` unconditionally clears `self.selection` on any full repaint (the rule
+above), and scrolling requires exactly that repaint to move content under the drag's fixed screen
+rows, `autoscroll_transcript_drag` stashes the live selection first, forces the scroll + repaint,
+then restores it with the anchor's row shifted by `offset_after - offset_before` — the scroll that
+actually happened once paint-time quantization (not enough history, or a wrapped line that can't be
+cut) has had its say — clamped to the claim's own visible rows so a long autoscroll drag that pushes
+the original anchor off the opposite edge pins it to that edge instead of naming a row nothing
+occupies. The head is simply re-extended to the same point, which resolves through the freshly
+rebuilt `selection_index` to whatever the scroll just revealed. `test_drag_past_top_edge_autoscrolls_and_reveals_older_content`
+and `test_drag_past_bottom_edge_autoscrolls_and_reveals_newer_content` in `src/lib.rs`'s
+`selection_tests` module pin the direction and the row-range extension; `test_drag_autoscroll_delta_fires_at_or_past_each_edge_only`
+in `scroll_view.rs` pins the edge geometry.
+
 ## Dialogs are conversation widgets (#807)
 
 An open dialog is an inline card claimed by the widget tree, not a global overlay. When
