@@ -4,11 +4,14 @@
 // Automatically spawns daemon if not running.
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use reqwest::{header, Client};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::daemon::ensure_daemon_running;
+use crate::generators::StreamChunk;
 use crate::providers::{ContentBlock, Message};
 use crate::server::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
@@ -195,6 +198,118 @@ fn parse_local_model_status(value: &serde_json::Value) -> Result<LocalModelStatu
         "not_available" => Ok(LocalModelStatus::NotAvailable),
         other => anyhow::bail!("Unknown local model state: {other}"),
     }
+}
+
+/// Parse the daemon's own `/v1/chat/completions` SSE stream (OpenAI-compatible
+/// `data: {...}` chunks, one JSON object per line) into [`StreamChunk`]
+/// events on a background task, the same shape
+/// `ClaudeClient::send_message_stream_with_cancel` hands the REPL for a cloud
+/// provider.
+///
+/// The daemon's local-streaming path (`handle_chat_completions_streaming`)
+/// only ever populates `choices[0].delta.content`; it carries no `model` or
+/// `usage` field trustworthy enough to publish as `StreamChunk::ResponseMetadata`
+/// or `StreamChunk::Usage` (the `model` field echoes the request's `"qwen-local"`
+/// placeholder, not the actual served model — see #1210, "show each local
+/// provider's actual model in /providers"), so this parser deliberately emits
+/// only `TextDelta`. Callers fall back to `generator.model_name()` for the
+/// displayed model, same as before this stream existed.
+fn spawn_local_stream_parser(
+    response: reqwest::Response,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) -> mpsc::Receiver<Result<StreamChunk>> {
+    let (tx, rx) = mpsc::channel(64);
+
+    tokio::spawn(async move {
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return,
+                _ = tx.closed() => return,
+                next = stream.next() => next,
+            };
+
+            let Some(chunk_result) = next else {
+                // Connection closed. A clean stream always ends with an
+                // explicit "[DONE]" line handled below (which returns before
+                // reaching here); an EOF without one means the daemon or the
+                // connection dropped mid-turn.
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "Local model stream ended before its [DONE] marker"
+                    )))
+                    .await;
+                return;
+            };
+
+            let bytes = match chunk_result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "Local model stream read failed: {error}"
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            buffer.extend_from_slice(&bytes);
+
+            while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let Ok(line) = std::str::from_utf8(&line) else {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "Local model stream was not valid UTF-8"
+                        )))
+                        .await;
+                    return;
+                };
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.strip_prefix(' ').unwrap_or(data);
+                if data == "[DONE]" {
+                    return;
+                }
+
+                let chunk: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "Local model stream sent invalid JSON: {error}"
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                if tx
+                    .send(Ok(StreamChunk::TextDelta(text.to_string())))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
+    rx
 }
 
 impl DaemonClient {
@@ -402,6 +517,60 @@ impl DaemonClient {
             .json()
             .await
             .context("Failed to parse local model response")
+    }
+
+    /// Stream a text-only turn from the daemon's own local model over SSE.
+    ///
+    /// Mirrors `ClaudeClient::send_message_stream_with_cancel`'s shape
+    /// (`src/claude/client.rs`) but talks to Finch's own daemon instead of a
+    /// remote provider: it POSTs `stream: true` at the same
+    /// `/v1/chat/completions` endpoint `query_local` uses, and the daemon
+    /// answers over the already-working SSE path
+    /// (`handle_chat_completions_streaming`,
+    /// `src/server/openai_handlers.rs`), which until now was reachable only
+    /// by an external OpenAI-API-compatible client.
+    ///
+    /// The daemon's local-only streaming path does not forward tool
+    /// definitions to the generator (`try_generate_from_pattern_streaming`
+    /// takes no `tools` parameter), so this method never sends any; a caller
+    /// whose turn may need tool use must fall back to [`Self::query_local`]
+    /// instead, which does carry tools through the non-streaming response.
+    pub async fn query_local_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        use reqwest::StatusCode;
+
+        let request = ChatCompletionRequest {
+            model: "qwen-local".to_string(),
+            messages: Self::convert_to_openai_messages(&messages),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: true,
+            stop: None,
+            tools: None,
+            local_only: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .json(&request)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to send streaming request to the daemon's local model")?;
+
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Local model streaming request failed ({status}): {body}");
+        }
+
+        Ok(spawn_local_stream_parser(response, cancellation_token))
     }
 
     /// Read the secret-free provider/model overlay for a named Brain.

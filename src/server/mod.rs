@@ -1409,6 +1409,155 @@ mod tests {
         let _ = serving.await;
     }
 
+    /// Regression for the local-model generation leg that never streamed:
+    /// `DaemonClient::query_local` hardcoded `stream: false`, and
+    /// `DaemonLocalGenerator::generate_stream` always returned `Ok(None)`
+    /// regardless of arguments, so a local-model turn always fell through to
+    /// the blocking non-streaming path even though the daemon's own SSE
+    /// endpoint (`handle_chat_completions_streaming` above) already worked —
+    /// reachable, until now, only by an external OpenAI-API-compatible
+    /// client that explicitly sent `stream: true`.
+    ///
+    /// This spins up a real `AgentServer` (same `serve_on_listener` the
+    /// production daemon uses) on a real ephemeral TCP listener, with
+    /// `GeneratorState::Ready` backed by a `TextGeneration` test double via
+    /// `GeneratorModel::from_test_backend` — no GGUF file, no model
+    /// download, no supervisor-issued daemon authority needed, because
+    /// `for_brain_http_test` (used by the feedback tests above) never
+    /// touches `~/.finch` or daemon auto-discovery; it only needs an
+    /// ephemeral credential and a temp state root, same as those tests. It
+    /// then drives the server through `DaemonClient::query_local_stream_cancellable`
+    /// — the exact method `DaemonLocalGenerator::generate_stream_cancellable`
+    /// now calls — over a real HTTP POST and real SSE bytes on the wire, not
+    /// a helper-only unit test of the parser alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_local_stream_delivers_text_deltas_over_real_sse_round_trip() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, GeneratorModel, InferenceProvider, ModelFamily, ModelLoadConfig,
+            ModelSize, TextGeneration, TokenCallback,
+        };
+
+        struct StreamingTestBackend;
+
+        impl TextGeneration for StreamingTestBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                Ok(b"streamed-local-token"
+                    .iter()
+                    .map(|byte| u32::from(*byte))
+                    .collect())
+            }
+
+            fn generate_stream(
+                &mut self,
+                input_ids: &[u32],
+                max_new_tokens: usize,
+                mut callback: TokenCallback,
+            ) -> Result<Vec<u32>> {
+                let output = self.generate(input_ids, max_new_tokens)?;
+                callback(output[0], "streamed-local-token");
+                Ok(output)
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "streaming test backend"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(StreamingTestBackend), config);
+        let shared_model = Arc::new(RwLock::new(model));
+        let local_generator = Arc::new(RwLock::new(LocalGenerator::with_models(Some(Arc::clone(
+            &shared_model,
+        )))));
+        let generator_state = Arc::new(RwLock::new(GeneratorState::Ready {
+            model: shared_model,
+            model_name: "streaming test backend".to_string(),
+        }));
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([42; 32]);
+        let mut server =
+            AgentServer::for_brain_http_test("stream-fixture.local", temp.path(), authority)
+                .unwrap();
+        server.local_generator = local_generator;
+        server.generator_state = generator_state;
+        let server = Arc::new(server);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+
+        let client = crate::client::DaemonClient::for_test(format!("http://{address}"));
+        let mut rx = None;
+        for _ in 0..20 {
+            match client
+                .query_local_stream_cancellable(
+                    vec![crate::providers::Message::user("hello")],
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            {
+                Ok(receiver) => {
+                    rx = Some(receiver);
+                    break;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        let mut rx = rx.expect("streaming daemon did not accept a local request");
+
+        let mut received_text = String::new();
+        let mut chunk_count = 0usize;
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(crate::generators::StreamChunk::TextDelta(delta)) => {
+                    received_text.push_str(&delta);
+                    chunk_count += 1;
+                }
+                Ok(other) => panic!("unexpected non-text chunk from local SSE stream: {other:?}"),
+                Err(error) => panic!("local SSE stream produced an error: {error}"),
+            }
+        }
+
+        assert!(
+            chunk_count > 0,
+            "expected at least one TextDelta chunk from the real SSE round trip through the \
+             daemon's own /v1/chat/completions endpoint; got zero chunks"
+        );
+        assert!(
+            received_text.contains("streamed-local-token"),
+            "expected the mock backend's streamed token to reach the client through the real \
+             daemon SSE endpoint; received {received_text:?} across {chunk_count} chunk(s)"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_daemon_feedback_quota_is_redacted_unchanged_and_never_trains() {
         let temp = tempfile::tempdir().unwrap();

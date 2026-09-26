@@ -29,7 +29,7 @@ impl DaemonLocalGenerator {
             client,
             profile_name: profile_name.into(),
             capabilities: GeneratorCapabilities {
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_tools: true,
                 supports_conversation: true,
                 max_context_messages: Some(20),
@@ -102,10 +102,38 @@ impl Generator for DaemonLocalGenerator {
 
     async fn generate_stream(
         &self,
-        _messages: Vec<Message>,
-        _tools: Option<Vec<ToolDefinition>>,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
-        Ok(None)
+        self.generate_stream_cancellable(
+            messages,
+            tools,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        // The daemon's local-only SSE path never forwards tool definitions to
+        // the generator (see `DaemonClient::query_local_stream_cancellable`'s
+        // doc comment), so a turn that offers tools cannot stream tool calls
+        // through it. Returning `None` here falls through to the existing
+        // non-streaming `generate()` call, which does carry tools via
+        // `query_local`.
+        if tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Ok(None);
+        }
+
+        let rx = self
+            .client
+            .query_local_stream_cancellable(messages, cancellation_token)
+            .await?;
+        Ok(Some(rx))
     }
 
     fn capabilities(&self) -> &GeneratorCapabilities {
