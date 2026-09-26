@@ -350,6 +350,238 @@ fn test_local_helpers_neural_embeddings_toggle_survives_config_mapping_and_reope
     );
 }
 
+/// A minimal terminal emulator covering exactly the escape vocabulary
+/// `WizardHost::paint` emits (cursor addressing CSI H, erase-in-line/display
+/// CSI K/J, CR/LF, deferred autowrap, and `?`-prefixed mode-set/SGR
+/// sequences consumed as screen noise) — enough to replay its raw output
+/// bytes into the screen a reader would actually see. This is the same
+/// end-to-end check the tmux `capture-pane -e -p` byte-level verification
+/// that found #1297 performed live, reproduced deterministically here.
+struct MiniVt {
+    width: usize,
+    height: usize,
+    screen: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+    pending_wrap: bool,
+}
+
+impl MiniVt {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            screen: vec![vec![' '; width]; height],
+            row: 0,
+            col: 0,
+            pending_wrap: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let chars: Vec<char> = String::from_utf8_lossy(bytes).chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            index = self.step(&chars, index);
+        }
+    }
+
+    fn step(&mut self, chars: &[char], index: usize) -> usize {
+        match chars[index] {
+            '\x1b' => self.escape(chars, index + 1),
+            '\r' => {
+                self.col = 0;
+                self.pending_wrap = false;
+                index + 1
+            }
+            '\n' => {
+                self.line_feed();
+                index + 1
+            }
+            c if (c as u32) < 0x20 => index + 1,
+            c => {
+                self.put(c);
+                index + 1
+            }
+        }
+    }
+
+    fn escape(&mut self, chars: &[char], index: usize) -> usize {
+        if chars.get(index) != Some(&'[') {
+            return index + 1;
+        }
+        let mut cursor = index + 1;
+        let start = cursor;
+        while cursor < chars.len() && !('\u{40}'..='\u{7e}').contains(&chars[cursor]) {
+            cursor += 1;
+        }
+        if cursor >= chars.len() {
+            return chars.len();
+        }
+        let body: String = chars[start..cursor].iter().collect();
+        self.csi(&body, chars[cursor]);
+        cursor + 1
+    }
+
+    fn csi(&mut self, body: &str, final_byte: char) {
+        if body.starts_with('?') || body.starts_with('>') {
+            return; // mode sets, synchronized updates: screen noise
+        }
+        let params: Vec<usize> = body
+            .split(';')
+            .map(|part| part.parse::<usize>().unwrap_or(0))
+            .collect();
+        let first = params.first().copied().unwrap_or(0);
+        match final_byte {
+            'H' | 'f' => {
+                self.row = first.saturating_sub(1).min(self.height.saturating_sub(1));
+                self.col = params
+                    .get(1)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1)
+                    .min(self.width.saturating_sub(1));
+                self.pending_wrap = false;
+            }
+            'J' if first >= 2 => {
+                self.screen = vec![vec![' '; self.width]; self.height];
+            }
+            'K' if first == 0 => {
+                for column in self.col..self.width {
+                    self.screen[self.row][column] = ' ';
+                }
+                self.pending_wrap = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn line_feed(&mut self) {
+        self.pending_wrap = false;
+        if self.row + 1 < self.height {
+            self.row += 1;
+        } else {
+            self.screen.remove(0);
+            self.screen.push(vec![' '; self.width]);
+        }
+    }
+
+    fn put(&mut self, c: char) {
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            self.col = 0;
+            self.line_feed();
+        }
+        if self.row < self.height && self.col < self.width {
+            self.screen[self.row][self.col] = c;
+        }
+        self.col += 1;
+        if self.col >= self.width {
+            self.pending_wrap = true;
+        }
+    }
+
+    /// The visible screen, trailing blanks trimmed per row.
+    fn rows(&self) -> Vec<String> {
+        self.screen
+            .iter()
+            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+            .collect()
+    }
+}
+
+/// REGRESSION (#1297): toggling the Local Helpers memory-embeddings checkbox
+/// OFF shrinks its two-physical-row "On: ..." description to a one-row
+/// "Off: ..." description. Live tmux `capture-pane -e -p` verification
+/// showed the OLD second row ("recall quality than the fallback below.")
+/// surviving underneath the new one-row text. Root cause: the widget host's
+/// row-diff blit (`WizardHost::paint`) skips repainting a logical line whose
+/// printed *content* is unchanged from the previous frame, without checking
+/// whether that line's *absolute terminal row* moved — and it moved here,
+/// because the un-wrapped description was one logical `WizardLine` whose
+/// physical-row span (via terminal auto-wrap) shrank from 2 to 1, shifting
+/// every following line (including a blank padding row whose *text* reads
+/// the same in both frames) one row higher. Asserting on `frame.lines` alone
+/// would miss this: the computed frame for the OFF state never contains the
+/// stale text — only the *blitted* screen does, after two real paints. This
+/// test drives the real two-frame paint through a byte-accurate replay of
+/// the exact bytes `WizardHost::paint` writes, not a substring check.
+#[test]
+fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row() {
+    // 131 columns: wide enough that the OFF description (126 chars) fits on
+    // one physical row, but the ON description (170 chars) still needs two
+    // -- the long-to-short shrink #1297 depends on -- and the raw terminal's
+    // dumb character wrap (this line isn't word-wrapped before printing)
+    // happens to break ON's second row exactly on the word boundary this
+    // test asserts on. At the file's other tests' usual 100-column width
+    // both variants wrap to two rows, which would mask the defect entirely.
+    let width = 131;
+    let height = 30;
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::LocalHelpers;
+    assert!(
+        matches!(
+            state.sections.get(&WizardSection::LocalHelpers),
+            Some(SectionState::LocalHelpers {
+                use_neural_embeddings: true
+            })
+        ),
+        "must start ON (the default) so the toggle exercises the long-to-short \
+         direction; got {:?}",
+        state.sections.get(&WizardSection::LocalHelpers)
+    );
+
+    let mut host = crate::cli::tui::WizardHost::new();
+    let mut sink: Vec<u8> = Vec::new();
+
+    let view_on = wizard_view_with_permission_target(&state, "", width, height);
+    let frame_on = crate::cli::tui::plan_wizard_frame(&view_on, width, height);
+    host.paint(&mut sink, &frame_on, width, height).unwrap();
+    let mut terminal = MiniVt::new(width, height);
+    terminal.feed(&sink);
+    assert!(
+        terminal
+            .rows()
+            .iter()
+            .any(|row| row.contains("recall quality than the fallback below.")),
+        "sanity check: the ON description's second wrapped row must actually \
+         reach the terminal before the toggle flips, or this test proves \
+         nothing; screen:\n{}",
+        terminal.rows().join("\n")
+    );
+
+    // The real key path (Space toggles the checkbox), not a direct field
+    // mutation, so this exercises the same input the live tmux session did.
+    assert_eq!(
+        handle_wizard_key(&mut state, key(KeyCode::Char(' '))).unwrap(),
+        WizardAction::Continue
+    );
+    let view_off = wizard_view_with_permission_target(&state, "", width, height);
+    let frame_off = crate::cli::tui::plan_wizard_frame(&view_off, width, height);
+    sink.clear();
+    host.paint(&mut sink, &frame_off, width, height).unwrap();
+    terminal.feed(&sink);
+
+    let screen = terminal.rows();
+    assert!(
+        screen
+            .iter()
+            .any(|row| row.contains("Off: built-in hashed n-gram embeddings")),
+        "the OFF description must reach the terminal after the toggle; \
+         screen:\n{}",
+        screen.join("\n")
+    );
+    assert!(
+        !screen
+            .iter()
+            .any(|row| row.contains("recall quality than the fallback below.")),
+        "REGRESSION (#1297): the ON description's stale second wrapped row \
+         must not survive after toggling to the shorter OFF description; \
+         full screen contents:\n{}",
+        screen.join("\n")
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_permission_keys_separate_passive_check_from_prompt_request() {
@@ -547,6 +779,84 @@ fn gui_permission_required_status_includes_non_authoritative_process_diagnostics
     assert!(output.contains("Diagnostic only — executable: /tmp/target/debug/finch"));
     assert!(output.contains("launcher hint: Apple_Terminal"));
     assert!(!output.contains("Accessibility is not granted to"));
+}
+
+/// REGRESSION (#1298): the Settings tab's compact "GUI automation" row
+/// derived its one-line summary with `.strip_prefix("Trust status: ")`, a
+/// prefix `gui_automation_status_lines` never emits -- every real outcome
+/// starts with "Configured; ..." or a plain disabled/unsupported sentence --
+/// so the match could never succeed and the row always fell back to the
+/// generic "GUI automation status unavailable" placeholder, whether the
+/// process was trusted, untrusted, or in error. Confirmed live: a trusted
+/// process (checkbox showing checked) still summarised as "unavailable" even
+/// though the full detail view (D) showed the correct status.
+///
+/// The expected text for both the trusted and not-trusted case comes from
+/// the real `gui_automation_status_lines` function, never a mock string, so
+/// this pins the row to whatever that function actually says rather than to
+/// a copy of its wording.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_gui_automation_settings_summary_shows_real_status_not_generic_placeholder() {
+    let width = 140;
+    let height = 40;
+
+    for (label, availability_state) in [
+        ("trusted", AutomationState::Available),
+        ("not trusted", AutomationState::PermissionRequired),
+    ] {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        let availability = if let Some(SectionState::Features {
+            gui_automation,
+            gui_automation_availability,
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_last_known_available,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            gui_automation_availability.state = availability_state;
+            *gui_automation_prompt = AutomationPromptDisposition::NotNeeded;
+            *gui_automation_prompted = false;
+            *gui_automation_last_known_available = false;
+            // Row 0 ("Live responses"), not the GUI automation row itself:
+            // this exercises the compact list summary, not the D-key
+            // expanded detail view (already covered elsewhere).
+            *selected_idx = 0;
+            gui_automation_availability.clone()
+        } else {
+            panic!("Features section must exist on a fresh WizardState");
+        };
+
+        let expected_summary = gui_automation_status_lines(
+            true,
+            &availability,
+            AutomationPromptDisposition::NotNeeded,
+            false,
+            false,
+            "",
+            None,
+        )
+        .first()
+        .expect("gui_automation_status_lines must always return at least one line")
+        .plain_text();
+
+        let rendered = wizard_text_with_permission_target(&state, "", width, height);
+        assert!(
+            rendered.contains(&expected_summary),
+            "REGRESSION (#1298, {label}): the Settings tab's GUI automation row must show \
+             the real status {expected_summary:?} that gui_automation_status_lines returns, \
+             not a placeholder; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("GUI automation status unavailable"),
+            "REGRESSION (#1298, {label}): the generic placeholder must never show once a \
+             real status is known; rendered:\n{rendered}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1172,6 +1482,111 @@ fn test_confirm_screen_drives_through_the_widget_host_with_visible_text() {
     assert!(
         rendered.contains("Ready to go!") && rendered.contains("save & start chatting"),
         "the confirm screen must be speakable through the widget host; rendered:\n{rendered}"
+    );
+}
+
+/// REGRESSION (#1299): the Finish screen's "Ready to go!" summary only ever
+/// checked `streaming` and `auto_approve` -- two of the Features section's
+/// ~7 toggles -- so every other enabled setting silently never reached the
+/// last review screen before saving, including the two with real
+/// network/external effect (mDNS advertise, LAN peer discovery). Confirmed
+/// live: with Debug logging, GUI automation, Advertise on network, and
+/// Discover peers on LAN all showing checked on the Settings tab, the
+/// Finish screen read only "Settings: Live responses".
+#[test]
+fn test_finish_screen_summary_includes_every_enabled_features_toggle() {
+    let mut state = WizardState::new(None);
+    if let Some(SectionState::Features {
+        streaming,
+        auto_approve,
+        debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        auto_discover,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Features)
+    {
+        *streaming = true;
+        *auto_approve = false;
+        *debug = true;
+        #[cfg(target_os = "macos")]
+        {
+            *gui_automation = true;
+        }
+        *daemon_only_mode = false;
+        *mdns_discovery = true;
+        *auto_discover = true;
+    }
+    state.current_section = WizardSection::Review;
+
+    let rendered = render_wizard_text_at(&state, 160, 30);
+    for expected in [
+        "Live responses",
+        "Debug logging",
+        "Advertise on network",
+        "Discover peers on LAN",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "REGRESSION (#1299): the Finish screen summary must include every enabled \
+             Features toggle, including {expected:?} (mDNS advertise and LAN peer \
+             discovery are the two with real network effect); rendered:\n{rendered}"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        rendered.contains("GUI automation"),
+        "REGRESSION (#1299): GUI automation must appear on the Finish summary when \
+         enabled; rendered:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Skip permission prompts"),
+        "a toggle the user left off (auto_approve) must not appear in the summary; \
+         rendered:\n{rendered}"
+    );
+}
+
+/// A toggle that's off everywhere still summarises as "Defaults", not an
+/// empty or malformed line.
+#[test]
+fn test_finish_screen_summary_falls_back_to_defaults_when_every_toggle_is_off() {
+    let mut state = WizardState::new(None);
+    if let Some(SectionState::Features {
+        streaming,
+        auto_approve,
+        debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        auto_discover,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Features)
+    {
+        *streaming = false;
+        *auto_approve = false;
+        *debug = false;
+        #[cfg(target_os = "macos")]
+        {
+            *gui_automation = false;
+        }
+        *daemon_only_mode = false;
+        *mdns_discovery = false;
+        *auto_discover = false;
+    }
+    state.current_section = WizardSection::Review;
+
+    let rendered = render_wizard_text_at(&state, 160, 30);
+    let settings_row = rendered
+        .lines()
+        .find(|line| line.contains("Settings:"))
+        .unwrap_or_else(|| panic!("no Settings row in rendered Finish screen:\n{rendered}"));
+    assert!(
+        settings_row.contains("Defaults"),
+        "every toggle off must summarise as Defaults, not an empty line; \
+         Settings row: {settings_row:?}"
     );
 }
 

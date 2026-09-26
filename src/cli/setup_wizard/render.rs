@@ -18,7 +18,7 @@ use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
     wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_plain,
-    wizard_selected, WizardCard, WizardLine, WizardSectionContent, WizardView,
+    wizard_selected, wizard_wrap, WizardCard, WizardLine, WizardSectionContent, WizardView,
 };
 
 // ─── Small shared helpers ────────────────────────────────────────────────────
@@ -229,6 +229,31 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
     lines
 }
 
+/// Wrap `text` at `width` into one [`WizardLine`] per physical row, then pad
+/// with blank rows up to `min_rows`.
+///
+/// A toggle-driven description that prints as a single un-wrapped
+/// `WizardLine` relies on the terminal's own line wrap: the widget host's
+/// row-diff blit (`WizardHost::paint` in `crates/finch-tui`) clears only the
+/// row it repaints, and skips a logical line whose *content* is unchanged
+/// without checking whether that line's physical row moved. When a shorter
+/// variant makes this line (or anything after it) occupy fewer rows than the
+/// previous render, everything past the shrink point silently shifts up by
+/// one absolute terminal row, and a downstream line whose text happens to
+/// read the same in both frames (most often a blank pad row) is skipped even
+/// though it now sits one row higher — leaving the longer variant's last
+/// wrapped row stranded on screen (#1297). Exploding the text into one entry
+/// per physical row, then padding every variant to the *same* declared
+/// height, keeps the row count constant across toggle states so nothing
+/// downstream ever shifts.
+fn wrapped_and_padded(text: &str, color: Color, width: usize, min_rows: usize) -> Vec<WizardLine> {
+    let mut rows = wizard_wrap(&wizard_line(text, color), width);
+    while rows.len() < min_rows {
+        rows.push(WizardLine::blank());
+    }
+    rows
+}
+
 /// Local Helpers section: the separate local-only model choice for
 /// finch-builtin functions (memory embeddings today), distinct from the
 /// "Model Setup" tab's chat-provider configuration.
@@ -249,16 +274,30 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
     ));
     lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
 
-    let detail = if use_neural_embeddings {
-        "On: bge-small-en-v1.5 (GGUF, via llama.cpp), downloaded once on \
+    const ON_DETAIL: &str = "On: bge-small-en-v1.5 (GGUF, via llama.cpp), downloaded once on \
          first use, then runs locally with no further network calls. Better \
-         recall quality than the fallback below."
-    } else {
+         recall quality than the fallback below.";
+    const OFF_DETAIL: &str =
         "Off: built-in hashed n-gram embeddings. No download, no network access, \
-         ever -- at lower recall quality than the neural model."
+         ever -- at lower recall quality than the neural model.";
+    let detail = if use_neural_embeddings {
+        ON_DETAIL
+    } else {
+        OFF_DETAIL
     };
+
+    // #1297: declare the fixed height from both variants so switching the
+    // toggle never changes this block's total row count.
+    let fixed_rows = wizard_wrap(&wizard_line(ON_DETAIL, Color::DarkGray), width)
+        .len()
+        .max(wizard_wrap(&wizard_line(OFF_DETAIL, Color::DarkGray), width).len());
     lines.push(WizardLine::blank());
-    lines.push(wizard_line(detail, Color::DarkGray));
+    lines.extend(wrapped_and_padded(
+        detail,
+        Color::DarkGray,
+        width,
+        fixed_rows,
+    ));
     lines
 }
 
@@ -608,6 +647,50 @@ pub(super) fn gui_automation_status_lines(
     lines
 }
 
+/// The Settings tab's boolean toggles, in list order: `(label, enabled)`.
+///
+/// This is the single source of truth for which toggles exist. Both the
+/// Settings tab (`features_section_content`, which zips descriptions onto
+/// this same list) and the Finish screen's "Ready to go!" summary
+/// (`review_section_lines`) build from it, so adding a toggle here is enough
+/// for it to show up in both places — the Finish screen previously hardcoded
+/// its own two-item allowlist and silently dropped every setting added since,
+/// including the two with real network effect (#1299).
+#[allow(clippy::too_many_arguments)]
+fn feature_toggle_states(
+    streaming: bool,
+    auto_approve: bool,
+    debug: bool,
+    #[cfg(target_os = "macos")] gui_automation: bool,
+    daemon_only_mode: bool,
+    mdns_discovery: bool,
+    auto_discover: bool,
+) -> Vec<(&'static str, bool)> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            ("Live responses", streaming),
+            ("Skip permission prompts", auto_approve),
+            ("Debug logging", debug),
+            ("GUI automation", gui_automation),
+            ("Daemon-only mode", daemon_only_mode),
+            ("Advertise on network", mdns_discovery),
+            ("Discover peers on LAN", auto_discover),
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![
+            ("Live responses", streaming),
+            ("Skip permission prompts", auto_approve),
+            ("Debug logging", debug),
+            ("Daemon-only mode", daemon_only_mode),
+            ("Advertise on network", mdns_discovery),
+            ("Discover peers on LAN", auto_discover),
+        ]
+    }
+}
+
 /// One settings row group: the toggle/edit line and its dim description.
 fn feature_group(
     selected: bool,
@@ -725,90 +808,61 @@ fn features_section_content(
         return WizardSectionContent::plain(lines);
     }
 
+    // #1298: `gui_automation_status_lines` never emits a "Trust status: "
+    // prefix — every real outcome starts with "Configured; ..." or a plain
+    // "Finch capability consent is disabled" / "Configured, but unsupported"
+    // sentence — so a `strip_prefix("Trust status: ")` match can never
+    // succeed and the row always fell back to the generic placeholder,
+    // regardless of whether the process was trusted, untrusted, or in error.
+    // The real trust-status sentence is the first line `gui_automation_status_lines`
+    // returns, except when a transient "Settings action: ..." banner (from a
+    // just-pressed P/R) is queued ahead of it; skip that one line to reach
+    // the real status instead of parsing a prefix the source never writes.
     #[cfg(target_os = "macos")]
     let gui_automation_description = gui_automation_status
         .iter()
-        .find_map(|line| {
-            line.plain_text()
-                .strip_prefix("Trust status: ")
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "GUI automation status unavailable".to_string())
-        .to_string();
+        .map(|line| line.plain_text())
+        .find(|text| !text.starts_with("Settings action: "))
+        .unwrap_or_else(|| "GUI automation status unavailable".to_string());
     #[cfg(not(target_os = "macos"))]
     let gui_automation_description = String::new();
 
+    // The label/enabled pairs come from `feature_toggle_states`, the same
+    // list the Finish screen's summary reads (#1299): a toggle added there is
+    // automatically a row here too, so the two views cannot drift apart.
     #[cfg(target_os = "macos")]
-    let bool_features: Vec<(&str, bool, &str)> = vec![
-        (
-            "Live responses",
-            streaming,
-            "See Finch's answer as it types, word by word",
-        ),
-        (
-            "Skip permission prompts",
-            auto_approve,
-            "Let Finch run tools without asking each time",
-        ),
-        (
-            "Debug logging",
-            debug,
-            "Write verbose logs to ~/.finch/debug.log",
-        ),
-        (
-            "GUI automation",
-            gui_automation,
-            &gui_automation_description,
-        ),
-        (
-            "Daemon-only mode",
-            daemon_only_mode,
-            "Run as background server, no interactive REPL",
-        ),
-        (
-            "Advertise on network",
-            mdns_discovery,
-            "Broadcast this Finch instance via mDNS so others can discover it",
-        ),
-        (
-            "Discover peers on LAN",
-            auto_discover,
-            "Find and connect to other Finch instances at startup",
-        ),
+    let descriptions: [&str; 7] = [
+        "See Finch's answer as it types, word by word",
+        "Let Finch run tools without asking each time",
+        "Write verbose logs to ~/.finch/debug.log",
+        &gui_automation_description,
+        "Run as background server, no interactive REPL",
+        "Broadcast this Finch instance via mDNS so others can discover it",
+        "Find and connect to other Finch instances at startup",
     ];
     #[cfg(not(target_os = "macos"))]
-    let bool_features: Vec<(&str, bool, &str)> = vec![
-        (
-            "Live responses",
-            streaming,
-            "See Finch's answer as it types, word by word",
-        ),
-        (
-            "Skip permission prompts",
-            auto_approve,
-            "Let Finch run tools without asking each time",
-        ),
-        (
-            "Debug logging",
-            debug,
-            "Write verbose logs to ~/.finch/debug.log",
-        ),
-        (
-            "Daemon-only mode",
-            daemon_only_mode,
-            "Run as background server, no interactive REPL",
-        ),
-        (
-            "Advertise on network",
-            mdns_discovery,
-            "Broadcast this Finch instance via mDNS so others can discover it",
-        ),
-        (
-            "Discover peers on LAN",
-            auto_discover,
-            "Find and connect to other Finch instances at startup",
-        ),
+    let descriptions: [&str; 6] = [
+        "See Finch's answer as it types, word by word",
+        "Let Finch run tools without asking each time",
+        "Write verbose logs to ~/.finch/debug.log",
+        "Run as background server, no interactive REPL",
+        "Broadcast this Finch instance via mDNS so others can discover it",
+        "Find and connect to other Finch instances at startup",
     ];
+    let bool_features: Vec<(&str, bool, &str)> = feature_toggle_states(
+        streaming,
+        auto_approve,
+        debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        auto_discover,
+    )
+    .into_iter()
+    .zip(descriptions)
+    .map(|((name, enabled), description)| (name, enabled, description))
+    .collect();
 
     let hf_group = |selected: bool| -> Vec<WizardLine> {
         let (prefix, suffix) = if selected {
@@ -1120,16 +1174,33 @@ fn review_section_lines(state: &WizardState, width: usize) -> Vec<WizardLine> {
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
+        debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        auto_discover,
         ..
     }) = state.sections.get(&WizardSection::Features)
     {
-        let mut settings = vec![];
-        if *streaming {
-            settings.push("Live responses");
-        }
-        if *auto_approve {
-            settings.push("Skip permission prompts");
-        }
+        // #1299: every Features-section toggle that's on, not a hardcoded
+        // two-item allowlist — this used to silently drop settings with real
+        // network effect (mDNS advertise, LAN peer discovery) from the last
+        // review screen before saving. `feature_toggle_states` is the same
+        // list the Settings tab renders, so a future toggle can't repeat this.
+        let settings: Vec<&str> = feature_toggle_states(
+            *streaming,
+            *auto_approve,
+            *debug,
+            #[cfg(target_os = "macos")]
+            *gui_automation,
+            *daemon_only_mode,
+            *mdns_discovery,
+            *auto_discover,
+        )
+        .into_iter()
+        .filter_map(|(name, enabled)| enabled.then_some(name))
+        .collect();
         let settings_text = if settings.is_empty() {
             "Defaults".to_string()
         } else {
