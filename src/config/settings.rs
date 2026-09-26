@@ -324,6 +324,7 @@ impl ProviderEntry {
             Self::Openrouter { api_key, .. } => Some(("openrouter", api_key)),
             Self::Credentialed { .. }
             | Self::LegacyChatgptSubscription { .. }
+            | Self::ClaudeCliBackend { .. }
             | Self::Ollama { .. }
             | Self::RemoteDaemon { .. }
             | Self::Local { .. } => None,

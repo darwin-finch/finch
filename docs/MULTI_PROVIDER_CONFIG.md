@@ -29,6 +29,35 @@ name = "Claude"               # optional display name
 
 Get an API key: https://console.anthropic.com/
 
+### Claude CLI (subscription)
+
+```toml
+[[providers]]
+type = "claude_cli_backend"
+model = "claude-sonnet-5"     # optional — default: the CLI's own default
+binary = "/usr/local/bin/claude"  # optional — default: `claude` on PATH
+name = "Claude subscription"  # optional display name
+```
+
+No API key: this entry drives the official `claude` CLI (Claude Code) as a
+subprocess with `--print --input-format stream-json --output-format
+stream-json`, overriding the system prompt and disabling the CLI's own tools.
+The CLI holds its own OAuth login; check it with `claude auth status`. Finch
+never sees or stores credentials.
+
+**Read this before enabling.** This back-ends Finch with a personal
+Claude.ai subscription through the interactive CLI product. Anthropic has
+enforced account suspensions against CLI-wrapper/proxy usage that disguises a
+subscription-gated product as a generic backend for another product. Adding
+this entry to your config is an explicit, informed acceptance of that risk.
+The setup wizard never offers it, and it is off unless configured by hand.
+Measured behavior differences from API-key providers: provider-native tool
+calls are unsupported by design (the CLI runs with no tools, so Finch's
+permission system stays the only execution authority), and conversation
+history is owned by the CLI session — Finch sends each turn's pending user
+content and lets `--resume` carry the rest, so its own context compaction
+does not apply to this backend.
+
 ### OpenAI
 
 ```toml
