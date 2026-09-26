@@ -11,8 +11,11 @@
 //! The #441 release-on-first-wheel policy is retired: the wheel is no longer
 //! handed back to the terminal, because native scrollback is not the reader —
 //! `canonical_commit` keeps the fully expanded copyable record there instead.
-//! Native text drag-selection under held capture remains the known trade
-//! tracked on #221, and a future opt-out preference is #244.
+//! Native text drag-selection under held capture was the #221 trade;
+//! `selection.rs` is Finch's own in-app replacement (click-drag highlight +
+//! clipboard copy) rather than giving capture back to the terminal, so #221
+//! no longer needs the terminal's own selection. A future opt-out preference
+//! is #244.
 //!
 //! Shutdown, panic, suspend, and emergency restore always emit
 //! `DisableMouseCapture` so a session that held tracking cannot leak it into

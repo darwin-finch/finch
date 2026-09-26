@@ -180,6 +180,37 @@ release-on-first-wheel hybrid is retired, native history stays the copyable reco
 `canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
 the reader.
 
+## Click-drag transcript text selection (#221)
+
+Mouse capture is held by default (#806, above), so the terminal never gets a native click-drag
+selection — `selection.rs` is Finch's own in-app replacement, dispatched from
+`TuiRenderer::handle_mouse_to`'s non-wheel branch. A `Down(Left)` on an existing click hitbox
+(`point_is_on_click_hitbox`: a tool-viewport control, a component disclosure region, or a legacy
+accordion `hit_region_at`) keeps today's immediate toggle-on-press behavior untouched and never
+starts a selection; a `Down(Left)` anywhere else in the transcript claim only stashes a press
+candidate — nothing highlights until a `Drag(Left)` actually moves, so a plain click still selects
+nothing and a press-then-drag that started on a hit region never also selects the row underneath it.
+`Up(Left)` finalizes the selection (it stays highlighted and copyable — matching Claude Code's own
+released-selection behavior) and best-effort copies the text to the system clipboard through
+`arboard` (`copy_selection_to_clipboard`), the same crate already used for the OAuth device-code
+copy in `grok_auth.rs`/`chatgpt_auth.rs`; a clipboard failure never clears the selection.
+
+`SelectionIndex` (rebuilt every frame in `rebuild_transcript_hit_regions`, from the same
+`combined` `RenderedTranscriptLine`s and `plan.transcript_top` the hit regions use) only indexes
+rows that occupy exactly one physical terminal row — a wrapped multi-row logical line is not
+indexed, so a drag simply has a gap there; wrapping-aware selection is a documented follow-up, not
+something guessed at. The highlight itself lowers through the normal `Span`/`SpanStyle` path
+(`span_render::selection_highlight_style`, `lower_span`) exactly like every other transcript
+style — never raw SGR in a renderer — but paints as a small targeted overlay
+(`paint_selection_overlay`, bracketed by `SavePosition`/`RestorePosition`) after the normal frame
+write, not as a third span-lowering seam over component content: it never touches
+`RenderedTranscriptLine`/component styling, and a row it touches reverts to plain text plus the
+highlight background until the next full content redraw restores its real styling. A finalized
+selection is cleared by the simplest rule that matches "redraw invalidates it": unconditionally, at
+the top of `redraw_full_viewport_inner` (a new committed message, an explicit scroll, or a
+resize) — a drag still in progress is never routed through that function, so an ordinary drag tick
+never trips the clear.
+
 ## Dialogs are conversation widgets (#807)
 
 An open dialog is an inline card claimed by the widget tree, not a global overlay. When

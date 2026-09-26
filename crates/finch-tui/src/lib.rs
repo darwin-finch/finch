@@ -20,7 +20,9 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     style::{Attribute, Color, Print, SetAttribute, SetForegroundColor},
     terminal::{
@@ -56,6 +58,7 @@ mod dom_manifest;
 mod isolation;
 mod mouse_capture;
 mod scroll_view;
+mod selection;
 mod shadow_buffer; // kept – good architecture for future diffing
 mod span_render;
 mod tabbed_dialog;
@@ -1474,6 +1477,23 @@ pub struct TuiRenderer {
     /// so wheels scroll the conversation ScrollView (#806); native history
     /// stays the copyable record, not the reader.
     mouse_tracking: mouse_capture::MouseTracking,
+
+    /// Click-drag text selection over the transcript (#221): `None` until a
+    /// drag starts, `Some(.., dragging: true)` while the button is still
+    /// down, and `Some(.., dragging: false)` for a released selection that
+    /// stays highlighted and copyable until something clears it. See
+    /// `selection.rs` for the invalidation rule.
+    selection: Option<selection::TranscriptSelection>,
+    /// The press point of a `Down(Left)` that landed on plain transcript
+    /// text (not a hit region), kept only long enough to see whether the
+    /// next event is a `Drag` (promotes to `selection`) or an `Up` (a plain
+    /// click; nothing to select).
+    selection_press_candidate: Option<selection::SelectionPoint>,
+    /// Row → plain-text snapshot of the currently painted transcript,
+    /// rebuilt every frame in `rebuild_transcript_hit_regions` so mouse
+    /// handling can always resolve a drag point against what is really on
+    /// screen.
+    selection_index: selection::SelectionIndex,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -1535,6 +1555,9 @@ impl TuiRenderer {
             last_status_snapshot: None,
             last_message_snapshot: Vec::new(),
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
+            selection: None,
+            selection_press_candidate: None,
+            selection_index: selection::SelectionIndex::default(),
         }
     }
 
@@ -1627,6 +1650,9 @@ impl TuiRenderer {
             last_status_snapshot: None,
             last_message_snapshot: Vec::new(),
             mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
+            selection: None,
+            selection_press_candidate: None,
+            selection_index: selection::SelectionIndex::default(),
         })
     }
 
@@ -1957,6 +1983,50 @@ impl TuiRenderer {
         self.active_rows = rows;
         self.cursor_row_from_top = frame.cursor_row;
         self.rebuild_transcript_hit_regions(&frame, rows, term_width, term_h);
+        self.paint_selection_overlay(out)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Paint the drag-selection highlight over whatever the frame above just
+    /// wrote (#221). This runs after the normal frame write, as a small
+    /// targeted overlay — not a third span-lowering seam over component
+    /// content, since it never touches `RenderedTranscriptLine`/component
+    /// styling. It repaints only the rows `selection::highlighted_rows`
+    /// names, using `self.selection_index`'s plain text for those rows (the
+    /// same snapshot `rebuild_transcript_hit_regions` just refreshed), so it
+    /// never guesses at content it did not just see painted. A row touched
+    /// by the overlay reverts to plain text plus the highlight background —
+    /// its own component styling (colours, bold) is not preserved while
+    /// selected; it returns on the next full content redraw. `SavePosition`/
+    /// `RestorePosition` bracket the writes so the composer cursor lands
+    /// exactly where the normal frame write left it.
+    fn paint_selection_overlay(&mut self, out: &mut impl Write) -> Result<()> {
+        let Some(active) = &self.selection else {
+            return Ok(());
+        };
+        let rows = selection::highlighted_rows(&self.selection_index, active);
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let style = span_render::selection_highlight_style();
+        execute!(out, cursor::SavePosition)?;
+        for (row, text, (start, end)) in rows {
+            let chars: Vec<char> = text.chars().collect();
+            let prefix: String = chars[..start].iter().collect();
+            let highlighted: String = chars[start..end].iter().collect();
+            let suffix: String = chars[end..].iter().collect();
+            execute!(out, cursor::MoveTo(0, row))?;
+            if !prefix.is_empty() {
+                execute!(out, Print(&prefix))?;
+            }
+            let span = finch_ui_model::Span::styled(highlighted, style);
+            execute!(out, Print(span_render::lower_span(&span)))?;
+            if !suffix.is_empty() {
+                execute!(out, Print(&suffix))?;
+            }
+        }
+        execute!(out, cursor::RestorePosition)?;
         Ok(())
     }
 
@@ -3042,6 +3112,14 @@ impl TuiRenderer {
         let live_top = height.saturating_sub(live_rows);
         self.accordion
             .adopt_claimed_hitboxes(&frame.hitboxes, live_top, width);
+
+        // Selection (#221) reads the same ordered lines and top offset the
+        // hit regions above just used, so a drag always resolves against
+        // exactly what this frame painted.
+        let selection_top = u16::try_from(plan.transcript_top).unwrap_or(u16::MAX);
+        let selection_width = u16::try_from(width).unwrap_or(u16::MAX);
+        self.selection_index =
+            selection::SelectionIndex::build(&combined, selection_top, selection_width);
     }
 
     pub(crate) fn handle_accordion_key(&mut self, key: KeyEvent) -> bool {
@@ -3258,7 +3336,128 @@ impl TuiRenderer {
             };
             self.scroll_transcript_view(transcript_delta)
         } else {
-            self.handle_accordion_mouse(mouse)
+            match mouse.kind {
+                // A press that lands on an interactive hit region keeps its
+                // existing click-to-toggle behavior untouched below (#221):
+                // only a press that lands on plain transcript text becomes a
+                // selection candidate, so starting a drag on a "Program
+                // source" header (say) still just toggles it, never also
+                // starts a selection underneath.
+                MouseEventKind::Down(MouseButton::Left) => self.handle_left_press(mouse),
+                MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(mouse),
+                MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(),
+                _ => self.handle_accordion_mouse(mouse),
+            }
+        }
+    }
+
+    /// Whether `(column, row)` lands on an existing click hitbox: a tool
+    /// viewport control, a component-owned disclosure row, or a legacy
+    /// accordion disclosure row. Mirrors the precedence
+    /// `handle_accordion_mouse` itself checks in, so "is this a hit region"
+    /// never disagrees with what a click there would actually do.
+    fn point_is_on_click_hitbox(&self, column: u16, row: u16) -> bool {
+        self.tool_viewports.region_at(column, row).is_some()
+            || self.accordion.component_region_at(column, row).is_some()
+            || self.accordion.hit_region_at(column, row).is_some()
+    }
+
+    /// `Down(Left)`: a press over a hit region keeps today's immediate
+    /// toggle-on-press behavior (`handle_accordion_mouse`) untouched. A press
+    /// over plain transcript text instead only stashes a selection
+    /// candidate — nothing highlights yet, so a plain click that never drags
+    /// paints nothing new. Either way, any previously finalized selection is
+    /// cleared: a new press elsewhere is exactly "the user is done reading
+    /// that selection."
+    fn handle_left_press(&mut self, mouse: MouseEvent) -> bool {
+        if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
+            // A dialog owns the live area (#807); selection stays inert
+            // behind it, matching the wheel's own dialog guard above.
+            return self.handle_accordion_mouse(mouse);
+        }
+        let had_selection = self.selection.take().is_some();
+        self.selection_press_candidate = None;
+        if !self.point_is_on_click_hitbox(mouse.column, mouse.row)
+            && self.transcript_scroll.owns(mouse.column, mouse.row)
+        {
+            self.selection_press_candidate = Some(selection::SelectionPoint {
+                row: mouse.row,
+                col: mouse.column,
+            });
+        }
+        let handled = self.handle_accordion_mouse(mouse);
+        if had_selection {
+            self.viewport_invalidated = true;
+            self.live_area_dirty = true;
+        }
+        handled || had_selection
+    }
+
+    /// `Drag(Left)`: promotes a pending press candidate into an active
+    /// selection on its first tick, then extends the existing selection's
+    /// head on every later tick. A drag that started on a hit region (no
+    /// candidate was stashed) is ignored, so dragging off a toggled header
+    /// never starts a selection underneath it.
+    fn handle_left_drag(&mut self, mouse: MouseEvent) -> bool {
+        let point = selection::SelectionPoint {
+            row: mouse.row,
+            col: mouse.column,
+        };
+        if let Some(active) = self.selection.as_mut() {
+            if !active.dragging {
+                return false;
+            }
+            active.extend(point);
+            self.live_area_dirty = true;
+            return true;
+        }
+        let Some(anchor) = self.selection_press_candidate else {
+            return false;
+        };
+        let mut fresh = selection::TranscriptSelection::new(anchor);
+        fresh.extend(point);
+        self.selection = Some(fresh);
+        self.live_area_dirty = true;
+        true
+    }
+
+    /// `Up(Left)`: finalizes an in-progress selection so it stays visible
+    /// and copyable, and best-effort copies it to the system clipboard. A
+    /// release that never actually dragged (anchor == head) leaves nothing
+    /// selected, matching a plain click.
+    fn handle_left_release(&mut self) -> bool {
+        self.selection_press_candidate = None;
+        let Some(active) = self.selection.as_mut() else {
+            return false;
+        };
+        if !active.dragging {
+            return false;
+        }
+        active.finish();
+        if active.is_empty() {
+            self.selection = None;
+            return true;
+        }
+        let text = selection::selected_text(&self.selection_index, active);
+        self.copy_selection_to_clipboard(&text);
+        self.live_area_dirty = true;
+        true
+    }
+
+    /// Best-effort system clipboard copy (#221): the same `arboard` crate
+    /// already used for the OAuth device-code copy (`grok_auth.rs`,
+    /// `chatgpt_auth.rs`). A clipboard failure (no clipboard provider, a
+    /// headless/sandboxed session) never breaks the selection itself — it
+    /// stays highlighted either way, so the text is still readable and
+    /// selectable again on the next drag.
+    fn copy_selection_to_clipboard(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Err(error) =
+            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        {
+            tracing::debug!(%error, "transcript selection: clipboard copy failed");
         }
     }
 
@@ -3548,6 +3747,17 @@ impl TuiRenderer {
     }
 
     fn redraw_full_viewport_inner(&mut self, synchronized_update_open: bool) -> Result<()> {
+        // A full repaint rewrites every row this function touches from
+        // scratch (a new committed message, an explicit scroll, or a
+        // terminal resize) — whatever a selection pointed at may no longer
+        // be there, or be there at a different row. #221 chooses the simple
+        // rule over trying to carry a selection across content that moved:
+        // any full repaint clears it. A drag in progress is repainted by
+        // `paint_selection_overlay` instead (`draw_live_area_to`), which
+        // never calls this function, so an ordinary drag tick does not trip
+        // this clear.
+        self.selection = None;
+        self.selection_press_candidate = None;
         let (width, height) = self
             .pending_viewport_size
             .take()
@@ -11965,6 +12175,262 @@ mod attention_bell_tests {
              bells={} payload_len={}",
             bell_count(&next),
             next.len()
+        );
+    }
+}
+
+/// Click-drag transcript text selection (#221). These drive real
+/// `MouseEvent`s through `TuiRenderer::handle_mouse` and real frames through
+/// `draw_live_area_to`/`redraw_full_viewport_inner` — the actual production
+/// dispatch and paint path — rather than calling `selection.rs`'s pure
+/// functions directly (those get their own unit tests in that module).
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use finch_messages::{StaticMessage, WorkUnit};
+    use std::sync::Arc;
+
+    fn renderer_with_plain_line(text: &str) -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        output.add_trait_message(Arc::new(StaticMessage::plain(text)) as MessageRef);
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut sink = Vec::new();
+        renderer
+            .draw_live_area_to(&mut sink)
+            .expect("initial live draw must succeed");
+        renderer
+    }
+
+    /// The row the given exact text painted on, from the same
+    /// `selection_index` a real drag consults — never a hand-computed
+    /// geometry guess.
+    fn row_of(renderer: &TuiRenderer, text: &str) -> u16 {
+        (0..48)
+            .find(|row| {
+                renderer
+                    .selection_index
+                    .row(*row)
+                    .is_some_and(|entry| entry.text == text)
+            })
+            .unwrap_or_else(|| panic!("{text:?} never appears as a single-row selectable line"))
+    }
+
+    fn left_down(row: u16, col: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn left_drag(row: u16, col: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn left_up(row: u16, col: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The core happy path: press on plain transcript text, drag right,
+    /// release. The selection must highlight while dragging, survive the
+    /// release (stay visible/copyable), and resolve to exactly the dragged
+    /// substring.
+    #[test]
+    fn test_drag_over_transcript_line_selects_and_survives_release() {
+        let mut renderer = renderer_with_plain_line("hello selectable world");
+        let row = row_of(&renderer, "hello selectable world");
+
+        renderer.handle_mouse(left_down(row, 0));
+        assert!(
+            renderer.selection.is_none(),
+            "a press alone, before any Drag, must not create a selection"
+        );
+
+        assert!(
+            renderer.handle_mouse(left_drag(row, 4)),
+            "the first Drag tick after a qualifying press must start a selection"
+        );
+        let dragging = renderer
+            .selection
+            .as_ref()
+            .expect("a selection must exist mid-drag");
+        assert!(dragging.dragging, "selection must still be marked dragging");
+        assert_eq!(
+            selection::highlighted_rows(&renderer.selection_index, dragging),
+            vec![(row, "hello selectable world".to_string(), (0, 5))],
+            "dragging from column 0 to column 4 must highlight 'hello' (char range [0,5))"
+        );
+
+        assert!(
+            renderer.handle_mouse(left_up(row, 4)),
+            "release must be handled (finalizes the selection and attempts the \
+             clipboard copy)"
+        );
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("the selection must survive Up — it stays visible until something clears it");
+        assert!(
+            !released.dragging,
+            "a released selection must no longer be marked dragging"
+        );
+        assert_eq!(
+            selection::selected_text(&renderer.selection_index, released),
+            "hello",
+            "the released selection's text must be exactly the dragged range"
+        );
+    }
+
+    /// A plain click (Down then Up at the same point, no Drag in between)
+    /// must not create any selection — matching a real terminal, where a
+    /// click alone never starts a drag-select.
+    #[test]
+    fn test_plain_click_without_drag_selects_nothing() {
+        let mut renderer = renderer_with_plain_line("just some text");
+        let row = row_of(&renderer, "just some text");
+
+        renderer.handle_mouse(left_down(row, 2));
+        assert!(renderer.selection.is_none(), "press alone selects nothing");
+        let handled = renderer.handle_mouse(left_up(row, 2));
+        assert!(
+            !handled,
+            "a release with no preceding Drag has nothing to finalize"
+        );
+        assert!(
+            renderer.selection.is_none(),
+            "a click that never dragged must leave no selection behind"
+        );
+    }
+
+    /// A press that lands on an existing disclosure hit region (a "Program
+    /// source" header, say) keeps today's immediate toggle-on-press
+    /// behavior, and a drag that starts there must not also start a text
+    /// selection underneath it (#221's coexistence rule).
+    #[test]
+    fn test_drag_starting_on_a_disclosure_header_still_toggles_and_does_not_select() {
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("compute"));
+        source.set_program_source("forth");
+        source.set_response("(emit \"hi\")");
+        source.set_complete();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors,
+        );
+        let message = source.clone() as MessageRef;
+        let projected = renderer.projected_lines(vec![message.clone()], 80);
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&projected, 0, 80);
+        let header_row = renderer
+            .accordion
+            .hit_regions
+            .first()
+            .expect("a Program source header claims a disclosure hit region")
+            .top;
+        let colors_for_node = ColorScheme::default();
+        let node = view_model::try_project_for_test(message.as_ref(), &colors_for_node)
+            .expect("a completed program-source WorkUnit projects a transcript node");
+        let was_expanded_before = renderer.accordion.is_expanded(&node);
+
+        assert!(
+            renderer.handle_mouse(left_down(header_row, 1)),
+            "the press on the header must still be handled as a toggle"
+        );
+        renderer.handle_mouse(left_drag(header_row, 5));
+        renderer.handle_mouse(left_up(header_row, 5));
+
+        assert!(
+            renderer.selection.is_none(),
+            "a drag that started on a disclosure hit region must never become a \
+             text selection"
+        );
+        let is_expanded_after = renderer.accordion.is_expanded(&node);
+        assert_ne!(
+            was_expanded_before, is_expanded_after,
+            "the header's disclosure state must still flip from the press, \
+             exactly like an ordinary click"
+        );
+    }
+
+    /// A full viewport repaint (`redraw_full_viewport_inner`: a new
+    /// committed message, an explicit scroll, or a resize) must clear a
+    /// finalized selection — the documented, simple invalidation rule.
+    #[test]
+    fn test_full_viewport_redraw_clears_a_finalized_selection() {
+        let mut renderer = renderer_with_plain_line("clear me please");
+        let row = row_of(&renderer, "clear me please");
+        renderer.handle_mouse(left_down(row, 0));
+        renderer.handle_mouse(left_drag(row, 3));
+        renderer.handle_mouse(left_up(row, 3));
+        assert!(
+            renderer.selection.is_some(),
+            "sanity precondition: a selection exists before the redraw"
+        );
+
+        renderer
+            .redraw_full_viewport_inner(false)
+            .expect("full redraw must succeed");
+
+        assert!(
+            renderer.selection.is_none(),
+            "a full viewport redraw must clear the selection"
+        );
+    }
+
+    /// Multi-line selection: a drag spanning two single-row transcript
+    /// lines must select the top row's tail and the bottom row's head, not
+    /// just one of the two lines.
+    #[test]
+    fn test_drag_across_two_lines_selects_both_partial_lines() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        output.add_trait_message(Arc::new(StaticMessage::plain("first line")) as MessageRef);
+        output.add_trait_message(Arc::new(StaticMessage::plain("second line")) as MessageRef);
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut sink = Vec::new();
+        renderer
+            .draw_live_area_to(&mut sink)
+            .expect("initial live draw must succeed");
+
+        let top_row = row_of(&renderer, "first line");
+        let bottom_row = row_of(&renderer, "second line");
+
+        renderer.handle_mouse(left_down(top_row, 6));
+        renderer.handle_mouse(left_drag(bottom_row, 5));
+        renderer.handle_mouse(left_up(bottom_row, 5));
+
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("a multi-line drag must finalize into a selection");
+        assert_eq!(
+            selection::selected_text(&renderer.selection_index, released),
+            "line\n\nsecond",
+            "top row keeps its tail from the press column, bottom row keeps its \
+             head up to the release column, and the blank separator row the \
+             transcript union inserts between messages is swept too — a real \
+             drag through that gap would select it as well"
         );
     }
 }
