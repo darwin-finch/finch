@@ -209,7 +209,7 @@ by Finch or an explicit user-selected GGUF file. Download bytes cross the daemon
 chat providers and their setup-migration markers have been removed. Configurations naming those
 engines are rejected instead of entering the runtime.
 The frontend memory selector still owns its required defaults, automatic model download, and
-current ONNX/TF-IDF implementation; its replacement and index-identity migration belong to
+current ONNX/hashed-n-gram implementation; its replacement and index-identity migration belong to
 separate memory work. Historical backend experiments
 are recorded in `docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or
 conformance evidence.
@@ -321,7 +321,7 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   [language implementation roadmap](docs/language/IMPLEMENTATION_ROADMAP.md).
   `finch-programs` now depends on the language facade for compilation, `finch-vm` for execution
   contracts, and `finch-tools-api` for shared effect vocabulary. `finch-programs` and
-  `finch-memory` (MemTree, retrieval, TF-IDF fallback, and an embedding port, without ONNX, Candle,
+  `finch-memory` (MemTree, retrieval, hashed-n-gram fallback, and an embedding port, without ONNX, Candle,
   tokenizer, Hugging Face, HTTP, or TUI stacks) are extracted workspace crates.
   The [application UI-model capsule](crates/finch-ui-model/AGENTS.md) is extracted as
   `finch-ui-model` and remains available through the root `ui_model` compatibility facade:

@@ -712,7 +712,7 @@ User query
     ↓
 EmbeddingEngine.embed(query)
     ← all-MiniLM-L6-v2 ONNX (384-dim) when the model is in the HF cache
-    ← otherwise TfIdfEmbedding (2048-dim lexical), the fallback in
+    ← otherwise HashedNgramEmbedding (2048-dim lexical), the fallback in
       MemorySystem::new; this is what a machine that never downloaded
       the model actually runs
     ↓
@@ -733,7 +733,7 @@ Injected into last user message:
 
 **Model:** `sentence-transformers/all-MiniLM-L6-v2` (~23 MB ONNX)
 - Downloaded from HuggingFace on first use via `hf-hub`
-- Falls back to TF-IDF keyword matching when model not yet cached
+- Falls back to hashed n-gram keyword matching when model not yet cached
 
 **REPL tools:**
 - `SearchMemory` — semantic search over saved memories

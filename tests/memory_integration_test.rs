@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use finch_memory::{
-    cosine_similarity, EmbeddingEngine, MemoryConfig, MemorySystem, TfIdfEmbedding,
+    cosine_similarity, EmbeddingEngine, HashedNgramEmbedding, MemoryConfig, MemorySystem,
 };
 use tempfile::NamedTempFile;
 
@@ -164,7 +164,7 @@ async fn test_get_recent_conversations() -> Result<()> {
 
 #[tokio::test]
 async fn test_embedding_similarity() -> Result<()> {
-    let engine = TfIdfEmbedding::new();
+    let engine = HashedNgramEmbedding::new();
 
     let emb1 = engine.embed("rust programming language")?;
     let emb2 = engine.embed("rust coding")?;

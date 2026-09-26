@@ -5,7 +5,7 @@ publish = false
 rust-version = "1.98"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
-description = "MemTree hierarchical memory, retrieval quality, TF-IDF fallback, and the injected EmbeddingEngine port — no ONNX, Candle, tokenizer, Hugging Face, HTTP, or TUI dependencies"
+description = "MemTree hierarchical memory, retrieval quality, hashed-n-gram fallback, and the injected EmbeddingEngine port — no ONNX, Candle, tokenizer, Hugging Face, HTTP, or TUI dependencies"
 repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]

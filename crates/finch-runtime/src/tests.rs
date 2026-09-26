@@ -2575,7 +2575,7 @@ fn failed_authority_sink_rolls_back_policy_and_its_revocations() {
 /// (frozen split axes, leaf membership that actually replay-descends
 /// correctly) that hand-crafted SQL rows cannot safely fake, so seeding for
 /// these tests goes through genuine `MemorySystem::insert_conversation`
-/// calls rather than raw SQL. The real `TfIdfEmbedding` engine's ~2048-dim
+/// calls rather than raw SQL. The real `HashedNgramEmbedding` engine's ~2048-dim
 /// vectors make that prohibitively slow for hundreds+ of points in an
 /// unoptimized debug test binary (`crates/finch-memory/src/lib.rs`'s own
 /// `SEEDED_STORE_SIZE` doc comment records the same finding); this engine's

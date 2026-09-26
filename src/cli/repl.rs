@@ -1060,13 +1060,14 @@ impl Repl {
                     // Download the neural embedding model in the background,
                     // for the *next* restart, not this session: it's already
                     // been chosen (`engine`, above) and a store this session
-                    // opens against TF-IDF cannot switch representations
-                    // mid-session without re-embedding everything already
-                    // written -- TF-IDF and neural embeddings live in
-                    // different vector spaces, so mixing them would silently
-                    // corrupt retrieval, not merely miss an upgrade. Prompt-
-                    // first startup (#242) is never blocked on this either
-                    // way: `tokio::spawn`, not awaited.
+                    // opens against the hashed-n-gram fallback cannot switch
+                    // representations mid-session without re-embedding
+                    // everything already written -- the hashed-n-gram fallback
+                    // and neural embeddings live in different vector spaces,
+                    // so mixing them would silently corrupt retrieval, not
+                    // merely miss an upgrade. Prompt-first startup (#242) is
+                    // never blocked on this either way: `tokio::spawn`, not
+                    // awaited.
                     if config.memory.use_neural_embeddings
                         && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
                     {
@@ -1121,7 +1122,7 @@ impl Repl {
                                 Err(error) => tracing::warn!(
                                     %error,
                                     "Background neural embedding model download failed; \
-                                     continuing on the TF-IDF fallback"
+                                     continuing on the hashed-n-gram fallback"
                                 ),
                             }
                         });
