@@ -5,6 +5,7 @@
 
 mod generator;
 mod patterns;
+mod tiered_history;
 
 pub use generator::GeneratedResponse;
 
