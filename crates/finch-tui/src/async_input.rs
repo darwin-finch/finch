@@ -154,17 +154,22 @@ impl KeyboardShortcut {
 const PASTE_MODIFIERS: KeyModifiers =
     KeyModifiers::from_bits_retain(KeyModifiers::CONTROL.bits() | KeyModifiers::SUPER.bits());
 
-/// Ctrl+C: clear the draft, or cancel the running query when it is empty.
+/// Ctrl+C: clear the draft immediately; when it's already empty, press twice
+/// (within `CTRL_C_CANCEL_WINDOW`) to cancel the running query — the Claude
+/// Code / Codex CLI SIGINT convention, unlike Escape's immediate single-press
+/// cancel below.
 const COMPOSER_CTRL_C: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::Char('c'),
     requires: KeyModifiers::CONTROL,
     label: "Ctrl+C",
-    description: "Clear the draft; cancel the query when empty",
+    description: "Clear the draft; press twice to cancel the query when empty",
     submit: None,
     authority: ShortcutAuthority::ComposerShortcut,
 };
 
-/// Escape: same clear-then-cancel behavior as Ctrl+C.
+/// Escape: clear the draft, or cancel the running query immediately (single
+/// press) when it is empty. Unlike Ctrl+C, Escape never requires a second
+/// press.
 const COMPOSER_ESCAPE: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::Esc,
     requires: KeyModifiers::NONE,
@@ -359,20 +364,30 @@ pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
 /// the entry's `submit` command for the input task to submit.
 fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Option<String>) {
     if COMPOSER_CTRL_C.owns(&key) {
-        // Ctrl+C: Clear input if non-empty, otherwise cancel query
+        // Ctrl+C: clear input if non-empty (immediate, like Escape); when
+        // the draft is already empty, this is the "nothing to clear" case
+        // where Ctrl+C follows the Claude Code / Codex CLI SIGINT convention
+        // instead of Escape's immediate single-press cancel — arm on the
+        // first press and only cancel on a confirming second press inside
+        // `CTRL_C_CANCEL_WINDOW`.
         let content = tui.input_textarea.lines().join("");
         if content.trim().is_empty() {
-            tui.pending_cancellation = true;
+            if crate::ctrl_c_should_cancel(&mut tui.ctrl_c_armed_at) {
+                tui.pending_cancellation = true;
+            }
             (false, None)
         } else {
             tui.input_textarea = TuiRenderer::create_clean_textarea();
+            tui.ctrl_c_armed_at = None;
             (true, None)
         }
     } else if COMPOSER_ESCAPE.owns(&key) {
         // Escape: Clear input if non-empty, otherwise cancel query
+        // immediately on a single press — unchanged by this task.
         let content = tui.input_textarea.lines().join("");
         if content.trim().is_empty() {
             tui.pending_cancellation = true;
+            tui.ctrl_c_armed_at = None;
             (false, None)
         } else {
             tui.input_textarea = TuiRenderer::create_clean_textarea();
@@ -1049,15 +1064,14 @@ mod tests {
                 entry.description, entry.label, entry.code, entry.requires, entry.authority
             );
             match (entry.label, entry.authority) {
-                ("Ctrl+C", ShortcutAuthority::ComposerShortcut)
-                | ("Esc", ShortcutAuthority::ComposerShortcut) => {
+                ("Esc", ShortcutAuthority::ComposerShortcut) => {
                     covered += 1;
                     let mut renderer = headless_renderer();
                     renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
                     let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
                     assert!(
                         modified && submitted.is_none(),
-                        "{why}: with a non-empty draft the binding must clear the \
+                        "{why}: with a non-empty draft Escape must clear the \
                          draft, not cancel or submit"
                     );
                     assert_eq!(
@@ -1070,6 +1084,9 @@ mod tests {
                         "{why}: a non-empty draft is cleared, never cancelled"
                     );
 
+                    // INVARIANT: unlike Ctrl+C below, Escape cancels an empty
+                    // draft immediately on a single press — this task must
+                    // not change that.
                     let mut renderer = headless_renderer();
                     let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
                     assert!(
@@ -1078,7 +1095,62 @@ mod tests {
                     );
                     assert!(
                         renderer.pending_cancellation,
-                        "{why}: an empty draft must request cancellation"
+                        "{why}: Escape must cancel an empty draft on a single press"
+                    );
+                }
+                ("Ctrl+C", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        modified && submitted.is_none(),
+                        "{why}: with a non-empty draft Ctrl+C must clear the \
+                         draft immediately, not cancel or submit"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        [""],
+                        "{why}: the draft must be cleared"
+                    );
+                    assert!(
+                        !renderer.pending_cancellation,
+                        "{why}: a non-empty draft is cleared, never cancelled"
+                    );
+
+                    // INVARIANT: with an empty draft, Ctrl+C must NOT cancel
+                    // on the first press (unlike Escape) — it only arms a
+                    // confirming second press within CTRL_C_CANCEL_WINDOW
+                    // (Claude Code / Codex CLI SIGINT convention).
+                    let mut renderer = headless_renderer();
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        !modified && submitted.is_none() && !renderer.pending_cancellation,
+                        "{why}: the first Ctrl+C on an empty draft must arm, \
+                         not cancel"
+                    );
+                    assert!(
+                        renderer.ctrl_c_armed_at.is_some(),
+                        "{why}: the first Ctrl+C on an empty draft must record \
+                         an arm timestamp"
+                    );
+
+                    // A second Ctrl+C within the window performs the cancel
+                    // Escape gives immediately.
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        !modified && submitted.is_none(),
+                        "{why}: the confirming Ctrl+C must not modify or \
+                         submit the draft"
+                    );
+                    assert!(
+                        renderer.pending_cancellation,
+                        "{why}: a second Ctrl+C within the window must cancel"
+                    );
+                    assert!(
+                        renderer.ctrl_c_armed_at.is_none(),
+                        "{why}: cancelling must clear the arm so a later \
+                         Ctrl+C starts over"
                     );
                 }
                 ("Ctrl+V", ShortcutAuthority::ComposerShortcut) => {
@@ -1347,6 +1419,48 @@ mod tests {
                 .iter()
                 .map(|b| b.label)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A Ctrl+C press after `CTRL_C_CANCEL_WINDOW` has elapsed must not count
+    /// as the confirming second press — it starts a fresh arm instead, so a
+    /// stray Ctrl+C long after the first one can never surprise-cancel a
+    /// query the user has since kept typing into (documented choice: only
+    /// Ctrl+C presses move the arm; unrelated keystrokes don't reset it).
+    #[test]
+    fn test_composer_ctrl_c_after_window_elapses_does_not_cancel_but_rearms() {
+        let mut renderer = headless_renderer();
+        let event = ctrl(KeyCode::Char('c'));
+
+        let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+        assert!(!modified && submitted.is_none() && !renderer.pending_cancellation);
+        let armed_at = renderer
+            .ctrl_c_armed_at
+            .expect("the first press on an empty draft must arm");
+
+        // Back-date the arm past the window instead of sleeping in a test —
+        // deterministic, no wall-clock flake.
+        renderer.ctrl_c_armed_at =
+            Some(armed_at - crate::CTRL_C_CANCEL_WINDOW - Duration::from_millis(1));
+
+        let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+        assert!(
+            !modified && submitted.is_none() && !renderer.pending_cancellation,
+            "a Ctrl+C press after the window elapsed must not cancel; \
+             pending_cancellation={}",
+            renderer.pending_cancellation
+        );
+        assert!(
+            renderer.ctrl_c_armed_at.is_some(),
+            "a lapsed press must start a fresh arm rather than leaving no arm \
+             at all (which would make the following in-window press look like \
+             an unconfirmed first press forever)"
+        );
+
+        let (_, _) = handle_composer_shortcuts(&mut renderer, event);
+        assert!(
+            renderer.pending_cancellation,
+            "the next Ctrl+C within the fresh window must cancel"
         );
     }
 

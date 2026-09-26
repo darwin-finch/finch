@@ -33,7 +33,7 @@ use crossterm::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 use finch_messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
@@ -1336,6 +1336,42 @@ pub enum PosetPanelMode {
     Typing,
 }
 
+// ─── Ctrl+C clear-then-cancel convention ───────────────────────────────────────
+//
+// Escape cancels immediately on a single press everywhere in this crate, and
+// that stays unchanged. Ctrl+C never does when there's nothing left for it to
+// clear first (an empty composer draft, or a dialog not in custom-input
+// mode): it arms on that press instead, and only a second Ctrl+C landing
+// inside `CTRL_C_CANCEL_WINDOW` performs the cancel — the SIGINT convention
+// Claude Code and Codex CLI both use (first press clears/interrupts, second
+// press within a short window exits). A press after the window elapses does
+// not count as that second press; it starts a fresh arm rather than carrying
+// a stale one forward.
+
+/// How long a first "nothing to clear" Ctrl+C press stays armed for a
+/// confirming second press.
+pub(crate) const CTRL_C_CANCEL_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Decide whether a "nothing to clear" Ctrl+C press should cancel now,
+/// updating `armed_at` for next time. Shared by every call site that gives
+/// Ctrl+C this convention (the async composer dispatch, `read_line`, and
+/// `show_dialog`).
+///
+/// Returns `true` exactly when this press is a confirming second press
+/// inside [`CTRL_C_CANCEL_WINDOW`] of a still-armed first press; `false`
+/// otherwise, having (re)armed `armed_at` to the current press.
+pub(crate) fn ctrl_c_should_cancel(armed_at: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    if let Some(armed) = *armed_at {
+        if now.duration_since(armed) <= CTRL_C_CANCEL_WINDOW {
+            *armed_at = None;
+            return true;
+        }
+    }
+    *armed_at = Some(now);
+    false
+}
+
 // ─── TuiRenderer ──────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -1408,6 +1444,15 @@ pub struct TuiRenderer {
     pub pending_feedback: Option<activity::Verdict>,
     pub pending_cancellation: bool,
     pub pending_dialog_result: Option<DialogResult>,
+    /// When Ctrl+C has nothing left to clear (empty composer draft, or a
+    /// dialog not in custom-input mode), the first press arms this instead
+    /// of cancelling; a second Ctrl+C within [`CTRL_C_CANCEL_WINDOW`] clears
+    /// it and performs the cancel. Escape's cancel is unaffected and stays
+    /// single-press everywhere. Shared by the async composer dispatch
+    /// (`async_input::handle_composer_shortcuts`), `read_line`, and
+    /// `show_dialog` — they run in disjoint input modes, so one field is
+    /// enough.
+    pub(crate) ctrl_c_armed_at: Option<Instant>,
 
     // Autocomplete
     pub(crate) ghost_text: Option<String>,
@@ -1538,6 +1583,7 @@ impl TuiRenderer {
             pending_feedback: None,
             pending_cancellation: false,
             pending_dialog_result: None,
+            ctrl_c_armed_at: None,
             ghost_text: None,
             command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
@@ -1628,6 +1674,7 @@ impl TuiRenderer {
             pending_feedback: None,
             pending_cancellation: false,
             pending_dialog_result: None,
+            ctrl_c_armed_at: None,
 
             ghost_text: None,
             command_registry: CommandRegistry::new(),
@@ -2927,7 +2974,9 @@ impl TuiRenderer {
                             return Ok(Some(input));
                         }
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            return Ok(None);
+                            if self.read_line_should_cancel(key) {
+                                return Ok(None);
+                            }
                         }
                         _ => {
                             self.input_textarea.input(Event::Key(key));
@@ -2946,6 +2995,27 @@ impl TuiRenderer {
                 }
             }
         }
+    }
+
+    /// `read_line`'s Esc/Ctrl+C arm, extracted so the Ctrl+C clear-then-cancel
+    /// convention has a terminal-free unit test surface (the loop above blocks
+    /// on real crossterm event polling and can't be driven directly).
+    ///
+    /// Returns `true` when the loop must return `Ok(None)` now.
+    fn read_line_should_cancel(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Esc {
+            return true;
+        }
+        // Ctrl+C: clear the draft first, like the composer and dialogs do;
+        // only cancel when there's nothing left to clear, and even then only
+        // on a confirming second press.
+        let content = self.input_textarea.lines().join("");
+        if !content.trim().is_empty() {
+            self.input_textarea = TuiRenderer::create_clean_textarea();
+            self.ctrl_c_armed_at = None;
+            return false;
+        }
+        ctrl_c_should_cancel(&mut self.ctrl_c_armed_at)
     }
 }
 
@@ -4799,20 +4869,7 @@ impl TuiRenderer {
                     }
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            let is_custom_mode = self
-                                .active_dialog
-                                .as_ref()
-                                .is_some_and(|d| d.custom_mode_active);
-                            let is_plain_esc = matches!(key.code, KeyCode::Esc);
-
-                            if is_custom_mode && is_plain_esc {
-                                // Exit custom mode, keep dialog open
-                                if let Some(ref mut d) = self.active_dialog {
-                                    d.handle_key_event(key);
-                                }
-                                self.erase_live_area()?;
-                                self.draw_live_area()?;
-                            } else {
+                            if self.dialog_should_cancel_on(key) {
                                 // The blocking caller receives the result
                                 // directly; only the settled record is staged
                                 // here — never `pending_dialog_result`, which
@@ -4825,6 +4882,10 @@ impl TuiRenderer {
                                 self.draw_live_area()?;
                                 return Ok(DialogResult::Cancelled);
                             }
+                            // Custom mode exited, or an unconfirmed Ctrl+C
+                            // armed — either way, redraw with updated state.
+                            self.erase_live_area()?;
+                            self.draw_live_area()?;
                         }
                         _ => {
                             let result = self
@@ -4851,6 +4912,44 @@ impl TuiRenderer {
                 }
             }
         }
+    }
+
+    /// `show_dialog`'s Esc/Ctrl+C arm, extracted for the same terminal-free
+    /// unit test reason as `read_line_should_cancel`.
+    ///
+    /// Returns `true` when the loop must settle the dialog `Cancelled` and
+    /// return now. A dialog in custom-input mode gets the same first-press
+    /// relief Escape already gives it (exit custom mode, keep the dialog
+    /// open) before Ctrl+C's clear-then-cancel convention applies to the
+    /// (now non-custom-mode) dialog underneath.
+    fn dialog_should_cancel_on(&mut self, key: KeyEvent) -> bool {
+        let is_custom_mode = self
+            .active_dialog
+            .as_ref()
+            .is_some_and(|d| d.custom_mode_active);
+
+        if key.code == KeyCode::Esc {
+            if is_custom_mode {
+                if let Some(ref mut d) = self.active_dialog {
+                    d.handle_key_event(key);
+                }
+                return false;
+            }
+            return true;
+        }
+
+        // Ctrl+C.
+        if is_custom_mode {
+            // Reuse the dialog's own Esc handling (rather than reaching into
+            // its fields directly) to exit custom mode; a raw Ctrl+C key
+            // would otherwise be typed into the custom-text field.
+            if let Some(ref mut d) = self.active_dialog {
+                d.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            self.ctrl_c_armed_at = None;
+            return false;
+        }
+        ctrl_c_should_cancel(&mut self.ctrl_c_armed_at)
     }
 
     /// Show the setup wizard using ratatui in an alternate screen.
@@ -4893,6 +4992,246 @@ impl TuiRenderer {
         options: Vec<DialogOption>,
     ) -> Result<DialogResult> {
         self.show_dialog(Dialog::select(title, options))
+    }
+}
+
+/// INVARIANT: Escape cancels `read_line`/`show_dialog` immediately on one
+/// press; Ctrl+C never does until there's nothing left to clear, and even
+/// then only on a confirming second press inside `CTRL_C_CANCEL_WINDOW`
+/// (Finch's Claude Code / Codex CLI SIGINT convention). See also
+/// `async_input::test_keyboard_shortcut_table_matches_the_real_dispatch_paths`
+/// for the same convention on the async composer.
+#[cfg(test)]
+mod ctrl_c_cancel_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn headless_renderer() -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors)
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    // --- read_line ---
+
+    #[test]
+    fn test_read_line_escape_cancels_immediately_on_one_press_regardless_of_draft() {
+        let mut renderer = headless_renderer();
+        assert!(
+            renderer.read_line_should_cancel(esc()),
+            "Escape must cancel read_line on the first press with an empty draft"
+        );
+
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
+        assert!(
+            renderer.read_line_should_cancel(esc()),
+            "Escape must still cancel read_line immediately even with unsubmitted \
+             text in the draft — this task must not change Escape's behavior"
+        );
+    }
+
+    #[test]
+    fn test_read_line_ctrl_c_clears_nonempty_draft_without_cancelling() {
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
+
+        let cancel = renderer.read_line_should_cancel(ctrl_c());
+
+        assert!(
+            !cancel,
+            "a non-empty draft must be cleared, not cancelled, by the first Ctrl+C"
+        );
+        assert_eq!(
+            renderer.input_textarea.lines(),
+            [""],
+            "Ctrl+C must clear the draft"
+        );
+    }
+
+    #[test]
+    fn test_read_line_ctrl_c_on_empty_draft_requires_a_second_press() {
+        let mut renderer = headless_renderer();
+
+        let first = renderer.read_line_should_cancel(ctrl_c());
+        assert!(
+            !first,
+            "a single Ctrl+C on an empty draft must not cancel read_line \
+             (Escape stays the only immediate single-press cancel)"
+        );
+        assert!(
+            renderer.ctrl_c_armed_at.is_some(),
+            "the first Ctrl+C on an empty draft must arm for a confirming press"
+        );
+
+        let second = renderer.read_line_should_cancel(ctrl_c());
+        assert!(
+            second,
+            "a second Ctrl+C within the window must cancel read_line"
+        );
+        assert!(
+            renderer.ctrl_c_armed_at.is_none(),
+            "cancelling must clear the arm so a later Ctrl+C starts over"
+        );
+    }
+
+    #[test]
+    fn test_read_line_ctrl_c_after_window_elapses_does_not_cancel_but_rearms() {
+        let mut renderer = headless_renderer();
+        assert!(!renderer.read_line_should_cancel(ctrl_c()));
+        let armed_at = renderer
+            .ctrl_c_armed_at
+            .expect("first press must record an arm timestamp");
+
+        // Back-date the arm past the window instead of sleeping in a test —
+        // deterministic, no wall-clock flake.
+        renderer.ctrl_c_armed_at = Some(armed_at - CTRL_C_CANCEL_WINDOW - Duration::from_millis(1));
+
+        let lapsed_press = renderer.read_line_should_cancel(ctrl_c());
+        assert!(
+            !lapsed_press,
+            "a Ctrl+C press after the window elapsed must not count as the \
+             confirming second press"
+        );
+        assert!(
+            renderer.ctrl_c_armed_at.is_some(),
+            "a lapsed press must start a fresh arm rather than leaving the \
+             stale timestamp cleared with nothing to confirm"
+        );
+
+        assert!(
+            renderer.read_line_should_cancel(ctrl_c()),
+            "the next Ctrl+C within the fresh window must cancel"
+        );
+    }
+
+    // --- show_dialog ---
+
+    #[test]
+    fn test_dialog_escape_cancels_immediately_on_one_press_outside_custom_mode() {
+        let mut renderer = headless_renderer();
+        renderer.active_dialog = Some(Dialog::select(
+            "Pick one",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        ));
+
+        assert!(
+            renderer.dialog_should_cancel_on(esc()),
+            "Escape must cancel the dialog on the first press outside custom mode"
+        );
+    }
+
+    #[test]
+    fn test_dialog_escape_exits_custom_mode_on_first_press_instead_of_cancelling() {
+        let mut renderer = headless_renderer();
+        let mut dialog = Dialog::select_with_custom("Pick one", vec![DialogOption::new("A")]);
+        dialog.custom_mode_active = true;
+        dialog.custom_input = Some("typed text".to_string());
+        renderer.active_dialog = Some(dialog);
+
+        let cancel = renderer.dialog_should_cancel_on(esc());
+
+        assert!(
+            !cancel,
+            "Escape's first press in custom mode must exit custom mode, not \
+             cancel the dialog (pre-existing behavior, unchanged by this task)"
+        );
+        assert!(
+            !renderer
+                .active_dialog
+                .as_ref()
+                .expect("dialog must stay open")
+                .custom_mode_active,
+            "custom mode must be exited"
+        );
+    }
+
+    #[test]
+    fn test_dialog_ctrl_c_exits_custom_mode_on_first_press_instead_of_cancelling() {
+        // Before this task, Ctrl+C skipped the custom-mode relief Escape
+        // already had and cancelled the whole dialog outright, discarding
+        // whatever the user had typed into the "Other" field. Ctrl+C must
+        // now give the same first-press relief Escape gives.
+        let mut renderer = headless_renderer();
+        let mut dialog = Dialog::select_with_custom("Pick one", vec![DialogOption::new("A")]);
+        dialog.custom_mode_active = true;
+        dialog.custom_input = Some("typed text".to_string());
+        renderer.active_dialog = Some(dialog);
+
+        let cancel = renderer.dialog_should_cancel_on(ctrl_c());
+
+        assert!(
+            !cancel,
+            "Ctrl+C's first press in custom mode must exit custom mode, not \
+             cancel the whole dialog"
+        );
+        assert!(
+            !renderer
+                .active_dialog
+                .as_ref()
+                .expect("dialog must stay open")
+                .custom_mode_active,
+            "custom mode must be exited"
+        );
+    }
+
+    #[test]
+    fn test_dialog_ctrl_c_outside_custom_mode_requires_a_second_press() {
+        let mut renderer = headless_renderer();
+        renderer.active_dialog = Some(Dialog::select(
+            "Pick one",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        ));
+
+        let first = renderer.dialog_should_cancel_on(ctrl_c());
+        assert!(
+            !first,
+            "a single Ctrl+C outside custom mode must not cancel the dialog"
+        );
+        assert!(
+            renderer.active_dialog.is_some(),
+            "the dialog must stay open after an unconfirmed Ctrl+C"
+        );
+        assert!(renderer.ctrl_c_armed_at.is_some());
+
+        let second = renderer.dialog_should_cancel_on(ctrl_c());
+        assert!(
+            second,
+            "a second Ctrl+C within the window must cancel the dialog"
+        );
+    }
+
+    #[test]
+    fn test_dialog_ctrl_c_after_window_elapses_does_not_cancel_but_rearms() {
+        let mut renderer = headless_renderer();
+        renderer.active_dialog = Some(Dialog::select("Pick one", vec![DialogOption::new("A")]));
+        assert!(!renderer.dialog_should_cancel_on(ctrl_c()));
+        let armed_at = renderer
+            .ctrl_c_armed_at
+            .expect("first press must record an arm timestamp");
+
+        renderer.ctrl_c_armed_at = Some(armed_at - CTRL_C_CANCEL_WINDOW - Duration::from_millis(1));
+
+        assert!(
+            !renderer.dialog_should_cancel_on(ctrl_c()),
+            "a lapsed Ctrl+C press must not cancel the dialog"
+        );
+        assert!(
+            renderer.active_dialog.is_some(),
+            "the dialog must still be open after a lapsed, re-arming press"
+        );
+        assert!(
+            renderer.dialog_should_cancel_on(ctrl_c()),
+            "the next Ctrl+C within the fresh window must cancel"
+        );
     }
 }
 
