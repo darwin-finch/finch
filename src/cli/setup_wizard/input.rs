@@ -1265,6 +1265,37 @@ pub(super) fn handle_models_input(
         } else {
             // Navigation mode
             match key.code {
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Reorder the selected tool_model with its immediate neighbor above.
+                    // The cursor follows the moved entry so repeated presses walk it
+                    // up the list. Swapping the *top* tool_model up would move it into
+                    // the primary slot, so that case promotes it to primary instead —
+                    // the same swap P already performs — rather than doing nothing.
+                    if *selected_idx > 0 {
+                        let tool_idx = *selected_idx - 1;
+                        if tool_idx == 0 {
+                            if !tool_models.is_empty() {
+                                std::mem::swap(primary_model, &mut tool_models[0]);
+                                *selected_idx = 0;
+                            }
+                        } else if tool_idx < tool_models.len() {
+                            tool_models.swap(tool_idx - 1, tool_idx);
+                            *selected_idx -= 1;
+                        }
+                    }
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Reorder the selected tool_model with its immediate neighbor below.
+                    // No-op on the primary row (index 0) and on the last tool_model,
+                    // which has no lower neighbor to swap with.
+                    if *selected_idx > 0 {
+                        let tool_idx = *selected_idx - 1;
+                        if tool_idx + 1 < tool_models.len() {
+                            tool_models.swap(tool_idx, tool_idx + 1);
+                            *selected_idx += 1;
+                        }
+                    }
+                }
                 KeyCode::Up => {
                     if *selected_idx > 0 {
                         *selected_idx -= 1;

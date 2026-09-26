@@ -450,7 +450,7 @@ fn models_section_lines(
     let instructions_text = if editing_mode || editing_model_mode {
         "Type here | Enter/Esc: Save & return"
     } else {
-        "Enter: Edit | P: Primary | A: Add | D: Remove | Tab: Next"
+        "Enter: Edit | P: Primary | Shift+↑/↓: Reorder | A: Add | D: Remove | Tab: Next"
     };
     lines.push(wizard_centered(
         wizard_bold(instructions_text, Color::Yellow),

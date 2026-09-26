@@ -3146,6 +3146,231 @@ fn test_select_add_type_esc_closes_overlay() {
     );
 }
 
+// ── Models: Shift+Up/Down reorder (#1255) ─────────────────────────────────
+
+fn remote_model(label: &str) -> ModelConfig {
+    ModelConfig::Remote {
+        provider: "claude".into(),
+        name: label.into(),
+        api_key: String::new(),
+        model: String::new(),
+        enabled: true,
+        persisted: None,
+    }
+}
+
+fn state_with_models(primary: &str, tools: &[&str]) -> WizardState {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        primary_model,
+        tool_models,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = remote_model(primary);
+        *tool_models = tools.iter().map(|t| remote_model(t)).collect();
+    }
+    state
+}
+
+fn set_selected_idx(state: &mut WizardState, idx: usize) {
+    if let Some(SectionState::Models { selected_idx, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *selected_idx = idx;
+    }
+}
+
+fn selected_idx_of(state: &WizardState) -> usize {
+    match state.sections.get(&WizardSection::Models) {
+        Some(SectionState::Models { selected_idx, .. }) => *selected_idx,
+        other => panic!("expected Models section state, got {other:?}"),
+    }
+}
+
+fn model_names(state: &WizardState) -> (String, Vec<String>) {
+    let name_of = |m: &ModelConfig| match m {
+        ModelConfig::Remote { name, .. } => name.clone(),
+        ModelConfig::Local { .. } => "local".to_string(),
+    };
+    match state.sections.get(&WizardSection::Models) {
+        Some(SectionState::Models {
+            primary_model,
+            tool_models,
+            ..
+        }) => (
+            name_of(primary_model),
+            tool_models.iter().map(name_of).collect(),
+        ),
+        other => panic!("expected Models section state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_shift_down_swaps_two_adjacent_non_primary_tool_models() {
+    let mut state = state_with_models("primary", &["a", "b", "c"]);
+    set_selected_idx(&mut state, 1); // "a"
+
+    handle_models_input(&mut state, modified_key(KeyCode::Down, KeyModifiers::SHIFT)).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        (
+            "primary",
+            ["b".to_string(), "a".to_string(), "c".to_string()].as_slice()
+        ),
+        "Shift+Down must swap the selected tool_model with its immediate lower \
+         neighbor and leave the primary row untouched"
+    );
+    assert_eq!(
+        selected_idx_of(&state),
+        2,
+        "the cursor should follow the moved entry to its new position"
+    );
+}
+
+#[test]
+fn test_shift_up_swaps_two_adjacent_non_primary_tool_models() {
+    let mut state = state_with_models("primary", &["a", "b", "c"]);
+    set_selected_idx(&mut state, 3); // "c"
+
+    handle_models_input(&mut state, modified_key(KeyCode::Up, KeyModifiers::SHIFT)).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        (
+            "primary",
+            ["a".to_string(), "c".to_string(), "b".to_string()].as_slice()
+        ),
+        "Shift+Up must swap the selected tool_model with its immediate upper neighbor"
+    );
+    assert_eq!(selected_idx_of(&state), 2);
+}
+
+#[test]
+fn test_shift_up_on_first_tool_model_promotes_it_to_primary() {
+    // Edge-case decision for issue #1255: swapping the top tool_model further
+    // up would move it into the primary slot. Rather than no-op there (which
+    // would strand it one step below where Up otherwise walks it), this
+    // performs the same swap P already does -- promote to primary -- so
+    // repeated Shift+Up keeps moving the entry in one consistent direction.
+    let mut state = state_with_models("primary", &["a", "b"]);
+    set_selected_idx(&mut state, 1); // "a", the top tool_model
+
+    handle_models_input(&mut state, modified_key(KeyCode::Up, KeyModifiers::SHIFT)).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        ("a", ["primary".to_string(), "b".to_string()].as_slice()),
+        "Shift+Up on the top tool_model promotes it to primary, matching P's swap"
+    );
+    assert_eq!(
+        selected_idx_of(&state),
+        0,
+        "the cursor should follow the promoted entry onto the primary row"
+    );
+}
+
+#[test]
+fn test_shift_down_on_last_tool_model_is_a_no_op() {
+    let mut state = state_with_models("primary", &["a", "b", "c"]);
+    set_selected_idx(&mut state, 3); // "c", last entry, no lower neighbor
+
+    handle_models_input(&mut state, modified_key(KeyCode::Down, KeyModifiers::SHIFT)).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        (
+            "primary",
+            ["a".to_string(), "b".to_string(), "c".to_string()].as_slice()
+        ),
+        "Shift+Down on the last tool_model must not panic, reorder, or drop state"
+    );
+    assert_eq!(
+        selected_idx_of(&state),
+        3,
+        "selection stays put when there is no neighbor below to swap with"
+    );
+}
+
+#[test]
+fn test_shift_up_and_down_on_primary_row_are_no_ops() {
+    let mut state = state_with_models("primary", &["a", "b"]);
+    // selected_idx defaults to 0, the primary row.
+    assert_eq!(selected_idx_of(&state), 0);
+
+    handle_models_input(&mut state, modified_key(KeyCode::Up, KeyModifiers::SHIFT)).unwrap();
+    handle_models_input(&mut state, modified_key(KeyCode::Down, KeyModifiers::SHIFT)).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        ("primary", ["a".to_string(), "b".to_string()].as_slice()),
+        "Shift+Up/Down on the primary row is not a supported reorder and must \
+         leave state unchanged (use P to move something into the primary slot)"
+    );
+    assert_eq!(selected_idx_of(&state), 0);
+}
+
+#[test]
+fn test_promote_key_still_swaps_selected_tool_model_into_primary() {
+    // Regression guard: adding Shift+Up/Down must not disturb the pre-existing
+    // P (promote) swap at src/cli/setup_wizard/input.rs handle_models_input.
+    let mut state = state_with_models("primary", &["a", "b"]);
+    set_selected_idx(&mut state, 2); // "b"
+
+    handle_models_input(&mut state, key(KeyCode::Char('p'))).unwrap();
+
+    let (primary, tools) = model_names(&state);
+    assert_eq!(
+        (primary.as_str(), tools.as_slice()),
+        ("b", ["a".to_string(), "primary".to_string()].as_slice()),
+        "P must still swap the selected tool_model directly into the primary slot"
+    );
+}
+
+#[test]
+fn test_add_and_enter_keys_still_open_overlays_in_models_section() {
+    // Regression guard: adding Shift+Up/Down must not shadow A (add) or Enter
+    // (edit) in navigation mode.
+    let mut state = state_with_models("primary", &["a"]);
+
+    handle_models_input(&mut state, key(KeyCode::Char('a'))).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::SelectAddType { selected: 0 })
+        ),
+        "A must still open the add-provider overlay; step={:?}",
+        get_step(&state)
+    );
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = None;
+    }
+
+    set_selected_idx(&mut state, 1); // "a", a remote provider
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                editing_idx: Some(1),
+                ..
+            })
+        ),
+        "Enter must still open the edit overlay for the selected provider; step={:?}",
+        get_step(&state)
+    );
+}
+
 // ── build_setup_result: inference_provider propagation ───────────────────
 
 #[test]
