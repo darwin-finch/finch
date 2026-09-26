@@ -14,6 +14,14 @@ classifier are implementation details; do not expose child-module paths as a sho
 training support, and configuration. This module generates candidate responses; it does not own
 tool execution, provider transport, model bootstrap, or application policy.
 
+**Tool markup (non-streaming only, #1276):** `try_generate_from_pattern_with_tools` formats
+passed `ToolDefinition`s into the prompt via `crate::models::ToolPromptFormatter` and parses any
+`<tool_use>` markup the model emits back out via `crate::models::ToolCallParser` -- the same
+shared formatter/parser `src/generators/qwen.rs`'s in-process path uses, so both paths speak the
+same tool-markup contract. This is markup interpretation, not tool execution: the returned
+`tool_uses`/`ContentBlock::ToolUse` values are proposals only. Streaming tool-call detection is
+out of scope here; the daemon's SSE path does not yet call this formatting/parsing step.
+
 **Invariants and lifetimes:** `LocalGenerator` is shared behind an application-owned lock; its
 generation methods mutate classifier/generator state. A missing or low-confidence local response
 is not a successful turn: the caller decides whether to forward. Neural model handles are
