@@ -20,9 +20,6 @@ pub mod web_fetch;
 // Command execution
 pub mod bash;
 
-// Delegate a coding task to the official Claude Code CLI as a sub-agent
-pub mod claude_code;
-
 // Long-lived background commands (issue #754)
 pub mod background;
 
@@ -78,7 +75,6 @@ pub mod spawn;
 pub use ask_user_question::AskUserQuestionTool;
 pub use background::{BackgroundBashTool, BackgroundPollTool, BackgroundStopTool};
 pub use bash::BashTool;
-pub use claude_code::ClaudeCodeDelegateTool;
 pub use code_hop::FindCodeTool;
 pub use code_outline::CodeOutlineTool;
 pub use edit::EditTool;
