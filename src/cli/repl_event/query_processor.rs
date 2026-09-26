@@ -83,7 +83,7 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
-/// Strip a stray Markdown inline-code backtick from a provider wire response
+/// Strip stray Markdown inline-code backtick(s) from a provider wire response
 /// before it reaches either language detection or the compiler.
 ///
 /// A leading backtick is real CoLisp quasiquote syntax (`crates/finch-colisp`
@@ -91,14 +91,41 @@ fn has_streamed_wire_source(source: &str) -> bool {
 /// `ProgramLanguage::infer_source` -- detection and the compiled source have
 /// to agree on the same bytes, or a leading backtick silently turns a real
 /// top-level definition into quoted, never-executed data while detection
-/// reports the submission as ordinary Lisp. Safe to strip unconditionally
-/// when present: a submission is only accepted once it produces a real
-/// output effect, and no valid submission places a quasiquote as the
-/// outermost expression of its very first form and still does that --
-/// every case this strips was already guaranteed to fail
-/// `MissingOutputEffect` unstripped, so stripping can only turn an
-/// always-broken submission into a potentially-working one, never break a
-/// working one. Leaves a genuine triple-backtick Markdown fence untouched;
+/// reports the submission as ordinary Lisp.
+///
+/// Two distinct shapes reach here, and they need different handling:
+///
+/// - A lone leading backtick with nothing pairing it at the end (e.g.
+///   `` `(say "hi") ``): stripping just the backtick is the original fix and
+///   stays unconditional, per the `MissingOutputEffect` reasoning below.
+/// - A complete Markdown inline-code span wrapping the *entire* trimmed
+///   response (`` `(factorial 7)` ``, backtick on both ends): stripping only
+///   the leading backtick leaves the trailing one as a dangling quasiquote
+///   token with no following datum, which turns an otherwise-valid program
+///   into `error[E-READ-002]: unexpected end of expression`. This is not
+///   hypothetical: a real local-Gemma turn produced exactly this failure --
+///   `~/.finch/metrics/wire-<date>.jsonl` recorded `diagnostic_code:
+///   "E-READ-002"` for a turn whose frontend log shows
+///   `StreamingComplete { full_response: "`(factorial 7)`" }` -- because the
+///   old version of this function stripped only the leading backtick,
+///   handing the compiler `(factorial 7)\`` (trailing backtick, no leading
+///   one) instead of either the fully-wrapped or fully-unwrapped source.
+///   When the trailing backtick closes the whole response, strip both.
+///
+/// Safe to strip the lone-leading case unconditionally when present: a
+/// submission is only accepted once it produces a real output effect, and no
+/// valid submission places a quasiquote as the outermost expression of its
+/// very first form and still does that -- every case this strips was already
+/// guaranteed to fail `MissingOutputEffect` unstripped, so stripping can only
+/// turn an always-broken submission into a potentially-working one, never
+/// break a working one. The paired case is safe by the same invariant: a
+/// complete top-level form followed by a second, dangling quasiquote token
+/// can never be part of a valid submission either, regardless of what sits
+/// between the two backticks (even a string literal that itself contains a
+/// literal backtick character -- that backtick lives strictly inside the
+/// paired span, never at the untrimmed edges this function inspects).
+///
+/// Leaves a genuine triple-backtick Markdown fence untouched;
 /// `ProgramLanguage::infer_wire_source` rejects that on its own (E-WIRE-002)
 /// before this distinction would ever matter.
 fn strip_markdown_backtick_noise(source: &str) -> String {
@@ -107,7 +134,22 @@ fn strip_markdown_backtick_noise(source: &str) -> String {
         return source.to_string();
     }
     let leading_ws = &source[..source.len() - trimmed_start.len()];
-    format!("{leading_ws}{}", &trimmed_start[1..])
+    let after_leading = &trimmed_start[1..];
+    let trimmed_end = after_leading.trim_end();
+    let trailing_ws = &after_leading[trimmed_end.len()..];
+    // A closing backtick that pairs with the one just stripped: the whole
+    // trimmed response is a single Markdown inline-code span. Strip both, not
+    // just the leading one, or the closing backtick survives as a dangling,
+    // unpairable quasiquote token. Guard against a run of multiple trailing
+    // backticks (`` `(a)`` ``) -- ambiguous, so leave it for its own
+    // diagnostic rather than guess which one closes the span.
+    if let Some(inner) = trimmed_end
+        .strip_suffix('`')
+        .filter(|inner| !inner.is_empty() && !inner.ends_with('`'))
+    {
+        return format!("{leading_ws}{inner}{trailing_ws}");
+    }
+    format!("{leading_ws}{after_leading}")
 }
 
 /// Build the submission for a provider response carried on the VM wire rather
@@ -4544,6 +4586,163 @@ mod tests {
         assert_eq!(
             strip_markdown_backtick_noise("(say \"hi\")"),
             "(say \"hi\")"
+        );
+    }
+
+    #[test]
+    fn strip_markdown_backtick_noise_strips_a_paired_inline_code_span() {
+        // The exact shape from a real local-Gemma turn (`~/.finch/metrics/
+        // wire-2026-09-25.jsonl`, `diagnostic_code: "E-READ-002"`, matching
+        // frontend log `StreamingComplete { full_response: "`(factorial
+        // 7)`" }`): the whole trimmed response is bracketed by one backtick
+        // on each end. Stripping only the leading one (the old behavior)
+        // leaves `(factorial 7)\`` -- a dangling quasiquote token with
+        // nothing to quote -- which is *worse* than not stripping at all.
+        assert_eq!(
+            strip_markdown_backtick_noise("`(factorial 7)`"),
+            "(factorial 7)"
+        );
+        // Outer whitespace on either side of the pair is preserved exactly;
+        // only the two backticks themselves are removed.
+        assert_eq!(
+            strip_markdown_backtick_noise("  `(say \"hi\")`  "),
+            "  (say \"hi\")  "
+        );
+        // A backtick that is genuine literal content of a string inside the
+        // paired span stays untouched -- only the two bracketing backticks
+        // at the trimmed edges are removed.
+        assert_eq!(
+            strip_markdown_backtick_noise("`(say \"back`tick\")`"),
+            "(say \"back`tick\")"
+        );
+        // A run of trailing backticks is ambiguous about which one closes
+        // the span, so it is left alone beyond the unconditional
+        // lone-leading strip -- the remaining diagnostic stays real rather
+        // than guessing.
+        assert_eq!(
+            strip_markdown_backtick_noise("`(a)``"),
+            "(a)``",
+            "a run of trailing backticks must not be silently collapsed"
+        );
+        // An unbalanced fence (opening only, no closing) is untouched by
+        // this function entirely: it never starts with a lone backtick, so
+        // the triple-backtick guard already leaves it for
+        // `ProgramLanguage::infer_wire_source`'s own E-WIRE-002 diagnostic.
+        assert_eq!(
+            strip_markdown_backtick_noise("```lisp\n(say \"hi\")"),
+            "```lisp\n(say \"hi\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paired_markdown_backtick_span_executes_instead_of_dangling_as_read_002() {
+        // Production-boundary reproduction of the real turn: a complete,
+        // self-contained Lisp program (define-then-invoke, like
+        // `examples/finch/factorial.lisp`) wrapped in one backtick on each
+        // end, exactly the `(factorial 7)` shape from the bug report. Before
+        // the fix this failed the first attempt with `error[E-READ-002]:
+        // unexpected end of expression` because only the leading backtick
+        // was stripped, leaving `(factorial 7)\`` for the reader.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let source = "`(begin \
+                       (define (factorial (n : int)) : int \
+                         (if (<= n 1) 1 (* n (factorial (- n 1))))) \
+                       (say (int-to-string (factorial 7))))`"
+            .to_string();
+
+        let submission = direct_wire_submission(&runtime, source).unwrap();
+        assert_eq!(
+            submission.language,
+            finch_programs::ProgramLanguage::Lisp,
+            "detection must still classify this as Lisp despite the backticks"
+        );
+        assert!(
+            !submission.source.starts_with('`') && !submission.source.ends_with('`'),
+            "both bracketing backticks must be stripped from the COMPILED \
+             source, not just the leading one, or the trailing backtick \
+             re-parses as a dangling quasiquote token: {:?}",
+            submission.source
+        );
+
+        let outcome = runtime.submit_typed_only(submission).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "outcome={outcome:?}"
+        );
+        assert_eq!(
+            outcome.output, "5040",
+            "factorial(7) must actually execute and print 5040, not fail \
+             with error[E-READ-002]: unexpected end of expression; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backtick_wrapped_wire_response_executes_on_first_pass_without_repair() {
+        // Same reproduction as the test above, but driven through the real
+        // wire-execution entry point (`execute_wire_with_single_repair`,
+        // the function every provider response actually goes through) with
+        // a mocked `Generator`, so a regression here is caught at the same
+        // boundary the bug crossed rather than only in a lower-level helper.
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = raw_wire_source(
+            "`(begin \
+              (define (factorial (n : int)) : int \
+                (if (<= n 1) 1 (* n (factorial (- n 1))))) \
+              (say (int-to-string (factorial 7))))`",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("compute 7 factorial")],
+            source,
+            Some(&metrics),
+            None,
+        )
+        .await;
+        drain_vm_events_as_event_loop(&mut event_rx);
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "a well-formed program wrapped in one Markdown backtick pair \
+             must run on the first attempt, never ask the model to repair \
+             text that was never broken"
+        );
+        assert_eq!(
+            execution.response, "5040",
+            "factorial(7) must actually execute, not fail with \
+             error[E-READ-002]: unexpected end of expression; \
+             source_for_history={:?}",
+            execution.source_for_history
+        );
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = metrics.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+        assert!(
+            recorded[0].first_pass_valid,
+            "the paired span must be classified as valid on the first pass, \
+             not recorded as a wire failure; recorded={:?}",
+            recorded[0]
+        );
+        assert!(
+            recorded[0].diagnostic_code.is_none(),
+            "no diagnostic should be recorded once the paired span is \
+             stripped before compilation; recorded={:?}",
+            recorded[0]
         );
     }
 
