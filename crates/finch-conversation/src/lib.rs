@@ -171,6 +171,36 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Splice a synthetic `[user, assistant]` exchange into committed
+    /// history as though it were a genuine earlier turn -- ordinary
+    /// messages, with no wrapper tag or framing text distinguishing them
+    /// from anything else in the array. Inserted immediately before the
+    /// trailing pending user message when the last message is one (so it
+    /// reads as context that precedes the live question, not a reply that
+    /// follows it, and role alternation stays intact); appended at the end
+    /// otherwise.
+    ///
+    /// This is how a retrieved memory judged worth persisting is promoted
+    /// into real conversation history exactly once, instead of being
+    /// re-rendered as a specially-tagged block on every turn: once spliced,
+    /// it rides along for free with ordinary history and is bounded by
+    /// whatever compaction already applies to the rest of the conversation.
+    /// The caller is responsible for only calling this once per exchange
+    /// (checking the text is not already present in the active window) --
+    /// this method itself does not deduplicate.
+    pub fn splice_synthetic_exchange(&mut self, user_text: String, assistant_text: String) {
+        let insert_at = if self.messages.last().is_some_and(|m| m.role == "user") {
+            self.messages.len() - 1
+        } else {
+            self.messages.len()
+        };
+        self.messages.splice(
+            insert_at..insert_at,
+            [Message::user(user_text), Message::assistant(assistant_text)],
+        );
+        self.trim_if_needed();
+    }
+
     /// Stage a complete provider assistant payload without making it visible
     /// to request builders, snapshots, compaction, or persistence.
     pub fn stage_assistant(
@@ -646,6 +676,75 @@ mod tests {
         conv.add_assistant_message("Hi there!".to_string());
         assert_eq!(conv.message_count(), 2);
         assert_eq!(conv.turn_count(), 1); // Now we have 1 complete turn
+    }
+
+    /// A splice inserted while the conversation ends with a pending user
+    /// question must land *before* that question, not after it -- it is
+    /// meant to read as earlier context, and inserting after it would also
+    /// produce two consecutive user-role messages (the splice's own user
+    /// half immediately followed by nothing, but the live question would
+    /// then have no assistant reply between it and the splice).
+    #[test]
+    fn splice_synthetic_exchange_lands_before_a_trailing_pending_user_message() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("older question".to_string());
+        conv.add_assistant_message("older answer".to_string());
+        conv.add_user_message("live question, not yet answered".to_string());
+
+        conv.splice_synthetic_exchange(
+            "remembered question".to_string(),
+            "remembered answer".to_string(),
+        );
+
+        let messages = conv.get_messages();
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant", "user"],
+            "splice must preserve strict role alternation; got {roles:?}"
+        );
+        assert_eq!(
+            messages[4].text(),
+            "live question, not yet answered",
+            "the live pending question must stay last, not get pushed \
+             earlier by the splice; messages={messages:?}"
+        );
+        assert_eq!(
+            messages[2].text(),
+            "remembered question",
+            "the splice must land immediately before the pending question; \
+             messages={messages:?}"
+        );
+        assert_eq!(messages[3].text(), "remembered answer");
+    }
+
+    /// With no trailing pending user message (e.g. mid tool-round, or an
+    /// empty conversation), the splice must still append cleanly rather than
+    /// panic on an out-of-bounds index.
+    #[test]
+    fn splice_synthetic_exchange_appends_when_conversation_does_not_end_on_a_user_message() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("older question".to_string());
+        conv.add_assistant_message("older answer".to_string());
+
+        conv.splice_synthetic_exchange(
+            "remembered question".to_string(),
+            "remembered answer".to_string(),
+        );
+
+        let messages = conv.get_messages();
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(messages[2].text(), "remembered question");
+        assert_eq!(messages[3].text(), "remembered answer");
+
+        let mut empty = ConversationHistory::new();
+        empty.splice_synthetic_exchange("q".to_string(), "a".to_string());
+        assert_eq!(
+            empty.message_count(),
+            2,
+            "splice into an empty conversation must not panic"
+        );
     }
 
     #[test]

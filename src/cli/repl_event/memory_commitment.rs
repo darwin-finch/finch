@@ -1,4 +1,4 @@
-//! Send-safe plumbing for the committed (byte-stable) memory-recall set
+//! Send-safe plumbing for the durably promoted (spliced-once) memory set
 //! (#940).
 //!
 //! `process_query_with_tools` runs under `tokio::spawn` (`Send` required),
@@ -7,7 +7,7 @@
 //! solves for `TodoWrite`. This module mirrors that split exactly:
 //!
 //! * [`MemoryCommitmentWriter`] is the `Send`, cloneable handle a query task
-//!   holds to request a replacement of the committed set.
+//!   holds to request a replacement of the promoted set.
 //! * [`MemoryCommitmentTarget`] is the frontend-local (non-`Send`) selector
 //!   for whichever Brain currently owns durable writes, set alongside
 //!   `TodoJournalTarget` wherever a Brain is attached or detached.
@@ -16,11 +16,15 @@
 //!
 //! Unlike the task-list journal, the local mirror
 //! (`Arc<RwLock<Vec<CommittedMemoryRecord>>>`) updates even when no Brain is
-//! attached: the committed set's job is turn-to-turn byte stability in the
-//! request prefix (the `SummaryCache` invariant shape), which a standalone
-//! session still benefits from even though nothing durable backs it. When a
-//! Brain *is* attached, the same replacement is also journaled, which is
-//! what lets the set survive `finch attach` / a daemon restart.
+//! attached: a standalone session still tracks which exchanges have been
+//! promoted into real conversation history, even though nothing durable
+//! backs that record. When a Brain *is* attached, the same replacement is
+//! also journaled, which is what lets the record survive `finch attach` / a
+//! daemon restart. The record itself no longer drives a per-turn
+//! re-rendering (`query_processor.rs`'s `process_query_with_tools` splices a
+//! promoted exchange into `ConversationHistory` exactly once instead) -- it
+//! is now an audit trail of what has been promoted this session, and a dedup
+//! key so the same exchange is not pushed as "newly promoted" twice.
 
 pub use crate::brain::CommittedMemoryRecord;
 use anyhow::Result;
@@ -123,24 +127,22 @@ impl MemoryCommitmentReceiver {
 }
 
 /// Everything `process_query_with_tools` needs each turn to read and update
-/// the committed memory set: the local mirror (read synchronously to render
-/// the byte-stable block), the writer (to request a replacement when the
-/// turn's decision changes the set), and the staleness clock. Bundled into
-/// one value so a per-turn query task takes one extra parameter instead of
-/// three.
+/// the promoted (spliced-once) memory set: the local mirror (read
+/// synchronously to fold in this turn's newly promoted exchanges) and the
+/// writer (to request a durable replacement when the set grows). Bundled
+/// into one value so a per-turn query task takes one extra parameter instead
+/// of two.
 ///
-/// `stale_counts` is deliberately not part of the durable
-/// `CommittedMemoryRecord`/mirror: it is `LlmLoop`'s own process-local scratch
-/// state (constructed fresh in `LlmLoop::new`, not threaded through
-/// `memory_commitment_journal`), so it never needs installing alongside a
-/// Brain target the way the writer/mirror do. A restart resets each
-/// committed memory's decay clock rather than guessing at an elapsed-turn
-/// count it never observed -- an accepted, conservative trade (#940).
+/// There is no staleness clock any more (#940 follow-up): a promoted
+/// exchange is spliced into real conversation history rather than
+/// re-rendered every turn, so nothing here needs a decay policy -- once
+/// promoted, an entry is a splice candidate for the rest of the session, and
+/// `conversation_compactor.rs`'s summarization is what bounds actual request
+/// size.
 #[derive(Clone)]
 pub struct MemoryCommitmentHandle {
     pub mirror: Arc<RwLock<Vec<CommittedMemoryRecord>>>,
     pub writer: MemoryCommitmentWriter,
-    pub stale_counts: Arc<RwLock<std::collections::HashMap<u64, u32>>>,
 }
 
 impl MemoryCommitmentHandle {
@@ -155,23 +157,21 @@ impl MemoryCommitmentHandle {
         Self {
             mirror: Arc::new(RwLock::new(Vec::new())),
             writer: MemoryCommitmentWriter { tx },
-            stale_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
-    /// A handle pre-seeded with `memories` as the current committed set, and
+    /// A handle pre-seeded with `memories` as the current promoted set, and
     /// no live worker (a push from this handle silently fails in the
     /// background, same as `inert()`). For tests that only need to observe
-    /// how an already-committed set renders and persists turn-to-turn, not
-    /// the push mechanism itself (covered separately by this module's own
-    /// tests and the `BrainStore` restart tests).
+    /// how an already-promoted set behaves, not the push mechanism itself
+    /// (covered separately by this module's own tests and the `BrainStore`
+    /// restart tests).
     #[cfg(test)]
     pub fn with_committed(memories: Vec<CommittedMemoryRecord>) -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
         Self {
             mirror: Arc::new(RwLock::new(memories)),
             writer: MemoryCommitmentWriter { tx },
-            stale_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }
