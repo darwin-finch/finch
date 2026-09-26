@@ -54,9 +54,62 @@ pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
     .any(|prefix| code.starts_with(prefix))
 }
 
+/// Provider-native tool names (and their registered dispatch aliases) that
+/// must be issued as tool calls, never written as `(name ...)` Lisp source or
+/// a bare Forth word inside a `ProgramSubmission`. This is the discovery
+/// ladder from `BOOT_CAPSULE` (`get_vm_state`, `search_word`, `inspect_word`,
+/// `get_language_definition`) plus the compatibility spellings
+/// `REPL_TOOL_ALIASES` dispatches to them (`src/cli/repl.rs`). Kept as a
+/// small fixed list, not a fuzzy matcher: a diagnostic naming any other
+/// unknown symbol gets no hint.
+const PROVIDER_NATIVE_TOOL_NAMES: &[&str] = &[
+    "get_vm_state",
+    "search_word",
+    "search_vm_vocabulary",
+    "search_vocabulary",
+    "inspect_word",
+    "inspect_vm_word",
+    "inspect_program",
+    "get_language_definition",
+];
+
+/// Pull the single-quoted symbol name out of an unknown/unlinked-word wire
+/// diagnostic, e.g. `unknown Lisp function 'search_word'` or `unknown
+/// Co-Forth word 'dupp'`. Every E-LINK-* constructor quotes the failing name
+/// this way (`finch-colisp`, `finch-coforth`, `finch-vm-core`), so a plain
+/// substring search is enough; this deliberately stays a lookup, not a
+/// diagnostic parser.
+fn unlinked_symbol_name(diagnostic: &str) -> Option<&str> {
+    let start = diagnostic.find('\'')? + 1;
+    let end = diagnostic[start..].find('\'')?;
+    Some(&diagnostic[start..start + end])
+}
+
+/// One-line reminder appended to a repair request when the rejected source
+/// referenced a provider-native tool name as if it were a linkable
+/// Lisp/Forth word. Without this, a model that made this exact mistake gets
+/// no better information on its repair attempt than on its first: the
+/// diagnostic alone (`unknown Lisp function 'search_word'`) does not say
+/// *why* the name is unknown, so the model is as likely to guess a different
+/// spelling as to stop writing it as source at all.
+fn provider_native_tool_repair_hint(diagnostic: &str, language: &str) -> String {
+    let Some(name) = unlinked_symbol_name(diagnostic) else {
+        return String::new();
+    };
+    if !PROVIDER_NATIVE_TOOL_NAMES.contains(&name) {
+        return String::new();
+    }
+    format!(
+        "\n\nNote: '{name}' is a provider-native tool call, not a {language} word. It cannot be \
+         linked from {language} source under any spelling; issue it as a tool call in its own turn \
+         instead of writing `({name} ...)` or a bare `{name}` inside this program."
+    )
+}
+
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     let language = ProgramLanguage::infer_source(rejected_source).as_str();
+    let tool_call_hint = provider_native_tool_repair_hint(diagnostic, language);
     format!(
         "E-WIRE-001. You do not communicate with the human directly; every byte of your text output is Finch VM input. \
          The preceding Finch VM wire program was rejected before execution. \
@@ -65,7 +118,7 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
          Re-emit exactly one complete raw Finch {language} ProgramSubmission; do not use Markdown, prose, labels, or tools. \
          User-visible text must be produced by an output effect inside that program.\n\n\
          Rejected source:\n---\n{rejected_source}\n---\n\
-         Diagnostic:\n{diagnostic}"
+         Diagnostic:\n{diagnostic}{tool_call_hint}"
     )
 }
 
@@ -1497,6 +1550,49 @@ mod tests {
         let lisp = wire_repair_request("(say message)", "E-NAME-001: unbound name");
         assert!(lisp.contains("It was lisp; repair it as lisp"));
         assert!(lisp.contains("smallest source correction"));
+    }
+
+    #[test]
+    fn test_wire_repair_reminds_that_a_provider_native_tool_name_is_not_linkable_source() {
+        // Reproduces the reported bug: a local model (Gemma 2 9B) emitted
+        // `(search_word "finch codebase")` as Lisp program source. `search_word` is a real,
+        // registered capability (`src/main.rs`, `src/tools/implementations/program.rs`,
+        // aliased in `src/cli/repl.rs`), but it is a provider-native tool call, never a
+        // Lisp-linkable function, so the VM correctly rejected it with E-LINK-002. Before
+        // this fix, the one-shot repair round echoed only the diagnostic back to the model,
+        // giving it no better information on the retry than on the first attempt.
+        let rejected_source = r#"(search_word "finch codebase")"#;
+        let diagnostic = "error[E-LINK-002]: unknown Lisp function 'search_word'\n \
+            --> wire:1:2\n  |\n1 | (search_word \"finch codebase\")\n  |  ^^^^^^^^^^^\n  = phase: linking";
+        let request = wire_repair_request(rejected_source, diagnostic);
+        assert!(
+            request.contains("'search_word' is a provider-native tool call, not a lisp word"),
+            "repair prompt must name the provider-native tool call explicitly: {request}"
+        );
+        assert!(
+            request.contains("issue it as a tool call in its own turn"),
+            "repair prompt must tell the model to issue a tool call instead of source: {request}"
+        );
+
+        // A registered dispatch alias (`inspect_vm_word` -> `inspect_word`, see
+        // `REPL_TOOL_ALIASES` in `src/cli/repl.rs`) must get the same reminder.
+        let alias_diagnostic = "E-LINK-002: unknown Co-Forth word 'inspect_vm_word'";
+        let alias_request = wire_repair_request(": bad inspect_vm_word ;", alias_diagnostic);
+        assert!(
+            alias_request.contains("'inspect_vm_word' is a provider-native tool call"),
+            "a registered alias must get the same reminder: {alias_request}"
+        );
+
+        // An ordinary unlinked word that is not a provider-native tool name (a typo, not a
+        // known tool) must not get this hint: the fixed list is an exact-name check, never a
+        // fuzzy "did you mean" matcher.
+        let typo_diagnostic =
+            "error[E-LINK-002]: unknown Co-Forth word 'dupp'\n  = hint: did you mean `dup`?";
+        let typo_request = wire_repair_request("dupp", typo_diagnostic);
+        assert!(
+            !typo_request.contains("provider-native tool call"),
+            "an ordinary unlinked word must not get the tool-call reminder: {typo_request}"
+        );
     }
 
     #[test]

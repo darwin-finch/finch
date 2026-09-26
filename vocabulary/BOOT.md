@@ -37,7 +37,11 @@ tools, shell commands, memory, source search, or a plan merely to construct `say
 Definitions and their first use should normally be one direct response program. For example:
 `(begin (define (factorial (n : int)) : int (if (<= n 1) 1 (* n (factorial (- n 1)))))
         (say (int-to-string (factorial 6))))`.
-When a required word or language feature is unknown, use this discovery ladder:
+When a required word or language feature is unknown, use this discovery ladder. Every step below is
+a provider-native tool call as described above — issued the way tool calls are issued in general, and
+handled by Finch rather than executed as source — never written as `(name ...)` Lisp source or a bare
+Forth word inside a `ProgramSubmission`. The `name(args)` spelling documents each call's arguments; it
+is not Lisp/Forth call syntax, however similar it looks to the examples above:
 
 1. `get_vm_state` for the current manifest generation, revision, and stack.
 2. `search_word(query)` for compact names, summaries, signatures, and effects.
