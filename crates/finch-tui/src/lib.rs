@@ -1048,6 +1048,10 @@ fn focused_reader_viewport_lines(
 /// stay on the frame at every scroll position. The completion pane is
 /// a sibling **above** the composer: an empty pane claims zero rows, so
 /// opening or closing it never moves the composer or status rects (#232).
+/// While open, the pane's own row count is pinned to
+/// `autocomplete_widget::RESERVED_PANE_ROWS` (padded with blank rows below
+/// however many rows actually match), so narrowing or widening a search
+/// cannot walk the composer up or down the screen either (#1247).
 pub(crate) fn plan_live_frame(
     vm: &view_model::LiveViewModel<'_>,
     autocomplete: &mut AutocompleteState,
@@ -9868,15 +9872,48 @@ mod tests {
         let width = 80;
         let height = 24;
 
-        let plain_draft = vec!["hello world".to_string()];
-        let closed_vm = live_inputs(width, height, &plain_draft, "ready");
-        let closed = plan_live_frame(&closed_vm, &mut AutocompleteState::new());
+        // Fill the transcript viewport past any claim it could receive, so
+        // the physical row each line paints at matches the abstract rect the
+        // widget tree claimed for it (the assertions below correlate the
+        // two). A real idle session can have an empty live viewport instead
+        // (nothing streaming) — that case, and the pane's fixed height while
+        // open, are covered by
+        // `test_composer_row_stays_fixed_as_completion_match_count_changes_regression_1247`,
+        // which asserts against the frame's actual physical cursor row.
+        let plan_with_filled_transcript = |draft: &str, matches: Option<&CommandRegistry>| {
+            let input_lines = vec![draft.to_string()];
+            let filler: Vec<RenderedTranscriptLine> = (0..height * 2)
+                .map(|row| RenderedTranscriptLine {
+                    text: format!("history row {row}"),
+                    ..RenderedTranscriptLine::default()
+                })
+                .collect();
+            let vm = view_model::LiveViewModel {
+                terminal_width: width,
+                terminal_height: height,
+                input_lines: &input_lines,
+                input_cursor: (0, 0),
+                ghost_text: None,
+                effective_status: "ready",
+                cwd_label: "~/repos/finch",
+                session_label: "jade-river",
+                model_identity: "",
+                dialog: None,
+                expanded_lines: None,
+                render_error: false,
+                task_rows: &[],
+                tracked_rows: &[],
+                live_rendered: &filler,
+            };
+            let mut autocomplete = AutocompleteState::new();
+            if let Some(registry) = matches {
+                autocomplete.show_matches(registry.match_prefix(draft));
+            }
+            plan_live_frame(&vm, &mut autocomplete)
+        };
 
-        let slash_draft = vec!["/quit".to_string()];
-        let open_vm = live_inputs(width, height, &slash_draft, "ready");
-        let mut open_autocomplete = AutocompleteState::new();
-        open_autocomplete.show_matches(registry.match_prefix("/quit"));
-        let open = plan_live_frame(&open_vm, &mut open_autocomplete);
+        let closed = plan_with_filled_transcript("hello world", None);
+        let open = plan_with_filled_transcript("/quit", Some(&registry));
 
         // A non-slash draft claims height 0.
         assert!(
@@ -9962,6 +9999,46 @@ mod tests {
             closed.rects.transcript.height,
             open.rects.transcript.height + pane.height,
             "the pane's rows come out of the transcript viewport, row for row"
+        );
+    }
+
+    #[test]
+    fn test_composer_row_stays_fixed_as_completion_match_count_changes_regression_1247() {
+        // #1247: the completion pane's printed row count tracked the live
+        // match count with no padding, so `rows_before_input` (and therefore
+        // `frame.cursor_row`, where the `❯` composer prints) walked up or
+        // down the screen on every keystroke that narrowed or widened a
+        // slash-command search — confirmed via tmux capture-pane snapshots
+        // showing the pane at 8/1/3 lines and the prompt row moving with it.
+        let registry = CommandRegistry::new();
+        let width = 80;
+        let height = 24;
+
+        let many_draft = vec!["/brain ".to_string()];
+        let mut many_autocomplete = AutocompleteState::new();
+        many_autocomplete.show_matches(registry.match_prefix("/brain "));
+        assert!(
+            many_autocomplete.matches.len() >= 8,
+            "fixture needs >= MAX_VISIBLE_SUGGESTIONS matches, got {}",
+            many_autocomplete.matches.len()
+        );
+        let many_vm = live_inputs(width, height, &many_draft, "ready");
+        let many_frame = plan_live_frame(&many_vm, &mut many_autocomplete);
+
+        let one_draft = vec!["/quit".to_string()];
+        let mut one_autocomplete = AutocompleteState::new();
+        one_autocomplete.show_matches(registry.match_prefix("/quit"));
+        assert_eq!(one_autocomplete.matches.len(), 1);
+        let one_vm = live_inputs(width, height, &one_draft, "ready");
+        let one_frame = plan_live_frame(&one_vm, &mut one_autocomplete);
+
+        assert_eq!(
+            many_frame.cursor_row, one_frame.cursor_row,
+            "the composer's screen row must stay fixed as the match count \
+             changes: an 8+-match frame landed the cursor at row {}, a \
+             1-match frame at row {}; many_frame lines: {:?}; one_frame \
+             lines: {:?}",
+            many_frame.cursor_row, one_frame.cursor_row, many_frame.lines, one_frame.lines
         );
     }
 
