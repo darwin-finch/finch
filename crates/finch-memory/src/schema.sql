@@ -129,6 +129,39 @@ CREATE TABLE IF NOT EXISTS routing_leaf_membership (
     FOREIGN KEY (point_id) REFERENCES routing_points(point_id)
 );
 
+-- Conversational occurrence chain, decoupled from `routing_points`' own text-level dedup
+-- (routing_memory.rs's `RoutingMemTree::insert_with_effect`, unchanged for its own direct
+-- callers). A point's id answers "what was said"; an occurrence's uuid answers "which time it
+-- was said" -- `RoutingMemTree::insert_occurrence` deliberately does NOT route through
+-- `insert_with_effect`'s dedup, so repeated identical text (e.g. "hello" recurring across a
+-- conversation) gets its own independent `point_id` and embedding every time, never collapsed
+-- onto an earlier occurrence just because the text matches; each occurrence gets its own row
+-- here too, so "what was said right before/after this" stays answerable. `retrieve`'s
+-- neighbor-context tie-break (routing_memory.rs, `NEAR_TIE_EPSILON`) reads this table's
+-- `prev_uuid`/`next_uuid` to compare a near-tied candidate's surrounding conversation against
+-- the live query.
+--
+-- `prev_uuid`/`next_uuid` are deliberately NOT foreign keys to this same table (SQLite would
+-- accept it, but nothing here enforces `PRAGMA foreign_keys=ON`, matching every other table in
+-- this file) and `point_id` is deliberately NOT a foreign key to `routing_points(point_id)`
+-- (unlike `memory_sources.node_id`): `insert_occurrence` persists this row without also
+-- requiring the point's own `routing_points` row to exist yet -- that persistence is a separate,
+-- already-existing concern (`RoutingMemTree::insert_with_effect` is in-memory only; a caller
+-- persists the point row itself, e.g. via `routing_tree::persistence::save_point`).
+--
+-- `next_uuid` is set by exactly one atomic `UPDATE ... WHERE uuid = ?1 AND next_uuid IS NULL`
+-- (`RoutingMemTree::link_next`) -- never a read-then-write -- so two callers racing to continue
+-- from the same `prev_uuid` can never both "win": the loser's `UPDATE` affects zero rows and
+-- surfaces as a real, expected `LinkConflict`, not corruption.
+CREATE TABLE IF NOT EXISTS routing_occurrences (
+    uuid        TEXT PRIMARY KEY,
+    point_id    INTEGER NOT NULL,
+    prev_uuid   TEXT,
+    next_uuid   TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routing_occurrences_point ON routing_occurrences(point_id);
+
 -- Indexes for fast retrieval
 CREATE INDEX IF NOT EXISTS idx_routing_nodes_parent ON routing_nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_routing_leaf_membership_point ON routing_leaf_membership(point_id);
