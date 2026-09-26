@@ -3,7 +3,7 @@
 // Each message type has its own update interface appropriate for its use case.
 // No need for downcasting - handlers receive concrete types directly.
 
-use super::{ComponentView, Message, MessageId, MessageStatus};
+use super::{ComponentAction, ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
 use finch_ui_model::{
@@ -875,6 +875,13 @@ impl Message for OperationMessage {
 // turn assembles its request, so the whole message is built once, complete,
 // from the start -- there is no add_row/complete_row lifecycle, and (unlike
 // a tool call) no input side to disclose separately from the recalled text.
+//
+// Each row's recalled text is collapsed behind its identity/summary line by
+// default and expands on click (#1235), the same component-owned disclosure
+// mechanism the say turn's `show_program` uses (docs/TUI_DESIGN.md, #882):
+// the open/closed flag is mutable UI state retained on the message behind its
+// own lock, addressed by row index through `transcript_action` /
+// `handle_transcript_action`, never the renderer's RowId-keyed maps.
 // ============================================================================
 
 /// One recalled memory's presentation: its identity line, presentation
@@ -888,21 +895,37 @@ pub struct MemoryRecallRow {
     pub body_lines: Vec<String>,
 }
 
-/// A recalled/committed memory set shown for one turn. Immutable once
-/// constructed: unlike a tool call, nothing about a recall streams in after
-/// the presentation decision is made.
+/// The memory-recall component's action vocabulary (#1235): expand/collapse
+/// one recalled memory's full text, addressed by its row index. Mirrors
+/// `ToggleProgram`'s opaque-action pattern in `work_unit.rs` -- each
+/// component defines its own payload beside the ViewModel it mutates, and the
+/// engine's hit-rect routing never inspects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToggleMemoryRow(pub usize);
+
+/// A recalled/committed memory set shown for one turn. The identity and
+/// content (`header`, `rows`) are immutable once constructed -- unlike a
+/// tool call, nothing about a recall streams in after the presentation
+/// decision is made -- but each row's disclosure (full text shown, or
+/// collapsed to its one-line summary) is mutable UI state behind its own
+/// lock, collapsed by default (#1235).
 pub struct MemoryRecalledMessage {
     id: MessageId,
     header: String,
     rows: Vec<MemoryRecallRow>,
+    /// One flag per row in `rows`, collapsed (`false`) by default; `true`
+    /// while that row's recalled text is expanded.
+    expanded: RwLock<Vec<bool>>,
 }
 
 impl MemoryRecalledMessage {
     pub fn new(header: impl Into<String>, rows: Vec<MemoryRecallRow>) -> Self {
+        let expanded = RwLock::new(vec![false; rows.len()]);
         Self {
             id: MessageId::new(),
             header: header.into(),
             rows,
+            expanded,
         }
     }
 }
@@ -914,20 +937,57 @@ impl Message for MemoryRecalledMessage {
 
     /// The chrome header plus one row per memory, its identity/summary line,
     /// and its recalled text -- no Input/Output split, since a memory has no
-    /// input side.
+    /// input side. The recalled text renders only while that row's
+    /// `expanded` flag is set (#1235); reads the flags fresh under the lock
+    /// every frame.
     fn component_view(&self) -> Option<ComponentView> {
+        let expanded = self.expanded.read().unwrap_or_else(|p| p.into_inner());
         Some(ComponentView::MemoryRecalled(MemoryRecalledView {
+            message_id: self.id,
             header: self.header.clone(),
             rows: self
                 .rows
                 .iter()
-                .map(|row| MemoryRecallRowView {
+                .zip(expanded.iter())
+                .map(|(row, &row_expanded)| MemoryRecallRowView {
                     label: row.label.clone(),
                     summary: row.summary.clone(),
                     body_lines: row.body_lines.clone(),
+                    expanded: row_expanded,
                 })
                 .collect(),
         }))
+    }
+
+    /// The component-defined action a click on recalled-memory row
+    /// `path[0]` produces (#1235): expand/collapse that row's full text. A
+    /// row with no recalled text has nothing to disclose and is not a click
+    /// target.
+    fn transcript_action(&self, path: &[u32]) -> Option<ComponentAction> {
+        if path.len() != 1 {
+            return None;
+        }
+        let index = path[0] as usize;
+        let row = self.rows.get(index)?;
+        if row.body_lines.is_empty() {
+            return None;
+        }
+        Some(ComponentAction::new(ToggleMemoryRow(index)))
+    }
+
+    /// Route a component action to the memory-recall component's handle:
+    /// flips that row's `expanded` flag under the message's lock. False for
+    /// foreign actions or an out-of-range row.
+    fn handle_transcript_action(&self, action: &ComponentAction) -> bool {
+        let Some(&ToggleMemoryRow(index)) = action.downcast_ref::<ToggleMemoryRow>() else {
+            return false;
+        };
+        let mut expanded = self.expanded.write().unwrap_or_else(|p| p.into_inner());
+        let Some(state) = expanded.get_mut(index) else {
+            return false;
+        };
+        *state = !*state;
+        true
     }
 
     fn format(&self, _colors: &ColorScheme) -> String {
@@ -1278,6 +1338,136 @@ impl Message for StaticMessage {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn memory_row(label: &str, summary: &str, body_lines: &[&str]) -> MemoryRecallRow {
+        MemoryRecallRow {
+            label: label.to_string(),
+            summary: summary.to_string(),
+            body_lines: body_lines.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    fn memory_row_view<'a>(view: &'a MemoryRecalledView, index: usize) -> &'a MemoryRecallRowView {
+        &view.rows[index]
+    }
+
+    /// #1235: a freshly constructed recall message defaults every row to
+    /// collapsed (`expanded: false`) -- the reported preference was that the
+    /// full recalled text must not render until the reader asks for it.
+    #[test]
+    fn test_memory_recalled_message_rows_default_collapsed() {
+        let message = MemoryRecalledMessage::new(
+            "2 memories retrieved",
+            vec![
+                memory_row(
+                    "recalled · score 0.64 · node 4",
+                    "5 chars, sent raw",
+                    &["hi"],
+                ),
+                memory_row(
+                    "recalled · score 0.60 · node 1",
+                    "5 chars, sent raw",
+                    &["yo"],
+                ),
+            ],
+        );
+        let Some(ComponentView::MemoryRecalled(view)) = message.component_view() else {
+            panic!("MemoryRecalledMessage must produce ComponentView::MemoryRecalled");
+        };
+        assert!(
+            view.rows.iter().all(|row| !row.expanded),
+            "every row must default to collapsed; rows={:?}",
+            view.rows
+        );
+    }
+
+    /// #1235: clicking a row's summary line (`transcript_action` at that
+    /// row's path) toggles exactly that row's `expanded` flag under the
+    /// message's lock, mirroring `WorkUnit::say_turn_action` /
+    /// `handle_say_turn_action`'s `ToggleProgram` pattern -- and clicking
+    /// again collapses it back.
+    #[test]
+    fn test_memory_recalled_message_transcript_action_toggles_one_row_expanded_state() {
+        let message = MemoryRecalledMessage::new(
+            "2 memories retrieved",
+            vec![
+                memory_row(
+                    "recalled · score 0.64 · node 4",
+                    "5 chars, sent raw",
+                    &["hi"],
+                ),
+                memory_row(
+                    "recalled · score 0.60 · node 1",
+                    "5 chars, sent raw",
+                    &["yo"],
+                ),
+            ],
+        );
+
+        let action = message
+            .transcript_action(&[1])
+            .expect("a row with recalled text produces a toggle action");
+        assert!(
+            message.handle_transcript_action(&action),
+            "the trait handle must toggle the targeted row"
+        );
+        let Some(ComponentView::MemoryRecalled(view)) = message.component_view() else {
+            panic!("MemoryRecalledMessage must produce ComponentView::MemoryRecalled");
+        };
+        assert!(
+            !memory_row_view(&view, 0).expanded,
+            "row 0 must be untouched by a click on row 1; rows={:?}",
+            view.rows
+        );
+        assert!(
+            memory_row_view(&view, 1).expanded,
+            "row 1 must have opened; rows={:?}",
+            view.rows
+        );
+
+        // Click again: the same action toggles it back closed.
+        let action_again = message
+            .transcript_action(&[1])
+            .expect("the row still produces a toggle action once expanded");
+        assert!(message.handle_transcript_action(&action_again));
+        let Some(ComponentView::MemoryRecalled(view)) = message.component_view() else {
+            panic!("MemoryRecalledMessage must produce ComponentView::MemoryRecalled");
+        };
+        assert!(
+            !memory_row_view(&view, 1).expanded,
+            "a second click must collapse the row again; rows={:?}",
+            view.rows
+        );
+
+        let foreign = ComponentAction::new(7u32);
+        assert!(
+            !message.handle_transcript_action(&foreign),
+            "a foreign action payload is rejected, never misinterpreted"
+        );
+    }
+
+    /// #1235: a row with no recalled text has nothing to disclose and is
+    /// never a click target -- `transcript_action` returns `None` rather
+    /// than an action that would toggle an always-empty body.
+    #[test]
+    fn test_memory_recalled_message_row_with_empty_body_has_no_transcript_action() {
+        let message = MemoryRecalledMessage::new(
+            "1 memory retrieved",
+            vec![memory_row(
+                "committed · score 0.50 · node 9",
+                "0 chars, sent raw",
+                &[],
+            )],
+        );
+        assert!(
+            message.transcript_action(&[0]).is_none(),
+            "a row with no recalled text must not be a click target"
+        );
+        assert!(
+            message.transcript_action(&[5]).is_none(),
+            "an out-of-range row index must not panic or produce an action"
+        );
+    }
 
     #[test]
     fn brain_participant_messages_distinguish_prompt_from_relay() {

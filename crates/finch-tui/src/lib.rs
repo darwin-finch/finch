@@ -37,7 +37,7 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use finch_messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
-use finch_ui_model::input_line_physical_rows_with_ghost;
+use finch_ui_model::{input_line_physical_rows_with_ghost, ComponentView};
 #[cfg(test)]
 use test_support::{OutputManager, StatusBar, StatusLineType};
 // Sub-modules
@@ -3264,11 +3264,21 @@ impl TuiRenderer {
         };
         if let Some(want) = want {
             // Honour the pinned direction without disturbing an already-correct
-            // state: read the component's current disclosure from its ViewModel.
-            if let Some(view) = message.say_turn_view() {
-                if view.vm.show_program == want {
-                    return false;
-                }
+            // state: read the component's current disclosure from its
+            // ViewModel. Say has exactly one toggle target per message (the
+            // output region, path `[1]`); MemoryRecalled has one per
+            // recalled-memory row (#1235), addressed by `row_id.path`.
+            let already_matches = match message.component_view() {
+                Some(ComponentView::Say(view)) => view.vm.show_program == want,
+                Some(ComponentView::MemoryRecalled(view)) => row_id
+                    .path
+                    .first()
+                    .and_then(|&index| view.rows.get(index as usize))
+                    .is_some_and(|row| row.expanded == want),
+                _ => false,
+            };
+            if already_matches {
+                return false;
             }
         }
         let Some(action) = message.transcript_action(&row_id.path) else {
@@ -7699,6 +7709,161 @@ mod tests {
         assert!(
             lines.iter().all(|line| line.row_expanded == Some(true)),
             "row_expanded reports the opened state for assistive consumers"
+        );
+    }
+
+    /// #1235 (issue: recalled-memory previews should be collapsed by
+    /// default, expand on click): production-boundary regression exercising
+    /// the exact click and keyboard routes a live session uses --
+    /// `TranscriptHitRegion`/`component_region_at` hit-testing plus
+    /// `dispatch_component_disclosure` -- rather than calling
+    /// `MemoryRecalledMessage`'s handle directly. Mirrors
+    /// `say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps`:
+    /// same component-owned mechanism (#882), different message type.
+    #[test]
+    fn test_memory_recall_row_collapsed_by_default_click_expands_click_again_collapses() {
+        use finch_messages::{MemoryRecallRow, MemoryRecalledMessage};
+
+        let colors = ColorScheme::default();
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&manager),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+
+        let recall = Arc::new(MemoryRecalledMessage::new(
+            "1 memory retrieved",
+            vec![MemoryRecallRow {
+                label: "recalled · score 0.64 · node 4".to_string(),
+                summary: "5 chars, sent raw".to_string(),
+                body_lines: vec!["user: hi".to_string(), "assistant: hello".to_string()],
+            }],
+        ));
+        manager.add_trait_message(recall.clone() as MessageRef);
+
+        // Collapsed by default: the recalled text must not render.
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !rendered.iter().any(|line| line.contains("user: hi")),
+            "the recalled text must stay hidden until the row is expanded; got {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recalled · score 0.64 · node 4")),
+            "the identity/summary line stays visible while collapsed; got {rendered:?}"
+        );
+        let summary_line = lines
+            .iter()
+            .find(|line| line.text.contains("recalled · score 0.64 · node 4"))
+            .expect("the summary line renders");
+        let target = summary_line
+            .row_id
+            .clone()
+            .expect("the summary line carries the row's disclosure identity");
+        assert!(
+            summary_line.component_owned,
+            "disclosure state lives on the component ViewModel (#882), not the accordion's \
+             RowId-keyed maps"
+        );
+        assert_eq!(
+            summary_line.row_expanded,
+            Some(false),
+            "row_expanded reports the collapsed state for assistive consumers"
+        );
+
+        // Click the summary line: the hitbox resolves to the row's RowId and
+        // routes to the component's handle, exactly as a live mouse click
+        // would (`handle_accordion_mouse`'s component-owned branch).
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&lines, 0, 80);
+        let clicked = renderer
+            .accordion
+            .component_region_at(0, 1)
+            .expect("the summary line registers as a component hit region");
+        assert_eq!(
+            clicked, target,
+            "the component hit region is the summary row"
+        );
+        assert!(
+            !renderer
+                .accordion
+                .handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left
+                    ),
+                    column: 0,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+            "the accordion must NOT toggle a component-owned row through its own maps"
+        );
+        assert!(
+            renderer.dispatch_component_disclosure(&target, None),
+            "the mouse-click route (want=None) must reach the component's handle"
+        );
+
+        // Re-render: the click expanded the row.
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("user: hi"))
+                && rendered
+                    .iter()
+                    .any(|line| line.contains("assistant: hello")),
+            "clicking must reveal the recalled text; got {rendered:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.row_id.as_ref() == Some(&target))
+                .all(|line| line.row_expanded == Some(true)),
+            "every line of the expanded row reports the expanded state; lines={lines:?}"
+        );
+
+        // Click again: the same route collapses it back.
+        assert!(
+            renderer.dispatch_component_disclosure(&target, None),
+            "clicking an expanded row must collapse it again"
+        );
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !rendered.iter().any(|line| line.contains("user: hi")),
+            "the second click must hide the recalled text again; got {rendered:?}"
+        );
+
+        // Keyboard equivalence (F6 focus + Right/Left): Right force-expands
+        // and is idempotent; Left force-collapses and is idempotent -- the
+        // pinned direction must never re-toggle an already-correct row
+        // (the bug this generalizes past Say alone, #1235).
+        assert!(
+            renderer.dispatch_component_disclosure(&target, Some(true)),
+            "Right must expand a collapsed row"
+        );
+        assert!(
+            !renderer.dispatch_component_disclosure(&target, Some(true)),
+            "Right on an already-expanded row must be a no-op, not a re-toggle"
+        );
+        let Some(finch_ui_model::ComponentView::MemoryRecalled(view)) = recall.component_view()
+        else {
+            panic!("MemoryRecalledMessage must produce ComponentView::MemoryRecalled");
+        };
+        assert!(
+            view.rows[0].expanded,
+            "the row must still be expanded after the idempotent Right press"
+        );
+        assert!(
+            renderer.dispatch_component_disclosure(&target, Some(false)),
+            "Left must collapse an expanded row"
+        );
+        assert!(
+            !renderer.dispatch_component_disclosure(&target, Some(false)),
+            "Left on an already-collapsed row must be a no-op, not a re-toggle"
         );
     }
 

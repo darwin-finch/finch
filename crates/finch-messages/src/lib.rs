@@ -25,7 +25,8 @@ mod work_unit;
 pub use concrete::{
     BrainParticipantMessage, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage,
     OperationMessage, OperationRow, OperationRowStatus, ProgressMessage, StaticMessage,
-    StaticMessageType, StreamingResponseMessage, ToolExecutionMessage, UserQueryMessage,
+    StaticMessageType, StreamingResponseMessage, ToggleMemoryRow, ToolExecutionMessage,
+    UserQueryMessage,
 };
 pub use work_unit::{random_spinner_verb, ComponentAction, ToggleProgram, WorkRow, WorkUnit};
 
