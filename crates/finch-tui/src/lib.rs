@@ -3417,18 +3417,18 @@ impl TuiRenderer {
             .is_some_and(|active| active.dragging);
         if dragging {
             let step = scroll_view::TRANSCRIPT_WHEEL_STEP_LINES;
-            if self
+            let edge_delta = self
                 .transcript_scroll
-                .drag_autoscroll_delta(point.row, step)
-                .is_some()
-            {
-                self.autoscroll_transcript_drag(point);
-            } else {
-                let active = self
-                    .selection
-                    .as_mut()
-                    .expect("dragging was just read as true from this same selection");
-                active.extend(point);
+                .drag_autoscroll_delta(point.row, step);
+            match edge_delta {
+                Some(delta) => self.autoscroll_transcript_drag(point, delta),
+                None => {
+                    let active = self
+                        .selection
+                        .as_mut()
+                        .expect("dragging was just read as true from this same selection");
+                    active.extend(point);
+                }
             }
             self.live_area_dirty = true;
             return true;
@@ -3481,14 +3481,12 @@ impl TuiRenderer {
     /// is simply re-extended to `point`: unchanged in screen terms, it
     /// resolves through the post-scroll index to whichever newly-revealed
     /// content now sits at the edge.
-    fn autoscroll_transcript_drag(&mut self, point: selection::SelectionPoint) {
-        let step = scroll_view::TRANSCRIPT_WHEEL_STEP_LINES;
-        let Some(delta) = self
-            .transcript_scroll
-            .drag_autoscroll_delta(point.row, step)
-        else {
-            return;
-        };
+    ///
+    /// `delta` is the caller's already-computed
+    /// `TranscriptScrollView::drag_autoscroll_delta(point.row, ..)` — passed
+    /// in rather than recomputed here, so the direction this method acts on
+    /// is always exactly the one `handle_left_drag` just decided to take.
+    fn autoscroll_transcript_drag(&mut self, point: selection::SelectionPoint, delta: isize) {
         let offset_before = self.transcript_scroll.offset();
         let saved = self.selection.take();
         if !self.scroll_transcript_view(delta) {

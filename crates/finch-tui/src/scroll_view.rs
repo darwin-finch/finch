@@ -112,6 +112,15 @@ impl TranscriptScrollView {
     /// caller's own per-tick row count — production reuses
     /// [`TRANSCRIPT_WHEEL_STEP_LINES`] so drag autoscroll and wheel
     /// scrolling move at the same, already-established rate.
+    ///
+    /// A one-row claim (`top == bottom_last`) has no distinct top and
+    /// bottom edge — the top check is evaluated first, so that single row
+    /// always scrolls toward older content. This is a deliberate tie-break
+    /// for an already-degenerate viewport (one committed transcript row
+    /// above the bottom chrome), not a reachable case in practice: a
+    /// terminal that short already falls into `draw_live_area_to`'s
+    /// `term_h <= 3` tiny-frame path, which claims nothing at all
+    /// (`Rect::default()`, caught by the empty-claim `None` above).
     pub(crate) fn drag_autoscroll_delta(&self, row: u16, step: usize) -> Option<isize> {
         let (top, bottom_last) = self.visible_row_bounds()?;
         if row <= top {
