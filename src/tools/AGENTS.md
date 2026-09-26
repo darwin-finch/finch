@@ -17,6 +17,31 @@ from a check command the user declared in `[diagnostics]` config — nothing is 
 declared command's authority verdict is read from the existing bash approval path
 (`PermissionManager::check_tool_use("bash", …)`), so it never runs where bash would not.
 
+**A check-command spawn retries a transient `ETXTBSY`, bounded, instead of surfacing it as a
+startup failure (issue #1204).** The kernel refuses to exec a file any process holds open for
+writing, and `fork()` copies the *entire* file descriptor table — so on a Linux-family kernel, a
+spawn anywhere else in the same process that forks while any thread still holds a write
+descriptor on a file this service just wrote hands its child an inherited copy of that
+descriptor, and this service's own exec is refused even though its own writer already closed its
+copy first. `cargo test`'s default parallelism runs many `#[tokio::test]` functions concurrently
+in one process, and this module both writes fresh executable fixtures and spawns them, repeatedly,
+across many tests, which is exactly the combination that behavior makes racy — three separate CI
+failures (main run 36262031799, PRs #1144 and #1193), each in a different test in this module,
+never one whose diff touched `diagnostics/`. `spawn_retrying_text_file_busy` in
+`diagnostics/mod.rs` mirrors the identical, already-reviewed fix for `process-run`
+(`finch_runtime::host::spawn_retrying_text_file_busy`, issue #287): retry specifically on
+`ETXTBSY`, bounded (eight attempts, linearly backed off from 5ms), never anything else. Verified
+directly (not merely asserted): a shebang script's own exec is *not* subject to this kernel
+check on macOS, so the deterministic reproduction below is Linux-family-only, while the
+production retry stays `cfg(unix)` as a no-cost safety net.
+`test_transient_text_file_busy_check_command_is_retried_not_reported_as_a_failure` in
+`diagnostics/mod.rs` forces a real refusal (a second write descriptor held open on the exact
+script about to be exec'd — the kernel's check is per-inode, so this is deterministic, not
+timing-dependent) and proves the retry recovers it; the concurrent-load counterpart
+`test_many_concurrent_check_command_spawns_never_report_a_startup_failure` (`worker_threads = 8`,
+unlike every other test in this module) stresses genuinely overlapping forks across real OS
+threads and asserts every one of many concurrent spawns still resolves to a passing check.
+
 **ToolLoop owns REPL and scheduler rounds.** Those two callers admit a call through the
 `finch-tools-api` protocol before execution; malformed arguments, duplicate ids, unknown or
 unsupported tools fail closed with a typed result. Cancel, timeout, disconnect, retry, and

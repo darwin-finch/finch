@@ -165,7 +165,7 @@ impl DiagnosticsService {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let child = match command.spawn() {
+        let child = match spawn_retrying_text_file_busy(&mut command, program).await {
             Ok(child) => child,
             Err(error) => {
                 return CheckRun {
@@ -223,6 +223,93 @@ impl DiagnosticsService {
     }
 }
 
+/// How many times to re-attempt a check-command spawn the kernel refuses
+/// with `ETXTBSY`, and how long to wait between attempts.
+///
+/// Mirrors `finch_runtime::host`'s `process-run` retry (issue #287, the
+/// first place this exact kernel behavior was diagnosed in this
+/// repository): the kernel refuses to exec a file any process holds open
+/// for writing, and `fork()` copies the *entire* file descriptor table —
+/// so a spawn anywhere else in the same process that forks while any
+/// thread still holds a write descriptor on this file hands its child an
+/// inherited copy of that descriptor, and *this* exec is refused even
+/// though this module's own writer (`write_script` in tests; the file the
+/// user declared in `[diagnostics]` in production) already closed its own
+/// copy before this spawn ever ran. The condition is transient and
+/// self-clearing: the inherited descriptor closes the moment that
+/// unrelated child execs.
+///
+/// This is issue #1204: three separate CI failures, each in a different
+/// test in this module, each shaped exactly like this — `write_script`
+/// writes and closes the file, then the very next `spawn()` call is
+/// refused — even though this module's own write-then-spawn sequence has
+/// no gap in it. The refusal comes from *outside* this module: `cargo
+/// test`'s default parallelism runs many `#[tokio::test]` functions
+/// concurrently in one process, and this module is the one that both
+/// writes fresh executable files *and* spawns them, repeatedly, across
+/// many tests — the exact combination `fork()`'s whole-table-copy
+/// semantics make racy. No reordering of this module's own write/chmod/
+/// spawn sequence closes that gap, because the gap is never inside this
+/// module: retrying the specific, documented, self-clearing error is the
+/// fix, the same way #287 fixed it for `process-run`.
+///
+/// The loop breaks before sleeping on its final attempt, so eight attempts
+/// means seven waits: `5ms * (1 + 2 + ... + 7)` = 140ms of sleep as a
+/// floor, not a ceiling.
+#[cfg(unix)]
+const TEXT_FILE_BUSY_ATTEMPTS: u32 = 8;
+
+#[cfg(unix)]
+const TEXT_FILE_BUSY_BACKOFF: Duration = Duration::from_millis(5);
+
+/// Spawn a check command, re-attempting while the kernel reports
+/// `ETXTBSY`. See [`TEXT_FILE_BUSY_ATTEMPTS`] for why this condition is
+/// transient and safe to retry: every attempt spawns the exact command the
+/// caller already built, so a retry has no path to running anything other
+/// than what was already going to run.
+#[cfg(unix)]
+async fn spawn_retrying_text_file_busy(
+    command: &mut tokio::process::Command,
+    executable: &str,
+) -> std::io::Result<tokio::process::Child> {
+    for attempt in 1..=TEXT_FILE_BUSY_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                #[cfg(test)]
+                tests::record_text_file_busy_refusal(executable);
+                tracing::debug!(
+                    executable,
+                    attempt,
+                    "check command exec refused with ETXTBSY; a descriptor \
+                     still holds it open for writing, retrying"
+                );
+                if attempt == TEXT_FILE_BUSY_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(TEXT_FILE_BUSY_BACKOFF * attempt).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    tracing::warn!(
+        executable,
+        attempts = TEXT_FILE_BUSY_ATTEMPTS,
+        "check command exec refused with ETXTBSY on every attempt; giving up"
+    );
+    command.spawn()
+}
+
+/// ETXTBSY is a POSIX exec-time refusal; platforms without fork/exec
+/// process spawning cannot hit it, so there is nothing to retry.
+#[cfg(not(unix))]
+async fn spawn_retrying_text_file_busy(
+    command: &mut tokio::process::Command,
+    _executable: &str,
+) -> std::io::Result<tokio::process::Child> {
+    command.spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +318,50 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::Instant;
+
+    /// Per-executable count of real `ETXTBSY` refusals `spawn_retrying_text_file_busy`
+    /// has observed, so a deterministic test can wait for a genuine kernel
+    /// refusal instead of a fixed sleep (a fixed sleep would make the test
+    /// vacuous on a loaded runner if the held descriptor happened to close
+    /// before the first spawn attempt). Keyed by executable path so a
+    /// concurrently running sibling test's own unrelated refusals on its own
+    /// script cannot be mistaken for this test's.
+    #[cfg(unix)]
+    static TEXT_FILE_BUSY_REFUSALS: OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        OnceLock::new();
+
+    #[cfg(unix)]
+    pub(super) fn record_text_file_busy_refusal(executable: &str) {
+        let mut table = TEXT_FILE_BUSY_REFUSALS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *table.entry(executable.to_string()).or_insert(0) += 1;
+    }
+
+    // Only the deterministic reproduction test below reads this, and that
+    // test is itself restricted to the platforms where a shebang script's
+    // own exec is actually subject to the kernel's deny-write check
+    // (verified directly: macOS is not one of them). Matching that
+    // restriction here, rather than the broader `cfg(unix)` production
+    // retry uses, keeps this getter from going unused on macOS.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    fn text_file_busy_refusals(executable: &str) -> u32 {
+        TEXT_FILE_BUSY_REFUSALS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(executable)
+            .copied()
+            .unwrap_or(0)
+    }
 
     fn source(extensions: &[&str], command: &str) -> CheckCommandSource {
         CheckCommandSource {
@@ -643,6 +773,180 @@ mod tests {
         assert!(
             annotation.contains("failed to start"),
             "spawn failure must be a bounded report naming the failure:\n{annotation}"
+        );
+    }
+
+    /// #1204: a check-command spawn the kernel refuses with `ETXTBSY` is
+    /// retried, not surfaced to the model as a startup failure.
+    ///
+    /// Three separate CI failures (PR #1144, PR #1193, and main run
+    /// 36262031799) hit this — a different specific test in this module
+    /// each time, never a test that touches `src/tools/diagnostics/` in its
+    /// diff. `write_script` writes and closes the fixture script, then
+    /// `run_check` spawns it next; there is no gap between those two steps
+    /// in this module's own code, and the gate mutex already serializes
+    /// concurrent runs of one source. The refusal instead comes from
+    /// *outside* this test: the kernel's ETXTBSY check is per-inode, and
+    /// `fork()` copies the *entire* file descriptor table, so cargo test's
+    /// default parallelism running many other `#[tokio::test]` functions in
+    /// this same module concurrently means some *other*, unrelated spawn
+    /// can fork while this test's own script still has a writer open
+    /// somewhere, and inherit a copy of that write descriptor into its
+    /// child — refusing *this* test's exec even though this test's own
+    /// writer already closed its copy.
+    ///
+    /// This does not need a second process racing to reproduce: the
+    /// kernel's check is per-inode, so a second write descriptor opened
+    /// here on this test's own script blocks its own exec exactly the same
+    /// way, deterministically instead of at CI's whim. Before the fix this
+    /// fails at the "must still annotate" expect: the first refusal was
+    /// returned to the caller verbatim, as `check command failed to start:
+    /// Text file busy (os error 26)`.
+    ///
+    /// Restricted to the platforms where a shebang script's own exec is
+    /// actually subject to the kernel's deny-write check (matching
+    /// `finch_runtime::host`'s identical #287 test): verified directly that
+    /// macOS does not refuse to exec a shell script that is still open for
+    /// writing, so this reproduction is not meaningful there, and gating it
+    /// there would make the test flicker between "proves the retry" and
+    /// "proves nothing" depending on the host kernel, not this fix.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn test_transient_text_file_busy_check_command_is_retried_not_reported_as_a_failure() {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let script = write_script(dir.path(), "check.sh", "echo ok\n");
+        let service = DiagnosticsService::from_config(
+            &config(vec![source(&["rs"], &script)]),
+            dir.path().to_path_buf(),
+        );
+        let permissions = owner_allowing_bash(dir.path());
+
+        // Hold a second write descriptor open on the exact script the spawn
+        // below is about to exec. The kernel's ETXTBSY check is per-inode,
+        // so this blocks the exec the same way an unrelated concurrent
+        // test's in-flight fork would, on demand instead of by chance.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("open the script for writing while it is still named");
+        let held: Arc<std::sync::Mutex<Option<fs::File>>> =
+            Arc::new(std::sync::Mutex::new(Some(writer)));
+        let releaser_script = script.clone();
+        let releaser_held = Arc::clone(&held);
+        std::thread::spawn(move || {
+            // Release once a real refusal has actually been observed,
+            // rather than after a fixed delay: a timer would make this test
+            // vacuous on a fast or lightly loaded machine — if the work
+            // before the spawn outlasts a fixed delay, the descriptor would
+            // already be closed before the first attempt, every assertion
+            // below would still pass, and the retry path would never have
+            // run.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while text_file_busy_refusals(&releaser_script) == 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            releaser_held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        });
+
+        let annotation = service
+            .annotation_for_edit_result("/w/src/main.rs", &permissions)
+            .await
+            .expect("a transiently busy check command must still annotate once retried");
+
+        assert!(
+            text_file_busy_refusals(&script) >= 1,
+            "the test's own held-open descriptor must have produced at least one \
+             real ETXTBSY refusal, or this proves nothing about the retry path: \
+             refusals=0, script={script}"
+        );
+        assert!(
+            annotation.contains("check passed (exit 0)"),
+            "a transiently busy check command must be retried through to its real \
+             result, not reported as a startup failure:\n{annotation}"
+        );
+        assert!(
+            !annotation.contains("failed to start"),
+            "ETXTBSY must never reach the model as a startup failure once the \
+             kernel-documented retry has run:\n{annotation}"
+        );
+
+        // Safety net: the releaser thread should already have taken this,
+        // but drop it explicitly before `dir` (and the script inside it)
+        // goes away regardless.
+        held.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Stress coverage for #1204 alongside the forced, deterministic
+    /// reproduction above: real OS threads (`worker_threads = 8`, not the
+    /// single-threaded default `#[tokio::test]` runtime every other test in
+    /// this module uses, which cannot make two `fork()` calls overlap at
+    /// all) each repeatedly write a fresh script and spawn it, so genuinely
+    /// concurrent forks can land inside each other's write windows the same
+    /// way distinct test functions did in the three CI failures. Every one
+    /// of the resulting spawns must still resolve to a passing check --
+    /// the retry must absorb any live ETXTBSY this actually triggers, not
+    /// merely the forced one above. Report the pass count in the commit's
+    /// verification evidence; a platform where the race never materializes
+    /// (verified directly: macOS) simply exercises the code path with zero
+    /// live refusals rather than proving nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_many_concurrent_check_command_spawns_never_report_a_startup_failure() {
+        const WORKERS: usize = 8;
+        const ITERATIONS_PER_WORKER: usize = 6;
+
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let cwd = dir.path().to_path_buf();
+        let permissions = Arc::new(owner_allowing_bash(&cwd));
+
+        let mut tasks = Vec::new();
+        for worker in 0..WORKERS {
+            let cwd = cwd.clone();
+            let permissions = Arc::clone(&permissions);
+            tasks.push(tokio::spawn(async move {
+                let mut failures = Vec::new();
+                for iteration in 0..ITERATIONS_PER_WORKER {
+                    let name = format!("check-{worker}-{iteration}.sh");
+                    let script = write_script(&cwd, &name, "echo ok\n");
+                    let service = DiagnosticsService::from_config(
+                        &config(vec![source(&["rs"], &script)]),
+                        cwd.clone(),
+                    );
+                    match service
+                        .annotation_for_edit_result("/w/src/main.rs", &permissions)
+                        .await
+                    {
+                        Some(annotation) if annotation.contains("check passed (exit 0)") => {}
+                        other => failures.push(format!(
+                            "worker={worker} iteration={iteration} result={other:?}"
+                        )),
+                    }
+                }
+                failures
+            }));
+        }
+
+        let mut all_failures = Vec::new();
+        for task in tasks {
+            all_failures.extend(task.await.expect("worker task must not panic"));
+        }
+
+        assert!(
+            all_failures.is_empty(),
+            "{} of {} concurrent check-command spawns did not resolve to a passing \
+             check after retry:\n{}",
+            all_failures.len(),
+            WORKERS * ITERATIONS_PER_WORKER,
+            all_failures.join("\n")
         );
     }
 
