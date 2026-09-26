@@ -121,8 +121,9 @@ modules, including `memory_status`, are private.
   occurrence has neither `prev` nor `next` set, falls back to raw-cosine order instead of
   crashing or being excluded — `test_retrieve_prefers_near_tied_candidate_whose_occurrence_neighbor_matches_query_context`
   and `test_retrieve_tie_break_falls_back_gracefully_when_neither_candidate_has_occurrence_context`
-  in `src/routing_memory/tests.rs`. Because the tie-break reads `routing_occurrences`,
-  `RoutingMemTree::retrieve` now takes `conn: &Connection`; both call sites in `lib.rs`
+  in `src/routing_memory/tests.rs`.
+  Because the tie-break reads the `routing_occurrences` table (`src/schema.sql`), `RoutingMemTree::retrieve`
+  now takes `conn: &Connection`; both call sites in `lib.rs`
   (`query_with_sources`, `conversation_summary`) acquire the db lock before the tree lock, the
   same order `stats()` already used, to avoid a lock-order deadlock.
 
