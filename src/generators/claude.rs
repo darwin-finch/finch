@@ -147,6 +147,16 @@ impl ClaudeGenerator {
         build_system_prompt(self.cwd.as_deref(), self.instructions.text())
     }
 
+    /// Whether `tools` would need the prompt-injection fold: the provider
+    /// declares no native tool-calling capability and a non-empty tool set
+    /// was requested. The single predicate both `split_tools_for_capability`
+    /// (which request shape to build) and `requires_prompt_injected_tools`
+    /// (whether streaming can be used at all) key off, so the two decisions
+    /// cannot drift apart.
+    fn needs_prompt_injection(tools: &Option<Vec<ToolDefinition>>, client: &ClaudeClient) -> bool {
+        tools.as_ref().is_some_and(|tools| !tools.is_empty()) && !client.supports_tools()
+    }
+
     /// Split requested tools into native `request.tools` (when the
     /// configured provider can execute function-calling itself) or prompt
     /// text to fold into the system prompt instead (when it cannot -- e.g.
@@ -161,13 +171,14 @@ impl ClaudeGenerator {
         &self,
         tools: Option<Vec<ToolDefinition>>,
     ) -> (Option<Vec<ToolDefinition>>, Option<String>) {
-        match tools {
-            Some(tools) if !tools.is_empty() && !self.client.supports_tools() => (
-                None,
-                Some(ToolPromptFormatter::format_tools_for_prompt(&tools)),
-            ),
-            other => (other, None),
+        if !Self::needs_prompt_injection(&tools, &self.client) {
+            return (tools, None);
         }
+        let tools = tools.expect("needs_prompt_injection confirmed a non-empty tool set");
+        (
+            None,
+            Some(ToolPromptFormatter::format_tools_for_prompt(&tools)),
+        )
     }
 
     /// Whether `tools` would need the prompt-injection fold above. Streaming
@@ -178,7 +189,7 @@ impl ClaudeGenerator {
     /// tool-markup proposals, which also declares `supports_streaming:
     /// false`).
     fn requires_prompt_injected_tools(&self, tools: &Option<Vec<ToolDefinition>>) -> bool {
-        tools.as_ref().is_some_and(|tools| !tools.is_empty()) && !self.client.supports_tools()
+        Self::needs_prompt_injection(tools, &self.client)
     }
 
     /// Parse `<tool_use>` markup a prompt-injected-tools turn produced back
@@ -522,22 +533,83 @@ mod tests {
         );
     }
 
-    /// Declares streaming supported but tool calls unsupported, matching
-    /// `finch_providers::ClaudeCliProvider`'s real capability declaration
-    /// (`--tools ""`, issue #1303). Never actually sends a request: the
-    /// capability check in `ClaudeGenerator::generate_stream_cancellable`
-    /// must short-circuit before either `ProviderBackend` method runs.
+    /// Shared capability declaration for the two fixtures below: streaming
+    /// supported, tool calls unsupported, matching
+    /// `finch_providers::ClaudeCliProvider`'s real declaration (`--tools
+    /// ""`, issue #1303).
     #[cfg(unix)]
-    struct NoNativeToolsProvider;
+    fn no_native_tools_capabilities(
+        name: &str,
+        model: &str,
+    ) -> crate::providers::ModelCapabilities {
+        use crate::providers::{CapabilitySupport, ModelCapabilities, ReasoningCapability};
+        ModelCapabilities::static_metadata(
+            name,
+            model,
+            "2026-09-26",
+            "test fixture",
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-09-26", "test fixture"),
+            Some(100_000),
+            Some(10_000),
+            None,
+        )
+    }
+
+    /// Declares streaming supported but tool calls unsupported, and panics
+    /// from *both* `ProviderBackend` methods: this fixture proves the
+    /// capability check in `ClaudeGenerator::generate_stream_cancellable`
+    /// short-circuits before anything is sent for a tool-bearing turn, not
+    /// merely that the returned value happens to look like `None`.
+    #[cfg(unix)]
+    struct PanicsIfSentNoNativeToolsProvider;
 
     #[cfg(unix)]
     #[async_trait::async_trait]
-    impl crate::providers::ProviderBackend for NoNativeToolsProvider {
+    impl crate::providers::ProviderBackend for PanicsIfSentNoNativeToolsProvider {
         async fn send_message_validated(
             &self,
             _request: crate::providers::ValidatedProviderRequest,
         ) -> Result<crate::providers::ProviderResponse> {
-            unreachable!("this test never drives a full send")
+            unreachable!("a tool-bearing turn must decline before sending anything")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+            unreachable!("a tool-bearing turn must decline to stream before sending anything")
+        }
+
+        fn name(&self) -> &str {
+            "no-native-tools-panics-if-sent"
+        }
+
+        fn default_model(&self) -> &str {
+            "no-native-tools-panics-if-sent-model"
+        }
+
+        fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
+            no_native_tools_capabilities(self.name(), model)
+        }
+    }
+
+    /// Declares the same no-native-tools capability but actually streams,
+    /// so a turn that never asked for tools can be proven to stream
+    /// normally against this same class of provider.
+    #[cfg(unix)]
+    struct StreamsWhenNoToolsAreRequestedProvider;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for StreamsWhenNoToolsAreRequestedProvider {
+        async fn send_message_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<crate::providers::ProviderResponse> {
+            unreachable!("this fixture only drives the streaming path")
         }
 
         async fn send_message_stream_validated(
@@ -556,28 +628,15 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            "no-native-tools"
+            "no-native-tools-streams"
         }
 
         fn default_model(&self) -> &str {
-            "no-native-tools-model"
+            "no-native-tools-streams-model"
         }
 
         fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
-            use crate::providers::{CapabilitySupport, ModelCapabilities, ReasoningCapability};
-            ModelCapabilities::static_metadata(
-                self.name(),
-                model,
-                "2026-09-26",
-                "test fixture",
-                CapabilitySupport::Supported,
-                CapabilitySupport::Unsupported,
-                CapabilitySupport::Unsupported,
-                ReasoningCapability::unsupported("2026-09-26", "test fixture"),
-                Some(100_000),
-                Some(10_000),
-                None,
-            )
+            no_native_tools_capabilities(self.name(), model)
         }
     }
 
@@ -603,7 +662,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tool_bearing_turn_against_a_non_native_tool_provider_skips_streaming() {
-        let provider = Arc::new(NoNativeToolsProvider);
+        let provider = Arc::new(PanicsIfSentNoNativeToolsProvider);
         let client = Arc::new(ClaudeClient::with_shared_provider(provider));
         let generator = ClaudeGenerator::new_in(client, None, None);
 
@@ -623,6 +682,21 @@ mod tests {
              fold tools into the prompt and parse <tool_use> markup back out; streaming a raw \
              request.tools attachment would instead hit validate_request's tool-calls gate"
         );
+        // `provider` never panicked reaching this point, proving the
+        // short-circuit ran before either ProviderBackend method could be
+        // invoked -- not merely that the eventual result looked like None.
+    }
+
+    /// Companion to the regression above: declining to stream must be
+    /// specific to tool-bearing turns against a non-native-tool-calling
+    /// provider, not a blanket regression for this provider's
+    /// otherwise-supported streaming capability.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_without_tools_still_streams_against_a_non_native_tool_provider() {
+        let provider = Arc::new(StreamsWhenNoToolsAreRequestedProvider);
+        let client = Arc::new(ClaudeClient::with_shared_provider(provider));
+        let generator = ClaudeGenerator::new_in(client, None, None);
 
         let without_tools = generator
             .generate_stream_cancellable(
@@ -634,9 +708,8 @@ mod tests {
             .expect("a turn without tools must still be able to stream");
         assert!(
             without_tools.is_some(),
-            "declining to stream must be specific to tool-bearing turns against a \
-             non-native-tool-calling provider, not a blanket regression for this provider's \
-             otherwise-supported streaming capability"
+            "a turn that never requested tools must still stream against a provider whose only \
+             unsupported capability is native tool calls"
         );
     }
 
@@ -705,8 +778,16 @@ printf '%s\n' \
             response.tool_uses,
             response.text
         );
-        assert_eq!(response.tool_uses[0].name, "read");
-        assert_eq!(response.tool_uses[0].input["file_path"], "/tmp/x.txt");
+        assert_eq!(
+            response.tool_uses[0].name, "read",
+            "the parsed ToolUse must carry the exact tool name the CLI's <tool_use> markup named: {:?}",
+            response.tool_uses[0]
+        );
+        assert_eq!(
+            response.tool_uses[0].input["file_path"], "/tmp/x.txt",
+            "the parsed ToolUse must carry the exact parameters the CLI's <tool_use> markup gave: {:?}",
+            response.tool_uses[0]
+        );
         assert!(
             !response.text.contains("<tool_use>"),
             "the surfaced text must have tool-call markup stripped, matching \
