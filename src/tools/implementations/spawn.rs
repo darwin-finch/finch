@@ -8,6 +8,8 @@
 // Multiple TaskTool calls in a single model response can be executed in
 // parallel by the executor (see executor.rs).
 
+use crate::config::{Config, ProviderEntry};
+use crate::providers::create_provider_profile_from_config;
 use crate::providers::{ContentBlock, Message};
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::bash::BashTool;
@@ -17,7 +19,7 @@ use crate::tools::implementations::read::ReadTool;
 use crate::tools::implementations::web_fetch::WebFetchTool;
 use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema, ToolUse};
 use crate::tools::Tool;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use finch_programs::ExecutionEffect;
 use serde_json::{json, Value};
@@ -113,7 +115,23 @@ const MAX_RECURSION_DEPTH: usize = 4;
 /// levels deep.  Beyond that depth the tool is omitted from the child's
 /// tool list so the tree terminates naturally.
 pub struct TaskTool {
-    provider: Arc<dyn LlmProvider>,
+    /// Provider used when the caller omits `provider`: the same provider
+    /// already driving the calling turn (or, for a nested `spawn_task`
+    /// inside a subagent, the provider that subagent itself is running on).
+    default_provider: Arc<dyn LlmProvider>,
+    /// Unified configuration, consulted at `execute()` time to look up a
+    /// named provider profile (the same names `/providers` lists) and used
+    /// to build `description` from the providers actually configured.
+    config: Arc<Config>,
+    /// Tool description including the live list of configured provider
+    /// profile names. Computed once, from `config`, when this `TaskTool` is
+    /// constructed (session start, or one recursion level down inside
+    /// `build_subagent_tools`) rather than literally per dispatch: the
+    /// `Tool::description` contract returns `&str` borrowed from `&self`,
+    /// so there is nowhere to materialize a freshly formatted `String` on
+    /// every call. A `TaskTool` never outlives the `config` it was built
+    /// from, so this stays accurate for the tool instance's lifetime.
+    description: String,
     max_turns: usize,
     /// Nesting depth of this instance (0 = top-level).
     depth: usize,
@@ -121,9 +139,12 @@ pub struct TaskTool {
 
 impl TaskTool {
     /// Create a top-level (depth 0) instance.
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(default_provider: Arc<dyn LlmProvider>, config: Arc<Config>) -> Self {
+        let description = build_description(&config);
         Self {
-            provider,
+            default_provider,
+            config,
+            description,
             max_turns: DEFAULT_MAX_TURNS,
             depth: 0,
         }
@@ -134,6 +155,92 @@ impl TaskTool {
         self.max_turns = max_turns;
         self
     }
+}
+
+/// Build the tool description, inlining the live list of configured
+/// provider profile names (the same names `/providers` shows) so the
+/// calling model sees valid `provider` values without a separate lookup
+/// round-trip.
+///
+/// Only profiles constructible as an [`LlmProvider`] (everything except
+/// `ProviderEntry::Local`) are listed as selectable: on-device local model
+/// profiles run through a separate generator runtime this tool does not
+/// drive, so they are named but marked unavailable here rather than
+/// silently omitted.
+fn build_description(config: &Config) -> String {
+    let mut selectable: Vec<String> = Vec::new();
+    let mut local_only: Vec<String> = Vec::new();
+    for entry in &config.providers {
+        if entry.is_local() {
+            local_only.push(entry.profile_name());
+        } else {
+            selectable.push(entry.profile_name());
+        }
+    }
+
+    let mut description = String::from(
+        "Spawn an isolated subagent to handle a specific subtask in a fresh \
+         conversation.  The subagent has access to read/search/bash tools and \
+         may itself spawn further subagents (up to 4 levels deep).  Runs its \
+         own agentic loop and returns its final answer as a string. \
+         Use this to delegate or fan out focused work without polluting the \
+         main conversation context. \
+         Optional 'provider': run the subagent against a specific configured \
+         provider profile instead of the one driving this conversation.",
+    );
+    if selectable.is_empty() {
+        description
+            .push_str(" No other provider profiles are configured; omit 'provider' to proceed.");
+    } else {
+        description.push_str(&format!(
+            " Available providers: {}. Omit 'provider' to use the current provider.",
+            selectable.join(", ")
+        ));
+    }
+    if !local_only.is_empty() {
+        description.push_str(&format!(
+            " On-device local model profiles ({}) are configured but not selectable by name \
+             here yet; they run through a separate local-generator path this tool does not use.",
+            local_only.join(", ")
+        ));
+    }
+    description
+}
+
+/// Resolve a `provider` argument to a constructed [`LlmProvider`], matching
+/// profile names case-insensitively the way `/model` selection does.
+///
+/// Fails closed with an actionable message (naming the requested profile and
+/// why it was rejected) rather than falling back to the default provider or
+/// panicking: an unconfigured or unsupported name is a caller mistake the
+/// model should see and correct, not a silent substitution.
+fn resolve_named_provider(config: &Config, name: &str) -> Result<Arc<dyn LlmProvider>> {
+    let matches: Vec<&ProviderEntry> = config
+        .providers
+        .iter()
+        .filter(|entry| entry.profile_name().eq_ignore_ascii_case(name))
+        .collect();
+    let entry = match matches.as_slice() {
+        [] => anyhow::bail!(
+            "spawn_task: provider '{name}' is not configured; run /providers to see configured \
+             provider profiles"
+        ),
+        [entry] => *entry,
+        _ => anyhow::bail!(
+            "spawn_task: provider '{name}' is ambiguous; multiple configured profiles share \
+             that name"
+        ),
+    };
+    if entry.is_local() {
+        anyhow::bail!(
+            "spawn_task: provider '{name}' is an on-device local model profile; spawn_task can \
+             only target a cloud or network provider profile today (see /providers for the full \
+             list)"
+        );
+    }
+    let profile_name = entry.profile_name();
+    create_provider_profile_from_config(config, &profile_name)
+        .with_context(|| format!("spawn_task: failed to construct configured provider '{name}'"))
 }
 
 #[async_trait]
@@ -147,12 +254,7 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn an isolated subagent to handle a specific subtask in a fresh \
-         conversation.  The subagent has access to read/search/bash tools and \
-         may itself spawn further subagents (up to 4 levels deep).  Runs its \
-         own agentic loop and returns its final answer as a string. \
-         Use this to delegate or fan out focused work without polluting the \
-         main conversation context."
+        &self.description
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -171,6 +273,12 @@ impl Tool for TaskTool {
                 "background": {
                     "type": "string",
                     "description": "Optional context from the parent conversation to share with the subagent."
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Name of a configured provider profile to run this subagent \
+                        against (see this tool's description for the current list, or run \
+                        /providers). Omit to use the provider already driving this conversation."
                 }
             }),
             required: vec!["task".to_string()],
@@ -189,6 +297,11 @@ impl Tool for TaskTool {
 
         let background = input["background"].as_str();
 
+        let provider = match input["provider"].as_str() {
+            Some(name) => resolve_named_provider(&self.config, name)?,
+            None => Arc::clone(&self.default_provider),
+        };
+
         info!(
             "Spawning {:?} subagent (depth {}) for task: {}",
             subagent_type,
@@ -197,7 +310,8 @@ impl Tool for TaskTool {
         );
 
         let result = run_subagent(
-            Arc::clone(&self.provider),
+            provider,
+            Arc::clone(&self.config),
             task,
             subagent_type,
             background,
@@ -253,6 +367,7 @@ impl TaskResult {
 /// directly without permission checks.
 async fn run_subagent(
     provider: Arc<dyn LlmProvider>,
+    config: Arc<Config>,
     task: &str,
     subagent_type: SubagentType,
     background: Option<&str>,
@@ -266,8 +381,16 @@ async fn run_subagent(
         system.push_str(bg);
     }
 
-    // Build tools for this subagent type
-    let tools = build_subagent_tools(subagent_type.allowed_tools(), Arc::clone(&provider), depth);
+    // Build tools for this subagent type. A nested spawn_task defaults to
+    // the provider this subagent is itself running on, not the top-level
+    // caller's provider, so an explicit `provider` choice propagates down
+    // rather than being silently reset one level in.
+    let tools = build_subagent_tools(
+        subagent_type.allowed_tools(),
+        Arc::clone(&provider),
+        Arc::clone(&config),
+        depth,
+    );
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
     let mut messages: Vec<Message> = vec![Message::user(task)];
@@ -361,6 +484,7 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
 fn build_subagent_tools(
     allowed: &[&str],
     provider: Arc<dyn LlmProvider>,
+    config: Arc<Config>,
     depth: usize,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -372,8 +496,11 @@ fn build_subagent_tools(
             "bash" => tools.push(Box::new(BashTool)),
             "web_fetch" => tools.push(Box::new(WebFetchTool::new())),
             "spawn_task" if depth < MAX_RECURSION_DEPTH => {
+                let description = build_description(&config);
                 tools.push(Box::new(TaskTool {
-                    provider: Arc::clone(&provider),
+                    default_provider: Arc::clone(&provider),
+                    config: Arc::clone(&config),
+                    description,
                     max_turns: DEFAULT_MAX_TURNS,
                     depth: depth + 1,
                 }));
@@ -539,6 +666,46 @@ mod tests {
         Arc::new(NullProvider)
     }
 
+    /// Minimal config with no provider entries, for tests that only need
+    /// `TaskTool`'s construction-time plumbing (tool wiring, recursion
+    /// depth, permissions) and never resolve a named `provider`.
+    fn empty_config() -> Arc<Config> {
+        Arc::new(Config::new(vec![]))
+    }
+
+    /// An Ollama-shaped entry pointed at `base_url`, named `name`: stands in
+    /// for a network-hosted model profile (e.g. a "qwen" model served
+    /// locally or over the network) the way `/providers` would list one.
+    /// Unlike the cloud `Openai`/`Claude`/etc. variants, Ollama's tool-use
+    /// capability is attested live against the configured endpoint rather
+    /// than gated on matching a canonical cloud URL, so a fixture pointed
+    /// at a mock server can actually be driven through a real turn.
+    fn named_ollama_entry(name: &str, base_url: &str) -> ProviderEntry {
+        ProviderEntry::Ollama {
+            model: "qwen2.5:7b".to_string(),
+            base_url: base_url.to_string(),
+            name: Some(name.to_string()),
+        }
+    }
+
+    /// An on-device local model profile entry, named `name`: constructible
+    /// in config but not reachable through the `LlmProvider` path
+    /// `spawn_task` uses.
+    fn named_local_entry(name: &str) -> ProviderEntry {
+        use crate::config::ExecutionTarget;
+        use crate::models::{InferenceProvider, ModelFamily, ModelSize};
+        ProviderEntry::Local {
+            inference_provider: InferenceProvider::LlamaCpp,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_path: None,
+            managed_artifact: None,
+            enabled: true,
+            name: Some(name.to_string()),
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Tests
     // ---------------------------------------------------------------------------
@@ -578,7 +745,12 @@ mod tests {
 
     #[test]
     fn test_subagent_tools_explore_is_read_only() {
-        let tools = build_subagent_tools(SubagentType::Explore.allowed_tools(), null_provider(), 0);
+        let tools = build_subagent_tools(
+            SubagentType::Explore.allowed_tools(),
+            null_provider(),
+            empty_config(),
+            0,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -592,7 +764,12 @@ mod tests {
 
     #[test]
     fn test_subagent_tools_bash_only() {
-        let tools = build_subagent_tools(SubagentType::Bash.allowed_tools(), null_provider(), 0);
+        let tools = build_subagent_tools(
+            SubagentType::Bash.allowed_tools(),
+            null_provider(),
+            empty_config(),
+            0,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -603,7 +780,12 @@ mod tests {
 
     #[test]
     fn test_subagent_tools_general_has_all() {
-        let tools = build_subagent_tools(SubagentType::General.allowed_tools(), null_provider(), 0);
+        let tools = build_subagent_tools(
+            SubagentType::General.allowed_tools(),
+            null_provider(),
+            empty_config(),
+            0,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -624,11 +806,13 @@ mod tests {
     #[test]
     fn test_subagent_recursion_depth_limit() {
         let provider = null_provider();
+        let config = empty_config();
 
         // Below MAX_RECURSION_DEPTH → spawn_task present
         let tools = build_subagent_tools(
             SubagentType::General.allowed_tools(),
             Arc::clone(&provider),
+            Arc::clone(&config),
             0,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -641,6 +825,7 @@ mod tests {
         let tools_at_max = build_subagent_tools(
             SubagentType::General.allowed_tools(),
             Arc::clone(&provider),
+            Arc::clone(&config),
             MAX_RECURSION_DEPTH,
         );
         let names_at_max: Vec<&str> = tools_at_max.iter().map(|t| t.name()).collect();
@@ -658,8 +843,12 @@ mod tests {
                 SubagentType::Coder,
                 SubagentType::Bash,
             ] {
-                let tools =
-                    build_subagent_tools(stype.allowed_tools(), Arc::clone(&provider), depth);
+                let tools = build_subagent_tools(
+                    stype.allowed_tools(),
+                    Arc::clone(&provider),
+                    Arc::clone(&config),
+                    depth,
+                );
                 for tool in &tools {
                     assert_ne!(
                         tool.name(),
@@ -685,9 +874,11 @@ mod tests {
         let handles: Vec<_> = (0..TASK_COUNT)
             .map(|i| {
                 let p: Arc<dyn crate::providers::LlmProvider> = provider.clone();
+                let config = empty_config();
                 tokio::spawn(async move {
                     run_subagent(
                         p,
+                        config,
                         &format!("task {i}"),
                         SubagentType::General,
                         None,
@@ -738,6 +929,7 @@ mod tests {
 
         let result = run_subagent(
             subagent_provider,
+            empty_config(),
             "must remain fail closed",
             SubagentType::General,
             None,
@@ -751,5 +943,186 @@ mod tests {
             "unknown tool capabilities must reject the subagent request"
         );
         assert_eq!(provider.backend_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Provider selection (optional `provider` parameter)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_description_lists_configured_provider_names() {
+        let config = Arc::new(Config::new(vec![
+            named_ollama_entry("qwen", "http://127.0.0.1:1"),
+            named_local_entry("local-gemma-2-9b"),
+        ]));
+        let tool = TaskTool::new(null_provider(), config);
+        assert!(
+            tool.description().contains("qwen"),
+            "description must inline the configured cloud/network provider names so the model \
+             sees valid choices without a lookup round-trip; got: {}",
+            tool.description()
+        );
+        assert!(
+            tool.description().contains("local-gemma-2-9b"),
+            "description must still name a configured local profile even though it is not \
+             selectable through this tool; got: {}",
+            tool.description()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_falls_back_to_default_provider_when_omitted() {
+        let default_provider = Arc::new(EchoProvider::new("default answer"));
+        let tool = TaskTool::new(default_provider.clone(), empty_config());
+        let context = ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            skip_interactive_review: false,
+        };
+
+        let output = tool
+            .execute(json!({"task": "say hi"}), &context)
+            .await
+            .expect("omitting 'provider' must fall back to the default provider");
+        assert_eq!(output, "default answer");
+        assert_eq!(
+            default_provider.backend_calls.load(Ordering::SeqCst),
+            1,
+            "the default provider must be the one actually invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_uses_named_provider_profile_when_given() {
+        let mut server = mockito::Server::new_async().await;
+        // Ollama's tool-use capability is attested live against this
+        // endpoint (issue #925); without it the turn would fail closed
+        // before ever reaching the chat-completions mock below.
+        server
+            .mock("POST", "/api/show")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"capabilities":["completion","tools"]}"#)
+            .create_async()
+            .await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"id":"chat-1","object":"chat.completion","created":1,"model":"qwen2.5:7b",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"answer from qwen"},
+                "finish_reason":"stop"}]}"#,
+            )
+            .create_async()
+            .await;
+        let config = Arc::new(Config::new(vec![named_ollama_entry("qwen", &server.url())]));
+        // The default provider must never be reached: naming a valid profile
+        // must route the whole turn to it, not merely prefer it.
+        let tool = TaskTool::new(null_provider(), config);
+        let context = ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            skip_interactive_review: false,
+        };
+
+        let output = tool
+            .execute(json!({"task": "say hi", "provider": "qwen"}), &context)
+            .await
+            .expect("a configured provider name must resolve and complete the turn");
+        assert_eq!(output, "answer from qwen");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_unconfigured_provider_name_fails_actionably() {
+        let default_provider = Arc::new(EchoProvider::new("should not be used"));
+        let config = Arc::new(Config::new(vec![named_ollama_entry(
+            "claude-subscription",
+            "http://127.0.0.1:1",
+        )]));
+        let tool = TaskTool::new(default_provider.clone(), config);
+        let context = ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            skip_interactive_review: false,
+        };
+
+        let error = tool
+            .execute(
+                json!({"task": "say hi", "provider": "does-not-exist"}),
+                &context,
+            )
+            .await
+            .expect_err("an unconfigured provider name must fail, not silently fall back");
+        let message = error.to_string();
+        assert!(
+            message.contains("does-not-exist"),
+            "error must name the requested provider; got: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("not configured"),
+            "error must say the profile is not configured, not just that it failed; got: {message}"
+        );
+        assert_eq!(
+            default_provider.backend_calls.load(Ordering::SeqCst),
+            0,
+            "an invalid provider name must not silently fall back to the default provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_local_provider_profile_rejected_actionably() {
+        let default_provider = Arc::new(EchoProvider::new("should not be used"));
+        let config = Arc::new(Config::new(vec![named_local_entry("local-gemma-2-9b")]));
+        let tool = TaskTool::new(default_provider.clone(), config);
+        let context = ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            skip_interactive_review: false,
+        };
+
+        let error = tool
+            .execute(
+                json!({"task": "say hi", "provider": "local-gemma-2-9b"}),
+                &context,
+            )
+            .await
+            .expect_err("a local on-device profile must be rejected, not silently substituted");
+        let message = error.to_string();
+        assert!(
+            message.contains("local-gemma-2-9b"),
+            "error must name the requested profile; got: {message}"
+        );
+        assert!(
+            message.contains("local model"),
+            "error must explain why a local profile cannot be targeted; got: {message}"
+        );
+        assert_eq!(
+            default_provider.backend_calls.load(Ordering::SeqCst),
+            0,
+            "a rejected local profile must not silently fall back to the default provider"
+        );
+    }
+
+    #[test]
+    fn test_peer_hard_deny_still_covers_task_tool_with_config_constructor() {
+        // Guards the #872-adjacent invariant this change touches directly:
+        // widening TaskTool::new to accept a config/provider-lookup capability
+        // must not change the name it registers under, which is what
+        // PEER_HARD_DENY_TOOLS and test_peer_cannot_spawn key on.
+        let tool = TaskTool::new(null_provider(), empty_config());
+        assert_eq!(Tool::name(&tool), "spawn_task");
     }
 }

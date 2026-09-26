@@ -1,4 +1,5 @@
 use super::{apply_repl_always_allow_tools, register_repl_tool_aliases, REPL_ALWAYS_ALLOW_TOOLS};
+use crate::config::Config;
 use crate::generators::{Generator, GeneratorCapabilities, GeneratorResponse};
 use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
@@ -9,8 +10,8 @@ use crate::tools::{
     CreateMemoryTool, EditTool, EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool,
     GetVmStateTool, GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectWordTool,
     ListRecentTool, PatchTool, PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool,
-    ReadTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool,
-    TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
+    ReadTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TaskTool,
+    TodoReadTool, TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
@@ -63,6 +64,33 @@ impl Generator for NameAuditGenerator {
     }
 }
 
+/// Fails on any call; TaskTool's default provider is never invoked by these
+/// name/effect/allowlist conformance tests.
+struct NameAuditProvider;
+
+#[async_trait::async_trait]
+impl crate::providers::ProviderBackend for NameAuditProvider {
+    async fn send_message_validated(
+        &self,
+        _req: crate::providers::ValidatedProviderRequest,
+    ) -> anyhow::Result<crate::providers::ProviderResponse> {
+        anyhow::bail!("name-audit provider is not invoked")
+    }
+    async fn send_message_stream_validated(
+        &self,
+        _req: crate::providers::ValidatedProviderRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>>
+    {
+        anyhow::bail!("name-audit provider is not invoked")
+    }
+    fn name(&self) -> &str {
+        "name-audit"
+    }
+    fn default_model(&self) -> &str {
+        "name-audit"
+    }
+}
+
 struct OwnerReplCatalog {
     registry: ToolRegistry,
     _memory_dir: tempfile::TempDir,
@@ -107,6 +135,10 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(BackgroundStopTool::new(background_tasks)),
         Box::new(ClaudeCodeDelegateTool::new(
             std::env::current_dir().expect("cwd"),
+        )),
+        Box::new(TaskTool::new(
+            Arc::new(NameAuditProvider),
+            Arc::new(Config::new(vec![])),
         )),
         Box::new(EditTool),
         Box::new(PatchTool),
@@ -177,9 +209,14 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
     // own literals. This test pins every permission policy table whose names
     // the REPL catalog must register, so a third drift cannot land silently.
     // PEER_HARD_DENY_TOOLS is pinned against the Tool implementations
-    // themselves in tools::permissions::tests, because `spawn_task` is
-    // TaskTool's registered name but has no REPL registration point (subagent
-    // loops build their tool lists in build_subagent_tools).
+    // themselves in tools::permissions::tests, which is also where
+    // `TaskTool`'s provider-selection behavior (the optional `provider`
+    // parameter, issue: subagent provider selection) is exercised;
+    // `spawn_task` is registered here too (mirroring its real REPL
+    // registration) so the declared-effect and allowlist conformance tests
+    // below cover it exactly like any other owner-session tool. Nested
+    // `spawn_task` calls inside a running subagent still build their own
+    // tool lists in `build_subagent_tools`, not through this registry.
     let catalog = owner_repl_catalog();
     let registry = &catalog.registry;
     let tables = [

@@ -25,6 +25,7 @@ pub use finch_tools_api::{
 pub use implementations::llm_tools::create_llm_tools;
 pub use implementations::propose::{propose_artifact_with_decision, ProposalDecision};
 pub use implementations::restart::DeferredFrontendRestart;
+pub use implementations::spawn::TaskTool;
 pub use implementations::{
     AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool, AnsibleTool,
     AskUserQuestionTool, BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool,

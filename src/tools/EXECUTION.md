@@ -12,7 +12,7 @@
 | `web_fetch` | Fetch URLs |
 | `bash` | Execute shell commands |
 | `restart` | Rebuild and restart finch itself |
-| `spawn_task` | Delegate to isolated subagent (Finch's own tools) |
+| `spawn_task` | Delegate to isolated subagent (Finch's own tools); optional `provider` targets a named configured provider profile instead of the current one |
 | `delegate_to_claude_code` | Delegate to the official Claude Code CLI, running as itself |
 | memory tools | Semantic memory read/write |
 
