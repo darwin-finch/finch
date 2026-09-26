@@ -471,8 +471,20 @@ fn memory_recalled_lines(
         let mut row_spans = vec![
             Span::plain("  "),
             Span::styled("\u{23bf}", palette.operation_row_glyph),
-            Span::plain(format!(" {}", row.label)),
         ];
+        // #1259: a static chevron affordance -- collapsed "▸"/expanded "▾" --
+        // prefixes the label of every row that has something to disclose, so
+        // there is a visible hint the row is a click/keyboard target even
+        // before the pointer moves. A row with no recalled text (not
+        // `expandable`) gets no chevron: it is not a click target (#1235).
+        if expandable {
+            let chevron = if row.expanded { '\u{25be}' } else { '\u{25b8}' };
+            row_spans.push(Span::styled(
+                format!(" {chevron}"),
+                palette.operation_row_glyph,
+            ));
+        }
+        row_spans.push(Span::plain(format!(" {}", row.label)));
         if !row.summary.is_empty() {
             row_spans.push(Span::plain(" "));
             row_spans.push(Span::styled(
@@ -554,9 +566,9 @@ mod tests {
         let texts: Vec<String> = via_component.iter().map(|line| line.text.clone()).collect();
         assert_eq!(
             texts,
-            vec!["hello", "", "(ran 2s)"],
-            "the say card renders prose, a blank separator, and the elapsed annotation \
-             through the accessor; got {texts:?}"
+            vec!["hello", "", "\u{25b8} (ran 2s)"],
+            "the say card renders prose, a blank separator, and the chevron-prefixed \
+             elapsed annotation through the accessor; got {texts:?}"
         );
     }
 
@@ -1116,15 +1128,16 @@ mod tests {
             texts,
             vec![
                 "⏺ 2 memories retrieved",
-                "  ⎿ committed · score 0.64 · node 4 — 138 chars, sent raw",
+                "  ⎿ ▾ committed · score 0.64 · node 4 — 138 chars, sent raw",
                 "      user: this repo I'm in (files on disk) are your harness. what do you think of it?",
                 "      assistant: I don't have direct access to your files or environment.",
-                "  ⎿ recalled · score 0.60 · node 1 — 81 chars, sent raw",
+                "  ⎿ ▾ recalled · score 0.60 · node 1 — 81 chars, sent raw",
                 "      user: Qwen, are you there?",
                 "      assistant: Qwen, I'm here.",
             ],
-            "chrome plus one identity+summary line and, while expanded, the recalled text \
-             beneath it, per memory; got {texts:?}"
+            "chrome plus one identity+summary line (prefixed with the #1259 expanded \
+             chevron '▾') and, while expanded, the recalled text beneath it, per memory; \
+             got {texts:?}"
         );
         assert!(
             !texts
@@ -1159,10 +1172,11 @@ mod tests {
             texts,
             vec![
                 "⏺ 1 memory retrieved",
-                "  ⎿ recalled · score 0.64 · node 4 — 138 chars, sent raw",
+                "  ⎿ ▸ recalled · score 0.64 · node 4 — 138 chars, sent raw",
             ],
-            "collapsed by default: the recalled text must not render until expanded; \
-             got {texts:?}"
+            "collapsed by default: the recalled text must not render until expanded, and \
+             the summary line leads with the #1259 collapsed chevron '▸' as the visible \
+             affordance that the row is a click/keyboard target; got {texts:?}"
         );
         let summary_line = &lines[1];
         assert_eq!(
@@ -1207,11 +1221,12 @@ mod tests {
             texts,
             vec![
                 "⏺ 1 memory retrieved",
-                "  ⎿ recalled · score 0.64 · node 4 — 138 chars, sent raw",
+                "  ⎿ ▾ recalled · score 0.64 · node 4 — 138 chars, sent raw",
                 "      user: hi",
                 "      assistant: hello",
             ],
-            "expanded: the recalled text renders beneath the summary line; got {texts:?}"
+            "expanded: the recalled text renders beneath the summary line, and the summary \
+             line's chevron flips to the #1259 expanded glyph '▾'; got {texts:?}"
         );
         let target = RowId {
             message_id: view.message_id,
@@ -1253,9 +1268,16 @@ mod tests {
             vec![
                 "⏺ 1 memory retrieved",
                 "  ⎿ committed · score 0.50 · node 9 — 0 chars, sent raw",
-            ]
+            ],
+            "a row with nothing to disclose carries no #1259 chevron ('▸'/'▾') at all -- \
+             not even the collapsed glyph -- since it is not an interactive row; got {texts:?}"
         );
         let summary_line = &lines[1];
+        assert!(
+            !summary_line.text.contains('\u{25b8}') && !summary_line.text.contains('\u{25be}'),
+            "a non-interactive row (nothing to disclose) must render no chevron glyph; \
+             line={summary_line:?}"
+        );
         assert_eq!(
             summary_line.row_id, None,
             "a row with nothing to disclose is not a click target; line={summary_line:?}"
