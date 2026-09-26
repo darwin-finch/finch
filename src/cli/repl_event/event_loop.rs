@@ -2523,7 +2523,7 @@ impl EventLoop {
                 let engine = if NeuralEmbeddingEngine::find_in_cache().is_some() {
                     "neural"
                 } else {
-                    "tfidf"
+                    "hashed-ngram"
                 };
                 self.status_bar.update_line(
                     crate::cli::status_bar::StatusLineType::MemoryContext,

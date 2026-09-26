@@ -75,7 +75,7 @@ pub(super) enum SectionState {
     /// `Models`, which configures the primary chat provider.
     LocalHelpers {
         /// Real neural embeddings (`bge-small-en-v1.5`, GGUF via llama.cpp,
-        /// downloaded once on first use) vs. the built-in TF-IDF fallback,
+        /// downloaded once on first use) vs. the built-in hashed n-gram fallback,
         /// which needs no download and no network access at lower recall
         /// quality. Mirrors `finch_memory::MemoryConfig::use_neural_embeddings`.
         use_neural_embeddings: bool,

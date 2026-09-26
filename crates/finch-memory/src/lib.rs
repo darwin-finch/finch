@@ -11,7 +11,9 @@ mod program_registry;
 mod quality;
 mod routing_memory;
 
-pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
+pub use embeddings::{
+    average_embeddings, cosine_similarity, EmbeddingEngine, HashedNgramEmbedding,
+};
 pub use memory_status::{caveat, count_qualifier, observed, Recall};
 pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 
@@ -270,7 +272,7 @@ pub struct MemoryConfig {
     /// quality work (#415) lands and scores become more trustworthy.
     ///
     /// This one number applies to whichever `EmbeddingEngine` the
-    /// composition root injected -- the sparse TF-IDF fallback and a dense
+    /// composition root injected -- the sparse hashed-n-gram fallback and a dense
     /// neural engine do not necessarily produce comparable cosine-similarity
     /// distributions for unrelated text, so a threshold reasoned about
     /// algebraically here has not been validated against either engine's
@@ -1002,12 +1004,12 @@ fn render_recall_entry(primary: &RecallTurn, counterpart: Option<&RecallTurn>) -
 }
 
 impl MemorySystem {
-    /// Create a new memory system with the TF-IDF fallback engine.
+    /// Create a new memory system with the hashed-n-gram fallback engine.
     ///
     /// Model selection and download belong to the composition root. Inject a
     /// neural engine with [`Self::new_with_engine`].
     pub fn new(config: MemoryConfig) -> Result<Self> {
-        Self::new_with_engine(config, Arc::new(TfIdfEmbedding::new()))
+        Self::new_with_engine(config, Arc::new(HashedNgramEmbedding::new()))
     }
 
     /// Open (or create) `db_path` with WAL mode enabled.
@@ -2900,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_uses_tfidf_and_ignores_neural_selection_flag() {
+    fn test_new_uses_hashed_ngram_and_ignores_neural_selection_flag() {
         let temp = NamedTempFile::new().unwrap();
         let memory = MemorySystem::new(MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -2910,7 +2912,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             memory.embedding_engine.dimension(),
-            TfIdfEmbedding::new().dimension(),
+            HashedNgramEmbedding::new().dimension(),
             "MemorySystem::new must not select or load a neural model; the \
              composition root injects the engine. flag=true, dim={}",
             memory.embedding_engine.dimension()
@@ -2960,7 +2962,7 @@ mod tests {
         let memory = MemorySystem::new_with_connection(
             Arc::clone(&db),
             config,
-            Arc::new(TfIdfEmbedding::new()),
+            Arc::new(HashedNgramEmbedding::new()),
         )
         .context(
             "new_with_connection must initialize schema and build against the \
@@ -3236,7 +3238,7 @@ mod tests {
     /// A "real, non-trivial store" size for hydration/reload tests. Used to be
     /// sized off `HYDRATION_BATCH` (multiples of 512) to exercise MemTree's own
     /// batch-boundary behavior -- meaningless now that RoutingTree hydration is
-    /// atomic, and at TfIdfEmbedding's real 2048-dim, building hundreds+ of
+    /// atomic, and at HashedNgramEmbedding's real 2048-dim, building hundreds+ of
     /// points via genuine `RoutingTree::insert()` in an unoptimized debug test
     /// binary is genuinely slow (confirmed live: 1024 points hung past several
     /// minutes; the same test passes in ~8s at this size). Large enough to
@@ -3396,7 +3398,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
+        seed_routing_points(temp.path(), NODES, HashedNgramEmbedding::new().dimension())?;
 
         // The blocking load, on a thread with no runtime.
         let blocking_config = config.clone();
@@ -3526,7 +3528,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
+        seed_routing_points(temp.path(), NODES, HashedNgramEmbedding::new().dimension())?;
 
         // This task blocks the sole Tokio worker. The test future itself is
         // driven by Runtime::block_on on the caller thread, so it can create
@@ -3674,7 +3676,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
+        seed_routing_points(temp.path(), NODES, HashedNgramEmbedding::new().dimension())?;
 
         // Hold the real loader after it publishes Ready but before its future
         // can return and drop HydrationGuard. Aborting at that exact point
@@ -3807,7 +3809,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_routing_points(temp.path(), 8, TfIdfEmbedding::new().dimension())?;
+        seed_routing_points(temp.path(), 8, HashedNgramEmbedding::new().dimension())?;
 
         // Break every row's `text`, so the whole load fails rather than one
         // batch of it.
@@ -4501,7 +4503,7 @@ mod tests {
     /// the `?` at the top of `project_stored_conversation` is a reachable
     /// production exit. Nothing else in this suite can reach it.
     struct FailableEmbedding {
-        inner: TfIdfEmbedding,
+        inner: HashedNgramEmbedding,
         fail: AtomicBool,
     }
 
@@ -5402,7 +5404,7 @@ mod tests {
         let brain_turn_id = strand_a_brain_conversation(&config).await?;
 
         let engine = Arc::new(FailableEmbedding {
-            inner: TfIdfEmbedding::new(),
+            inner: HashedNgramEmbedding::new(),
             fail: AtomicBool::new(true),
         });
         let reopened = MemorySystem::new_with_engine(config, Arc::clone(&engine) as _)?;
@@ -5481,7 +5483,7 @@ mod tests {
         };
         drop(MemorySystem::new(config.clone())?);
         const NODES: u64 = SEEDED_STORE_SIZE;
-        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
+        seed_routing_points(temp.path(), NODES, HashedNgramEmbedding::new().dimension())?;
 
         let memory = MemorySystem::new(config)?;
         assert!(
@@ -5607,7 +5609,7 @@ mod tests {
         // Every seeded memory, not "a memory matching `Runbook step`". An
         // earlier version searched for the shared prefix, which 29 survivors
         // still match even if one point is overwritten — so it could not fail.
-        // Ranking cannot carry this assertion either: `TfIdfEmbedding` drops
+        // Ranking cannot carry this assertion either: `HashedNgramEmbedding` drops
         // tokens under two characters, so the single-digit index that
         // distinguishes these memories is not in the embedding at all and
         // `query` orders them arbitrarily. Scan the hydrated point set instead.
@@ -6128,7 +6130,7 @@ mod tests {
 
     /// Seed a store created through the real schema with real `routing_points`
     /// -- one real `RoutingTree` point per entry (real embedding via
-    /// `TfIdfEmbedding`, so duplicate TEXT across entries is real duplicate
+    /// `HashedNgramEmbedding`, so duplicate TEXT across entries is real duplicate
     /// content on genuinely distinct points, bypassing `RoutingMemTree`'s own
     /// insert-time text dedup the same way a store built by an older/different
     /// process would). A reopen then hydrates exactly these rows.
@@ -6144,7 +6146,7 @@ mod tests {
     /// against it directly instead of simulating an incompatible old one.
     fn seed_legacy_tree_rows(db_path: &std::path::Path, leaves: &[(&str, u8)]) -> Result<()> {
         let mut conn = Connection::open(db_path)?;
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let dim = engine.dimension();
         let mut tree = RoutingTree::new(RoutingConfig::default(), dim, routing_memory::FIXED_SEED);
         let tx = conn.transaction()?;
@@ -6438,7 +6440,7 @@ mod tests {
          in the Employee vault under the Finch signing item, not in the repository.";
     const GATE_PROBE: &str = "The deploy key for the production environment lives \
          in the Employee vault";
-    /// A deliberately weak-but-not-sub-floor memory. The TF-IDF fallback
+    /// A deliberately weak-but-not-sub-floor memory. The hashed-n-gram fallback
     /// embeds character n-grams, so even a topic-disjoint English sentence
     /// shares enough letter pairs to clear the 0.15 default floor -- which
     /// is exactly the leak family the turn-level gate addresses. Weak
@@ -6449,7 +6451,7 @@ mod tests {
 
     /// Seed one fresh store with [`GATE_SEED`] and recall [`GATE_PROBE`],
     /// returning the recalled best weighted score and result count. The
-    /// TF-IDF engine is deterministic over identical content, so two
+    /// hashed-n-gram engine is deterministic over identical content, so two
     /// identically-seeded stores produce identical scores -- the only
     /// difference between two such recalls is the knob's value.
     async fn seeded_recall_probe(min_turn: Option<f32>) -> Result<(f32, usize)> {
@@ -6600,7 +6602,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_turn_gate_knob_flips_the_injection_decision() -> Result<()> {
-        // Identically-seeded stores; TF-IDF scoring is deterministic over
+        // Identically-seeded stores; hashed-n-gram scoring is deterministic over
         // identical content, so the only difference between the two recalls
         // below is the knob's value. This is the flip itself.
         let (best_off, count_off) = seeded_recall_probe(None).await?;

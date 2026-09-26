@@ -23,7 +23,7 @@
 // from an unverified source.
 
 use anyhow::{anyhow, bail, Context, Result};
-use finch_memory::{EmbeddingEngine, TfIdfEmbedding};
+use finch_memory::{EmbeddingEngine, HashedNgramEmbedding};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -174,14 +174,14 @@ pub fn select_memory_embedding_engine(use_neural_embeddings: bool) -> Arc<dyn Em
             }
             None => {
                 debug!(
-                    "Embedding model not in cache — using TF-IDF fallback until \
+                    "Embedding model not in cache — using hashed-n-gram fallback until \
                      NeuralEmbeddingEngine::ensure_downloaded() completes."
                 );
-                Arc::new(TfIdfEmbedding::new())
+                Arc::new(HashedNgramEmbedding::new())
             }
         }
     } else {
-        Arc::new(TfIdfEmbedding::new())
+        Arc::new(HashedNgramEmbedding::new())
     }
 }
 
@@ -271,12 +271,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_select_memory_embedding_engine_disabled_is_tfidf() {
+    fn test_select_memory_embedding_engine_disabled_is_hashed_ngram() {
         let engine = select_memory_embedding_engine(false);
         assert_eq!(
             engine.dimension(),
-            TfIdfEmbedding::new().dimension(),
-            "disabling neural embeddings must yield the TF-IDF fallback, dim={}",
+            HashedNgramEmbedding::new().dimension(),
+            "disabling neural embeddings must yield the hashed-n-gram fallback, dim={}",
             engine.dimension()
         );
     }

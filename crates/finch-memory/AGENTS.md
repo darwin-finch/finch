@@ -7,7 +7,9 @@ modules, including `memory_status`, are private.
 
 ## Dependencies and extension rules
 
-- This crate owns the SQLite schema and hydration, TF-IDF fallback, and opaque `ProgramIndexRecord`
+- This crate owns the SQLite schema and hydration, the hashed-n-gram fallback embedding
+  (`HashedNgramEmbedding`, `src/embeddings.rs` — feature-hashed, weighted word/character-n-gram
+  bag, not TF-IDF: it has no corpus-level document-frequency statistic), and opaque `ProgramIndexRecord`
   rows. The `RoutingTree` mechanism itself lives in `crates/finch-routing-tree` — a dependency-free
   foundational crate this crate depends on (its only production dependency on another Finch crate;
   the tree depends on nothing Finch-side, so no cycle). Callers inject an `EmbeddingEngine`;

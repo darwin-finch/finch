@@ -254,7 +254,7 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
          first use, then runs locally with no further network calls. Better \
          recall quality than the fallback below."
     } else {
-        "Off: built-in TF-IDF embeddings. No download, no network access, \
+        "Off: built-in hashed n-gram embeddings. No download, no network access, \
          ever -- at lower recall quality than the neural model."
     };
     lines.push(WizardLine::blank());

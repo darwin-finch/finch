@@ -7867,7 +7867,7 @@ mod tests {
     }
 
     /// Content long enough to survive the memory quality classifier's noise
-    /// filter and specific enough that TF-IDF retrieval reliably ranks it
+    /// filter and specific enough that hashed-n-gram retrieval reliably ranks it
     /// for a matching query.
     fn substantive_memory(tag: &str) -> String {
         format!(

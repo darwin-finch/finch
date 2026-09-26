@@ -13,23 +13,25 @@ pub trait EmbeddingEngine: Send + Sync {
     fn dimension(&self) -> usize;
 }
 
-/// Word + character n-gram TF-IDF embedding engine
+/// Feature-hashed, weighted bag of word/character-n-gram embedding engine
 ///
-/// Dramatically better than a pure hash approach:
+/// Not TF-IDF: there is no corpus-level document-frequency statistic. Instead:
 /// - Tokenises into words (lowercase, alphanumeric)
 /// - Generates character bigrams and trigrams from each word
-/// - Maps every token to multiple dimensions via FNV-64 (fewer collisions than DefaultHasher)
-/// - Applies a simple IDF proxy: shorter tokens get lower weight (common stop-words de-emphasised)
-/// - Normalises to a unit vector
+/// - Hashes every token into multiple slots of a fixed-size dense vector via FNV-64
+///   (fewer collisions than DefaultHasher), accumulating weight at each slot
+/// - Weights each token by a length-based proxy: shorter tokens get lower weight
+///   (common stop-words de-emphasised), longer tokens weigh more
+/// - L2-normalises the accumulated vector to unit length
 ///
 /// Quality is sufficient for technical-text retrieval (code discussions, function names,
 /// error messages) where terms are distinctive. A neural sentence transformer will be
 /// added as an optional upgrade once the ONNX infrastructure is ready.
-pub struct TfIdfEmbedding {
+pub struct HashedNgramEmbedding {
     dimension: usize,
 }
 
-impl TfIdfEmbedding {
+impl HashedNgramEmbedding {
     pub fn new() -> Self {
         Self { dimension: 2048 }
     }
@@ -72,8 +74,8 @@ impl TfIdfEmbedding {
             .collect();
 
         for word in &words {
-            // IDF proxy: weight by log(len+1) so single-char tokens weigh less
-            // and rare long words weigh more.
+            // Length-based weight proxy: weight by log(len+1) so single-char tokens
+            // weigh less and longer words weigh more.
             let word_weight = (word.len() as f32 + 1.0).ln();
 
             // Whole-word token (4 slots for good coverage)
@@ -105,13 +107,13 @@ impl TfIdfEmbedding {
     }
 }
 
-impl Default for TfIdfEmbedding {
+impl Default for HashedNgramEmbedding {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EmbeddingEngine for TfIdfEmbedding {
+impl EmbeddingEngine for HashedNgramEmbedding {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         Ok(self.embed_text(text))
     }
@@ -168,20 +170,20 @@ mod tests {
 
     #[test]
     fn test_embedding_dimension() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         assert_eq!(engine.dimension(), 2048);
     }
 
     #[test]
     fn test_embedding_generation() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb = engine.embed("Hello world").unwrap();
         assert_eq!(emb.len(), 2048);
     }
 
     #[test]
     fn test_cosine_similarity_identical() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb1 = engine.embed("rust lifetimes borrow checker").unwrap();
         let emb2 = engine.embed("rust lifetimes borrow checker").unwrap();
         let sim = cosine_similarity(&emb1, &emb2);
@@ -194,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity_related() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb1 = engine.embed("rust async await tokio").unwrap();
         let emb2 = engine
             .embed("rust async programming tokio runtime")
@@ -217,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity_technical_terms() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
 
         // These share character n-grams ("ort", "sort") but different semantics — just checks non-crash
         let emb1 = engine.embed("quicksort algorithm").unwrap();
@@ -228,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_embedding_is_unit_vector() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb = engine
             .embed("the quick brown fox jumps over the lazy dog")
             .unwrap();
@@ -242,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_empty_text() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb = engine.embed("").unwrap();
         assert_eq!(emb.len(), 2048);
         // Zero vector for empty input
@@ -252,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_average_embeddings() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
         let emb1 = engine.embed("test one").unwrap();
         let emb2 = engine.embed("test two").unwrap();
         let avg = average_embeddings(&[&emb1, &emb2]);
@@ -264,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_coding_term_similarity() {
-        let engine = TfIdfEmbedding::new();
+        let engine = HashedNgramEmbedding::new();
 
         // Two descriptions of the same concept should score well
         let e1 = engine
