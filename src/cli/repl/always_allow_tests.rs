@@ -5,12 +5,12 @@ use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
     invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
     AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BackgroundBashTool,
-    BackgroundPollTool, BackgroundStopTool, BashTool, CodeOutlineTool, CreateMemoryTool, EditTool,
-    EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
-    HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
-    PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
-    SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
-    ToolRegistry, WebFetchTool, WriteTool,
+    BackgroundPollTool, BackgroundStopTool, BashTool, ClaudeCodeDelegateTool, CodeOutlineTool,
+    CreateMemoryTool, EditTool, EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool,
+    GetVmStateTool, GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectWordTool,
+    ListRecentTool, PatchTool, PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool,
+    ReadTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool,
+    TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
@@ -105,6 +105,9 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
             &background_tasks,
         ))),
         Box::new(BackgroundStopTool::new(background_tasks)),
+        Box::new(ClaudeCodeDelegateTool::new(
+            std::env::current_dir().expect("cwd"),
+        )),
         Box::new(EditTool),
         Box::new(PatchTool),
         Box::new(WriteTool),
@@ -280,6 +283,11 @@ fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
         // and polling only reads this session's captured output.
         "background_bash" | "background_stop" => ExecutionEffect::ExternalWrite,
         "background_poll" => ExecutionEffect::ExternalRead,
+        // Delegating to the Claude Code CLI grants a second, independently-
+        // authenticated agent the same real host authority bash has once it
+        // starts (file writes, shell commands) — the same worst case
+        // spawn_task already carries for an equivalent delegation.
+        "delegate_to_claude_code" => ExecutionEffect::ExternalWrite,
         _ => pre_refactor_effect(tool_name),
     }
 }

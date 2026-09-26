@@ -12,7 +12,8 @@
 | `web_fetch` | Fetch URLs |
 | `bash` | Execute shell commands |
 | `restart` | Rebuild and restart finch itself |
-| `spawn_task` | Delegate to isolated subagent |
+| `spawn_task` | Delegate to isolated subagent (Finch's own tools) |
+| `delegate_to_claude_code` | Delegate to the official Claude Code CLI, running as itself |
 | memory tools | Semantic memory read/write |
 
 ## Permission system
@@ -26,7 +27,7 @@
   - `write`/`edit`/`patch`: AskUser (caller converts to DiffPropose event)
   - `bash` (read-only command): silently Allow
   - `bash` (side effects): AskUser
-  - `restart`/`spawn`: always Deny
+  - `restart`/`spawn`/`delegate_to_claude_code`: always Deny
 
 Constitutional constraints apply to **both** roles: `rm -rf`, `sudo`, `dd if=`, fork bombs, system file reads, dangerous URL schemes, and private IPs are blocked unconditionally.
 
