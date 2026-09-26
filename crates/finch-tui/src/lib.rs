@@ -3502,7 +3502,17 @@ impl TuiRenderer {
             return;
         }
         if let Err(error) = self.redraw_full_viewport() {
+            // The paint that would have rebuilt `selection_index` for the
+            // new offset never ran, so a restored selection's rows would
+            // resolve against a stale frame instead of what is actually on
+            // screen now. `viewport_invalidated` is still set (the error
+            // path returns before clearing it), so the next successful
+            // render retries the full repaint and applies the normal
+            // "any full repaint clears the selection" rule on its own —
+            // dropping it here (leaving `saved` unrestored) is the same
+            // outcome, just immediate instead of stale in the meantime.
             tracing::debug!(%error, "transcript drag autoscroll: full-viewport redraw failed");
+            return;
         }
         let offset_after = self.transcript_scroll.offset();
         let compensation = offset_after as i64 - offset_before as i64;
