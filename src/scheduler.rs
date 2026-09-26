@@ -3965,6 +3965,86 @@ mod tests {
         );
     }
 
+    /// Issue #1258: verify that a peer (scheduler child agent) reaching a VM
+    /// program capable of invoking the live `FileWrite` host effect
+    /// (`CoreHostBinding::FileWrite`, driven here through `task-output-file-write`)
+    /// cannot get that write performed without authority the owner already
+    /// granted — matching or exceeding the Tool-pipeline guarantee that a
+    /// peer's write always requires review (`PEER_REVIEWED_CHANGESET_TOOLS`).
+    ///
+    /// `submit_program` itself returns `PermissionCheck::Allow` for a peer at
+    /// the Tool-pipeline gate (`crates/finch-tools-api/src/permissions.rs`,
+    /// "the typed broker... authorizes every concrete host effect"), so this
+    /// test exercises the second authority system end to end: the VM
+    /// capability ledger must still deny the write because this child's
+    /// `grant_ceiling` carries no capability at all, and there is no
+    /// interactive escalation available to a background child (unlike the
+    /// owner's own interactive session, which would see an approval dialog).
+    /// A prior defect here would let the write proceed silently or would let
+    /// the child self-approve; either failure mode leaves `attempted.txt` on
+    /// disk.
+    #[tokio::test]
+    async fn test_peer_child_submit_program_file_write_without_grant_fails_closed() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let task_output = tempfile::tempdir().unwrap();
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+
+        // A freshly spawned child with zero inherited authority — the
+        // tightest possible ceiling, and the one a newly created peer task
+        // actually gets before any owner approval.
+        let identity = AgentIdentity {
+            agent_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            parent_agent_id: None,
+            root_agent_id: Uuid::new_v4(),
+            depth: 0,
+            provider_model: "echo".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "peer-file-write-test".into(),
+            grant_ceiling: EffectSet::pure(),
+            brain_run_id: None,
+        };
+        let tools = scheduler.child_tools(&identity);
+
+        let input = serde_json::json!({
+            "language": "forth",
+            "source": "s\" attempted.txt\" task-output-path s\" untrusted-write\" bytes task-output-file-write",
+            "intent": "peer attempts an unauthorized write",
+            "manifest_generation": runtime.manifest_generation(),
+        });
+        let result = execute_child_tool(&tools, "submit_program", input)
+            .await
+            .expect("submit_program itself is a normal tool result, not a hard error");
+        let outcome: crate::runtime::ExecutionOutcome =
+            serde_json::from_str(&result).expect("submit_program returns a JSON ExecutionOutcome");
+
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::AuthorizationRequired,
+            "invariant: a peer child with no granted FileWrite authority must not have its \
+             write executed or silently approved; outcome={outcome:?}"
+        );
+        assert!(
+            outcome
+                .required_capabilities
+                .iter()
+                .any(|requirement| requirement.capability == CapabilityKind::FileWrite),
+            "the missing-authority report must name FileWrite so the owner (or test) can see \
+             exactly what was withheld; required_capabilities={:?}",
+            outcome.required_capabilities
+        );
+        assert!(
+            !task_output.path().join("attempted.txt").exists(),
+            "a peer child must never perform the host effect while authorization is pending; \
+             the file must not exist on disk"
+        );
+    }
+
     struct DuplicateIdGenerator {
         calls: AtomicUsize,
     }
