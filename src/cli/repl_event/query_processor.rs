@@ -7205,6 +7205,91 @@ mod tests {
         }
     }
 
+    /// Like `RecordingTurnGenerator`, but drives the *streaming* branch of
+    /// `process_query_with_tools` (`caps.supports_streaming = true`, and
+    /// `generate_stream_cancellable` returns `Ok(Some(rx))` with a single
+    /// pre-queued `TextDelta` on an already-closed channel) instead of the
+    /// non-streaming `generate()` call -- the branch local models
+    /// (Gemma/Qwen via `DaemonLocalGenerator`, streaming since #1216) take.
+    /// `generate()` deliberately panics if reached: this fixture exists to
+    /// prove the streaming branch itself defers the echo correctly, so a
+    /// silent fallback to non-streaming would make the test pass for the
+    /// wrong reason.
+    struct StreamingRecordingGenerator {
+        requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    }
+
+    impl Default for StreamingRecordingGenerator {
+        fn default() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for StreamingRecordingGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            panic!(
+                "StreamingRecordingGenerator::generate must never be called -- \
+                 this fixture exists to exercise the streaming branch of \
+                 process_query_with_tools, and a call here means the turn \
+                 silently fell back to non-streaming generation instead"
+            );
+        }
+
+        async fn generate_stream(
+            &self,
+            messages: Vec<crate::providers::Message>,
+            tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            self.generate_stream_cancellable(
+                messages,
+                tools,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+
+        async fn generate_stream_cancellable(
+            &self,
+            messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+            _cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            self.requests
+                .lock()
+                .expect("streaming recording generator request lock poisoned")
+                .push(messages);
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(Ok(StreamChunk::TextDelta("(say \"ack\")".to_string())))
+                .await
+                .expect("seed the paced stream with its one chunk");
+            drop(tx);
+            Ok(Some(rx))
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPS: std::sync::OnceLock<GeneratorCapabilities> = std::sync::OnceLock::new();
+            CAPS.get_or_init(|| GeneratorCapabilities {
+                supports_streaming: true,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "streaming-request-recorder"
+        }
+    }
+
     /// Summary generator that returns a distinct, numbered text per call and
     /// records how many times it was consulted.
     struct CountingSummaryGenerator {
@@ -7477,6 +7562,107 @@ mod tests {
             max_verbatim,
             recall_k,
             false,
+            false,
+            false,
+            no_summary_gen,
+            Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            "test persona".to_string(),
+            pending_echo,
+        ));
+        SummarizedTurnHarness {
+            task,
+            events,
+            output,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// Same as [`spawn_turn_with_memory`], but with `streaming_enabled: true`
+    /// so the turn takes the `if should_stream_responses(...)` branch of
+    /// `process_query_with_tools` -- the branch local models (Gemma/Qwen via
+    /// `DaemonLocalGenerator`, streaming since #1216) take. Every
+    /// `spawn_turn_with_memory` caller up to #1248 hardcoded `false` for
+    /// `streaming_enabled` (`RecordingTurnGenerator.capabilities()
+    /// .supports_streaming` is also `false`), so no existing test exercised
+    /// this branch at all. `main_gen` must report `supports_streaming: true`
+    /// or `should_stream_responses` will route back to the non-streaming
+    /// branch regardless of this flag.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_streaming_turn_with_memory(
+        conversation: Arc<RwLock<ConversationHistory>>,
+        query: &str,
+        main_gen: Arc<dyn Generator>,
+        memory_system: Arc<finch_memory::MemorySystem>,
+        recall_k: usize,
+        memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
+        pending_echo: Option<String>,
+    ) -> SummarizedTurnHarness {
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        conversation
+            .write()
+            .await
+            .add_user_message(query.to_string());
+
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let no_summary_gen: Arc<dyn Generator> = Arc::clone(&main_gen);
+        let task = tokio::spawn(process_query_with_tools(
+            query_id,
+            query.to_string(),
+            event_tx,
+            Arc::clone(&main_gen),
+            Arc::clone(&main_gen),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(tokio::sync::RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            conversation,
+            Arc::clone(&query_states),
+            tool_coordinator,
+            Arc::clone(&runtime),
+            tui_renderer,
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            status,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            Some(memory_system),
+            memory_commitment,
+            "test-session".to_string(),
+            "/test/workspace".to_string(),
+            4,
+            10_000,
+            recall_k,
+            true,
             false,
             false,
             no_summary_gen,
@@ -8144,6 +8330,87 @@ mod tests {
              before the question in the request the model sees \
              (inject_recall_prefix); memory_notice_idx = {memory_notice_idx}, \
              echo_idx = {echo_idx}, rows = {row_previews:?}"
+        );
+    }
+
+    /// #1248: the same guarantee as
+    /// `test_memory_notice_commits_before_user_echo_in_scrollback`, but
+    /// driven through the *streaming* branch of `process_query_with_tools`
+    /// (`should_stream_responses` true, via `StreamingRecordingGenerator`
+    /// and `spawn_streaming_turn_with_memory`) -- the branch local models
+    /// take since #1216 (`DaemonLocalGenerator` reports
+    /// `supports_streaming: true`). Reported live, twice, against
+    /// local-gemma-2-9b on a completely idle, non-queued submission: the
+    /// echo committed before the recall notice even with both #1194 and
+    /// #1242 merged, because neither of those fixes' regression tests ever
+    /// exercised this branch -- `test_memory_notice_commits_before_user_
+    /// echo_in_scrollback`'s `RecordingTurnGenerator` reports
+    /// `supports_streaming: false`, and `spawn_turn_with_memory` hardcodes
+    /// `streaming_enabled: false`, so every prior automated check of this
+    /// invariant only ever took the non-streaming path.
+    #[tokio::test]
+    async fn test_memory_notice_commits_before_user_echo_in_scrollback_streaming() {
+        let recorder = Arc::new(StreamingRecordingGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_text = "Where is the deploy key for the staging environment?";
+
+        let turn = spawn_streaming_turn_with_memory(
+            Arc::clone(&conversation),
+            query_text,
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            3,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            Some(query_text.to_string()),
+        )
+        .await;
+        turn.task.await.expect("query task panicked");
+        drop(turn.events);
+
+        assert_eq!(
+            recorder
+                .requests
+                .lock()
+                .expect("streaming recording generator request lock poisoned")
+                .len(),
+            1,
+            "the turn must actually have streamed -- a fallback to \
+             StreamingRecordingGenerator::generate would have panicked \
+             instead of leaving the request log empty"
+        );
+
+        let colors = crate::theme::ColorScheme::default();
+        let messages = turn.output.get_messages();
+        let row_previews: Vec<String> = messages.iter().map(|m| m.content()).collect();
+
+        let memory_notice_idx = messages
+            .iter()
+            .position(|m| m.format(&colors).contains("retrieved"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a memory-recall notice row (\"N memories retrieved\") \
+                     in the committed scrollback; rows = {row_previews:?}"
+                )
+            });
+        let echo_idx = messages
+            .iter()
+            .position(|m| m.content() == query_text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the user's own echoed question row in the \
+                     committed scrollback; rows = {row_previews:?}"
+                )
+            });
+
+        assert!(
+            memory_notice_idx < echo_idx,
+            "on the STREAMING branch, the memory notice must commit to \
+             scrollback before the user's own echoed question -- recall \
+             content is already injected before the question in the \
+             request the model sees (inject_recall_prefix); \
+             memory_notice_idx = {memory_notice_idx}, echo_idx = {echo_idx}, \
+             rows = {row_previews:?}"
         );
     }
 
