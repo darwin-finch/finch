@@ -140,6 +140,10 @@ impl LocalGenerator {
     ///
     /// This method is used by the daemon to support tool execution.
     /// Delegates to the configured local chat generator if available.
+    /// Returns `Ok(None)` only when local generation is disabled; a real
+    /// generation failure (e.g. the prompt exceeding the model's context
+    /// window) returns `Err` so the caller never mistakes the failure text
+    /// for a candidate wire response (#1234).
     pub fn try_generate_from_pattern_with_tools(
         &mut self,
         messages: &[Message],
@@ -180,8 +184,15 @@ impl LocalGenerator {
                 Ok(Some(response))
             }
             Err(e) => {
+                // Propagate the real failure (e.g. a context-window overflow)
+                // instead of swallowing it into `Ok(None)`: callers must be
+                // able to tell "local generation genuinely produced nothing"
+                // apart from "local generation errored," and the error text
+                // itself must never be mistaken for a candidate response
+                // (#1234). `e`'s message is already a clean, actionable
+                // description (see `TemplateGenerator::generate_with_system`).
                 tracing::warn!("Local generation failed: {}", e);
-                Ok(None)
+                Err(e)
             }
         }
     }
@@ -398,6 +409,97 @@ mod tests {
         assert!(
             !sent_to_model.contains("helpful coding assistant"),
             "the generic local constitution must not replace the caller's system contract, got: {sent_to_model}"
+        );
+    }
+
+    /// Regression for #1234: a local generation failure (e.g. the prompt plus
+    /// requested output exceeding the GGUF context window) must reach the
+    /// daemon boundary as `Err`, never as `Ok(Some(response))` carrying the
+    /// failure text disguised as the model's reply. Before the fix,
+    /// `TemplateGenerator::generate_with_system` turned this `Err` into a
+    /// fabricated `Ok(GeneratedResponse { text: "[NEURAL GENERATION
+    /// FAILED]: ...", confidence: 0.0, .. })`, and
+    /// `try_generate_from_pattern_with_tools` forwarded it unchecked as
+    /// `Ok(Some(response))` -- the caller (the daemon's OpenAI-compatible
+    /// handler) then returned that text as a normal 200 response, which
+    /// `query_processor.rs` fed straight into `raw_wire_source` and the
+    /// Lisp/Forth compiler, producing a nonsensical `E-FORTH-SIG-001`
+    /// diagnostic about the word "NEURAL" as if it were a type definition.
+    #[test]
+    fn local_daemon_boundary_surfaces_context_overflow_as_err_not_fake_response() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+        };
+
+        struct ContextOverflowBackend;
+
+        impl crate::models::TextGeneration for ContextOverflowBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                // Same shape as the real failure reported live:
+                // `src/models/loaders/llama_cpp.rs`'s `generate_inner` bails
+                // with this exact message when the prompt plus requested
+                // output would overflow the model's context window.
+                anyhow::bail!(
+                    "GGUF prompt (1987) plus requested output (100) exceeds context (2048)"
+                )
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "context-overflow test backend"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(ContextOverflowBackend), config);
+        let mut local_generator = LocalGenerator::with_models(Some(Arc::new(RwLock::new(model))));
+
+        let messages = vec![Message::user("do something that blows the context budget")];
+
+        let result = local_generator.try_generate_from_pattern_with_tools(&messages, None);
+
+        let error = match result {
+            Err(error) => error,
+            Ok(response) => panic!(
+                "a context-window overflow must surface as Err, not as a disguised \
+                 successful response that a caller could feed to the wire compiler: \
+                 {response:?}"
+            ),
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds context"),
+            "the clean error must preserve the actionable context-overflow detail, \
+             got: {message:?}"
+        );
+        assert!(
+            !message.contains("NEURAL GENERATION FAILED"),
+            "the error must not carry the old disguised-response marker text, \
+             got: {message:?}"
         );
     }
 }

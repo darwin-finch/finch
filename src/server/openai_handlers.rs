@@ -773,11 +773,15 @@ async fn handle_local_only_query(
                     .into_response());
             }
             Err(e) => {
+                // `e`'s message is already a clean, complete description
+                // (e.g. "local generation failed: GGUF prompt (1987) plus
+                // requested output (100) exceeds context (2048)" — #1234),
+                // so surface it as-is instead of re-wrapping it.
                 warn!("Local generation failed: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse::new(
-                        format!("Local generation failed: {}", e),
+                        e.to_string(),
                         "generation_failed".to_string(),
                     )),
                 )

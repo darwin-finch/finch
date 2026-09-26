@@ -278,15 +278,18 @@ impl TemplateGenerator {
                     });
                 }
                 Err(e) => {
-                    // Neural generation failed entirely - show the full error with context
-                    let full_error = format!("{:#}", e); // Use alternate display for full error chain
+                    // Neural generation failed entirely (e.g. the prompt plus
+                    // requested output exceeds the model's context window).
+                    // This is a real failure, not a candidate response: it
+                    // must propagate as `Err` so callers treat the turn as
+                    // failed instead of compiling the failure text as if it
+                    // were the model's wire response (#1234). Fold the full
+                    // error chain into one top-level message so it survives
+                    // both `{}` and `{:#}` rendering at every downstream call
+                    // site.
+                    let full_error = format!("{:#}", e); // full chain for the log and the message
                     tracing::error!("Neural generation failed: {}", full_error);
-                    return Ok(GeneratedResponse {
-                        text: format!("[NEURAL GENERATION FAILED]: {}", full_error),
-                        method: "neural_error".to_string(),
-                        confidence: 0.0,
-                        pattern: pattern.as_str().to_string(),
-                    });
+                    return Err(anyhow::anyhow!("local generation failed: {full_error}"));
                 }
             }
         }
@@ -1309,7 +1312,7 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct GeneratedResponse {
     pub text: String,
-    pub method: String, // "template", "learned", "neural", or "neural_error"
+    pub method: String, // "template", "learned", or "neural"
     pub confidence: f64,
     pub pattern: String,
 }

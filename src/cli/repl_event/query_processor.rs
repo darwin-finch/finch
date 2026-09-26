@@ -8955,4 +8955,189 @@ mod tests {
              rendered lines were {texts:?}"
         );
     }
+
+    // ── #1234: local generation failure must never reach the wire compiler ──
+
+    /// Adapter shaped like the real local-model generators
+    /// (`QwenGenerator`/`DaemonLocalGenerator`): it reaches the model through
+    /// `LocalGenerator::try_generate_from_pattern_with_tools`, the same real
+    /// entry point the daemon uses, instead of hand-crafting a response.
+    struct LocalContextOverflowGenerator {
+        local: tokio::sync::Mutex<crate::local::LocalGenerator>,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for LocalContextOverflowGenerator {
+        async fn generate(
+            &self,
+            messages: Vec<crate::providers::Message>,
+            tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let mut local = self.local.lock().await;
+            match local.try_generate_from_pattern_with_tools(&messages, tools)? {
+                Some(response) => Ok(response),
+                None => Err(anyhow::anyhow!("local generation returned no response")),
+            }
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "local-context-overflow-fixture"
+        }
+    }
+
+    /// Regression for #1234 ("[NEURAL GENERATION FAILED] internal engine
+    /// error leaks into wire-execution pipeline as if it were program
+    /// source"). Drives a context-window-overflow local-generation failure
+    /// through the real `process_query_with_tools` path -- the same
+    /// non-streaming path a live local-model turn takes (`streaming_enabled:
+    /// false` below lands on the `generator.generate(...)` call around line
+    /// 2163, not the streaming branch) -- and proves the failure surfaces as
+    /// one clean `QueryFailed` event instead of ever reaching
+    /// `raw_wire_source`/the Lisp/Forth compiler.
+    ///
+    /// Before the fix to `TemplateGenerator::generate_with_system` and
+    /// `LocalGenerator::try_generate_from_pattern_with_tools`, the wrapped
+    /// `LocalGenerator` here would turn the backend's context-overflow `Err`
+    /// into a fabricated `Ok(GeneratorResponse { text: "[NEURAL GENERATION
+    /// FAILED]: ...", .. })`; this exact call path would then submit that
+    /// text as wire source and compile it, producing the reported
+    /// `error[E-FORTH-SIG-001]` about the word "NEURAL" as if it were a type
+    /// definition.
+    #[tokio::test]
+    async fn context_window_overflow_never_reaches_the_wire_compiler() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, GeneratorModel, InferenceProvider, ModelFamily, ModelLoadConfig,
+            ModelSize, TextGeneration,
+        };
+
+        struct ContextOverflowBackend;
+
+        impl TextGeneration for ContextOverflowBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> anyhow::Result<Vec<u32>> {
+                // Same shape as the real failure reported live:
+                // `src/models/loaders/llama_cpp.rs`'s `generate_inner` bails
+                // with this exact message when the prompt plus requested
+                // output would overflow the model's context window.
+                anyhow::bail!(
+                    "GGUF prompt (1987) plus requested output (100) exceeds context (2048)"
+                )
+            }
+
+            fn tokenize(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> anyhow::Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "context-overflow test backend"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(ContextOverflowBackend), config);
+        let local_generator =
+            crate::local::LocalGenerator::with_models(Some(Arc::new(RwLock::new(model))));
+        let generator = Arc::new(LocalContextOverflowGenerator {
+            local: tokio::sync::Mutex::new(local_generator),
+        }) as Arc<dyn Generator>;
+
+        let summary_gen = Arc::new(CountingSummaryGenerator::default());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_text = "do something that blows the local context budget";
+
+        let mut harness = spawn_summarized_turn(
+            Arc::clone(&conversation),
+            query_text,
+            Arc::clone(&generator),
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            summary_cache,
+            None,
+        )
+        .await;
+        harness.task.await.expect("query task panicked");
+
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        let failed = events.iter().find_map(|event| match event {
+            ReplEvent::QueryFailed { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+        let error = failed.unwrap_or_else(|| {
+            panic!(
+                "a context-window overflow must surface as a clean QueryFailed event, \
+                 not silently compile as wire source; events were {events:?}"
+            )
+        });
+        assert!(
+            error.contains("exceeds context"),
+            "the surfaced error must keep the actionable context-overflow detail, \
+             got: {error:?}"
+        );
+        assert!(
+            !error.contains("NEURAL GENERATION FAILED"),
+            "the error must not carry the old disguised-response marker text, got: {error:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ReplEvent::StreamingComplete { .. } | ReplEvent::VmOutputComplete { .. }
+            )),
+            "a generation failure must never reach wire execution/completion; \
+             events were {events:?}"
+        );
+
+        let rendered: Vec<String> = harness
+            .output
+            .get_messages()
+            .iter()
+            .map(|m| m.content())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("E-FORTH") && !line.contains("VM wire error")),
+            "the failure text must never reach the Lisp/Forth compiler; \
+             rendered rows were {rendered:?}"
+        );
+    }
 }
