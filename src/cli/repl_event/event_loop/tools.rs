@@ -330,6 +330,10 @@ impl EventLoop {
                     return Ok(());
                 }
                 *self.conversation.write().await = proposed_history;
+                // Only echo once the merge is durably committed -- a restored
+                // (failed) merge above returns before this point so a later
+                // retry does not echo twice.
+                self.write_pending_echoes(&pending);
 
                 let _ = self.llm_tx.send(LlmRequest::Query {
                     id: query_id,
@@ -365,6 +369,10 @@ impl EventLoop {
             });
             return Ok(());
         }
+        // Only echo once the continuation is durably admitted -- a restored
+        // (failed) merge above returns before this point so a later retry
+        // does not echo twice.
+        self.write_pending_echoes(&pending);
 
         Ok(())
     }
