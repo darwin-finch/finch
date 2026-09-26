@@ -51,6 +51,16 @@ impl ClaudeClient {
         self.provider.default_model()
     }
 
+    /// Whether the configured provider can execute function-calling itself
+    /// for its default model. `false` for transports like the Claude CLI
+    /// subscription backend, which run with no native tool execution by
+    /// design (see `finch_providers::ClaudeCliProvider::capabilities`);
+    /// callers that still need tool use fold tool definitions into the
+    /// prompt instead of attaching `ProviderRequest::tools` (issue #1303).
+    pub fn supports_tools(&self) -> bool {
+        self.provider.supports_tools()
+    }
+
     /// Convert MessageRequest to ProviderRequest
     fn to_provider_request(&self, request: &MessageRequest) -> ProviderRequest {
         // The provider profile owns the upstream model. `MessageRequest`
