@@ -832,6 +832,7 @@ fn source_metadata_for_node(
 
 /// One stored turn with everything recall rendering needs beyond the public
 /// source metadata: the raw content and the ordering timestamp.
+#[derive(Debug)]
 struct RecallTurn {
     source: MemorySourceMetadata,
     content: String,
@@ -870,18 +871,96 @@ fn recall_turn_by_id(conn: &Connection, conversation_id: &str) -> Result<Option<
 
 /// The stored turn this one replies to, or that replies to this one.
 ///
+/// Resolved primarily through the retrieved turn's own occurrence-chain link
+/// (`routing_occurrences`, PR #1213): a user turn's true reply is whatever
+/// occurrence comes right after it in its session's chain (`next`), and an
+/// assistant turn's true question is whatever occurrence comes right before
+/// it (`prev`). This is a real request/response link, not a heuristic, so it
+/// cannot be fooled by some other same-session turn of the opposite role
+/// landing closer in wall-clock time than the actual reply.
+///
+/// Falls back to the previous nearest-timestamp heuristic
+/// ([`counterpart_turn_by_nearest_timestamp`]) when the retrieved turn has no
+/// occurrence row at all (a legacy leaf predating occurrence chains, or a
+/// classifier-discarded turn), or when its occurrence exists but has no
+/// `next`/`prev` set yet (the chain's own documented "first/last turn" case,
+/// already handled the same way by `RoutingMemTree::retrieve`'s neighbor-
+/// context tie-break -- see `crates/finch-memory/AGENTS.md`).
+fn counterpart_turn(conn: &Connection, turn: &RecallTurn) -> Result<Option<RecallTurn>> {
+    if turn.source.role != "user" && turn.source.role != "assistant" {
+        return Ok(None);
+    }
+    if let Some(counterpart) = counterpart_turn_via_occurrence_chain(conn, turn)? {
+        return Ok(Some(counterpart));
+    }
+    counterpart_turn_by_nearest_timestamp(conn, turn)
+}
+
+/// The real reply/question this turn's occurrence chain names, or `None` when
+/// there is nothing to walk (see [`counterpart_turn`]'s doc for the exact
+/// fallback cases).
+fn counterpart_turn_via_occurrence_chain(
+    conn: &Connection,
+    turn: &RecallTurn,
+) -> Result<Option<RecallTurn>> {
+    let occurrence: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT ro.prev_uuid, ro.next_uuid
+             FROM memory_sources ms
+             JOIN routing_occurrences ro ON ro.point_id = ms.node_id
+             WHERE ms.conversation_id = ?1",
+            params![turn.source.source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context(
+            "counterpart_turn_via_occurrence_chain: query routing_occurrences by conversation",
+        )?;
+    let Some((prev_uuid, next_uuid)) = occurrence else {
+        return Ok(None);
+    };
+    // A user turn's reply is whatever comes after it in the chain; an assistant turn's
+    // question is whatever came before it.
+    let neighbor_uuid = if turn.source.role == "user" {
+        next_uuid
+    } else {
+        prev_uuid
+    };
+    let Some(neighbor_uuid) = neighbor_uuid else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.role, c.model, c.session_id,
+                c.brain_id, c.run_id, c.request_seq, c.content, c.timestamp
+         FROM routing_occurrences ro
+         JOIN memory_sources ms ON ms.node_id = ro.point_id
+         JOIN conversations c ON c.id = ms.conversation_id
+         WHERE ro.uuid = ?1",
+    )?;
+    let mut rows = stmt.query(params![neighbor_uuid])?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(row) => Ok(Some(recall_turn_from_row(row)?)),
+    }
+}
+
+/// The pre-#1213 pairing heuristic, kept only as [`counterpart_turn`]'s fallback for turns with
+/// no occurrence-chain link to walk (see that function's doc).
+///
 /// Scoped to the session and to the two conversation roles: `session_id` is
 /// what every captured turn carries, and a NULL session cannot bound "the
 /// exchange" against interleaved other sessions, so such turns stay single.
 /// Closest in time wins, which pairs adjacent turns and survives a follow-up
-/// exchange after the first.
-fn counterpart_turn(conn: &Connection, turn: &RecallTurn) -> Result<Option<RecallTurn>> {
+/// exchange after the first -- but, unlike the occurrence chain, can mis-pair
+/// with any other same-session opposite-role turn that happens to land closer
+/// in wall-clock time than the real reply.
+fn counterpart_turn_by_nearest_timestamp(
+    conn: &Connection,
+    turn: &RecallTurn,
+) -> Result<Option<RecallTurn>> {
     let Some(session_id) = turn.source.session_id.as_deref() else {
         return Ok(None);
     };
-    if turn.source.role != "user" && turn.source.role != "assistant" {
-        return Ok(None);
-    }
     let mut stmt = conn.prepare(
         "SELECT c.id, c.role, c.model, c.session_id,
                 c.brain_id, c.run_id, c.request_seq, c.content, c.timestamp
@@ -5177,6 +5256,123 @@ mod tests {
                 .any(|r| r.text == substantive("race-turn-one")),
             "the losing turn must still be a real, queryable memory, not corrupted or dropped; \
              results={results:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Regression for the nearest-wall-clock-timestamp mis-pairing bug: `counterpart_turn` must
+    /// pair a retrieved turn with its REAL reply via the occurrence chain (PR #1213's
+    /// `prev`/`next` links), not with whatever other same-session, opposite-role turn happens to
+    /// land closer in wall-clock time.
+    ///
+    /// Arranged deterministically per this crate's rule against timing as a correctness oracle:
+    /// three turns are inserted in the real chain order (question, true reply, unrelated
+    /// assistant turn) so the occurrence chain records question -> true reply -> unrelated turn
+    /// regardless of clock behavior, and then `conversations.timestamp` is overwritten directly
+    /// so the unrelated turn is numerically closest to the question -- reproducing exactly the
+    /// reported case (a real reply that loses to a nearer-in-time impostor under the old
+    /// heuristic) without depending on real elapsed time.
+    #[tokio::test]
+    async fn test_counterpart_turn_follows_occurrence_chain_not_nearest_timestamp() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        memory
+            .insert_conversation(
+                "user",
+                &substantive("pairing-question"),
+                None,
+                Some("sess-pairing"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                &substantive("pairing-true-reply"),
+                None,
+                Some("sess-pairing"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                &substantive("pairing-unrelated-turn"),
+                None,
+                Some("sess-pairing"),
+            )
+            .await?;
+
+        let question_id =
+            conversation_id_for_content(temp.path(), &substantive("pairing-question"))?;
+        let true_reply_id =
+            conversation_id_for_content(temp.path(), &substantive("pairing-true-reply"))?;
+        let unrelated_id =
+            conversation_id_for_content(temp.path(), &substantive("pairing-unrelated-turn"))?;
+
+        let question_occurrence = occurrence_row_for_conversation(temp.path(), &question_id)?
+            .expect("the question must be projected as an occurrence");
+        assert_eq!(
+            question_occurrence.2,
+            Some(
+                occurrence_row_for_conversation(temp.path(), &true_reply_id)?
+                    .expect("the true reply must be projected as an occurrence")
+                    .0
+            ),
+            "the question's occurrence must chain forward to the TRUE reply's occurrence \
+             (insertion order), not to the unrelated turn inserted afterward; \
+             question_occurrence={question_occurrence:?}"
+        );
+
+        // Overwrite timestamps directly so the unrelated turn is numerically nearest to the
+        // question -- the exact condition that fooled the old nearest-timestamp heuristic --
+        // while the occurrence chain above (set at insert time, independent of this column)
+        // still names the true reply.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE conversations SET timestamp = 1000 WHERE id = ?1",
+                params![question_id],
+            )?;
+            conn.execute(
+                "UPDATE conversations SET timestamp = 1001 WHERE id = ?1",
+                params![unrelated_id],
+            )?;
+            conn.execute(
+                "UPDATE conversations SET timestamp = 50000 WHERE id = ?1",
+                params![true_reply_id],
+            )?;
+        }
+
+        let conn = Connection::open(temp.path())?;
+        let question_turn = recall_turn_by_id(&conn, &question_id)?
+            .expect("the question's conversation row must still exist");
+        let counterpart = counterpart_turn(&conn, &question_turn)?.expect(
+            "the question has a real reply via the occurrence chain and must not return None",
+        );
+        assert_eq!(
+            counterpart.source.source_id, true_reply_id,
+            "counterpart_turn must return the TRUE reply (linked via the occurrence chain), not \
+             the unrelated turn that was made numerically closer in timestamp \
+             (question_ts=1000, unrelated_ts=1001, true_reply_ts=50000); got \
+             counterpart={counterpart:?}, true_reply_id={true_reply_id}, unrelated_id={unrelated_id}"
+        );
+
+        let rendered = render_recall_entry(&question_turn, Some(&counterpart));
+        assert_eq!(
+            rendered,
+            format!(
+                "user: {}\nassistant: {}",
+                substantive("pairing-question"),
+                substantive("pairing-true-reply")
+            ),
+            "the rendered recall entry must display the TRUE reply, not the unrelated turn; \
+             rendered={rendered:?}"
         );
 
         Ok(())
