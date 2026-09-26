@@ -213,28 +213,35 @@ enum Command {
 enum AuthCommand {
     /// Show local, secret-free authentication status without network access
     Status {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            default_value_if("provider", "claude", Some("claude:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
-    /// Start Finch-native ChatGPT or SuperGrok device login
+    /// Start Finch-native ChatGPT, SuperGrok, or Claude subscription sign-in
+    ///
+    /// Claude subscription sign-in is disabled by default; see
+    /// `claude_subscription_oauth_enabled` under `[features]` in config.toml.
     Login {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            default_value_if("provider", "claude", Some("claude:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
-        /// Copy the one-time code to the clipboard
+        /// Copy the one-time code to the clipboard (chatgpt/grok-sub device
+        /// codes only; has no effect for claude, whose browser flow has no
+        /// one-time code to copy)
         #[arg(long)]
         copy: bool,
         /// Explicitly open the sign-in URL in the default browser
@@ -243,24 +250,26 @@ enum AuthCommand {
     },
     /// Revoke a named subscription credential and retain a local tombstone
     Logout {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            default_value_if("provider", "claude", Some("claude:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
     /// Recover an interrupted local mutation as a signed-out tombstone
     Recover {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            default_value_if("provider", "claude", Some("claude:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
@@ -2987,8 +2996,84 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
     match auth_provider(&command) {
         "chatgpt" => run_chatgpt_auth(command).await,
         "grok-sub" => run_grok_auth(command).await,
+        "claude" => run_claude_auth(command).await,
         other => anyhow::bail!("unsupported auth provider {other}"),
     }
+}
+
+/// Claude subscription sign-in is opt-in, disabled by default: it reuses
+/// Claude Code's own OAuth client identity (Finch has no client id of its
+/// own registered with Anthropic for this surface), a pattern Anthropic has
+/// a documented history of actively detecting and blocking for other
+/// third-party tools. This check runs before any network access so an
+/// un-opted-in user never has Finch talk to Anthropic's OAuth servers.
+fn require_claude_subscription_oauth_opt_in() -> Result<()> {
+    let config =
+        load_config().context("Could not load Finch config to check Claude subscription opt-in")?;
+    if !config.features.claude_subscription_oauth_enabled {
+        anyhow::bail!(
+            "Claude subscription sign-in is disabled by default. It reuses Claude Code's own \
+             OAuth client identity rather than one Anthropic issued to Finch, which matches a \
+             pattern Anthropic has a documented history of detecting and blocking for other \
+             third-party tools. To opt in with that risk explicitly accepted, set \
+             `claude_subscription_oauth_enabled = true` under `[features]` in your Finch \
+             config.toml, then rerun this command. See crates/finch-providers/AGENTS.md for \
+             the full rationale."
+        );
+    }
+    Ok(())
+}
+
+async fn run_claude_auth(command: AuthCommand) -> Result<()> {
+    use finch::cli::{
+        render_claude_auth_status_line, save_claude_named_credential, BrowserLoginPresentation,
+        ClaudeAuthService,
+    };
+
+    let service = ClaudeAuthService::production()?;
+    match command {
+        AuthCommand::Status { credential, .. } => {
+            let status = service.status(&credential)?;
+            println!("{}", render_claude_auth_status_line(&status)?);
+        }
+        AuthCommand::Login {
+            credential, open, ..
+        } => {
+            require_claude_subscription_oauth_opt_in()?;
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    BrowserLoginPresentation { open_browser: open },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "Claude login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_claude_named_credential(config, metadata)?;
+            println!("Claude login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout { credential, .. } => {
+            let metadata = service.logout(&credential)?;
+            let config = load_config()?;
+            save_claude_named_credential(config, metadata)?;
+            println!(
+                "Claude credential {credential} was forgotten locally. Anthropic exposes no \
+                 known public revocation endpoint for this client, so this token was not \
+                 remotely invalidated; revoke access from your Anthropic account settings for \
+                 full server-side invalidation."
+            );
+        }
+        AuthCommand::Recover { credential, .. } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_claude_named_credential(config, metadata)?;
+            println!("Recovered Claude credential {credential} as signed_out; run `finch auth login claude --credential {credential}` to sign in again.");
+        }
+    }
+    Ok(())
 }
 
 async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
@@ -4023,6 +4108,54 @@ mod tests {
                     ..
                 }
             }) if provider == "grok-sub" && credential == "grok-sub:default"
+        ));
+    }
+
+    #[test]
+    fn claude_auth_cli_parses_default_credential_for_every_subcommand() {
+        let login = Args::try_parse_from(["finch", "auth", "login", "claude", "--open"]).unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    open: true,
+                    ..
+                }
+            }) if provider == "claude" && credential == "claude:default"
+        ));
+
+        let status = Args::try_parse_from(["finch", "auth", "status", "claude"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Status { credential, .. }
+            }) if credential == "claude:default"
+        ));
+
+        let logout = Args::try_parse_from(["finch", "auth", "logout", "claude"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Logout { credential, .. }
+            }) if credential == "claude:default"
+        ));
+
+        let recover = Args::try_parse_from([
+            "finch",
+            "auth",
+            "recover",
+            "claude",
+            "--credential",
+            "claude:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Recover { credential, .. }
+            }) if credential == "claude:work"
         ));
     }
 

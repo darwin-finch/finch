@@ -1,11 +1,20 @@
 # Finch provider transports
 
 This crate owns provider-neutral request and stream contracts plus the concrete Claude,
-OpenAI-compatible, Gemini, ChatGPT, and Grok transports, provider capability and model-catalog
-logic, credential ports, and OAuth state machines. It validates provider-specific wire behavior
-without importing Finch application configuration. The root application maps `Config` onto these
-contracts and decides which provider profile to run; generation lifecycle and tool execution
-belong elsewhere.
+OpenAI-compatible, Gemini, ChatGPT, Grok, and Claude-subscription transports, provider capability
+and model-catalog logic, credential ports, and OAuth state machines. It validates
+provider-specific wire behavior without importing Finch application configuration. The root
+application maps `Config` onto these contracts and decides which provider profile to run;
+generation lifecycle and tool execution belong elsewhere.
+
+Claude subscription (`claude_oauth.rs`/`claude_subscription.rs`) authenticates a claude.ai
+Pro/Max/Team subscription via Anthropic's browser authorization-code + PKCE OAuth flow, reusing
+the audited Anthropic Messages wire protocol (`claude.rs`) with an OAuth bearer token in place of
+an API key. It is **opt-in and disabled by default** in the application layer
+(`Config::features.claude_subscription_oauth_enabled`, checked in `src/cli/claude_auth.rs` and
+`src/providers/factory.rs`) because it reuses Claude Code's own OAuth client identity rather than
+one Anthropic issued to Finch — see the Invariants section below and `claude_oauth.rs`'s module
+doc comment for the full rationale and confidence level.
 
 For configured generation, `src/providers/factory.rs` reads Finch provider entries and
 credentials, constructs a concrete provider through this crate, and exposes a `ProviderGraph` to

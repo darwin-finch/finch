@@ -15,14 +15,30 @@ use crate::config::{
     ResolvedCredential,
 };
 use finch_providers::{
-    ChatGptSubscriptionProvider, ClaudeProvider, GeminiProvider, GrokSubscriptionProvider,
-    OpenAIProvider,
+    ChatGptSubscriptionProvider, ClaudeProvider, ClaudeSubscriptionProvider, GeminiProvider,
+    GrokSubscriptionProvider, OpenAIProvider,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 const LEGACY_CHATGPT_MIGRATION_ERROR: &str = "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys";
+
+/// Claude subscription is opt-in and disabled by default: it reuses Claude
+/// Code's own OAuth client identity (Finch has no client id of its own
+/// registered with Anthropic for this surface), which matches a pattern
+/// Anthropic has a documented history of actively detecting and blocking for
+/// other third-party tools. A credential can exist in the local OAuth store
+/// (e.g. from an earlier opt-in, or a copied config) without the flag being
+/// set now, so this is re-checked at every construction, not only at login.
+fn require_claude_subscription_oauth_opt_in(config: &Config) -> Result<()> {
+    if !config.features.claude_subscription_oauth_enabled {
+        bail!(
+            "Claude subscription is disabled by default; set claude_subscription_oauth_enabled = true under [features] in config.toml to opt in (see crates/finch-providers/AGENTS.md for why)"
+        );
+    }
+    Ok(())
+}
 
 struct CredentialBoundProvider {
     inner: Box<dyn LlmProvider>,
@@ -409,6 +425,9 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::ChatgptSubscription => bail!(
             "ChatGPT subscription credentials are distinct from OpenAI Platform credentials, but no documented Finch-native subscription transport is currently available"
         ),
+        CredentialProvider::ClaudeSubscription => bail!(
+            "Claude subscription credentials are distinct from Anthropic API-key credentials and cannot be resolved as an environment secret"
+        ),
         CredentialProvider::GrokSubscription => bail!(
             "Grok subscription credentials are distinct from xAI Console API-key credentials and cannot be resolved as an environment secret"
         ),
@@ -436,6 +455,7 @@ fn resolve_named_graph(
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked every named credential reference");
         if credential.provider == CredentialProvider::ChatgptSubscription
+            || credential.provider == CredentialProvider::ClaudeSubscription
             || credential.provider == CredentialProvider::GrokSubscription
         {
             continue;
@@ -479,6 +499,11 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("ChatGPT subscription custom endpoints and paths are not supported")
+        }
+        CredentialProvider::ClaudeSubscription
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Claude subscription custom endpoints and paths are not supported")
         }
         CredentialProvider::GrokSubscription
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
@@ -535,6 +560,7 @@ fn create_named_profiles_from_config_with_resolver(
                 entry,
                 ProviderEntry::Credentialed {
                     provider: CredentialProvider::ChatgptSubscription
+                        | CredentialProvider::ClaudeSubscription
                         | CredentialProvider::GrokSubscription,
                     ..
                 }
@@ -569,6 +595,19 @@ fn create_named_profiles_from_config_with_resolver(
                         unreachable!("credential binding implies credentialed entry")
                     };
                     Ok(Box::new(ChatGptSubscriptionProvider::production(
+                        metadata,
+                        model.as_deref(),
+                        *reasoning_effort,
+                    )?) as Box<dyn LlmProvider>)
+                } else if metadata.provider == CredentialProvider::ClaudeSubscription {
+                    if !production_oauth {
+                        bail!("Injected credential resolvers cannot fabricate a refreshable Claude subscription lease")
+                    }
+                    require_claude_subscription_oauth_opt_in(config)?;
+                    let ProviderEntry::Credentialed { model, reasoning_effort, .. } = entry else {
+                        unreachable!("credential binding implies credentialed entry")
+                    };
+                    Ok(Box::new(ClaudeSubscriptionProvider::production(
                         metadata,
                         model.as_deref(),
                         *reasoning_effort,
@@ -774,6 +813,7 @@ pub fn create_provider_profile_from_config_with_resolver(
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked the selected named credential reference");
         if credential.provider == CredentialProvider::ChatgptSubscription
+            || credential.provider == CredentialProvider::ClaudeSubscription
             || credential.provider == CredentialProvider::GrokSubscription
         {
             bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
@@ -822,6 +862,22 @@ fn create_provider_from_overlaid_entry_with_resolver(
                 unreachable!("credential binding implies credentialed entry")
             };
             return Ok(Arc::new(ChatGptSubscriptionProvider::production(
+                credential,
+                model.as_deref(),
+                *reasoning_effort,
+            )?) as Arc<dyn LlmProvider>);
+        }
+        if credential.provider == CredentialProvider::ClaudeSubscription {
+            require_claude_subscription_oauth_opt_in(config)?;
+            let ProviderEntry::Credentialed {
+                model,
+                reasoning_effort,
+                ..
+            } = entry
+            else {
+                unreachable!("credential binding implies credentialed entry")
+            };
+            return Ok(Arc::new(ClaudeSubscriptionProvider::production(
                 credential,
                 model.as_deref(),
                 *reasoning_effort,
@@ -1264,6 +1320,13 @@ mod tests {
                 false,
             ),
             (
+                CredentialProvider::ClaudeSubscription,
+                CredentialKind::OauthBrowserPkce,
+                "anthropic-claude",
+                EndpointFamily::ClaudeSubscription,
+                false,
+            ),
+            (
                 CredentialProvider::GrokSubscription,
                 CredentialKind::OauthDevice,
                 "xai-grok",
@@ -1333,6 +1396,64 @@ mod tests {
             assert!(create_provider_graph_from_config_with_resolver(&config, &resolver).is_err());
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn test_claude_subscription_construction_refuses_without_explicit_opt_in() {
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::ClaudeSubscription,
+            credential: CredentialBinding {
+                credential_ref: "work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".into()),
+            reasoning_effort: None,
+        };
+        let credential = ProviderCredential {
+            name: "work".into(),
+            kind: CredentialKind::OauthBrowserPkce,
+            provider: CredentialProvider::ClaudeSubscription,
+            issuer: "anthropic-claude".into(),
+            audience: AudienceBinding::standard(EndpointFamily::ClaudeSubscription),
+            tenant: None,
+            project: None,
+            account: Some("acct-work".into()),
+            scopes: BTreeSet::new(),
+            secret_ref: "oauth-store:work".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let mut config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        assert!(
+            !config.features.claude_subscription_oauth_enabled,
+            "the opt-in flag must default to false for this to be a meaningful test"
+        );
+
+        // Disabled by default: refused before ever touching the OAuth store
+        // or the network, even on the real `production_oauth = true` path.
+        let error = create_providers_from_config(&config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("disabled by default"),
+            "expected the opt-in refusal, got: {error}"
+        );
+
+        // Opting in removes the gate: construction only leases/refreshes the
+        // credential lazily on first use, so it succeeds here without ever
+        // touching the (possibly absent) on-disk OAuth store.
+        config.features.claude_subscription_oauth_enabled = true;
+        create_providers_from_config(&config)
+            .expect("opting in must let a validly-shaped Claude subscription profile construct");
     }
 
     #[tokio::test]

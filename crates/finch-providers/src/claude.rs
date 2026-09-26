@@ -46,7 +46,7 @@ fn decode_claude_content(
         .collect()
 }
 
-const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
@@ -65,8 +65,35 @@ fn cached_request_json(request: &MessageRequest, stream: bool) -> Result<serde_j
     Ok(payload)
 }
 
+/// How a [`ClaudeProvider`] instance authenticates against the Anthropic
+/// Messages API. API-key auth is the ordinary, long-standing path; OAuth
+/// bearer auth is used only by the Claude subscription transport
+/// (`claude_subscription.rs`), which leases and refreshes the token itself
+/// and hands this provider a live access token per request.
+#[derive(Clone)]
+enum ClaudeAuth {
+    ApiKey(String),
+    /// A Claude subscription OAuth access token. Anthropic requires the
+    /// `anthropic-beta: oauth-2025-04-20` header on requests authenticated
+    /// this way (see `claude_oauth::CLAUDE_OAUTH_BETA_HEADER`); omitting it
+    /// is the documented failure mode a live test would need to rule out.
+    OAuthBearer(String),
+}
+
+impl ClaudeAuth {
+    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::ApiKey(key) => builder.header("x-api-key", key),
+            Self::OAuthBearer(token) => builder.bearer_auth(token).header(
+                "anthropic-beta",
+                crate::claude_oauth::CLAUDE_OAUTH_BETA_HEADER,
+            ),
+        }
+    }
+}
+
 /// Parse an Anthropic API error body and return a human-friendly message with hints.
-fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
+fn friendly_api_error(status: reqwest::StatusCode, body: &str, auth: &ClaudeAuth) -> String {
     // Anthropic errors look like: {"type":"error","error":{"type":"...","message":"..."}}
     let extracted = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -79,8 +106,16 @@ fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
 
     let msg = extracted.as_deref().unwrap_or(body.trim());
 
+    let unauthorized_hint = match auth {
+        ClaudeAuth::ApiKey(_) => {
+            " — Check that your ANTHROPIC_API_KEY or api_key in ~/.finch/config.toml is correct"
+        }
+        ClaudeAuth::OAuthBearer(_) => {
+            " — Your Claude subscription sign-in may have expired; run `finch auth login claude` again"
+        }
+    };
     let hint = match status.as_u16() {
-        401 => " — Check that your ANTHROPIC_API_KEY or api_key in ~/.finch/config.toml is correct",
+        401 => unauthorized_hint,
         403 => " — Your API key may lack permissions",
         429 => " — You've hit a rate limit; wait a moment before retrying",
         400 => " — The request was malformed (this may be a finch bug; please report it)",
@@ -106,7 +141,7 @@ struct BlockBuilder {
 #[derive(Clone)]
 pub struct ClaudeProvider {
     client: Client,
-    api_key: String,
+    auth: ClaudeAuth,
     default_model: String,
     endpoints: ProviderEndpoints,
 }
@@ -125,6 +160,38 @@ impl ClaudeProvider {
         chat_path: &str,
         models_path: &str,
     ) -> Result<Self> {
+        Self::new_with_auth(
+            ClaudeAuth::ApiKey(api_key),
+            base_url,
+            chat_path,
+            models_path,
+        )
+    }
+
+    /// Create a Claude provider authenticated with a live Claude subscription
+    /// OAuth access token instead of a static API key. Crate-internal: only
+    /// `claude_subscription.rs` constructs this, since it owns leasing and
+    /// refreshing the token on 401.
+    pub(crate) fn new_with_oauth_bearer(
+        access_token: String,
+        base_url: &str,
+        chat_path: &str,
+        models_path: &str,
+    ) -> Result<Self> {
+        Self::new_with_auth(
+            ClaudeAuth::OAuthBearer(access_token),
+            base_url,
+            chat_path,
+            models_path,
+        )
+    }
+
+    fn new_with_auth(
+        auth: ClaudeAuth,
+        base_url: &str,
+        chat_path: &str,
+        models_path: &str,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
@@ -132,7 +199,7 @@ impl ClaudeProvider {
 
         Ok(Self {
             client,
-            api_key,
+            auth,
             default_model: DEFAULT_CLAUDE_MODEL.to_string(),
             endpoints: ProviderEndpoints::new(base_url, chat_path, models_path),
         })
@@ -191,13 +258,14 @@ impl ClaudeProvider {
             "sending Claude request"
         );
 
-        let response = self
-            .client
-            .post(&self.endpoints.chat_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&request_json)
+        let request_builder = self.auth.apply(
+            self.client
+                .post(&self.endpoints.chat_url)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&request_json),
+        );
+        let response = request_builder
             .send()
             .await
             .context("Failed to send request to Claude API")?;
@@ -206,7 +274,7 @@ impl ClaudeProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            let msg = friendly_api_error(status, &error_body);
+            let msg = friendly_api_error(status, &error_body, &self.auth);
             if status.is_client_error() {
                 return Err(anyhow::Error::new(NonRetriableError(msg)));
             }
@@ -253,13 +321,14 @@ impl ClaudeProvider {
 
         tracing::debug!("Sending streaming request to Claude API");
 
-        let response = self
-            .client
-            .post(&self.endpoints.chat_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&request_json)
+        let request_builder = self.auth.apply(
+            self.client
+                .post(&self.endpoints.chat_url)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&request_json),
+        );
+        let response = request_builder
             .send()
             .await
             .context("Failed to send streaming request to Claude API")?;
@@ -267,7 +336,7 @@ impl ClaudeProvider {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            let msg = friendly_api_error(status, &error_body);
+            let msg = friendly_api_error(status, &error_body, &self.auth);
             if status.is_client_error() {
                 return Err(anyhow::Error::new(NonRetriableError(msg)));
             }
@@ -884,6 +953,57 @@ mod tests {
             .await
             .unwrap();
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn oauth_bearer_auth_sends_bearer_and_beta_header_never_x_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("authorization", "Bearer subscription-access-secret")
+            .match_header(
+                "anthropic-beta",
+                crate::claude_oauth::CLAUDE_OAUTH_BETA_HEADER,
+            )
+            .match_header("x-api-key", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(r#"{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-test","stop_reason":"end_turn"}"#)
+            .create_async()
+            .await;
+        let provider = ClaudeProvider::new_with_oauth_bearer(
+            "subscription-access-secret".to_string(),
+            &server.url(),
+            "/v1/messages",
+            "/v1/models",
+        )
+        .unwrap()
+        .with_model(DEFAULT_CLAUDE_MODEL);
+
+        provider
+            .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn oauth_unauthorized_error_hint_points_at_claude_login_not_the_api_key() {
+        let message = friendly_api_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{}",
+            &ClaudeAuth::OAuthBearer("secret-token".into()),
+        );
+        assert!(message.contains("finch auth login claude"));
+        assert!(!message.contains("ANTHROPIC_API_KEY"));
+        assert!(!message.contains("secret-token"));
+
+        let api_key_message = friendly_api_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{}",
+            &ClaudeAuth::ApiKey("sk-ant-secret".into()),
+        );
+        assert!(api_key_message.contains("ANTHROPIC_API_KEY"));
+        assert!(!api_key_message.contains("secret-token"));
     }
 
     #[tokio::test]
