@@ -27,6 +27,12 @@ tests. Do not publish a child-module path or generate an interface catalog.
 - `save` atomically replaces the JSON file after syncing its bytes, and on Unix syncs the parent
   directory. `load` restores skipped session defaults and starts with no staged rounds. A named
   Brain journal is the durable authority; this snapshot is a client-local projection.
+- `splice_synthetic_exchange` inserts a `[user, assistant]` pair immediately before a trailing
+  pending user message (or appends when there is none), keeping strict role alternation either
+  way. It is how the application promotes a retrieved memory into real history exactly once
+  (`src/cli/repl_event/query_processor.rs`'s splice-gate, #940 follow-up) instead of re-rendering
+  it as a tagged block every turn; this method does not deduplicate, so the caller must check the
+  text is not already present in the active window first.
 
 ## Focused proof
 

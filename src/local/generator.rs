@@ -308,28 +308,35 @@ impl TemplateGenerator {
             })
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
 
-        // Recalled memory is injected as a synthetic [user(memory), assistant(ack)]
-        // pair immediately before the current question (`inject_recall_prefix`), or
-        // as the same shape at index 0 for durable committed memory
-        // (`inject_committed_memories_prefix`) -- both in
-        // `src/cli/repl_event/query_processor.rs`, both wrapped in a
-        // `<retrieved_memory>`/`<committed_memory>` tag. The rest of `messages`
-        // (ordinary conversation history) stays excluded here on purpose: this
-        // path has a tight local-model context budget and unbounded history
-        // doesn't fit it. But the UI already tells the user recalled memory is
-        // "sent raw" to the model, so silently dropping it along with the rest
-        // of history made that claim false for the local path specifically
-        // (cloud providers get the full `messages` array as-is and never had
-        // this gap). Pull just the tagged memory blocks forward into the
-        // single-turn prompt so they actually reach the model.
+        // Fresh recall is injected as a synthetic [user(memory), assistant(ack)]
+        // pair, wrapped in a `<retrieved_memory>` tag, immediately before the
+        // current question (`inject_recall_prefix` in
+        // `src/cli/repl_event/query_processor.rs`). A memory judged worth
+        // persisting is spliced into real, ordinary (untagged) conversation
+        // history instead -- once promoted, it is deliberately
+        // indistinguishable from a genuine earlier turn, so it no longer
+        // carries a tag to pull forward here; see
+        // `ordinary_conversation_history_stays_excluded_from_the_local_prompt`
+        // below and the splice-gate doc comment on
+        // `exchange_is_verbatim_in_window` in `query_processor.rs` for why
+        // that is a known, separate gap for this bounded local-model path
+        // rather than something this function's tag-forwarding covers. The
+        // rest of `messages` (ordinary conversation history) stays excluded
+        // here on purpose: this path has a tight local-model context budget
+        // and unbounded history doesn't fit it. But the UI already tells the
+        // user recalled memory is "sent raw" to the model, so silently
+        // dropping it along with the rest of history made that claim false
+        // for the local path specifically (cloud providers get the full
+        // `messages` array as-is and never had this gap). Pull just the
+        // tagged memory block forward into the single-turn prompt so it
+        // actually reaches the model.
         let memory_blocks: Vec<&str> = messages[..last_user_idx]
             .iter()
             .filter(|message| message.role == "user")
             .flat_map(|message| message.content.iter())
             .filter_map(|block| match block {
                 crate::providers::ContentBlock::Text { text }
-                    if text.contains("<retrieved_memory>")
-                        || text.contains("<committed_memory>") =>
+                    if text.contains("<retrieved_memory>") =>
                 {
                     Some(text.as_str())
                 }
@@ -865,35 +872,6 @@ mod tests {
         );
     }
 
-    /// Durable committed memory (`inject_committed_memories_prefix`, index 0,
-    /// `<committed_memory>` tag) must reach the local prompt the same way as
-    /// transient recall.
-    #[test]
-    fn committed_memory_reaches_the_local_prompt_query() {
-        let generator = TemplateGenerator::new(PatternClassifier::new());
-        let messages = vec![
-            crate::providers::Message::user(
-                "<committed_memory>\n\
-                 The following is durable retrieved context from past sessions -- \
-                 not part of this conversation's live dialogue. It applies for \
-                 the rest of this conversation, not only the next message.\n\n\
-                 Ship without Co-Authored-By trailers.\n\
-                 </committed_memory>",
-            ),
-            crate::providers::Message::assistant(
-                "Noted -- I'll keep this in mind for the rest of this conversation.",
-            ),
-            crate::providers::Message::user("draft the commit message"),
-        ];
-
-        let (_, query) = generator.prompt_parts(&messages).unwrap();
-
-        assert!(
-            query.contains("Ship without Co-Authored-By trailers."),
-            "committed memory text must reach the local prompt query: {query:?}"
-        );
-    }
-
     /// Ordinary conversation history (no memory tag) stays excluded from the
     /// bounded local-model prompt -- this path's deliberate context-budget
     /// behavior (last user message + system only) must survive the memory
@@ -912,6 +890,41 @@ mod tests {
         assert_eq!(
             query, "current question",
             "non-memory history must stay excluded from the bounded local prompt: {query:?}"
+        );
+    }
+
+    /// Documents a known, discovered gap rather than a regression: once a
+    /// retrieved memory is spliced into real conversation history
+    /// (`ConversationHistory::splice_synthetic_exchange`,
+    /// `query_processor.rs`'s splice gate), it is deliberately an ordinary,
+    /// untagged `[user, assistant]` pair -- ordinary history stays excluded
+    /// from this bounded local-model path by design (see the test above).
+    /// The practical effect: a local model stops receiving that memory after
+    /// the turn it was first recalled and shown via `<retrieved_memory>`,
+    /// while a cloud provider (which gets the full `messages` array as-is)
+    /// keeps seeing it for free from history. Recorded here so the gap stays
+    /// visible instead of silently regressing further; closing it is a
+    /// follow-up decision (e.g. a bounded recent-history window for this
+    /// path), not something the splice change itself was meant to solve.
+    #[test]
+    fn spliced_untagged_memory_does_not_reach_the_local_prompt() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user("Where do I keep the deploy key?"),
+            crate::providers::Message::assistant(
+                "The deploy key lives in the Employee vault under the Finch signing item.",
+            ),
+            crate::providers::Message::user("hello again"),
+        ];
+
+        let (_, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert_eq!(
+            query, "hello again",
+            "a spliced, untagged exchange is ordinary history from this path's point of \
+             view and stays excluded from the bounded local prompt, exactly like any \
+             other earlier turn -- confirming this is a known consequence, not new \
+             breakage: {query:?}"
         );
     }
 }
