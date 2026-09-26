@@ -182,11 +182,24 @@ impl AutocompleteState {
     }
 }
 
+/// Fixed rows the completion pane reserves whenever it has more than one row
+/// of budget: one heading row plus up to `MAX_VISIBLE_SUGGESTIONS` match
+/// rows. A pane with fewer matches than this pads the remainder with blank
+/// rows, so the pane's total height never depends on how many rows
+/// currently match — only the transition between hidden (nothing matches)
+/// and visible ever moves the composer below it (the pre-existing #232
+/// boundary). Without this, narrowing a search from 8 matches to 1 shrank
+/// the pane and visibly walked the `❯` input row up the screen every
+/// keystroke (#1247).
+pub(crate) const RESERVED_PANE_ROWS: usize = MAX_VISIBLE_SUGGESTIONS + 1;
+
 /// Plain-text rows for the production raw-mode completion pane.
 ///
 /// Every returned string is a complete physical row and remains useful with
 /// ANSI colors disabled or when read by a screen reader. `row_budget` includes
 /// the heading; a one-row viewport therefore shows the selected command.
+/// The pane pads to [`RESERVED_PANE_ROWS`] (clamped to `row_budget`) so its
+/// height stays constant while visible, regardless of match count (#1247).
 pub(crate) fn completion_pane_lines(
     state: &mut AutocompleteState,
     width: usize,
@@ -202,10 +215,26 @@ pub(crate) fn completion_pane_lines(
         return Vec::new();
     }
 
-    if state.mode == CompletionMode::Mentions {
-        return mention_pane_lines(state, width, row_budget);
+    let mut lines = if state.mode == CompletionMode::Mentions {
+        mention_pane_lines(state, width, row_budget)
+    } else {
+        command_pane_lines(state, width, row_budget)
+    };
+    if row_budget > 1 {
+        let target = row_budget.min(RESERVED_PANE_ROWS);
+        while lines.len() < target {
+            lines.push(fit_line("", width));
+        }
     }
+    state.rendered_rows = lines.len();
+    lines
+}
 
+fn command_pane_lines(
+    state: &mut AutocompleteState,
+    width: usize,
+    row_budget: usize,
+) -> Vec<String> {
     let suggestion_rows = if row_budget == 1 {
         1
     } else {
@@ -238,7 +267,6 @@ pub(crate) fn completion_pane_lines(
         );
         lines.push(fit_line(&line, width));
     }
-    state.rendered_rows = lines.len();
     lines
 }
 
@@ -271,7 +299,6 @@ fn mention_pane_lines(
         };
         lines.push(fit_line(&heading, width));
         if lines.len() >= row_budget {
-            state.rendered_rows = lines.len();
             return lines;
         }
     }
@@ -288,7 +315,6 @@ fn mention_pane_lines(
         let line = format!("{marker} {}", candidate.speakable_row);
         lines.push(fit_line(&line, width));
     }
-    state.rendered_rows = lines.len();
     lines
 }
 
@@ -421,9 +447,16 @@ mod tests {
 
         let lines = completion_pane_lines(&mut state, 80, 9);
 
-        assert_eq!(lines.len(), 2);
+        // The pane reserves RESERVED_PANE_ROWS (9: heading + 8 rows) whenever
+        // it has room, padding unused rows blank, so a single match does not
+        // shrink the pane below what an 8-match pane claims (#1247).
+        assert_eq!(lines.len(), RESERVED_PANE_ROWS);
         assert!(lines[0].contains("Commands 1-1 of 1"));
         assert!(lines[1].contains("> /help - Show available commands"));
+        assert!(
+            lines[2..].iter().all(|line| line.trim().is_empty()),
+            "unused suggestion rows must pad blank, not disappear; got {lines:?}"
+        );
         assert!(lines.iter().all(|line| !line.contains('\x1b')));
         assert!(lines.iter().all(|line| line.chars().count() == 80));
     }
