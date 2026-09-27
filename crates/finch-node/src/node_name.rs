@@ -14,7 +14,7 @@ const ANIMALS: &[&str] = &[
 ];
 
 /// Load the node name from `~/.finch/node_name`, creating it if absent.
-pub fn load_or_create() -> String {
+pub(crate) fn load_or_create() -> String {
     if let Some(path) = name_path() {
         if let Ok(existing) = std::fs::read_to_string(&path) {
             let n = existing.trim().to_string();

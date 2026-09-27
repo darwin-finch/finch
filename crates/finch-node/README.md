@@ -12,8 +12,12 @@ material and the certificate/key pairing.
 
 When the server answers node-info and node-stats requests, `src/server/handlers/node.rs` gathers
 model and host facts, supplies them to `NodeCapabilities`, and reads persisted `WorkTracker`
-statistics. The server owns endpoint behavior and model selection; this crate describes and
-persists the node facts it receives.
+statistics via `WorkTracker::load_persisted`. The server owns endpoint behavior and model
+selection; this crate describes the node facts it receives and owns the identity, signing, and
+machine-name state it persists to disk. No production caller currently records or writes work
+statistics — `WorkTracker::persist` was unwired dead code and was removed (issue #986); reintroducing
+write-side work-stat persistence is separate, scoped production work, not implied by this crate's
+existing surface.
 
 Read [AGENTS.md](AGENTS.md) for boundary and testing rules, [src/lib.rs](src/lib.rs) for the
 facade, and `cargo doc -p finch-node --no-deps --open` for methods on exported types.
