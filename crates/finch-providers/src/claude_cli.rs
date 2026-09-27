@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::mpsc;
@@ -207,8 +208,10 @@ struct TurnRecord {
 /// own fields — notably `record` and `stderr_task` — can still be moved out
 /// of a completed turn; a type with its own `Drop` impl cannot be partially
 /// moved out of.
+#[cfg(unix)]
 struct SocketGuard(PathBuf);
 
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -217,6 +220,13 @@ impl Drop for SocketGuard {
 
 /// One live `claude` child process plus everything needed to keep reading its
 /// stdout across a pause for a real tool execution (issue #1341).
+///
+/// Unix-only (issue #1357): the bridge's `listener` is a Unix domain socket,
+/// with no cross-platform equivalent wired up. The Claude CLI Subscription
+/// provider is not supported on non-Unix platforms; see
+/// [`ClaudeCliProvider`]'s non-Unix `ProviderBackend` methods for the runtime
+/// error a caller gets instead.
+#[cfg(unix)]
 struct RunningTurn {
     child: Child,
     reader: BufReader<ChildStdout>,
@@ -240,6 +250,9 @@ struct RunningTurn {
 /// process, its MCP bridge subprocess, and this transport's own bridge
 /// listener socket stay exactly as they were the moment the bridge forwarded
 /// the `tools/call`.
+///
+/// Unix-only (issue #1357): see [`RunningTurn`].
+#[cfg(unix)]
 struct ParkedTurn {
     running: RunningTurn,
     /// Finch-minted id for the specific call the bridge is still blocked on.
@@ -274,6 +287,9 @@ enum TurnOutcome {
 }
 
 /// What one [`drive`] pass produced.
+///
+/// Unix-only (issue #1357): see [`RunningTurn`].
+#[cfg(unix)]
 enum DriveOutcome {
     Exited(std::process::ExitStatus),
     ToolCallPending {
@@ -301,6 +317,13 @@ pub struct ClaudeCliProvider {
     /// its own MCP bridge subprocess waits on a real, interactive tool
     /// execution result (issue #1341). `None` whenever no `claude` child is
     /// mid-tool-call. See [`RunningTurn`]/[`pump_until_settled`].
+    ///
+    /// Unix-only (issue #1357): the MCP bridge's transport is a Unix domain
+    /// socket with no cross-platform equivalent wired up, so this field —
+    /// and every turn-execution path that touches it — compiles out on
+    /// non-Unix platforms. The Claude CLI Subscription provider is not
+    /// supported there; see this type's non-Unix `ProviderBackend` methods.
+    #[cfg(unix)]
     parked: Arc<Mutex<Option<ParkedTurn>>>,
     /// Text the user typed while a tool call was parked, queued (with the
     /// system prompt in effect when it was typed) because it could never
@@ -322,6 +345,7 @@ impl ClaudeCliProvider {
             model: model.unwrap_or_else(|| CLAUDE_CLI_DEFAULT_MODEL.to_string()),
             session_id: uuid::Uuid::new_v4(),
             resumable: Arc::new(Mutex::new(false)),
+            #[cfg(unix)]
             parked: Arc::new(Mutex::new(None)),
             pending_followup: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -347,6 +371,7 @@ impl ClaudeCliProvider {
     /// session, reachable by more than one frontend connection over its
     /// lifetime — must not let an uninformed request silently take that
     /// same path.
+    #[cfg(unix)]
     pub async fn parked_call_match(&self, request: &ProviderRequest) -> ParkedCallMatch {
         let guard = self.parked.lock().await;
         let Some(parked) = guard.as_ref() else {
@@ -358,6 +383,14 @@ impl ClaudeCliProvider {
                 pending_id: parked.pending_id.clone(),
             },
         }
+    }
+
+    /// Unix-only (issue #1357): this platform never parks a turn (turn
+    /// execution itself is unsupported here, see [`ProviderBackend`]'s
+    /// non-Unix methods below), so no call is ever pending.
+    #[cfg(not(unix))]
+    pub async fn parked_call_match(&self, _request: &ProviderRequest) -> ParkedCallMatch {
+        ParkedCallMatch::NoPendingCall
     }
 
     /// Whether the CLI is installed and logged in. Read-only probes only;
@@ -575,6 +608,7 @@ impl ClaudeCliProvider {
     /// killed via `kill_on_drop`, its socket file removed by `RunningTurn`'s
     /// `Drop`) rather than left to hang or silently double-park later
     /// (issue #1341's cancel/retry hostile-timing case).
+    #[cfg(unix)]
     async fn take_matching_parked_turn(
         &self,
         request: &ProviderRequest,
@@ -594,6 +628,7 @@ impl ClaudeCliProvider {
         }
     }
 
+    #[cfg(unix)]
     async fn execute_turn(
         &self,
         request: &ProviderRequest,
@@ -712,6 +747,7 @@ impl ClaudeCliProvider {
         }
     }
 
+    #[cfg(unix)]
     async fn mark_resumable(&self) {
         *self.resumable.lock().await = true;
     }
@@ -722,6 +758,7 @@ impl ClaudeCliProvider {
     /// connect) so [`RunningTurn`]'s shape and [`drive`]'s control flow stay
     /// uniform; the cost is one idle listener and one socket file cleaned up
     /// by `RunningTurn`'s `Drop`.
+    #[cfg(unix)]
     async fn bind_tool_socket(&self) -> Result<(UnixListener, PathBuf)> {
         // `sockaddr_un.sun_path` is a fixed, short buffer (104 bytes on
         // macOS/BSD, 108 on Linux) — `bind` fails outright past that, and
@@ -758,6 +795,7 @@ impl ClaudeCliProvider {
     /// Spawn a brand-new `claude` child process for a fresh Finch-level turn.
     /// Never used to answer a pending tool call on an already-running
     /// process — see [`Self::execute_turn`]'s parked-turn branch for that.
+    #[cfg(unix)]
     async fn spawn_running_turn(
         &self,
         resumable: bool,
@@ -829,6 +867,7 @@ impl ClaudeCliProvider {
     /// paused tool call. The "already in use" retry in [`Self::execute_turn`]
     /// wraps this whole spawn-and-drive sequence, matching the pre-#1341
     /// behavior of retrying the entire turn, not just the drive loop.
+    #[cfg(unix)]
     async fn run_turn_once(
         &self,
         resumable: bool,
@@ -847,6 +886,7 @@ impl ClaudeCliProvider {
     /// exits (`TurnOutcome::Complete`) or makes another `tools/call` that
     /// needs real, interactive execution (`TurnOutcome::Paused`, with the
     /// process parked in `self.parked`) — issue #1341.
+    #[cfg(unix)]
     async fn pump_until_settled(
         &self,
         mut running: RunningTurn,
@@ -918,6 +958,7 @@ impl ClaudeCliProvider {
         }
     }
 
+    #[cfg(unix)]
     fn response_from(&self, record: &TurnRecord, requested_model: &str) -> ProviderResponse {
         ProviderResponse {
             id: record
@@ -1016,6 +1057,7 @@ async fn spawn_retrying_text_file_busy(
 /// needs real execution (issue #1341). `deltas` is only consulted for text
 /// output; the caller (`pump_until_settled`) decides what to do with a
 /// pending tool call, including the no-streaming-sink fallback.
+#[cfg(unix)]
 async fn drive(
     turn: &mut RunningTurn,
     deltas: Option<&mpsc::Sender<Result<StreamChunk>>>,
@@ -1065,6 +1107,7 @@ async fn drive(
 /// accepted bridge connection, returning the connection back so the reply
 /// can be written to it later (potentially much later — real interactive
 /// approval has no timeout).
+#[cfg(unix)]
 async fn read_bridge_request(
     mut stream: UnixStream,
 ) -> Result<(ClaudeCliBridgeToolRequest, UnixStream)> {
@@ -1090,6 +1133,7 @@ async fn read_bridge_request(
 
 /// Write one line-delimited [`ClaudeCliBridgeToolResponse`] back to the
 /// bridge's still-open connection.
+#[cfg(unix)]
 async fn write_bridge_response(
     mut stream: UnixStream,
     response: &ClaudeCliBridgeToolResponse,
@@ -1436,8 +1480,21 @@ async fn run_capture(binary: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Issue #1357: the Claude CLI Subscription provider's MCP tool-call bridge
+/// is a Unix domain socket with no cross-platform equivalent wired up, so
+/// turn execution is unsupported outside Unix. Provider selection, the
+/// daemon-owned session registry, and the daemon RPC surface all still
+/// construct and store [`ClaudeCliProvider`] unconditionally on every
+/// platform (issue #1354 grew that surface further) — this error is the
+/// single, clear failure point a caller reaches at first actual use instead
+/// of a separate platform check at every one of those call sites.
+#[cfg(not(unix))]
+const NOT_SUPPORTED_ON_THIS_PLATFORM: &str = "Claude CLI Subscription provider is not supported \
+     on this platform: its MCP tool-call bridge requires a Unix domain socket (issue #1357)";
+
 #[async_trait::async_trait]
 impl ProviderBackend for ClaudeCliProvider {
+    #[cfg(unix)]
     async fn send_message_validated(
         &self,
         request: ValidatedProviderRequest,
@@ -1454,6 +1511,15 @@ impl ProviderBackend for ClaudeCliProvider {
         }
     }
 
+    #[cfg(not(unix))]
+    async fn send_message_validated(
+        &self,
+        _request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        bail!(NOT_SUPPORTED_ON_THIS_PLATFORM)
+    }
+
+    #[cfg(unix)]
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
@@ -1484,6 +1550,14 @@ impl ProviderBackend for ClaudeCliProvider {
             }
         });
         Ok(rx)
+    }
+
+    #[cfg(not(unix))]
+    async fn send_message_stream_validated(
+        &self,
+        _request: ValidatedProviderRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        bail!(NOT_SUPPORTED_ON_THIS_PLATFORM)
     }
 
     fn name(&self) -> &str {

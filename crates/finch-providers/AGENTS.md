@@ -7,6 +7,28 @@ boundary, provider-neutral wire types and stream events, model catalog, capabili
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
 and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok / Claude-subscription adapters.
 
+**Platform boundary (issue #1357).** `claude_cli.rs`'s MCP tool-call bridge is a
+`tokio::net::{UnixListener, UnixStream}` transport with no Windows equivalent. Rather than gating
+the whole module (which would also require `src/providers/factory.rs`, `src/providers/mod.rs`,
+`src/server/claude_cli_session.rs`, `src/providers/claude_cli_daemon.rs`, and `src/server/mod.rs`
+/`ipc.rs` in the root crate — all of which reference `ClaudeCliProvider`/`ClaudeCliSessionRegistry`
+unconditionally, issue #1354 grew that surface further — to gain their own platform split),
+`ClaudeCliProvider` itself stays one type, constructible and nameable on every platform. Only the
+socket-dependent internals (`RunningTurn`, `ParkedTurn`, `DriveOutcome`, the `parked` field,
+`execute_turn` and everything it calls, `drive`/`read_bridge_request`/`write_bridge_response`) are
+`#[cfg(unix)]`, matching this same file's pre-existing
+`spawn_retrying_text_file_busy`/`harden_bridge_socket_permissions` split. `parked_call_match` and
+the `ProviderBackend::send_message_validated`/`send_message_stream_validated` entry points get
+`#[cfg(not(unix))]` twins: the former reports `ParkedCallMatch::NoPendingCall` (true, since nothing
+can ever park a turn there), the latter fail closed with a clear "not supported on this platform"
+error. Every other file that constructs or stores a `ClaudeCliProvider` — `factory.rs`,
+`claude_cli_session.rs`, `claude_cli_daemon.rs`, `server/ipc.rs`'s `claude_cli_round` RPC handler —
+needs no changes at all: the type, its constructors, and its trait impl exist unconditionally, so
+selecting this provider on a non-Unix build still compiles and fails only at first real use, with a
+named cause. Test code (`#[cfg(test)] mod tests`, heavily `UnixStream`-based) is untouched — `cargo
+check` never compiles `#[cfg(test)]` items, so it does not affect the Windows compile this fixes,
+and splitting it is unnecessary extra work with no current Windows test CI job to serve.
+
 **Boundary:** [README.md](README.md) traces configured-provider and setup-catalog callers.
 [`src/lib.rs`](src/lib.rs) is the flat facade; every handwritten child module is private,
 including `oauth` (its contract is re-exported flat from the facade, issue #958). Rustdoc
