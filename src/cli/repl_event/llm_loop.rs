@@ -44,6 +44,12 @@ pub struct LlmLoop {
     qwen_gen: Arc<dyn Generator>,
     router: Arc<Router>,
     generator_state: Arc<RwLock<GeneratorState>>,
+    /// Configured provider profiles -- used to tell whether the active
+    /// session generator is a local profile and to find a configured cloud
+    /// one to prefer for summarisation instead (#1236).
+    available_providers: Vec<crate::config::ProviderEntry>,
+    /// Builds a generator for a configured provider profile on demand.
+    provider_resolver: crate::scheduler::ProviderResolver,
     tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>,
     tool_coordinator: ToolExecutionCoordinator,
     /// Shared typed runtime that receives raw provider VM-wire programs.
@@ -111,6 +117,8 @@ impl LlmLoop {
             local: qwen_gen,
             router,
             state: generator_state,
+            available_providers,
+            provider_resolver,
         } = generation;
         let crate::cli::repl_event::parts::LlmTools {
             definitions: tool_definitions,
@@ -155,6 +163,8 @@ impl LlmLoop {
             qwen_gen,
             router,
             generator_state,
+            available_providers,
+            provider_resolver,
             tool_definitions,
             tool_coordinator,
             program_runtime,
@@ -278,8 +288,25 @@ impl LlmLoop {
         let auto_compact_enabled = self.auto_compact_enabled;
         let wire_metrics_logger = self.wire_metrics_logger.clone();
         let persona_system_prompt = self.active_persona.read().await.to_system_message();
-        // Always use the capable cloud model for summarisation, regardless of routing.
-        let summary_gen = Arc::clone(&claude_gen);
+        // Prefer a genuinely cloud-backed provider for summarisation, even
+        // when the active session generator (`claude_gen`, despite the name)
+        // is a local profile: summarising conversation history is a harder,
+        // more nuanced task than ordinary chat -- "preserve key decisions,
+        // code written, errors fixed" -- and a weak local model can produce
+        // a confidently wrong summary as easily as it produces confidently
+        // wrong program source (#1223, #1226, #1230). Falls back to the
+        // active generator unchanged when summarisation is off or no cloud
+        // provider is configured, matching the pre-#1236 behaviour.
+        let summary_gen = if enable_summarization && max_verbatim > 0 {
+            resolve_summary_generator(
+                &claude_gen,
+                &self.available_providers,
+                &self.provider_resolver,
+            )
+            .await
+        } else {
+            Arc::clone(&claude_gen)
+        };
         let summary_cache = Arc::clone(&self.summary_cache);
         let tool_call_history = Arc::clone(&self.tool_call_history);
         let pinned_generators = Arc::clone(&self.pinned_generators);
@@ -341,5 +368,205 @@ impl LlmLoop {
         if let Some(spawned) = spawned {
             let _ = spawned.send(());
         }
+    }
+}
+
+/// Choose the generator `ConversationCompactor` should summarise with (#1236).
+///
+/// `active` is the session's current default generator (`LlmGeneration::cloud`
+/// -- the name predates local models becoming selectable through it). When
+/// `available_providers` shows `active` is backed by a local profile, this
+/// looks for a configured cloud profile and resolves it instead; summarising
+/// history well matters more than summarising it with whatever model happens
+/// to be chatting. It falls back to `active` unchanged when `active` is
+/// already non-local, when no cloud profile is configured, or when resolving
+/// the configured cloud profile fails -- the pre-#1236 behaviour in every
+/// case, never a hard error.
+async fn resolve_summary_generator(
+    active: &Arc<dyn Generator>,
+    available_providers: &[crate::config::ProviderEntry],
+    provider_resolver: &crate::scheduler::ProviderResolver,
+) -> Arc<dyn Generator> {
+    let active_is_local = available_providers
+        .iter()
+        .find(|entry| entry.profile_name() == active.name())
+        .is_some_and(|entry| entry.is_local());
+    if !active_is_local {
+        return Arc::clone(active);
+    }
+    let Some(cloud_entry) = available_providers.iter().find(|entry| !entry.is_local()) else {
+        return Arc::clone(active);
+    };
+    match provider_resolver.resolve_entry(cloud_entry).await {
+        Ok(generator) => generator,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                cloud_profile = %cloud_entry.profile_name(),
+                "failed to resolve configured cloud provider for summarisation; \
+                 falling back to the active (local) generator"
+            );
+            Arc::clone(active)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderEntry;
+    use crate::models::{InferenceProvider, ModelFamily, ModelSize};
+
+    fn local_gemma_entry() -> ProviderEntry {
+        ProviderEntry::Local {
+            inference_provider: InferenceProvider::LlamaCpp,
+            execution_target: crate::config::ExecutionTarget::Auto,
+            model_family: ModelFamily::Gemma2,
+            model_size: ModelSize::Medium,
+            model_path: None,
+            managed_artifact: None,
+            enabled: true,
+            name: Some("local-gemma-2-9b".to_string()),
+        }
+    }
+
+    fn cloud_claude_entry() -> ProviderEntry {
+        ProviderEntry::Claude {
+            api_key: "test-api-key".to_string(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("cloud-claude".to_string()),
+        }
+    }
+
+    /// A minimal `Generator` standing in for a session's active model,
+    /// identified only by the profile name it reports through `name()` --
+    /// the same identity `resolve_summary_generator` matches against
+    /// `ProviderEntry::profile_name()`.
+    struct NamedStubGenerator {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for NamedStubGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<crate::generators::GeneratorResponse, anyhow::Error> {
+            unreachable!("resolve_summary_generator must never call generate() itself")
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<
+            Option<
+                tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk, anyhow::Error>>,
+            >,
+            anyhow::Error,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPS: std::sync::OnceLock<crate::generators::GeneratorCapabilities> =
+                std::sync::OnceLock::new();
+            CAPS.get_or_init(|| crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: false,
+                supports_conversation: true,
+                max_context_messages: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    fn stub_generator(name: &str) -> Arc<dyn Generator> {
+        Arc::new(NamedStubGenerator {
+            name: name.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_resolve_summary_generator_prefers_configured_cloud_provider_over_active_local_model(
+    ) {
+        let local = local_gemma_entry();
+        let cloud = cloud_claude_entry();
+        let active = stub_generator(&local.profile_name());
+        // No daemon client: the active local generator is only ever
+        // returned as-is by this function, never resolved through the
+        // provider resolver, so a missing daemon must not matter here.
+        let resolver = crate::scheduler::ProviderResolver::with_profiles(
+            Arc::clone(&active),
+            vec![local.clone(), cloud.clone()],
+            None,
+        );
+
+        let resolved =
+            resolve_summary_generator(&active, std::slice::from_ref(&local), &resolver).await;
+        assert_eq!(
+            resolved.name(),
+            local.profile_name(),
+            "sanity check: with only the local entry visible there is nothing to switch to"
+        );
+
+        let resolved = resolve_summary_generator(&active, &[local, cloud.clone()], &resolver).await;
+        assert_eq!(
+            resolved.name(),
+            cloud.profile_name(),
+            "ConversationCompactor::summarize must receive the configured cloud provider, \
+             not the active local one, once one is configured: got generator {:?}",
+            resolved.name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_summary_generator_falls_back_to_active_generator_when_no_cloud_provider_configured(
+    ) {
+        let local = local_gemma_entry();
+        let active = stub_generator(&local.profile_name());
+        let resolver = crate::scheduler::ProviderResolver::with_profiles(
+            Arc::clone(&active),
+            vec![local.clone()],
+            None,
+        );
+
+        let resolved = resolve_summary_generator(&active, &[local], &resolver).await;
+        assert_eq!(
+            resolved.name(),
+            active.name(),
+            "with no cloud provider configured, summarisation must keep using the active \
+             generator unchanged (pre-#1236 behaviour): got generator {:?} instead of {:?}",
+            resolved.name(),
+            active.name()
+        );
+        assert!(
+            Arc::ptr_eq(&resolved, &active),
+            "the fallback must return the same Arc, not a freshly constructed generator"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_summary_generator_leaves_an_already_cloud_active_generator_untouched() {
+        let cloud = cloud_claude_entry();
+        let active = stub_generator(&cloud.profile_name());
+        let resolver = crate::scheduler::ProviderResolver::with_profiles(
+            Arc::clone(&active),
+            vec![cloud.clone()],
+            None,
+        );
+
+        let resolved = resolve_summary_generator(&active, &[cloud], &resolver).await;
+        assert!(
+            Arc::ptr_eq(&resolved, &active),
+            "an already cloud-backed active generator must not be swapped for another one"
+        );
     }
 }
