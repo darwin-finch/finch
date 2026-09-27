@@ -40,6 +40,41 @@ keeps most of the local prompt byte-identical turn to turn for llama.cpp's own K
 see `same_entry_at_same_budget_produces_byte_identical_output_across_calls` and
 `tier_never_regresses_when_budget_grows_after_compaction` in `tiered_history.rs`.
 
+**The history budget must be reduced by the real system-prompt cost, not a flat overhead
+constant (#1310).** `TemplateGenerator::prompt_parts` (`generator.rs`) resolves `system_prompt`
+-- which already carries any tool-definitions block `LocalGenerator::inject_tool_definitions`
+prepended -- *before* computing the history token budget, then subtracts that system prompt's
+real tokenized cost (`count_tokens(&system_prompt)`) from `context_length()` on top of
+`LOCAL_RESPONSE_TOKEN_RESERVE` and the small fixed `LOCAL_PROMPT_OVERHEAD_RESERVE` (chat-template
+markers only). Before this fix, only the flat 64-token `LOCAL_PROMPT_OVERHEAD_RESERVE` was
+subtracted, so a large tool-definitions block silently consumed history's assumed headroom
+instead of shrinking the history budget to compensate -- a brand-new Brain's first, trivial turn
+(one line, two recalled memories, the full local tool catalog) measured live at 8152 of an
+8192-token context before any real conversation existed. If you add another variable-size
+system-prompt contributor, route its cost through this same `system_prompt`-then-budget ordering
+rather than adding another flat reserve constant.
+
+**Tool-definitions injection stays under a bounded, measured token cost (#1310).**
+`ToolPromptFormatter::format_tools_for_prompt` (`crate::models`) emits one shared XML
+`<tool_use>` example (not one per tool) and a single compact `name(param: type, ...): description`
+line per tool, replacing a format that repeated a full `**Parameters:**` list and a full XML
+`**Example:**` block for every registered tool. Against the real registered-tool catalog (36
+tools as of #1310 -- more than a same-line-only grep of `repl.rs` counts, since several
+registrations span multiple lines), a real llama.cpp tokenizer (Qwen 2.5 1.5B Instruct) measured
+the old format at 5707 tokens for the tool-definitions block alone; the current format measures
+2664 tokens for the same catalog, a 53% reduction. `LocalGenerator::inject_tool_definitions`
+(`mod.rs`) logs this block's own token cost via `tracing::debug!` (`tool_prompt_tokens`),
+separately from the combined-prompt total `LlamaCppGenerator::generate_inner` logs at decode time
+(`src/models/loaders/llama_cpp.rs`), since that call site only sees the final token vector and
+cannot attribute how many tokens came from this block.
+`cli::repl::always_allow_tests::test_tool_definitions_prompt_block_stays_within_a_bounded_word_budget`
+bounds this against the real, current tool registry so silent catalog growth or a reversion to
+per-tool boilerplate trips a visible failure, and
+`cli::repl::always_allow_tests::local_daemon_boundary_first_turn_with_real_tool_catalog_and_recalled_memory_fits_context`
+reproduces the reported scenario at the `LocalGenerator::try_generate_from_pattern_with_tools`
+production boundary (confirmed to fail against the pre-#1310 format and pass against the current
+one).
+
 **Extension rule:** keep family-specific request adaptation in `src/generators` and model loading
 in `src/models`. Add a flat facade entry only for a demonstrated caller need; do not expose
 `generator` or `patterns` as public modules. Keep persistence and learning changes covered by

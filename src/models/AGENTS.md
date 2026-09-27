@@ -91,3 +91,21 @@ this invariant fixes for chat generation, just not yet fixed here: embedding tex
 exceed the context's resolved batch size can hit the same native abort. Fix it the same way
 (chunk `embed()`'s `decode()` call, or cap and reject an over-length input before it) before
 claiming this invariant covers the whole capsule instead of only `LlamaCppGenerator`.
+
+**`ToolPromptFormatter::format_tools_for_prompt`'s injected block stays bounded, not a fixed
+multi-thousand-token tax (#1310).** Issue #1292/#1295 fixed the chunked-`decode()` crash above;
+the very next live turn against a fresh Brain showed the fix's failure mode had moved from a
+process abort to a graceful-but-severe context exhaustion: a one-line arithmetic question, with
+two recalled memories and nothing else unusual, produced an 8152-token prompt against an
+8192-token context before any real conversation existed. The dominant cause was
+`format_tools_for_prompt` (`tool_prompt.rs`) formatting every registered tool's full description,
+a per-parameter `**Parameters:**` list, and a full XML `**Example:**` block into the prompt on
+every local-model turn, unconditionally, regardless of whether the query needed tools at all --
+measured at 5707 tokens for the real then-current 36-tool registry (a real llama.cpp tokenizer,
+Qwen 2.5 1.5B Instruct; more tools than a same-line-only grep of `repl.rs` counts, since several
+registrations span multiple lines). The format now emits one shared XML example (not one per
+tool) and a compact `name(param: type, ...): description` line per tool, measuring 2664 tokens
+for the same real catalog -- a 53% reduction. `src/local/AGENTS.md` documents the companion fix to
+`TemplateGenerator::prompt_parts`'s history budget, which must subtract this block's real cost
+rather than a small flat overhead reserve, and names the tests that bound and reproduce this at
+the production boundary.

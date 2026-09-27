@@ -40,10 +40,15 @@ fn test_tool_prompt_formatting() {
 
     let formatted = ToolPromptFormatter::format_tools_for_prompt(&tools);
 
-    // Verify format contains key elements
+    // Verify format contains key elements. The per-tool `### name` heading
+    // plus a full `**Parameters:**` list and full XML `**Example:**` block
+    // were replaced by a single compact `name(param: type, ...): description`
+    // line per tool, with one shared XML example for the whole catalog
+    // (#1310 -- that per-tool boilerplate was a fixed multi-thousand-token
+    // tax paid on every local-model turn regardless of tool count).
     assert!(formatted.contains("# Available Tools"));
-    assert!(formatted.contains("### read"));
-    assert!(formatted.contains("### bash"));
+    assert!(formatted.contains("read(file_path: string)"));
+    assert!(formatted.contains("bash(command: string, description: string)"));
     assert!(formatted.contains("Read a file from disk"));
     assert!(formatted.contains("Execute a shell command"));
     assert!(formatted.contains("file_path"));

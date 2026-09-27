@@ -686,3 +686,217 @@ fn test_owner_repl_does_not_pre_approve_unregistered_or_write_names() {
         );
     }
 }
+
+// ── Local-model tool-injection token budget (#1310) ────────────────────
+//
+// A brand-new Brain's first, trivial local-model turn was measured live
+// nearly exhausting an 8192-token context before this fix: the daemon
+// formatted every registered tool's full description, a per-parameter
+// `**Parameters:**` list, and a full XML `**Example:**` block into the
+// system prompt on every turn, regardless of whether the query needed
+// tools at all. Against the real registry `owner_repl_catalog` builds here
+// (36 registered tools -- more than the 26 a same-line-only grep of
+// `repl.rs` undercounts, since several registrations span multiple lines),
+// a real llama.cpp tokenizer (Qwen 2.5 1.5B Instruct) measured that old
+// format at 5707 tokens; the compact format below measures at 2664 tokens
+// for the same real catalog, a 53% reduction. See `local::AGENTS.md` and
+// `models::AGENTS.md` for the full before/after record.
+//
+// The two tests below cover this at different layers: the first bounds the
+// formatted block's approximate token cost (so silent catalog growth or a
+// reversion to per-tool boilerplate trips a visible failure) using the
+// same whitespace-count approximation `TemplateGenerator::count_tokens`
+// falls back to when no model tokenizer is available; the second
+// reproduces the actual reported failure at the production boundary
+// (`LocalGenerator::try_generate_from_pattern_with_tools`) with a
+// controllable-context-length mock backend that enforces the same
+// prompt-vs-context bounds check as the real llama.cpp backend, proving the
+// exact reported scenario -- a trivial question plus two recalled-memory
+// exchanges, against the real tool catalog -- now fits instead of erroring.
+#[test]
+fn test_tool_definitions_prompt_block_stays_within_a_bounded_word_budget() {
+    let catalog = owner_repl_catalog();
+    let definitions = catalog.registry.definitions();
+    let prompt = crate::models::ToolPromptFormatter::format_tools_for_prompt(&definitions);
+
+    // Whitespace-count approximation, not a real tokenizer: this test must
+    // run in ordinary `cargo test` without a GGUF fixture. It is the same
+    // fallback `TemplateGenerator::count_tokens` and `prompt_parts`'s
+    // history-budget `count_tokens` closure use when no model tokenizer is
+    // available, so the bound below is deliberately generous (real
+    // tokenizers typically produce *more* tokens than whitespace words for
+    // this markup- and identifier-heavy text -- 1772 whitespace words
+    // measured 2664 real Qwen tokens above, a ~1.5x ratio).
+    let approx_words = prompt.split_whitespace().count();
+    let tool_count = definitions.len();
+
+    assert!(
+        tool_count >= 30,
+        "the real registered-tool catalog dropped to {tool_count} tools; this test's bound \
+         was calibrated against a real 36-tool catalog and needs re-checking, not silently \
+         passing on a shrunken registry"
+    );
+    assert!(
+        approx_words < 2500,
+        "the formatted tool-definitions block grew to ~{approx_words} whitespace-approximated \
+         words ({} bytes) for {tool_count} registered tools; this either means the tool catalog \
+         grew significantly or the compact per-tool format (#1310) regressed back toward the \
+         old per-tool `**Parameters:**` list plus full XML `**Example:**` block. Re-measure with \
+         a real tokenizer before raising this bound: {prompt:?}",
+        prompt.len()
+    );
+
+    // Guards against the per-tool boilerplate reappearing even if the
+    // catalog shrinks: average words per tool must stay low, since the
+    // fix's core property is a *shared* example block plus one compact
+    // line per tool, not a per-tool multi-line template.
+    let words_per_tool = approx_words as f64 / tool_count as f64;
+    assert!(
+        words_per_tool < 80.0,
+        "average words per tool ({words_per_tool:.1}) is too high for the compact \
+         name(param: type, ...): description format (#1310); a real per-tool XML example \
+         block alone was previously ~35-45 words on top of the description, so a regression \
+         back to per-tool examples would push this well past the bound: {prompt:?}"
+    );
+}
+
+/// Production-boundary regression for #1310: reproduces the exact reported
+/// scenario (a brand-new Brain, a trivial one-line question, two recalled
+/// memories attached, the real tool catalog) through the real daemon entry
+/// point (`LocalGenerator::try_generate_from_pattern_with_tools`), against a
+/// mock backend whose `generate()` enforces the *same*
+/// prompt-plus-output-vs-context bounds check and error message shape as
+/// the real llama.cpp backend (`LlamaCppGenerator::generate_inner` in
+/// `src/models/loaders/llama_cpp.rs`), so this test fails the same way the
+/// real daemon did before #1310, not on an arbitrary unrelated mechanism.
+///
+/// `CALIBRATED_CONTEXT_LENGTH` is deliberately smaller than Gemma 2 9B's
+/// real reported 8192 (matching the existing small-on-purpose convention
+/// `SmallContextBackend`/`RoomyContextBackend` already use in
+/// `local::generator`'s own tests, rather than a realistic-looking number):
+/// the mock's `tokenize()` approximates real subword tokenization as one
+/// token per four characters (calibrated against the real measurement
+/// above -- the real Qwen 2.5 1.5B tokenizer produced 4.2-4.7 characters
+/// per token for this exact tool-catalog text, both before and after
+/// #1310), and at that ratio this exact scenario measures ~6051
+/// approximated tokens with the pre-#1310 per-tool XML-example format and
+/// ~3143 with the current compact format -- both comfortably under a real
+/// 8192 context, so reproducing the reported failure at Gemma's real
+/// context size would require Gemma's real (denser) tokenizer, which this
+/// environment cannot load. `CALIBRATED_CONTEXT_LENGTH` sits between those
+/// two measurements so the test still exercises the real bounds-check
+/// mechanism and discriminates old vs. new format, confirmed by running
+/// this test against both implementations before landing the fix.
+#[test]
+fn local_daemon_boundary_first_turn_with_real_tool_catalog_and_recalled_memory_fits_context() {
+    use crate::config::ExecutionTarget;
+    use crate::local::LocalGenerator;
+    use crate::models::{
+        GeneratorConfig, GeneratorModel, InferenceProvider, ModelFamily, ModelLoadConfig,
+        ModelSize, TextGeneration,
+    };
+    use crate::providers::{ContentBlock, Message};
+    use tokio::sync::RwLock;
+
+    /// See the test doc comment: chosen between the ~3143-token compact-format
+    /// measurement and the ~6051-token pre-#1310 measurement for this exact
+    /// scenario, at the mock's four-chars-per-token approximation.
+    const CALIBRATED_CONTEXT_LENGTH: usize = 4500;
+
+    struct GemmaSizedContextBackend;
+
+    impl TextGeneration for GemmaSizedContextBackend {
+        /// Mirrors `LlamaCppGenerator::generate_inner`'s own bounds check
+        /// (`src/models/loaders/llama_cpp.rs`) and error message shape, so a
+        /// prompt that would abort the real backend fails this mock the
+        /// same way.
+        fn generate(
+            &mut self,
+            input_ids: &[u32],
+            max_new_tokens: usize,
+        ) -> anyhow::Result<Vec<u32>> {
+            if input_ids.len().saturating_add(max_new_tokens) > CALIBRATED_CONTEXT_LENGTH {
+                anyhow::bail!(
+                    "GGUF prompt ({}) plus requested output ({}) exceeds context ({})",
+                    input_ids.len(),
+                    max_new_tokens,
+                    CALIBRATED_CONTEXT_LENGTH
+                );
+            }
+            Ok((0..3).collect())
+        }
+
+        /// One token per four characters: calibrated against the real
+        /// Qwen 2.5 1.5B tokenizer measurement of this exact tool-catalog
+        /// text (4.2-4.7 chars/token both before and after #1310), a much
+        /// closer proxy than whitespace-word count for markup-heavy text.
+        fn tokenize(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+            Ok((0..(text.chars().count() / 4) as u32).collect())
+        }
+
+        fn decode_tokens(&self, _tokens: &[u32]) -> anyhow::Result<String> {
+            Ok("12 times 8 is 96.".to_string())
+        }
+
+        fn name(&self) -> &str {
+            "gemma-2-9b-context-test"
+        }
+
+        fn context_length(&self) -> u32 {
+            CALIBRATED_CONTEXT_LENGTH as u32
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+        provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Gemma2,
+        size: ModelSize::Medium,
+        target: ExecutionTarget::Cpu,
+        model_path: None,
+    });
+    let model = GeneratorModel::from_test_backend(Box::new(GemmaSizedContextBackend), config);
+    let shared = Arc::new(RwLock::new(model));
+    let mut local_generator = LocalGenerator::with_models(Some(shared));
+
+    let catalog = owner_repl_catalog();
+    let tools = catalog.registry.definitions();
+
+    // Mirrors the reported repro: a fresh Brain's first turn, two recalled
+    // memories immediately before the trivial question (the shape
+    // `inject_recall_prefix` produces in `query_processor.rs`), nothing
+    // else in history.
+    let messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "<retrieved_memory>User prefers concise answers.</retrieved_memory>"
+                    .to_string(),
+            }],
+        },
+        Message::assistant("Noted."),
+        Message::user("what is 12 times 8"),
+    ];
+
+    let response = local_generator
+        .try_generate_from_pattern_with_tools(&messages, Some(tools))
+        .expect(
+            "a trivial first turn with the real tool catalog and two recalled memories must \
+             fit the calibrated context after #1310's compact tool-definitions format, not \
+             fail with a context-overflow error the way the pre-fix per-tool XML-example \
+             format did",
+        )
+        .expect("a neural backend is configured, so a response must be produced");
+
+    assert_eq!(
+        response.text, "12 times 8 is 96.",
+        "unexpected response: {response:?}"
+    );
+}

@@ -329,6 +329,28 @@ impl TemplateGenerator {
             .format_chat_prompt(system_prompt, user_query)
     }
 
+    /// Best-effort token count for `text`, using the loaded neural model's
+    /// real tokenizer when a model is loaded and its lock is free, falling
+    /// back to a whitespace-count approximation otherwise -- the same
+    /// fallback `prompt_parts`'s own `count_tokens` closure uses for history
+    /// budgeting. Exposed so `LocalGenerator::inject_tool_definitions`
+    /// (`local/mod.rs`) can log the real token cost of the formatted
+    /// tool-definitions block specifically, not just the combined prompt
+    /// total (#1310).
+    pub(super) fn count_tokens(&self, text: &str) -> usize {
+        match self
+            .neural_generator
+            .as_ref()
+            .and_then(|generator| generator.try_read().ok())
+        {
+            Some(generator) => generator
+                .tokenize(text)
+                .map(|tokens| tokens.len())
+                .unwrap_or_else(|_| text.split_whitespace().count()),
+            None => text.split_whitespace().count(),
+        }
+    }
+
     fn prompt_parts(&mut self, messages: &[crate::providers::Message]) -> Result<(String, String)> {
         let last_user_idx = messages
             .iter()
@@ -401,54 +423,13 @@ impl TemplateGenerator {
             })
             .collect();
 
-        // The fixed exchange-count window above bounds *how many* exchanges
-        // are candidates, but not their size: three long exchanges (long
-        // code pastes, verbose answers) can still overflow a small model's
-        // real context window on their own (the failure #1234 reports after
-        // the fact). Trim further against an actual token budget derived
-        // from the loaded model's real context length
-        // (`GeneratorModel::context_length`, itself resolved from the
-        // GGUF's trained length in `src/models/loaders/llama_cpp.rs` rather
-        // than a hardcoded default) when a model is loaded and its lock is
-        // free; otherwise keep the prior unconditional-join behaviour so a
-        // model that hasn't finished loading, or a momentarily contended
-        // lock, doesn't fail the turn.
-        //
-        // Past this fixed-count window, history no longer survives or is
-        // dropped as an all-or-nothing block: `TierAssigner` (#1266)
-        // compacts it through discrete, stable tiers (Verbatim ->
-        // LightlyCompressed -> Gist) sized against this real budget, and
-        // remembers each entry's tier across calls so repeated turns at the
-        // same effective budget reuse byte-identical compressed history --
-        // preserving llama.cpp's own KV-cache reuse for the untouched bulk
-        // of the prompt (see `tiered_history.rs` for the full design).
-        let tier_assigner = &mut self.tier_assigner;
-        let query = match self
-            .neural_generator
-            .as_ref()
-            .and_then(|generator| generator.try_read().ok())
-        {
-            Some(generator) => {
-                let budget = (generator.context_length() as usize)
-                    .saturating_sub(LOCAL_RESPONSE_TOKEN_RESERVE + LOCAL_PROMPT_OVERHEAD_RESERVE);
-                let count_tokens = |text: &str| {
-                    generator
-                        .tokenize(text)
-                        .map(|tokens| tokens.len())
-                        .unwrap_or_else(|_| text.split_whitespace().count())
-                };
-                let compressed_history = tier_assigner.assign_and_compress(
-                    current_question,
-                    recent_history,
-                    budget,
-                    count_tokens,
-                );
-                join_history_and_question(current_question, compressed_history)
-            }
-            None if recent_history.is_empty() => current_question.to_string(),
-            None => format!("{}\n\n{}", recent_history.join("\n\n"), current_question),
-        };
-
+        // The system prompt (the caller's own system content, joined with
+        // whatever `LocalGenerator::inject_tool_definitions` prepended as a
+        // system-role message when the turn carries tools) is resolved
+        // *before* the history budget below, because its real size varies
+        // turn to turn and must be subtracted from the same finite context
+        // window history competes for -- see the token-budget note below
+        // (#1310).
         let caller_system = messages
             .iter()
             .filter(|message| message.role == "system")
@@ -466,6 +447,76 @@ impl TemplateGenerator {
         } else {
             caller_system
         };
+
+        // The fixed exchange-count window above bounds *how many* exchanges
+        // are candidates, but not their size: three long exchanges (long
+        // code pastes, verbose answers) can still overflow a small model's
+        // real context window on their own (the failure #1234 reports after
+        // the fact). Trim further against an actual token budget derived
+        // from the loaded model's real context length
+        // (`GeneratorModel::context_length`, itself resolved from the
+        // GGUF's trained length in `src/models/loaders/llama_cpp.rs` rather
+        // than a hardcoded default) when a model is loaded and its lock is
+        // free; otherwise keep the prior unconditional-join behaviour so a
+        // model that hasn't finished loading, or a momentarily contended
+        // lock, doesn't fail the turn.
+        //
+        // The budget must also subtract the *real* cost of `system_prompt`
+        // itself, not just a small flat overhead reserve: when the caller
+        // attaches tools, `system_prompt` already carries the formatted
+        // tool-definitions block (`LocalGenerator::inject_tool_definitions`
+        // -> `ToolPromptFormatter::format_tools_for_prompt`), which can run
+        // to hundreds or thousands of tokens depending on how many tools are
+        // registered. Before this fix, `LOCAL_PROMPT_OVERHEAD_RESERVE` (a
+        // flat 64 tokens, sized for chat-template markers alone) was the
+        // only overhead subtracted here, so a large tool-definitions block
+        // silently ate into the *history* budget's assumed headroom instead
+        // of being accounted for, letting the formatted prompt balloon well
+        // past what this budget calculation believed it reserved (#1310).
+        //
+        // Past the fixed-count window, history no longer survives or is
+        // dropped as an all-or-nothing block: `TierAssigner` (#1266)
+        // compacts it through discrete, stable tiers (Verbatim ->
+        // LightlyCompressed -> Gist) sized against this real budget, and
+        // remembers each entry's tier across calls so repeated turns at the
+        // same effective budget reuse byte-identical compressed history --
+        // preserving llama.cpp's own KV-cache reuse for the untouched bulk
+        // of the prompt (see `tiered_history.rs` for the full design).
+        let tier_assigner = &mut self.tier_assigner;
+        let query = match self
+            .neural_generator
+            .as_ref()
+            .and_then(|generator| generator.try_read().ok())
+        {
+            Some(generator) => {
+                let count_tokens = |text: &str| {
+                    generator
+                        .tokenize(text)
+                        .map(|tokens| tokens.len())
+                        .unwrap_or_else(|_| text.split_whitespace().count())
+                };
+                let system_prompt_tokens = count_tokens(&system_prompt);
+                let budget = (generator.context_length() as usize)
+                    .saturating_sub(LOCAL_RESPONSE_TOKEN_RESERVE)
+                    .saturating_sub(LOCAL_PROMPT_OVERHEAD_RESERVE)
+                    .saturating_sub(system_prompt_tokens);
+                tracing::debug!(
+                    system_prompt_tokens,
+                    history_budget_tokens = budget,
+                    "local prompt history budget after reserving the real system-prompt cost"
+                );
+                let compressed_history = tier_assigner.assign_and_compress(
+                    current_question,
+                    recent_history,
+                    budget,
+                    count_tokens,
+                );
+                join_history_and_question(current_question, compressed_history)
+            }
+            None if recent_history.is_empty() => current_question.to_string(),
+            None => format!("{}\n\n{}", recent_history.join("\n\n"), current_question),
+        };
+
         Ok((system_prompt, query))
     }
 
@@ -1096,6 +1147,16 @@ mod tests {
     /// model's real context window.
     #[test]
     fn prompt_parts_trims_oldest_history_to_stay_within_the_models_real_token_budget() {
+        // reserve (100 response + 64 overhead) + the default constitution's
+        // real word-count cost as `system_prompt` (11 words: "You are
+        // Shammah, a helpful coding assistant. Be concise and accurate." --
+        // no caller system message is attached below, so `prompt_parts`
+        // falls back to `TemplateGenerator::system_prompt`, and since #1310
+        // that real cost is subtracted from the history budget too, not
+        // just a flat overhead reserve) + budget (10), chosen so only the
+        // two most recent history messages below fit.
+        const CONTEXT_LENGTH: usize = 185;
+
         struct SmallContextBackend;
 
         impl TextGeneration for SmallContextBackend {
@@ -1116,9 +1177,7 @@ mod tests {
             }
 
             fn context_length(&self) -> u32 {
-                // reserve (164) + budget (10), chosen so only the two most
-                // recent history messages below fit.
-                174
+                CONTEXT_LENGTH as u32
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
@@ -1173,10 +1232,10 @@ mod tests {
         let formatted = generator.format_chat_prompt_with_system(&system_prompt, &query);
         let prompt_tokens = formatted.split_whitespace().count();
         assert!(
-            prompt_tokens + LOCAL_RESPONSE_TOKEN_RESERVE <= 174,
+            prompt_tokens + LOCAL_RESPONSE_TOKEN_RESERVE <= CONTEXT_LENGTH,
             "formatted prompt ({prompt_tokens} tokens) plus the reserved response budget \
              ({LOCAL_RESPONSE_TOKEN_RESERVE}) must fit inside the model's real context \
-             window (174 tokens), not overflow it: {formatted:?}"
+             window ({CONTEXT_LENGTH} tokens), not overflow it: {formatted:?}"
         );
     }
 
