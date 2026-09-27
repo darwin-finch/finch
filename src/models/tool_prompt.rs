@@ -4,7 +4,6 @@
 // and tool results into continuation messages.
 
 use crate::tools::{ToolDefinition, ToolResult};
-use serde_json::Value;
 
 /// Formats tool definitions and results for local model prompts
 pub struct ToolPromptFormatter;
@@ -12,10 +11,20 @@ pub struct ToolPromptFormatter;
 impl ToolPromptFormatter {
     /// Format tool definitions into system prompt text
     ///
-    /// Creates a comprehensive system prompt that includes:
-    /// - Tool usage instructions
-    /// - Available tools with descriptions and parameters
-    /// - XML format examples
+    /// Creates a compact system prompt that includes:
+    /// - One shared `<tool_use>` XML format example (not repeated per tool)
+    /// - Each tool as a single line: `name(param: type, ...): description`
+    ///
+    /// This replaced a per-tool `### name` heading plus a full `**Parameters:**`
+    /// list plus a full `**Example:**` XML block for every tool (#1310):
+    /// with the real, current tool catalog (36 registered tools as of this
+    /// writing, not the 26 a same-line-only grep undercounts because
+    /// several registrations span multiple lines), that per-tool
+    /// boilerplate was a fixed multi-thousand-token tax paid on every
+    /// local-model turn before any real conversation content, regardless of
+    /// whether the query had anything to do with tools. See
+    /// `local::AGENTS.md` for the measured before/after cost and the
+    /// regression test that bounds it.
     ///
     /// # Arguments
     /// * `tools` - Vector of tool definitions to include
@@ -40,41 +49,14 @@ impl ToolPromptFormatter {
         prompt.push_str("## Available Tools:\n\n");
 
         for tool in tools {
-            prompt.push_str(&format!("### {}\n", tool.name));
-            prompt.push_str(&format!("{}\n\n", tool.description));
-
-            // Extract parameters from schema
-            if let Some(properties) = tool.input_schema.properties.as_object() {
-                prompt.push_str("**Parameters:**\n");
-                for (param_name, param_info) in properties {
-                    let param_desc = param_info
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("No description");
-                    let param_type = param_info
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("string");
-                    let is_required = tool.input_schema.required.contains(param_name);
-                    let required_marker = if is_required { " (required)" } else { "" };
-
-                    prompt.push_str(&format!(
-                        "- `{}` ({}){}: {}\n",
-                        param_name, param_type, required_marker, param_desc
-                    ));
-                }
-                prompt.push('\n');
-            }
-
-            // Example usage
-            prompt.push_str("**Example:**\n");
-            prompt.push_str("```xml\n<tool_use>\n");
-            prompt.push_str(&format!("  <name>{}</name>\n", tool.name));
-            prompt.push_str("  <parameters>");
-            prompt.push_str(&Self::generate_example_params(&tool.input_schema));
-            prompt.push_str("</parameters>\n");
-            prompt.push_str("</tool_use>\n```\n\n");
+            prompt.push_str(&format!(
+                "- `{}({})`: {}\n",
+                tool.name,
+                Self::compact_param_signature(&tool.input_schema),
+                tool.description
+            ));
         }
+        prompt.push('\n');
 
         prompt.push_str("## Important Rules:\n\n");
         prompt.push_str("1. **Think before acting**: Explain your reasoning before using tools\n");
@@ -91,6 +73,37 @@ impl ToolPromptFormatter {
         );
 
         prompt
+    }
+
+    /// Render a tool's parameters as a compact `name: type` signature
+    /// (`name?: type` when the parameter is optional), e.g.
+    /// `file_path: string, limit?: number`.
+    ///
+    /// This deliberately drops each parameter's own `description` field
+    /// (unlike the pre-#1310 format's `**Parameters:**` bullet list): the
+    /// per-tool line already carries the tool's own description, and the
+    /// type plus required/optional marker is enough for the model to
+    /// construct a valid call without a second, verbose listing.
+    fn compact_param_signature(schema: &crate::tools::ToolInputSchema) -> String {
+        let Some(properties) = schema.properties.as_object() else {
+            return String::new();
+        };
+
+        properties
+            .iter()
+            .map(|(param_name, param_info)| {
+                let param_type = param_info
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("string");
+                if schema.required.contains(param_name) {
+                    format!("{param_name}: {param_type}")
+                } else {
+                    format!("{param_name}?: {param_type}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Format tool results for continuation prompt
@@ -132,28 +145,6 @@ impl ToolPromptFormatter {
         prompt.push_str("Based on these results, provide your answer to the user's question.\n");
         prompt
     }
-
-    /// Generate example parameters for a tool
-    fn generate_example_params(schema: &crate::tools::ToolInputSchema) -> String {
-        let mut params = serde_json::Map::new();
-
-        if let Some(properties) = schema.properties.as_object() {
-            for (param_name, param_info) in properties.iter().take(3) {
-                // Take first 3 params for brevity
-                let example_value = match param_info.get("type").and_then(|v| v.as_str()) {
-                    Some("string") => Value::String("example_value".to_string()),
-                    Some("number") => Value::Number(serde_json::Number::from(42)),
-                    Some("boolean") => Value::Bool(true),
-                    Some("array") => Value::Array(vec![]),
-                    Some("object") => Value::Object(serde_json::Map::new()),
-                    _ => Value::String("value".to_string()),
-                };
-                params.insert(param_name.clone(), example_value);
-            }
-        }
-
-        serde_json::to_string(&Value::Object(params)).unwrap_or_else(|_| "{}".to_string())
-    }
 }
 
 #[cfg(test)]
@@ -179,11 +170,16 @@ mod tests {
         let result = ToolPromptFormatter::format_tools_for_prompt(&tools);
 
         assert!(result.contains("# Available Tools"));
-        assert!(result.contains("### read"));
+        assert!(result.contains("read(file_path: string)"));
         assert!(result.contains("Read a file from disk"));
-        assert!(result.contains("file_path"));
+        // The shared XML example appears once, in the intro block, not
+        // repeated per tool (#1310).
         assert!(result.contains("<tool_use>"));
-        assert!(result.contains("<name>read</name>"));
+        assert!(
+            !result.contains("<name>read</name>"),
+            "a per-tool XML example block must not be emitted; the single shared \
+             `tool_name` placeholder example is the only <tool_use> template: {result:?}"
+        );
     }
 
     #[test]
@@ -206,10 +202,46 @@ mod tests {
 
         let result = ToolPromptFormatter::format_tools_for_prompt(&tools);
 
-        assert!(result.contains("### read"));
-        assert!(result.contains("### bash"));
-        assert!(result.contains("file_path"));
-        assert!(result.contains("command"));
+        assert!(result.contains("read(file_path: string)"));
+        assert!(result.contains("bash(command: string, description: string)"));
+        // No per-tool `<name>...</name>` XML example block, regardless of
+        // tool count -- the fixed cost this format no longer multiplies by
+        // the number of registered tools (#1310). (The intro's one shared
+        // `<tool_use>` template and its prose mention of the tag both stay,
+        // so counting raw `<tool_use>` occurrences isn't a precise check
+        // here; the per-tool `<name>...</name>` markup is what the old
+        // format repeated per tool.)
+        assert!(
+            !result.contains("<name>read</name>") && !result.contains("<name>bash</name>"),
+            "a per-tool XML example block must not be emitted for either tool: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_param_signature_marks_optional_params() {
+        let mut schema = ToolInputSchema::simple(vec![("required_param", "desc")]);
+        schema.properties.as_object_mut().unwrap().insert(
+            "optional_param".to_string(),
+            serde_json::json!({"type": "number", "description": "desc"}),
+        );
+        // `required` deliberately excludes "optional_param".
+
+        let tools = vec![ToolDefinition {
+            name: "example".to_string(),
+            description: "An example tool".to_string(),
+            input_schema: schema,
+        }];
+
+        let result = ToolPromptFormatter::format_tools_for_prompt(&tools);
+
+        assert!(
+            result.contains("required_param: string"),
+            "a required parameter must render without a `?` marker: {result:?}"
+        );
+        assert!(
+            result.contains("optional_param?: number"),
+            "an optional parameter must render with a `?` marker: {result:?}"
+        );
     }
 
     #[test]
@@ -239,20 +271,5 @@ mod tests {
         assert!(formatted.contains("truncated"));
         assert!(formatted.contains("3000 total characters"));
         assert!(formatted.len() < 2500); // Should be truncated
-    }
-
-    #[test]
-    fn test_generate_example_params() {
-        let schema = ToolInputSchema::simple(vec![
-            ("file_path", "Path to file"),
-            ("encoding", "File encoding"),
-        ]);
-
-        let example = ToolPromptFormatter::generate_example_params(&schema);
-
-        assert!(example.contains("file_path"));
-        assert!(example.contains("example_value"));
-        // Should be valid JSON
-        assert!(serde_json::from_str::<Value>(&example).is_ok());
     }
 }

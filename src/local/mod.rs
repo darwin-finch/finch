@@ -168,7 +168,7 @@ impl LocalGenerator {
         let augmented_messages;
         let messages_to_send: &[Message] = match &tools {
             Some(tools) => {
-                augmented_messages = Self::inject_tool_definitions(messages, tools);
+                augmented_messages = self.inject_tool_definitions(messages, tools);
                 &augmented_messages
             }
             None => messages,
@@ -273,8 +273,25 @@ impl LocalGenerator {
     /// prompt_parts` already joins multiple system messages -- the caller's
     /// system contract (e.g. the Finch VM wire ABI) is preserved verbatim,
     /// never replaced.
-    fn inject_tool_definitions(messages: &[Message], tools: &[ToolDefinition]) -> Vec<Message> {
+    fn inject_tool_definitions(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Vec<Message> {
         let tool_prompt = ToolPromptFormatter::format_tools_for_prompt(tools);
+        // Log the tool-definitions block's own token cost, separately from
+        // the combined prompt total logged later at the llama.cpp decode
+        // call site (`evaluating llama.cpp prompt` in
+        // `src/models/loaders/llama_cpp.rs`): that site only sees the final
+        // token vector and cannot attribute how many of those tokens came
+        // from this block. This is where the block is actually assembled,
+        // so this is where its cost is visible (#1310).
+        let tool_prompt_tokens = self.response_generator.count_tokens(&tool_prompt);
+        tracing::debug!(
+            tool_count = tools.len(),
+            tool_prompt_tokens,
+            "injecting tool definitions into local prompt"
+        );
         let mut augmented = Vec::with_capacity(messages.len() + 1);
         let mut last_system_idx = None;
         for (idx, message) in messages.iter().enumerate() {
@@ -692,7 +709,8 @@ mod tests {
 
         let sent_to_model = captured_prompt.lock().expect("lock captured prompt");
         assert!(
-            sent_to_model.contains("<tool_use>") && sent_to_model.contains("### read"),
+            sent_to_model.contains("<tool_use>")
+                && sent_to_model.contains("read(file_path: string)"),
             "the tool definitions must reach the model's prompt via ToolPromptFormatter, \
              same as QwenGenerator::format_prompt_with_tools does, got: {sent_to_model}"
         );
