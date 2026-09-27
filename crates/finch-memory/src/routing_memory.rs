@@ -38,6 +38,53 @@ use uuid::Uuid;
 /// introducing an unrelated tolerance.
 const NEAR_TIE_EPSILON: f32 = 0.01;
 
+/// How many live corpus points [`RoutingMemTree::random_baseline_mean`] samples per query
+/// (#1327), selected by the smallest deterministic hash-based rank key rather than a fresh RNG
+/// draw -- the same reason [`FIXED_SEED`] exists: the same store must answer identically on every
+/// process that opens it. The number of cosine comparisons and retained samples is bounded by
+/// this constant regardless of corpus size; the one-pass rank-key scan of the corpus needed to
+/// find them is still `O(corpus size)`, since nothing shorter than visiting every live point can
+/// pick a representative sample from it without an incremental structure (a disclosed
+/// simplification -- see that method's doc comment).
+const RANDOM_BASELINE_SAMPLE_SIZE: usize = 32;
+
+/// The score floor a candidate must clear, relative to the RESULT SET's own top score and random
+/// baseline (#1327) -- not a fixed global threshold like `MemoryConfig::min_relevance_score`.
+/// `cutoff` is `MemoryConfig::relative_margin_cutoff`, intended to sit in `[0, 1]`: `0.0` keeps
+/// only candidates tied with `top_score`, and `1.0` reduces to the "beats the random baseline"
+/// absolute floor the validated research (issue #1327) measured as a near no-op (0.5% suppressed
+/// / 99.0% kept) precisely because a top-k list is already better than random by construction.
+/// The issue's own measured default, `0.5`, drops a candidate scoring below halfway from the
+/// random baseline up to the top score.
+fn relative_margin_floor(top_score: f32, random_baseline_mean: f32, cutoff: f32) -> f32 {
+    top_score - cutoff * (top_score - random_baseline_mean)
+}
+
+/// Drop candidates from `results` whose score falls below [`relative_margin_floor`] (#1327) --
+/// applied within one result set, using that set's own top score, so a candidate is judged
+/// against how good the BEST match found for this query was, not a fixed absolute floor.
+///
+/// A no-op when `random_baseline_mean` is not strictly below the result set's top score: a
+/// degenerate baseline (most commonly a corpus too small for the sample to differ meaningfully
+/// from the candidates it is judging) would otherwise make the floor equal to or above the top
+/// score, which would drop every candidate including the top one -- clearly wrong for a filter
+/// meant to remove only the weak tail. Nothing is dropped rather than dropping everything.
+fn filter_by_relative_margin(
+    results: &mut Vec<(PointId, String, f32)>,
+    random_baseline_mean: f32,
+    cutoff: f32,
+) {
+    let top_score = results
+        .iter()
+        .map(|(_, _, score)| *score)
+        .fold(f32::MIN, f32::max);
+    if random_baseline_mean >= top_score {
+        return;
+    }
+    let floor = relative_margin_floor(top_score, random_baseline_mean, cutoff);
+    results.retain(|(_, _, score)| *score >= floor);
+}
+
 /// Fixed, not random: every process that opens the same store must seed identical
 /// candidate/stability-gate randomness for a freshly-built or freshly-reloaded tree to behave
 /// identically to what produced the persisted structure it's continuing.
@@ -347,16 +394,21 @@ impl RoutingMemTree {
     /// Top-k real candidates by cosine similarity, importance=0 (Discard) excluded -- the one
     /// `MemTree::retrieve` filter this facade keeps (module doc: no boost re-ranking yet) -- with
     /// near-tied candidates (`NEAR_TIE_EPSILON`) reordered by occurrence-chain neighbor context
-    /// (see [`Self::break_near_ties`]) before the final `top_k` truncation, so a genuine near-tie
-    /// can change which candidates survive the cut, not only their order within it.
+    /// (see [`Self::break_near_ties`]), then individually weak candidates dropped by
+    /// [`filter_by_relative_margin`] (#1327), before the final `top_k` truncation -- so either
+    /// step can change which candidates survive the cut, not only their order within it.
     ///
     /// Takes `conn` because the tie-break needs `routing_occurrences` (never needed by this
     /// method before); everything else it uses (the tree, `self.meta`) was already in hand.
+    /// `relative_margin_cutoff` is `MemoryConfig::relative_margin_cutoff`, threaded through
+    /// rather than stored on `Self` because it can change between calls (a config reload) and
+    /// only this method needs it.
     pub(crate) fn retrieve(
         &self,
         conn: &Connection,
         query_embedding: &[f32],
         top_k: usize,
+        relative_margin_cutoff: f32,
     ) -> Result<Vec<(PointId, String, f32)>> {
         if top_k == 0 {
             return Ok(Vec::new());
@@ -383,8 +435,88 @@ impl RoutingMemTree {
         self.break_near_ties(conn, query_embedding, &mut results)
             .context("retrieve: neighbor-context tie-break")?;
 
+        // #1327: filtering can never change a `top_k <= 1` result. `results` is sorted
+        // descending and `filter_by_relative_margin`'s `retain` never reorders, so whichever
+        // candidate is already first (the pool's own top score, which always clears its own
+        // floor by construction) is still first -- and still the ONLY element left -- after
+        // `results.truncate(top_k)` below, whether or not filtering ran. Skip sampling the
+        // baseline (an O(corpus size) scan) for a result truncation cannot let it affect.
+        if top_k > 1 && results.len() > 1 {
+            if let Some(baseline) = self.random_baseline_mean(query_embedding) {
+                filter_by_relative_margin(&mut results, baseline, relative_margin_cutoff);
+            }
+        }
+
         results.truncate(top_k);
         Ok(results)
+    }
+
+    /// Mean cosine similarity between `query_embedding` and a deterministic sample of this
+    /// corpus's own live, non-Discard points -- #1327's `randomBaselineMean`, an approximation of
+    /// how an unrelated/"random" memory would score against this query, drawn from the real
+    /// corpus rather than synthesized. Discard (importance=0) content is excluded from the
+    /// sample, matching `retrieve`'s own candidate filter above (module doc): content that could
+    /// never itself be returned must not skew the baseline other candidates are judged against.
+    ///
+    /// Selected by the smallest [`RANDOM_BASELINE_SAMPLE_SIZE`] deterministic hash-based rank
+    /// keys (`DefaultHasher` over the point id -- fixed, non-randomized keys, so stable within one
+    /// build) rather than a fresh RNG draw or a full sort of every point id, for the same
+    /// determinism reason [`FIXED_SEED`] exists: the same store must answer identically on every
+    /// process that opens it, at a bounded number of retained samples and cosine comparisons
+    /// regardless of corpus size (see that constant's doc comment).
+    ///
+    /// Computed fresh per query rather than tracked incrementally -- a disclosed simplification.
+    /// An incremental running estimate, mirroring the Welford-style streaming statistics issues
+    /// #1323/#1324 describe for their own mechanisms, is a reasonable later upgrade, but neither
+    /// of those mechanisms exists in this crate yet to share an implementation with, and a fresh
+    /// per-query sample is already correct for this filter.
+    ///
+    /// `None` when the corpus has no live points to sample (nothing to compare against).
+    fn random_baseline_mean(&self, query_embedding: &[f32]) -> Option<f32> {
+        use std::hash::{Hash, Hasher};
+
+        // Deterministic per-point rank key: `DefaultHasher` uses fixed, non-randomized keys (unlike
+        // the `HashMap`/`self.meta` iteration order it reads from), so the same point id always
+        // ranks the same way within one build -- the determinism `FIXED_SEED` above needs, without
+        // collecting and fully sorting the whole corpus just to pick a small sample from it. A
+        // single pass keeps the smallest `RANDOM_BASELINE_SAMPLE_SIZE` keys seen so far, so the
+        // number of retained samples (and cosine comparisons below) never grows with corpus size,
+        // unlike a full sort.
+        fn rank_key(point_id: PointId) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            point_id.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let mut sample: Vec<(u64, &[f32])> = Vec::with_capacity(RANDOM_BASELINE_SAMPLE_SIZE + 1);
+        for (pid, meta, embedding) in self.iter_points() {
+            // Discard (importance=0) is a real content-safety exclusion (module doc): `retrieve`'s
+            // own candidate list already excludes it, and the baseline this filter judges
+            // candidates against must not be skewed by content that could never itself be returned.
+            if meta.importance == 0 {
+                continue;
+            }
+            let key = rank_key(pid);
+            match sample.last() {
+                Some((worst, _))
+                    if sample.len() >= RANDOM_BASELINE_SAMPLE_SIZE && key >= *worst =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            let pos = sample.partition_point(|(k, _)| *k < key);
+            sample.insert(pos, (key, embedding));
+            sample.truncate(RANDOM_BASELINE_SAMPLE_SIZE);
+        }
+        if sample.is_empty() {
+            return None;
+        }
+        let total: f64 = sample
+            .iter()
+            .map(|(_, e)| crate::cosine_similarity(query_embedding, e) as f64)
+            .sum();
+        Some((total / sample.len() as f64) as f32)
     }
 
     /// Reorder every near-tied run within `results` (already sorted descending by cosine score,

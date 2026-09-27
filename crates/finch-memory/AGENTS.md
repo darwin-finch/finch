@@ -250,6 +250,50 @@ modules, including `memory_status`, are private.
   now takes `conn: &Connection`; both call sites in `lib.rs`
   (`query_with_sources`, `conversation_summary`) acquire the db lock before the tree lock, the
   same order `stats()` already used, to avoid a lock-order deadlock.
+- After the near-tie-break above and before `top_k` truncation, `RoutingMemTree::retrieve`
+  (routing_memory.rs) applies a relative-margin filter (#1327, validated research) that drops an
+  individual weak candidate judged against THIS result set's own top score, not a fixed/global
+  "beats a random document" baseline — that global-baseline framing was tested and found a near
+  no-op (a top-k list is already better than random by construction, so comparing against random
+  does not discriminate within it). A candidate below
+  `top_score - relative_margin_cutoff * (top_score - random_baseline_mean)` is dropped;
+  `relative_margin_cutoff` is `MemoryConfig::relative_margin_cutoff` (default `0.5`, an explicit
+  first-guess constant from the research, not swept against Finch's own corpus, same caveat as
+  `min_relevance_score`/`min_turn_relevance_score`). `random_baseline_mean` is
+  `RoutingMemTree::random_baseline_mean`: the mean cosine similarity between the query and a
+  deterministic sample of up to 32 of the corpus's own live, non-Discard points, selected by the
+  smallest `DefaultHasher`-derived rank key over the point id in one pass (fixed, non-randomized
+  hasher keys, so stable within one build — the same determinism reason `FIXED_SEED` above exists
+  — and bounded cost regardless of corpus size, unlike collecting and fully sorting every point id
+  just to pick 32 of them). Discard (importance=0) content is excluded from the sample, matching
+  `retrieve`'s own candidate filter above: content that can never itself be returned must not skew
+  the baseline other candidates are judged against — `test_random_baseline_mean_excludes_discard_content`
+  plants a Discard point deliberately near-identical to the query and asserts it does not pull the
+  mean up. Computed fresh per query rather than tracked incrementally like the Welford-style
+  running statistics #1323/#1324 describe — disclosed as a reasonable later upgrade, not required
+  for correctness today, and neither of those mechanisms exists in this crate yet to share an
+  implementation with. Applied only when `top_k > 1` (not merely when the pre-truncation pool has
+  more than one candidate): `results` is sorted descending and `filter_by_relative_margin`'s
+  `retain` never reorders, so for `top_k <= 1` the pool's own top score — which always clears its
+  own floor by construction — is always still first, and the only element left, after
+  `results.truncate(top_k)` regardless of whether filtering ran at all; sampling the baseline (an
+  `O(corpus size)` scan) for a truncation it cannot affect was pure waste, paid on every
+  `conversation_summary` per-window centroid query (`top_k=1`) as the corpus grew —
+  `test_retrieve_top_k_one_is_invariant_to_relative_margin_cutoff` pins the invariant the skip
+  relies on. Also skipped entirely when the sampled baseline is not strictly below the top score
+  (a degenerate case — most commonly a corpus too small for the sample to differ meaningfully from
+  the candidates it judges — where dropping everything, including the top candidate, would be
+  strictly worse than dropping nothing). This is additive to, and applied before, the fixed
+  `min_relevance_score`/`min_turn_relevance_score` floors in `query_with_sources`, which are
+  unchanged. `test_relative_margin_floor_matches_hand_worked_formula`,
+  `test_relative_margin_floor_cutoff_endpoints`,
+  `test_filter_by_relative_margin_drops_below_floor_keeps_at_or_above`,
+  `test_filter_by_relative_margin_is_a_no_op_when_baseline_is_not_below_top_score`,
+  `test_random_baseline_mean_excludes_discard_content`,
+  `test_retrieve_top_k_one_is_invariant_to_relative_margin_cutoff`, and the production-boundary
+  `test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one` (three real candidates plus
+  six orthogonal filler points through the real `retrieve()` path) all live in
+  `src/routing_memory/tests.rs`.
 - `counterpart_turn` (`lib.rs`, used by `query_recall`'s rendering) pairs a retrieved turn with
   its real reply/question via that same occurrence chain, not by wall-clock proximity: for a
   retrieved user turn it walks the turn's own occurrence `next` (the reply is whatever occurrence
