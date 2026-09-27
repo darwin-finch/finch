@@ -1743,10 +1743,19 @@ interface BrainService {
   # frontend that disconnects mid-round and a different frontend that later
   # reattaches to the same Brain both drive the same live process and
   # conversation state.
+  # `hasModel`/`model` name the Brain's configured Claude CLI Subscription
+  # model, consulted only the first time this Brain's session is created
+  # (an already-live daemon-owned session keeps whatever model it started
+  # with, since switching models mid `claude --resume` conversation is not
+  # supported); `hasModel = false` means "use ClaudeCliProvider's own
+  # default". A later round for an already-live session may resend a
+  # different value here with no effect — the session was already created.
   claudeCliRound @20 (brain :Text,
                       messages :List(Message),
                       tools :List(ToolDefinition),
-                      receiver :StreamReceiver) -> ();
+                      receiver :StreamReceiver,
+                      hasModel :Bool,
+                      model :Text) -> ();
 }
 
 # ---------------------------------------------------------------------------

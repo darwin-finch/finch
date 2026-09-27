@@ -50,6 +50,7 @@ struct RoundRequest {
     brain: String,
     messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
+    model: Option<String>,
     reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<Result<StreamChunk>>>>,
 }
 
@@ -72,7 +73,12 @@ impl DaemonClaudeCliHandle {
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
                 let result = client
-                    .brain_claude_cli_round(&request.brain, request.messages, request.tools)
+                    .brain_claude_cli_round(
+                        &request.brain,
+                        request.messages,
+                        request.tools,
+                        request.model.as_deref(),
+                    )
                     .await;
                 // The caller may have stopped waiting (e.g. its own request
                 // future was dropped); a failed send here just means no one
@@ -92,6 +98,7 @@ impl DaemonClaudeCliHandle {
         brain: &str,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
+        model: Option<String>,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamChunk>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -99,6 +106,7 @@ impl DaemonClaudeCliHandle {
                 brain: brain.to_string(),
                 messages,
                 tools,
+                model,
                 reply: reply_tx,
             })
             .map_err(|_| {
@@ -174,6 +182,7 @@ impl DaemonClaudeCliProvider {
                 &self.brain,
                 request.messages.clone(),
                 request.tools.clone().unwrap_or_default(),
+                Some(self.model.clone()),
             )
             .await?;
 
@@ -181,6 +190,16 @@ impl DaemonClaudeCliProvider {
         while let Some(item) = rx.recv().await {
             let chunk = item?;
             let is_tool_call = matches!(chunk, StreamChunk::ToolCallComplete { .. });
+            // The daemon's own reused `ClaudeCliProvider::send_message_stream_validated`
+            // already synthesizes exactly one `ContentBlockComplete` on a genuine finish
+            // (crates/finch-providers/src/claude_cli.rs), which arrives here over the wire
+            // like any other chunk. This capture-and-swallow (never forwarded to `deltas`)
+            // matches that same method's own shape on the local, non-daemon path: its
+            // internal `execute_turn`/`drive` never emit `ContentBlockComplete` themselves
+            // either, leaving exactly one synthesis point below. Forwarding it here too, on
+            // top of the one this function synthesizes on `RoundOutcome::Complete`, would
+            // double the assistant's finished text for every daemon-owned round.
+            let is_content_complete = matches!(chunk, StreamChunk::ContentBlockComplete(_));
             match &chunk {
                 StreamChunk::TextDelta(delta) => response_text.push_str(delta),
                 StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
@@ -189,7 +208,9 @@ impl DaemonClaudeCliProvider {
                 _ => {}
             }
             if let Some(deltas) = &deltas {
-                let _ = deltas.send(Ok(chunk)).await;
+                if !is_content_complete {
+                    let _ = deltas.send(Ok(chunk)).await;
+                }
             }
             if is_tool_call {
                 return Ok(RoundOutcome::Paused);
@@ -336,12 +357,77 @@ mod tests {
         drop(rx); // Nothing will ever receive a RoundRequest again.
         let handle = DaemonClaudeCliHandle { tx };
         let error = handle
-            .round("some-brain", Vec::new(), Vec::new())
+            .round("some-brain", Vec::new(), Vec::new(), None)
             .await
             .expect_err("a dead actor task must fail the round, not hang");
         assert!(
             error.to_string().contains("no longer running"),
             "the error must name the real cause (actor task gone), not a generic failure: {error}"
+        );
+    }
+
+    /// A `DaemonClaudeCliHandle` whose "actor" answers exactly one round
+    /// with a canned wire chunk sequence, without any real `IpcClient` or
+    /// daemon connection — enough to exercise `drive_round`'s own chunk
+    /// handling in isolation.
+    fn canned_handle(chunks: Vec<Result<StreamChunk>>) -> DaemonClaudeCliHandle {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RoundRequest>();
+        tokio::spawn(async move {
+            let Some(request) = rx.recv().await else {
+                return;
+            };
+            let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
+            for chunk in chunks {
+                let _ = chunk_tx.send(chunk);
+            }
+            let _ = request.reply.send(Ok(chunk_rx));
+        });
+        DaemonClaudeCliHandle { tx }
+    }
+
+    #[tokio::test]
+    async fn drive_round_forwards_the_daemons_content_block_complete_at_most_once() {
+        // Regression (issue #1354, independent review finding): the daemon's
+        // own reused `ClaudeCliProvider::send_message_stream_validated`
+        // already synthesizes one `ContentBlockComplete` on a genuine finish
+        // and sends it over the wire like any other chunk. Forwarding that
+        // wire chunk to `deltas` *and* letting `send_message_stream_validated`
+        // synthesize a second one from the accumulated text doubled the
+        // assistant's finished response text for every daemon-owned round.
+        let handle = canned_handle(vec![
+            Ok(StreamChunk::TextDelta("real ".to_string())),
+            Ok(StreamChunk::TextDelta("answer".to_string())),
+            Ok(StreamChunk::ContentBlockComplete(ContentBlock::text(
+                "real answer",
+            ))),
+        ]);
+        let provider = DaemonClaudeCliProvider {
+            handle,
+            brain: "some-brain".to_string(),
+            model: CLAUDE_CLI_DEFAULT_MODEL.to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel::<Result<StreamChunk>>(16);
+        let outcome = provider
+            .drive_round(&finch_providers::ProviderRequest::new(Vec::new()), Some(tx))
+            .await
+            .unwrap();
+        match outcome {
+            RoundOutcome::Complete(text) => assert_eq!(text, "real answer"),
+            RoundOutcome::Paused => panic!("expected Complete, got Paused"),
+        }
+        let mut forwarded = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            forwarded.push(chunk.unwrap());
+        }
+        let content_complete_count = forwarded
+            .iter()
+            .filter(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_)))
+            .count();
+        assert_eq!(
+            content_complete_count, 0,
+            "drive_round must never itself forward the wire's ContentBlockComplete chunk to \
+             `deltas` — send_message_stream_validated synthesizes the caller-facing one exactly \
+             once, from the RoundOutcome::Complete text this function returns: forwarded={forwarded:?}"
         );
     }
 }

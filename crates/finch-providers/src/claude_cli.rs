@@ -767,14 +767,16 @@ impl ClaudeCliProvider {
     ) -> Result<RunningTurn> {
         let (listener, socket_path) = self.bind_tool_socket().await?;
         let args = self.invocation_args(resumable, system, tool_names, Some(&socket_path))?;
-        let mut child = tokio::process::Command::new(&self.binary)
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
             .args(&args)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        let mut child = spawn_retrying_text_file_busy(&mut command)
+            .await
             .with_context(|| {
                 format!(
                     "spawning claude CLI at {}; `claude auth status` inspects its login",
@@ -934,6 +936,79 @@ impl ClaudeCliProvider {
             allowance: record.allowance.clone(),
         }
     }
+}
+
+/// How many times to re-attempt a `claude` spawn the kernel refuses with
+/// `ETXTBSY`, and how long to wait between attempts.
+///
+/// Mirrors `src/tools/diagnostics/mod.rs`'s identical `spawn_retrying_text_file_busy`
+/// (issue #1204, itself mirroring `finch_runtime::host`'s `process-run` retry,
+/// issue #287): the kernel refuses to exec a file any process holds open for
+/// writing, and `fork()` copies the *entire* file descriptor table — so a
+/// spawn anywhere else in the same test process that forks while any thread
+/// still holds a write descriptor on the fake `claude` fixture this
+/// transport's own tests write hands its child an inherited copy of that
+/// descriptor, and *this* exec is refused even though the real writer
+/// already closed its own copy. `cargo test`'s default parallelism runs
+/// many `#[tokio::test]` functions concurrently in one process, and this
+/// module both writes fresh executable fixtures (`install_fake_claude`) and
+/// spawns them, repeatedly, across many tests (issue #1354 added several
+/// more) — exactly the combination that behavior makes racy. The condition
+/// is transient and self-clearing: retrying the specific, documented,
+/// self-clearing error is the fix, not reordering this module's own
+/// write/chmod/spawn sequence, which never has a gap in it — the refusal
+/// comes from *outside* this module.
+///
+/// The loop breaks before sleeping on its final attempt, so eight attempts
+/// means seven waits: `5ms * (1 + 2 + ... + 7)` = 140ms of sleep as a floor.
+#[cfg(unix)]
+const TEXT_FILE_BUSY_ATTEMPTS: u32 = 8;
+
+#[cfg(unix)]
+const TEXT_FILE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Spawn `command`, re-attempting while the kernel reports `ETXTBSY`. See
+/// [`TEXT_FILE_BUSY_ATTEMPTS`] for why this condition is transient and safe
+/// to retry: every attempt spawns the exact command the caller already
+/// built, so a retry has no path to running anything other than what was
+/// already going to run.
+#[cfg(unix)]
+async fn spawn_retrying_text_file_busy(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    for attempt in 1..=TEXT_FILE_BUSY_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                #[cfg(test)]
+                tests::record_text_file_busy_refusal();
+                tracing::debug!(
+                    attempt,
+                    "claude CLI exec refused with ETXTBSY; a descriptor still holds it open \
+                     for writing, retrying"
+                );
+                if attempt == TEXT_FILE_BUSY_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(TEXT_FILE_BUSY_BACKOFF * attempt).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    tracing::warn!(
+        attempts = TEXT_FILE_BUSY_ATTEMPTS,
+        "claude CLI exec refused with ETXTBSY on every attempt; giving up"
+    );
+    command.spawn()
+}
+
+/// ETXTBSY is a POSIX exec-time refusal; platforms without fork/exec
+/// process spawning cannot hit it, so there is nothing to retry.
+#[cfg(not(unix))]
+async fn spawn_retrying_text_file_busy(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    command.spawn()
 }
 
 /// Read `claude`'s stdout, racing it against the bridge's own listener
@@ -1462,6 +1537,57 @@ mod tests {
     use crate::LlmProvider;
     use tempfile::TempDir;
 
+    /// Count of real `ETXTBSY` refusals `spawn_retrying_text_file_busy` has
+    /// observed, process-wide, so a deterministic test can wait for a
+    /// genuine kernel refusal instead of a fixed sleep (a fixed sleep would
+    /// make the test vacuous on a loaded runner if the held descriptor
+    /// happened to close before the first spawn attempt). Mirrors
+    /// `src/tools/diagnostics/mod.rs`'s identical counter for the same
+    /// reason (issue #1204); unlike that module, this transport spawns
+    /// only one executable (`self.binary`) per provider instance, so a
+    /// single process-wide counter (not one keyed per executable path)
+    /// is enough to disambiguate this test's own refusals.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    static TEXT_FILE_BUSY_REFUSALS: std::sync::OnceLock<std::sync::atomic::AtomicU32> =
+        std::sync::OnceLock::new();
+
+    pub(super) fn record_text_file_busy_refusal() {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
+        TEXT_FILE_BUSY_REFUSALS
+            .get_or_init(|| std::sync::atomic::AtomicU32::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Only the deterministic reproduction test below reads this, and that
+    /// test is itself restricted to the platforms where a shebang script's
+    /// own exec is actually subject to the kernel's deny-write check
+    /// (verified directly by `src/tools/diagnostics/mod.rs`: macOS is not
+    /// one of them, and this transport's fake `claude` fixture is the same
+    /// kind of shebang script). Matching that restriction here, rather than
+    /// the broader `cfg(unix)` production retry uses, keeps this getter
+    /// from going unused on macOS.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    fn text_file_busy_refusals() -> u32 {
+        TEXT_FILE_BUSY_REFUSALS
+            .get_or_init(|| std::sync::atomic::AtomicU32::new(0))
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Install a fake `claude` executable that records its argv and stdin and
     /// emits canned NDJSON matching the measured wire contract. Behavior is
     /// selected by the first argument word: default is a successful turn;
@@ -1835,6 +1961,71 @@ printf '%s\n' \
             complete.as_deref(),
             Some("hello"),
             "the terminal assistant text must arrive as one complete text block"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn a_transiently_busy_claude_binary_is_retried_not_reported_as_a_spawn_failure() {
+        // Regression (issue #1354's own CI: this exact, already-documented
+        // #1204 ETXTBSY race — see spawn_retrying_text_file_busy's own doc
+        // comment — started firing for real once this issue added several
+        // more spawn-heavy tests to this module). Deterministic
+        // reproduction mirrors `src/tools/diagnostics/mod.rs`'s identical
+        // test: hold a second write descriptor open on the exact fake
+        // `claude` binary about to be exec'd (the kernel's check is
+        // per-inode, so this is deterministic, not timing-dependent), and
+        // prove the retry recovers it instead of surfacing a spawn error.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "ok");
+        let provider = ClaudeCliProvider::with_binary(binary.clone(), None);
+
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&binary)
+            .expect("open the fake claude binary for writing while it is still named");
+        let held: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(writer)));
+        let releaser_held = std::sync::Arc::clone(&held);
+        std::thread::spawn(move || {
+            // Release once a real refusal has actually been observed,
+            // rather than after a fixed delay: a timer would make this
+            // test vacuous on a fast or lightly loaded machine.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while text_file_busy_refusals() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            releaser_held
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        });
+
+        let mut rx = provider
+            .send_message_stream(&simple_request())
+            .await
+            .expect("a transiently busy claude binary must still be retried and succeed");
+        let mut complete = None;
+        while let Some(chunk) = rx.recv().await {
+            if let StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) = chunk.unwrap() {
+                complete = Some(text);
+            }
+        }
+        assert_eq!(
+            complete.as_deref(),
+            Some("hello"),
+            "the retried spawn must still complete the turn normally, not just avoid an error"
+        );
+        assert!(
+            text_file_busy_refusals() > 0,
+            "this test's own held write descriptor must have produced at least one real \
+             ETXTBSY refusal for the retry path to have actually been exercised — a refusal \
+             count of 0 means this test raced its own setup and proved nothing"
         );
     }
 

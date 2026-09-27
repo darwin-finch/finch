@@ -344,6 +344,7 @@ impl IpcClient {
         brain: &str,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
+        model: Option<&str>,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamChunk>>> {
         let service = self.brain_service().await?;
         let (tx, rx) = mpsc::unbounded_channel();
@@ -362,6 +363,12 @@ impl IpcClient {
             )?;
             write_tools(p.reborrow().init_tools(tools.len() as u32), &tools);
             p.set_receiver(receiver_client);
+            // Consulted by the daemon only the first time this Brain's
+            // session is created (issue #1354's independent review found
+            // this Brain-configured model was silently dropped entirely —
+            // there was no wire field for it at all).
+            p.set_has_model(model.is_some());
+            p.set_model(model.unwrap_or(""));
         }
 
         // Fire and forget, exactly like `query_stream`: the server calls

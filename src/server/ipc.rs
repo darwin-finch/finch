@@ -1628,6 +1628,16 @@ impl brain_service::Server for BrainRpcService {
             .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let receiver = pry!(p.get_receiver());
+        // Consulted by `sessions.get_or_create` only the first time this
+        // Brain's session is created (issue #1354's independent review:
+        // this was previously silently dropped — no wire field existed for
+        // it at all, so a Brain's configured Claude CLI model was always
+        // ignored for a daemon-owned session).
+        let model = if p.get_has_model() {
+            Some(pry!(p.get_model()).to_str().unwrap_or("").to_string())
+        } else {
+            None
+        };
         let lifecycle = self.lifecycle.clone();
         let sessions = self.claude_cli_sessions.clone();
 
@@ -1648,9 +1658,10 @@ impl brain_service::Server for BrainRpcService {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), capnp::Error>>();
         tokio::task::spawn_local(
             async move {
-                let outcome =
-                    drive_claude_cli_round(lifecycle, sessions, brain, messages, tools, receiver)
-                        .await;
+                let outcome = drive_claude_cli_round(
+                    lifecycle, sessions, brain, messages, tools, receiver, model,
+                )
+                .await;
                 let _ = done_tx.send(outcome);
             }
             .instrument(ipc_call_span("claude_cli_round")),
@@ -1753,6 +1764,104 @@ fn parse_runner_handoff_id(
 // Helper: read tool definitions
 // ---------------------------------------------------------------------------
 
+/// Whether [`encode_common_stream_chunk`] filled in the capnp `StreamChunk`
+/// builder it was given.
+enum EncodedChunk {
+    /// The builder now holds this chunk; the caller should send it.
+    Encoded,
+    /// This chunk kind is not encoded by this shared helper — the caller
+    /// decides what (if anything) to do with it. Only
+    /// `ThinkingDelta`/`ToolCallDelta`/`ToolCallComplete` reach this arm
+    /// today: neither `query_stream` (IPC projection for native tool-call
+    /// deltas is #776/#777, unrelated to this method) nor
+    /// `drive_claude_cli_round` (which gives `ToolCallComplete` its own,
+    /// entirely different pause-and-return handling before ever reaching
+    /// this function) send them through here.
+    NotHandled,
+}
+
+/// Encode the wire-representable common subset of [`StreamChunk`] into an
+/// already-`init_chunk()`ed capnp builder — shared by `query_stream` and
+/// `drive_claude_cli_round`, which previously each carried their own,
+/// independently-maintained copy of this match (issue #1354's independent
+/// review: the two had already started to diverge). Pure and synchronous:
+/// no RPC send happens here, and neither caller's own error-handling policy
+/// (propagate vs. best-effort-and-keep-draining) is decided here — only
+/// `Err` for a chunk that can never be sent at all (an invalid
+/// `ResponseMetadata` model, or a `ContentBlockComplete(ToolUse)` whose
+/// input fails to encode as JSON) is common to both.
+fn encode_common_stream_chunk(
+    chunk: &crate::generators::StreamChunk,
+    mut builder: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>,
+) -> Result<EncodedChunk, capnp::Error> {
+    use crate::generators::StreamChunk;
+    match chunk {
+        StreamChunk::TextDelta(delta) => {
+            builder.set_text_delta(delta.as_str());
+        }
+        StreamChunk::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            let mut upd = builder.init_usage_update();
+            upd.set_input_tokens(*input_tokens);
+            upd.set_output_tokens(*output_tokens);
+        }
+        StreamChunk::ResponseMetadata { model } => {
+            crate::generators::validate_response_model(model).map_err(|_| {
+                capnp::Error::failed("IPC response model metadata was invalid".into())
+            })?;
+            builder.init_response_metadata().set_model(model.as_str());
+        }
+        StreamChunk::Allowance {
+            primary_used_percent,
+            secondary_used_percent,
+        } => {
+            let mut allowance = builder.init_allowance_update();
+            allowance.set_has_primary(primary_used_percent.is_some());
+            allowance.set_primary_used_percent(primary_used_percent.unwrap_or_default());
+            allowance.set_has_secondary(secondary_used_percent.is_some());
+            allowance.set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
+        }
+        StreamChunk::ContentBlockComplete(block) => {
+            let mut encoded = builder.init_content_block_complete();
+            match block {
+                crate::providers::ContentBlock::Text { text } => encoded.set_text(text),
+                crate::providers::ContentBlock::Image { source } => {
+                    let mut image = encoded.init_image();
+                    image.set_source_type(&source.source_type);
+                    image.set_media_type(&source.media_type);
+                    image.set_data(&source.data);
+                }
+                crate::providers::ContentBlock::ToolUse { id, name, input } => {
+                    let mut tool = encoded.init_tool_use();
+                    tool.set_id(id);
+                    tool.set_name(name);
+                    crate::ipc::encode_json_value(tool.reborrow().init_input(), input)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                }
+                crate::providers::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let mut result = encoded.init_tool_result();
+                    result.set_tool_use_id(tool_use_id);
+                    result.set_content(content);
+                    result.set_is_error(is_error.unwrap_or(false));
+                }
+                crate::providers::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                    encoded.set_thinking(encrypted_content);
+                }
+            }
+        }
+        StreamChunk::ThinkingDelta { .. }
+        | StreamChunk::ToolCallDelta { .. }
+        | StreamChunk::ToolCallComplete { .. } => return Ok(EncodedChunk::NotHandled),
+    }
+    Ok(EncodedChunk::Encoded)
+}
+
 /// The real work behind `BrainRpcService::claude_cli_round`, running on its
 /// own `spawn_local` task so a disconnecting caller can never cut this
 /// short — see that method's own doc comment for why. `receiver` is a
@@ -1772,16 +1881,29 @@ async fn drive_claude_cli_round(
     messages: Vec<crate::providers::Message>,
     tools: Vec<crate::tools::ToolDefinition>,
     receiver: finch_ipc::finch_ipc_capnp::stream_receiver::Client,
+    model: Option<String>,
 ) -> Result<(), capnp::Error> {
-    // Brain existence/visibility check, matching every other per-Brain
-    // BrainService method (`pendingEffectDelivery`, `inspectRun`, ...): a
-    // session is never created for a Brain name nothing has
-    // snapshot-visible state for.
+    // Brain visibility check, matching every other per-Brain BrainService
+    // method (`pendingEffectDelivery`, `inspectRun`, ...). This does *not*
+    // reject a nonexistent/archived Brain the way the comment here once
+    // claimed: `BrainStore::snapshot` -> `ensure_loaded` silently creates a
+    // fresh, empty Brain on first reference for *any* per-Brain
+    // BrainService method (the same resurrection behavior already tracked
+    // for schedules, issue #383) — this call site inherits that, it does
+    // not introduce it. A `claudeCliRound` for an archived or typo'd Brain
+    // name therefore still spawns a real `claude` child, which nothing
+    // currently tears back down (`ClaudeCliSessionRegistry::remove` is only
+    // called from the real archive path, which this resurrected Brain never
+    // goes through again). Tracked as a known gap, not fixed here: fixing
+    // it for this one call site without also fixing every other per-Brain
+    // BrainService method's identical `snapshot`-based existence check
+    // would make this method inconsistent with its siblings for no real
+    // gain.
     lifecycle
         .snapshot(&brain)
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
 
-    let session = sessions.get_or_create(&brain, claude_cli_binary_path(), None);
+    let session = sessions.get_or_create(&brain, claude_cli_binary_path(), model);
     let provider = session.lock().await;
 
     use finch_providers::LlmProvider as _;
@@ -1829,82 +1951,9 @@ async fn drive_claude_cli_round(
     // racing a second `claude` process into existence.
 
     let mut receiver_alive = true;
-    macro_rules! try_send_chunk {
-        ($build:expr) => {
-            if receiver_alive {
-                let mut r = receiver.on_chunk_request();
-                $build(r.get().init_chunk());
-                if r.send().promise.await.is_err() {
-                    // The calling connection is gone. Stop trying to
-                    // deliver further chunks, but keep draining `rx` below
-                    // so this function's return — and therefore the
-                    // per-Brain lock's release — still lines up with the
-                    // round's real completion, not this cancellation.
-                    receiver_alive = false;
-                }
-            }
-        };
-    }
 
     while let Some(result) = rx.recv().await {
         match result {
-            Ok(StreamChunk::TextDelta(delta)) => {
-                try_send_chunk!(
-                    |mut chunk: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>| {
-                        chunk.set_text_delta(delta.as_str())
-                    }
-                );
-            }
-            Ok(StreamChunk::Usage {
-                input_tokens,
-                output_tokens,
-            }) => {
-                try_send_chunk!(
-                    |mut chunk: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>| {
-                        let mut upd = chunk.init_usage_update();
-                        upd.set_input_tokens(input_tokens);
-                        upd.set_output_tokens(output_tokens);
-                    }
-                );
-            }
-            Ok(StreamChunk::ResponseMetadata { model }) => {
-                if crate::generators::validate_response_model(&model).is_err() {
-                    // Fail the whole round: unlike a dead connection, a
-                    // provider-reported model that fails validation is a
-                    // real data problem the caller must see as an error,
-                    // not a chunk it silently never received.
-                    return Err(capnp::Error::failed(
-                        "IPC response model metadata was invalid".into(),
-                    ));
-                }
-                try_send_chunk!(
-                    |mut chunk: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>| {
-                        chunk.init_response_metadata().set_model(model.as_str())
-                    }
-                );
-            }
-            Ok(StreamChunk::Allowance {
-                primary_used_percent,
-                secondary_used_percent,
-            }) => {
-                try_send_chunk!(
-                    |mut chunk: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>| {
-                        let mut allowance = chunk.init_allowance_update();
-                        allowance.set_has_primary(primary_used_percent.is_some());
-                        allowance
-                            .set_primary_used_percent(primary_used_percent.unwrap_or_default());
-                        allowance.set_has_secondary(secondary_used_percent.is_some());
-                        allowance
-                            .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
-                    }
-                );
-            }
-            Ok(StreamChunk::ThinkingDelta { .. }) | Ok(StreamChunk::ToolCallDelta { .. }) => {
-                // Not emitted by ClaudeCliProvider today (see its module
-                // doc comment). IPC projection for other providers' native
-                // streaming deltas is #776/#777, unrelated to this method.
-                continue;
-            }
             Ok(StreamChunk::ToolCallComplete {
                 id,
                 name,
@@ -1942,45 +1991,33 @@ async fn drive_claude_cli_round(
                 }
                 return Ok(());
             }
-            Ok(StreamChunk::ContentBlockComplete(block)) => {
-                try_send_chunk!(
-                    |mut chunk: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>| {
-                        let mut encoded = chunk.init_content_block_complete();
-                        match block.clone() {
-                            crate::providers::ContentBlock::Text { text } => {
-                                encoded.set_text(&text)
+            Ok(chunk) => {
+                // Every remaining `Ok` chunk kind — TextDelta, Usage,
+                // ResponseMetadata, Allowance, ContentBlockComplete,
+                // ThinkingDelta/ToolCallDelta (not emitted by
+                // ClaudeCliProvider today; see its module doc comment) —
+                // shares one encoder with `query_stream` (issue #1354's
+                // independent review: the two had already started to
+                // diverge). A `NotHandled` chunk is simply skipped, never
+                // sent and never counted against `receiver_alive`.
+                if receiver_alive {
+                    let mut r = receiver.on_chunk_request();
+                    match encode_common_stream_chunk(&chunk, r.get().init_chunk())? {
+                        EncodedChunk::Encoded => {
+                            if r.send().promise.await.is_err() {
+                                // The calling connection is gone. Stop
+                                // trying to deliver further chunks, but
+                                // keep draining `rx` below so this
+                                // function's return — and therefore the
+                                // per-Brain lock's release — still lines up
+                                // with the round's real completion, not
+                                // this cancellation.
+                                receiver_alive = false;
                             }
-                            crate::providers::ContentBlock::Image { source } => {
-                                let mut image = encoded.init_image();
-                                image.set_source_type(&source.source_type);
-                                image.set_media_type(&source.media_type);
-                                image.set_data(&source.data);
-                            }
-                            crate::providers::ContentBlock::ToolUse { id, name, input } => {
-                                let mut tool = encoded.init_tool_use();
-                                tool.set_id(&id);
-                                tool.set_name(&name);
-                                let _ = crate::ipc::encode_json_value(
-                                    tool.reborrow().init_input(),
-                                    &input,
-                                );
-                            }
-                            crate::providers::ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                let mut result = encoded.init_tool_result();
-                                result.set_tool_use_id(&tool_use_id);
-                                result.set_content(&content);
-                                result.set_is_error(is_error.unwrap_or(false));
-                            }
-                            crate::providers::ContentBlock::OpaqueReasoning {
-                                encrypted_content,
-                            } => encoded.set_thinking(&encrypted_content),
                         }
+                        EncodedChunk::NotHandled => {}
                     }
-                );
+                }
             }
             Err(e) => {
                 if receiver_alive {
@@ -2228,99 +2265,23 @@ impl finch_daemon::Server for FinchDaemonImpl {
                     .await
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-                use crate::generators::StreamChunk;
+                // Shares its chunk encoding with `drive_claude_cli_round`
+                // (issue #1354's independent review: the two had already
+                // started to diverge). This surface never emits a
+                // `ToolCallComplete`/`ThinkingDelta`/`ToolCallDelta` chunk
+                // today (native-tool-call IPC projection is #776/#777,
+                // unrelated to this method), so every `NotHandled` chunk is
+                // simply skipped, matching the pre-refactor `continue`.
                 while let Some(result) = rx.recv().await {
                     match result {
-                        Ok(StreamChunk::TextDelta(delta)) => {
+                        Ok(chunk) => {
                             let mut r = receiver.on_chunk_request();
-                            r.get().init_chunk().set_text_delta(delta.as_str());
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::Usage {
-                            input_tokens,
-                            output_tokens,
-                        }) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut upd = r.get().init_chunk().init_usage_update();
-                            upd.set_input_tokens(input_tokens);
-                            upd.set_output_tokens(output_tokens);
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::ResponseMetadata { model }) => {
-                            crate::generators::validate_response_model(&model).map_err(|_| {
-                                capnp::Error::failed(
-                                    "IPC response model metadata was invalid".into(),
-                                )
-                            })?;
-                            let mut r = receiver.on_chunk_request();
-                            r.get()
-                                .init_chunk()
-                                .init_response_metadata()
-                                .set_model(model.as_str());
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::Allowance {
-                            primary_used_percent,
-                            secondary_used_percent,
-                        }) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut allowance = r.get().init_chunk().init_allowance_update();
-                            allowance.set_has_primary(primary_used_percent.is_some());
-                            allowance
-                                .set_primary_used_percent(primary_used_percent.unwrap_or_default());
-                            allowance.set_has_secondary(secondary_used_percent.is_some());
-                            allowance.set_secondary_used_percent(
-                                secondary_used_percent.unwrap_or_default(),
-                            );
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::ThinkingDelta { .. })
-                        | Ok(StreamChunk::ToolCallDelta { .. })
-                        | Ok(StreamChunk::ToolCallComplete { .. }) => {
-                            // Adapters do not emit these yet. IPC projection is #776/#777;
-                            // this schema is unchanged.
-                            continue;
-                        }
-                        Ok(StreamChunk::ContentBlockComplete(block)) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut encoded = r.get().init_chunk().init_content_block_complete();
-                            match block {
-                                crate::providers::ContentBlock::Text { text } => {
-                                    encoded.set_text(&text)
+                            match encode_common_stream_chunk(&chunk, r.get().init_chunk())? {
+                                EncodedChunk::Encoded => {
+                                    r.send().promise.await?;
                                 }
-                                crate::providers::ContentBlock::Image { source } => {
-                                    let mut image = encoded.init_image();
-                                    image.set_source_type(&source.source_type);
-                                    image.set_media_type(&source.media_type);
-                                    image.set_data(&source.data);
-                                }
-                                crate::providers::ContentBlock::ToolUse { id, name, input } => {
-                                    let mut tool = encoded.init_tool_use();
-                                    tool.set_id(&id);
-                                    tool.set_name(&name);
-                                    crate::ipc::encode_json_value(
-                                        tool.reborrow().init_input(),
-                                        &input,
-                                    )
-                                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                                }
-                                crate::providers::ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } => {
-                                    let mut result = encoded.init_tool_result();
-                                    result.set_tool_use_id(&tool_use_id);
-                                    result.set_content(&content);
-                                    result.set_is_error(is_error.unwrap_or(false));
-                                }
-                                crate::providers::ContentBlock::OpaqueReasoning {
-                                    encrypted_content,
-                                } => {
-                                    encoded.set_thinking(&encrypted_content);
-                                }
+                                EncodedChunk::NotHandled => continue,
                             }
-                            r.send().promise.await?;
                         }
                         Err(e) => {
                             let mut r = receiver.on_chunk_request();

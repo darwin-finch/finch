@@ -403,6 +403,7 @@ async fn claude_cli_round_fails_closed_on_a_mismatched_reattach_scenario() -> Re
             &brain,
             vec![user_message("please use the tool")],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
 
@@ -436,6 +437,7 @@ async fn claude_cli_round_fails_closed_on_a_mismatched_reattach_scenario() -> Re
                 tool_result_message("some-other-id-entirely", "wrong answer"),
             ],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
     let error = match mismatched.recv().await {
@@ -470,6 +472,7 @@ async fn claude_cli_round_fails_closed_on_a_mismatched_reattach_scenario() -> Re
                 tool_result_message(&call_id, "real tool output"),
             ],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
 
@@ -529,6 +532,7 @@ async fn frontend_disconnect_mid_pending_tool_call_does_not_lose_the_session_sce
             &brain,
             vec![user_message("please use the tool")],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
     let bridge_stream = simulate_bridge_tool_call(
@@ -552,10 +556,13 @@ async fn frontend_disconnect_mid_pending_tool_call_does_not_lose_the_session_sce
     // disconnect too.
     drop(rx);
     drop(client_a);
-    // Give the disconnect a moment to actually propagate through the real
-    // Unix socket before continuing — this is a liveness allowance for the
-    // OS/runtime to notice the close, not a correctness assumption.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // No wait needed here, deterministically: by the time `rx.recv()`
+    // above returned the `ToolCallComplete`, `drive_claude_cli_round`
+    // (src/server/ipc.rs) had already sent that chunk and `return`ed,
+    // releasing the per-Brain lock — the round-1 RPC call is already fully
+    // complete server-side. Dropping `client_a` afterward has nothing left
+    // to race: there is no daemon-side state that still needs to "notice"
+    // this disconnect before client B's round below can proceed correctly.
 
     // A fresh frontend connects and answers the still-pending call. If the
     // daemon had lost the session on disconnect, this would either hang (no
@@ -570,6 +577,7 @@ async fn frontend_disconnect_mid_pending_tool_call_does_not_lose_the_session_sce
                 tool_result_message(&call_id, "real tool output"),
             ],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
 
@@ -641,6 +649,7 @@ async fn daemon_restart_kills_the_live_claude_child_with_no_orphan_scenario() ->
             &brain,
             vec![user_message("please use the tool")],
             vec![read_tool_definition()],
+            None,
         )
         .await?;
     let _bridge_stream = simulate_bridge_tool_call(
