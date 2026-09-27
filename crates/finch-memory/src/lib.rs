@@ -5,6 +5,7 @@
 //! program-index composition through [`MemorySystem::index_program_record`]. Rustdoc renders
 //! the method signatures without a generated interface catalog.
 
+mod confidence;
 mod embeddings;
 mod memory_status;
 mod program_registry;
@@ -26,6 +27,7 @@ pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 pub type NodeId = u64;
 pub use quality::{MemoryClassifier, MemoryImportance};
 
+use confidence::{retrieval_margin, P2Quantile};
 use finch_routing_tree::{save_point, write_dirty_nodes_within};
 use routing_memory::{LinkNextError, Occurrence, PointId, RoutingMemTree};
 
@@ -310,6 +312,40 @@ pub struct MemoryConfig {
     /// with the turn floor, the best score, and the candidate count, so the
     /// decision is visible in the trace.
     pub min_turn_relevance_score: Option<f32>,
+    /// Confidence-based retrieval abstention (#1324): when `Some`, an
+    /// additional, independent gate layered on top of `min_relevance_score`
+    /// and `min_turn_relevance_score` above -- it does not replace either
+    /// and does not change retrieval ordering. `None` (the default) ships
+    /// the gate off; existing recall behavior is unchanged until it is set.
+    ///
+    /// The confidence signal is the margin between the best and
+    /// second-best retrieved candidate's score (the simplest signal tested
+    /// in the validated research behind this gate). The threshold a
+    /// margin must clear is not fixed: it is a running, streaming-estimated
+    /// percentile of the margin (the P² algorithm, `confidence.rs`),
+    /// re-estimated online from every turn's own margin rather than
+    /// hand-picked once. Below the tracked percentile, the turn is treated
+    /// like the existing turn-level gate treats a sub-floor best score:
+    /// `query_with_sources` returns an empty set rather than surfacing a
+    /// low-confidence guess.
+    ///
+    /// The tracked percentile is `1.0 - answer_fraction`
+    /// (`ConfidenceAbstentionConfig::answer_fraction`), so "answer only the
+    /// top 10% most confident queries" is `answer_fraction: 0.10` tracking
+    /// the 90th percentile of the margin. That 10% figure is a single
+    /// measurement on one corpus in the validated research, not a
+    /// property of the mechanism -- it is deliberately a tunable field
+    /// here, not a hardcoded constant, and the mechanism is useful
+    /// (a real improvement over a fixed threshold) even before any
+    /// feedback-loop calibration of the fraction-to-accuracy mapping
+    /// exists (out of scope for this gate; see #1324's own tracking of
+    /// that as a separate concern).
+    ///
+    /// The tracker starts with no data and stays inactive (never abstains)
+    /// until it has seen five margins, the same "too few samples to be
+    /// meaningful" guard #1323's own streaming-stats gate uses for a
+    /// different statistic.
+    pub confidence_abstention: Option<ConfidenceAbstentionConfig>,
     /// Maximum number of memories the committed (Brain-persisted, byte-
     /// stable) recall set may hold at once. A newly-qualifying memory
     /// above this cap must out-score the current lowest-scoring committed
@@ -335,10 +371,24 @@ impl Default for MemoryConfig {
             embedding_cache_dir: home.join(".finch").join("embeddings"),
             min_relevance_score: 0.15,
             min_turn_relevance_score: None,
+            confidence_abstention: None,
             max_committed_memories: 8,
             stale_after_turns: 20,
         }
     }
+}
+
+/// Configuration for the confidence-based retrieval abstention gate (#1324).
+/// See `MemoryConfig::confidence_abstention` for the mechanism and how this
+/// is wired into `query_with_sources`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfidenceAbstentionConfig {
+    /// Fraction of queries to answer, in `(0.0, 1.0]` -- e.g. `0.10`
+    /// answers only the top 10% most-confident queries by retrieval margin.
+    /// This is the one genuine product decision (accuracy vs. coverage) the
+    /// mechanism itself does not make; there is deliberately no default
+    /// baked in from any single measurement.
+    pub answer_fraction: f64,
 }
 
 /// The turn-level injection decision for one recall turn (#1134).
@@ -627,6 +677,14 @@ pub struct MemorySystem {
     insert_lock: Arc<Mutex<()>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
+    /// Streaming P² percentile tracker backing the confidence-based
+    /// retrieval abstention gate (#1324, `confidence.rs`). `None` inside
+    /// the mutex until the first turn that both enables
+    /// `MemoryConfig::confidence_abstention` and has a defined margin
+    /// lazily creates it, targeting `1.0 - answer_fraction`. Plain
+    /// (non-`Arc`) because nothing outside `query_with_sources` needs to
+    /// share it -- unlike `db`/`tree`, no background task touches this.
+    confidence_tracker: Mutex<Option<P2Quantile>>,
     hydration: Arc<HydrationState>,
     /// Whether a pending-projection sweep is still owed.
     ///
@@ -1309,6 +1367,7 @@ impl MemorySystem {
             insert_lock,
             embedding_engine,
             config,
+            confidence_tracker: Mutex::new(None),
         })
     }
 
@@ -1890,6 +1949,41 @@ impl MemorySystem {
             tree.retrieve(&conn, &query_embedding, k)?
         };
         let min_score = self.config.min_relevance_score;
+        let retrieved_scores: Vec<f32> = retrieved.iter().map(|(_, _, score)| *score).collect();
+
+        // Confidence-based retrieval abstention (#1324): an independent,
+        // additional gate layered on top of the turn/per-result floors
+        // below -- see `MemoryConfig::confidence_abstention`. Runs first, on
+        // its own signal (the margin between the best and second-best
+        // candidate), so a disabled gate (`None`, the default) is a total
+        // no-op and every existing floor below behaves exactly as before.
+        if let Some(abstention) = &self.config.confidence_abstention {
+            if let Some(margin) = retrieval_margin(&retrieved_scores) {
+                let mut guard = self.confidence_tracker.lock().await;
+                let tracker =
+                    guard.get_or_insert_with(|| P2Quantile::new(1.0 - abstention.answer_fraction));
+                // Decide from the threshold as it stood BEFORE this turn's
+                // margin is folded in -- an online decision must not use a
+                // percentile the current observation itself moved.
+                let threshold = tracker.value();
+                tracker.observe(margin as f64);
+                drop(guard);
+                if let Some(threshold) = threshold {
+                    if (margin as f64) < threshold {
+                        tracing::info!(
+                            margin,
+                            threshold,
+                            answer_fraction = abstention.answer_fraction,
+                            candidates = retrieved.len(),
+                            "memory confidence-abstention gate skipped recall: \
+                             retrieval margin below the tracked percentile \
+                             threshold, injecting nothing this turn"
+                        );
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
 
         // The turn-level gate (#1134): decide whether anything at all is
         // injected this turn BEFORE the per-result floor is applied. The
@@ -1898,7 +1992,6 @@ impl MemorySystem {
         // cannot answer "does this turn need memory context at all" -- a
         // query needing no memory context received k weak-but-qualifying
         // matches injected every turn.
-        let retrieved_scores: Vec<f32> = retrieved.iter().map(|(_, _, score)| *score).collect();
         let decision =
             turn_injection_decision(self.config.min_turn_relevance_score, &retrieved_scores);
         if let Some(turn_floor) = decision.turn_floor {
@@ -6632,6 +6725,266 @@ mod tests {
              (count {count_off}) and inject nothing with the knob at {} \
              (count {count_on})",
             best_off + 0.02
+        );
+        Ok(())
+    }
+
+    // --- confidence-based retrieval abstention gate (#1324) ---
+
+    #[test]
+    fn test_confidence_gate_off_by_default() {
+        assert!(
+            MemoryConfig::default().confidence_abstention.is_none(),
+            "the confidence-abstention gate must ship disabled: \
+             MemoryConfig::default() carries confidence_abstention = None so \
+             existing recall behavior is unchanged until it is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confidence_gate_inactive_before_five_observations() -> Result<()> {
+        // A brand-new tracker (the common case: the very first turns of a
+        // fresh store) has seen no margins yet, so it must never abstain --
+        // the same "too few samples to be meaningful" guard #1323's own
+        // gate uses for its own statistic. This exercises the real
+        // `query_with_sources` path, not just `P2Quantile::value()`
+        // directly: the first turn against a freshly enabled gate must
+        // behave exactly like the gate being off.
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            confidence_abstention: Some(ConfidenceAbstentionConfig {
+                answer_fraction: 0.1,
+            }),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        memory
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        let results = memory.query_with_sources(GATE_PROBE, Some(5)).await?;
+        assert!(
+            !results.is_empty(),
+            "the first query against a freshly enabled, still-uninitialized \
+             confidence tracker must not abstain; got {results:?}"
+        );
+        Ok(())
+    }
+
+    /// Measures the real margin between [`GATE_SEED`] and [`GATE_WEAK_MEMORY`]
+    /// when querying with [`GATE_SEED`] itself, with the confidence gate
+    /// off. Queries with `GATE_SEED` rather than `GATE_PROBE` because the
+    /// existing turn-gate tests above already establish that BOTH memories
+    /// clear the 0.15 per-result floor for that exact query (`weak_score >=
+    /// 0.15` in `test_turn_gate_allows_strong_results_and_keeps_per_result_floor`)
+    /// -- `GATE_PROBE` is tuned for self-similarity against `GATE_SEED`
+    /// alone and does not reliably keep `GATE_WEAK_MEMORY` above the floor,
+    /// which would leave only one candidate and no defined margin.
+    async fn measured_gate_seed_margin() -> Result<(f32, Vec<MemorySearchResult>)> {
+        let baseline_store = NamedTempFile::new()?;
+        let baseline = MemorySystem::new(MemoryConfig {
+            db_path: baseline_store.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        baseline
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        baseline
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        let base_results = baseline.query_with_sources(GATE_SEED, Some(5)).await?;
+        assert!(
+            base_results.len() >= 2,
+            "need at least two candidates for a defined margin; got \
+             {base_results:?}"
+        );
+        assert!(
+            base_results[0].score >= base_results[1].score,
+            "query_with_sources must preserve `retrieve`'s descending score \
+             order; got {base_results:?}"
+        );
+        let margin = base_results[0].score - base_results[1].score;
+        Ok((margin, base_results))
+    }
+
+    #[tokio::test]
+    async fn test_confidence_gate_abstains_below_and_allows_above_a_measured_margin() -> Result<()>
+    {
+        let (margin, base_results) = measured_gate_seed_margin().await?;
+
+        // A tracker fixed just ABOVE the measured margin must abstain: this
+        // turn's confidence is real but below the (fixed, for determinism)
+        // tracked cutoff.
+        let strict_store = NamedTempFile::new()?;
+        let strict = MemorySystem::new(MemoryConfig {
+            db_path: strict_store.path().to_path_buf(),
+            confidence_abstention: Some(ConfidenceAbstentionConfig {
+                answer_fraction: 0.1,
+            }),
+            ..Default::default()
+        })?;
+        strict
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        strict
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        *strict.confidence_tracker.lock().await =
+            Some(P2Quantile::fixed_for_test((margin + 0.05) as f64));
+        let strict_results = strict.query_with_sources(GATE_SEED, Some(5)).await?;
+        assert_eq!(
+            strict_results.len(),
+            0,
+            "the confidence gate must abstain when its tracked threshold \
+             ({}) sits above the real measured margin ({margin}); got \
+             {strict_results:?}",
+            margin + 0.05
+        );
+
+        // The identical store setup, tracker fixed just BELOW the measured
+        // margin, must allow the turn through -- and unaffected otherwise:
+        // same results as the gate-off baseline.
+        let lenient_store = NamedTempFile::new()?;
+        let lenient = MemorySystem::new(MemoryConfig {
+            db_path: lenient_store.path().to_path_buf(),
+            confidence_abstention: Some(ConfidenceAbstentionConfig {
+                answer_fraction: 0.1,
+            }),
+            ..Default::default()
+        })?;
+        lenient
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        lenient
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        *lenient.confidence_tracker.lock().await =
+            Some(P2Quantile::fixed_for_test((margin - 0.05).max(0.0) as f64));
+        let lenient_results = lenient.query_with_sources(GATE_SEED, Some(5)).await?;
+        assert_eq!(
+            lenient_results.len(),
+            base_results.len(),
+            "the confidence gate must allow this turn when its tracked \
+             threshold sits below the measured margin ({margin}), matching \
+             the gate-off baseline; got {lenient_results:?} vs baseline \
+             {base_results:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_confidence_gate_does_not_disturb_existing_turn_and_per_result_floors(
+    ) -> Result<()> {
+        // Reruns the existing turn/per-result floor scenario
+        // (`test_turn_gate_allows_strong_results_and_keeps_per_result_floor`)
+        // with the confidence-abstention gate ALSO configured -- leniently,
+        // so it never itself triggers -- to prove the two are additive, not
+        // interfering: #1324 is scoped as strictly additive on top of
+        // #1134's existing turn/per-result floors, which must continue to
+        // work completely unchanged.
+        let baseline_store = NamedTempFile::new()?;
+        let baseline = MemorySystem::new(MemoryConfig {
+            db_path: baseline_store.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        baseline
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        baseline
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        let base_results = baseline.query_with_sources(GATE_SEED, Some(5)).await?;
+        let weak_score = base_results
+            .iter()
+            .find(|r| r.text.contains("staging"))
+            .map(|r| r.score)
+            .context("the weak memory must recall in the baseline to measure its score")?;
+
+        let gated_store = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: gated_store.path().to_path_buf(),
+            min_relevance_score: weak_score + 0.02,
+            min_turn_relevance_score: Some(0.5),
+            confidence_abstention: Some(ConfidenceAbstentionConfig {
+                answer_fraction: 0.99,
+            }),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        memory
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        // Margin is always >= 0 (best - second-best, best sorted first), so
+        // a threshold fixed below zero can never itself cause an abstention
+        // -- isolating this test to the pre-existing turn/per-result gates.
+        *memory.confidence_tracker.lock().await = Some(P2Quantile::fixed_for_test(-1.0));
+
+        let results = memory.query_with_sources(GATE_SEED, Some(5)).await?;
+        assert!(
+            !results.is_empty(),
+            "the pre-existing turn floor must still allow this turn with \
+             the confidence gate also configured (leniently); got \
+             {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| !r.text.contains("staging")),
+            "the pre-existing per-result floor must still drop the weak \
+             entry with the confidence gate also configured; got {:?}",
+            results.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        assert!(
+            results.iter().all(|r| r.score >= weak_score + 0.02),
+            "every allowed injection must still clear the configured \
+             per-result floor with the confidence gate also configured; \
+             got {:?}",
+            results
+                .iter()
+                .map(|r| (&r.text, r.score))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_confidence_gate_updates_its_tracker_across_turns() -> Result<()> {
+        // The gate is meant to adapt online: once enabled, every turn with a
+        // defined margin folds into the tracker, not just the turn being
+        // decided. After five real turns the tracker must report SOME
+        // estimate (no longer `None`) -- proof the gate is actually being
+        // fed by `query_with_sources`, not merely wired to a config field.
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            confidence_abstention: Some(ConfidenceAbstentionConfig {
+                answer_fraction: 0.5,
+            }),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation("user", GATE_SEED, None, None)
+            .await?;
+        memory
+            .insert_conversation("user", GATE_WEAK_MEMORY, None, None)
+            .await?;
+        for _ in 0..5 {
+            memory.query_with_sources(GATE_PROBE, Some(5)).await?;
+        }
+        let estimate = memory
+            .confidence_tracker
+            .lock()
+            .await
+            .as_ref()
+            .and_then(P2Quantile::value);
+        assert!(
+            estimate.is_some(),
+            "after five turns with a defined margin, the tracker must have \
+             an estimate -- it starts uninitialized and only five real \
+             `query_with_sources` calls fed it, so `None` here means the \
+             gate is not actually observing production turns"
         );
         Ok(())
     }

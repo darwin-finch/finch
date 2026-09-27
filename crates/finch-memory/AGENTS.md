@@ -106,6 +106,50 @@ modules, including `memory_status`, are private.
   `info` with the floor, the best score, and the candidate count. The
   per-result `min_relevance_score` floor still applies whenever injection
   happens; the gate does not change retrieval ordering.
+- Confidence-based retrieval abstention (#1324, `src/confidence.rs`) is a third, independent gate
+  in `query_with_sources`, additive on top of the two above -- `min_relevance_score` and
+  `min_turn_relevance_score` continue to work completely unchanged when `confidence_abstention` is
+  `None` (the default) or configured, both individually and together;
+  `test_confidence_gate_does_not_disturb_existing_turn_and_per_result_floors` (`lib.rs`) reruns the
+  existing turn/per-result floor scenario with this gate also configured (leniently) to prove that.
+  The confidence signal is the margin between the best and second-best retrieved candidate's score
+  (`retrieval_margin`, `confidence.rs`) -- the simplest signal tested in the validated research
+  behind this gate, deliberately not the more elaborate alternatives that research also tried.
+  The margin a turn must clear is not a fixed constant: `MemorySystem` tracks a running,
+  streaming-estimated percentile of every turn's own margin via the P² algorithm (Jain & Chlamtac
+  1985; `P2Quantile`, `confidence.rs`), an O(1)-memory approximate quantile estimator that stores
+  no observation history (five markers only). `MemoryConfig::confidence_abstention` is
+  `Option<ConfidenceAbstentionConfig { answer_fraction: f64 }>`; the tracked percentile is
+  `1.0 - answer_fraction`, so "answer only the top 10% most confident queries" (the one number
+  the validated research actually measured, on one corpus) is `answer_fraction: 0.10`. That
+  fraction is a genuine, deliberately NOT-hardcoded product decision (accuracy vs. coverage) --
+  it is a configuration field, never a baked-in constant. Below the tracked percentile,
+  `query_with_sources` returns an empty set for the turn (mirroring how the turn-level gate above
+  handles a sub-floor best score) and logs the skip at `info` with the margin, the threshold, the
+  configured `answer_fraction`, and the candidate count.
+  The tracker (`MemorySystem::confidence_tracker`, a lazily-created `Mutex<Option<P2Quantile>>`)
+  stays inactive -- `query_with_sources` never abstains -- until it has observed five real turn
+  margins, the same "too few samples to be meaningful" minimum-sample-count shape #1323's own
+  streaming-stats gate uses for a different statistic; `test_confidence_gate_inactive_before_five_observations`
+  covers this at the production boundary and `test_p2_quantile_returns_none_before_five_observations`
+  covers `P2Quantile::value()` directly. The decision for a turn is made from the threshold as it
+  stood BEFORE that turn's own margin is folded in, then the margin is observed -- an online
+  decision must never be made from a percentile estimate the very observation being judged already
+  moved. `test_confidence_gate_abstains_below_and_allows_above_a_measured_margin` exercises real
+  abstain/allow outcomes through `query_with_sources` at a threshold fixed via the `cfg(test)`-only
+  `P2Quantile::fixed_for_test` seam (same crate, so no `test-support` feature is needed);
+  `test_confidence_gate_updates_its_tracker_across_turns` confirms production turns actually feed
+  the tracker. `retrieval_margin` itself (`test_retrieval_margin_*`, `confidence.rs`) and
+  `P2Quantile`'s convergence to a known percentile on a synthetic uniform stream
+  (`test_p2_quantile_converges_to_*`, seeded deterministic xorshift PRNG, no `rand` dependency) are
+  tested independently of `MemorySystem`. #1323 investigated a Welford-based streaming-stats
+  primitive for a different purpose (a pre-indexing degenerate-content quality gate) and both
+  tickets asked whether the two should share a module; as of this change #1323 has not landed
+  anything in this crate, so `P2Quantile` stays self-contained in `confidence.rs` rather than
+  inventing a speculative shared abstraction -- revisit if #1323 lands a real shared home first.
+  Wiring real per-turn correctness feedback into `FeedbackLogger` so the percentile-to-accuracy
+  mapping can calibrate itself over time is a separate, non-blocking concern #1324 explicitly
+  scoped out; this gate is a real improvement over a fixed threshold even uncalibrated.
 - Retrieval may proceed while the tree hydrates, but every caller must report the coverage of
   the index it actually read. Sample hydration before and after a read and use `observed`; never
   upgrade a partial read to `Ready` because hydration completed afterward.
