@@ -55,6 +55,23 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
   this exact class of problem was not replicated here.
 - No test-support feature exists: no cross-crate test seam is needed — nothing pauses the tree.
   All tests are plain `#[cfg(test)]` within this crate.
+- `RoutingConfig::default()`'s `dual_insert_threshold` is `0.10`, not `0.0` (issue #1322, corrected
+  2026-09-26): the field's own doc comment already called this "the single largest accuracy lever
+  measured" in the D reference port, but the crate shipped it disabled. A dispatched investigation
+  measured `descend_adaptive_top_k` against brute-force cosine on Finch's actual
+  `HashedNgramEmbedding` (dim=2048) embeddings and found real, monotonic accuracy loss with corpus
+  size at `0.0` (top-10 overlap 91.5%→51.5%, N=500→100,000) that `0.10` substantially mitigates
+  (97.2%→76.7% over the same range) — a real, measured, no-new-dependency win at every tested size,
+  though the same degrade-with-N trend still shows through at the corrected value, just shifted
+  later (mitigation, not a fix for the underlying navigation-accuracy question tracked by #1322's
+  larger brute-force/HNSW fork decision). Independently re-measured on this worktree's own code
+  with a smaller synthetic topic-structured corpus (30 held-out queries against `HashedNgramEmbedding`
+  embeddings, N up to 8,000): top-10 overlap improved from 0.820→0.887 at N=500 to 0.270→0.473 at
+  N=8,000 (`0.0`→`0.10`), the same direction and, at this corpus's higher-N end, an even larger
+  relative gain — confirms the fix on real code, not just the cited investigation's own numbers.
+  The known cost (leaf-membership fans out ~2.43x at `threshold=0.10` per the field's own doc
+  comment) is real; re-calibrate if a specific deployment's storage/query-cost budget can't absorb
+  it.
 
 ## Focused proof
 

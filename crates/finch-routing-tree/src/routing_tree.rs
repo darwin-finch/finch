@@ -63,8 +63,13 @@ pub struct RoutingConfig {
     /// relative at threshold=0.10) — but a real, substantial cost: the canonical embedding is
     /// stored exactly once per point regardless of dual-insert count, but leaf-membership fans out
     /// (2.43x more membership rows at threshold=0.10 on that repo's corpus). `0.0` disables
-    /// dual-insert entirely. Calibrate against a real storage/query-cost budget, don't default this
-    /// on blindly.
+    /// dual-insert entirely. Default is `0.10` (issue #1322, comment measuring Finch's own
+    /// `HashedNgramEmbedding` embeddings against brute-force top-10 overlap): at `0.0` accuracy
+    /// degrades from 91.5% at N=500 to 51.5% at N=100,000; at `0.10` it holds 97.2%→76.7% over the
+    /// same range — a real, measured, no-new-dependency win at every corpus size tested, though
+    /// still degrading with N (a mitigation, not a fix for the underlying navigation-accuracy
+    /// question). The 2.43x leaf-membership fan-out cost above is real; re-calibrate this value if
+    /// a specific deployment's storage/query-cost budget can't absorb it.
     pub dual_insert_threshold: f64,
     /// Before committing a split, independently fit PC1 on two random halves of the same bucket and
     /// require they agree beyond the real, derivable chance baseline for random unit vectors in
@@ -83,7 +88,7 @@ impl Default for RoutingConfig {
             max_split_candidates: 3,
             candidate_switch_margin: 0.05,
             spherical_mode: true,
-            dual_insert_threshold: 0.0,
+            dual_insert_threshold: 0.10,
             stability_gated_splitting: true,
         }
     }
