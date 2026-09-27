@@ -19,7 +19,7 @@ use crate::models::{ToolCallParser, ToolPromptFormatter};
 use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -182,12 +182,19 @@ impl LocalGenerator {
 
                 let (text, tool_uses, content_blocks, stop_reason) =
                     if ToolCallParser::has_tool_calls(&generated.text) {
-                        let parsed = ToolCallParser::parse(&generated.text).with_context(|| {
-                            format!(
-                                "failed to parse local tool-call markup from model output: {}",
-                                generated.text
-                            )
-                        })?;
+                        // Each <tool_use> block is parsed independently
+                        // (#1307): one malformed block is logged and
+                        // dropped rather than discarding every well-formed
+                        // tool call the same response also proposed.
+                        let outcome = ToolCallParser::parse(&generated.text);
+                        for malformed in &outcome.errors {
+                            tracing::warn!(
+                                error = %malformed.message,
+                                raw_block = %malformed.raw_block,
+                                "dropping malformed local tool-call block"
+                            );
+                        }
+                        let parsed = outcome.tool_uses;
                         let text = ToolCallParser::extract_text(&generated.text);
                         let mut content_blocks = Vec::new();
                         if !text.is_empty() {
