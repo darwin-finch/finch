@@ -672,12 +672,10 @@ pub fn compile_forth_with_functions(
         );
     }
 
-    let mut functions = linked_functions.clone();
-    let mut local_vocabulary = vocabulary.clone();
     let mut definition_names = BTreeSet::new();
     for definition in &definitions {
         if vocabulary.contains_key(definition.name)
-            || functions.contains_key(definition.name)
+            || linked_functions.contains_key(definition.name)
             || definition.name == "main"
             || !definition_names.insert(definition.name.to_owned())
         {
@@ -687,75 +685,133 @@ pub fn compile_forth_with_functions(
                 origin(source_id, source, definition.start, definition.end),
             )]);
         }
-        // A declared-pure signature is complete authority information, so it
-        // can safely be made visible before compiling bodies. This supports
-        // pure mutually-recursive words without an untyped forward reference.
-        // `! infer` words intentionally remain sequential: their effects are
-        // learned from their body and must not be guessed for a sibling call.
-        if definition.declares_pure {
-            local_vocabulary.insert(definition.name.to_owned(), definition.signature.clone());
-        }
     }
-    for definition in definitions {
-        local_vocabulary.insert(definition.name.to_owned(), definition.signature.clone());
-        let compiled = lower_forth_ast_body_with_locals(
-            source_id,
-            source,
-            &definition.body,
-            definition.signature.input.values.clone(),
-            &local_vocabulary,
-            &functions,
-            &definition.locals,
-            &[],
-            Some(&definition.signature.output.values),
-        )?;
-        let verified = &compiled.functions[&compiled.module.entry];
-        let mut function = compiled.module.functions[&compiled.module.entry].clone();
-        for (nested_name, nested_function) in &compiled.module.functions {
-            if nested_name != &compiled.module.entry {
-                functions.insert(nested_name.clone(), nested_function.clone());
-                local_vocabulary.insert(nested_name.clone(), nested_function.signature.clone());
+
+    // Every definition's name is visible to every other definition's body
+    // before any body compiles, so self- and mutually-recursive calls are
+    // compiled against a real signature instead of an unknown-word error or
+    // a guess baked into `pending_functions`
+    // (`lower_forth_ast_body_with_locals`'s callee-has-a-body signal).
+    //
+    // A declared-pure signature is complete authority information and is
+    // fixed at `EffectSet::pure()` immediately; that already supported pure
+    // mutually-recursive words. A `! infer` signature's effects are not
+    // known until its body is compiled, and under mutual recursion one
+    // infer word's effects can depend on another's, so this reaches a
+    // fixpoint: compile every definition using the previous round's
+    // best-known effect guess for every forward/self reference (starting
+    // from pure), and repeat while any guess grows. `EffectSet` only grows
+    // by unioning a finite, fixed set of capability requirements reachable
+    // from this batch's source text, so this always terminates; propagating
+    // one newly-discovered capability around an N-definition call graph
+    // needs at most N rounds, plus one confirming round with no further
+    // growth, so `definitions.len() + 2` rounds is always enough headroom.
+    let mut effect_guess: BTreeMap<String, EffectSet> = definitions
+        .iter()
+        .filter(|definition| !definition.declares_pure)
+        .map(|definition| (definition.name.to_owned(), EffectSet::pure()))
+        .collect();
+    let max_rounds = definitions.len() + 2;
+    let mut settled: Option<(BTreeMap<String, Function>, Vocabulary)> = None;
+    for round in 0..max_rounds {
+        let mut functions = linked_functions.clone();
+        let mut local_vocabulary = vocabulary.clone();
+        for definition in &definitions {
+            let mut signature = definition.signature.clone();
+            if !definition.declares_pure {
+                signature.effects = effect_guess[definition.name].clone();
             }
+            local_vocabulary.insert(definition.name.to_owned(), signature);
         }
-        let actual_output = function.signature.output.values.clone();
-        if actual_output != definition.signature.output.values {
-            let mut diagnostic = control_error(
-                "E-FORTH-DEF-002",
-                format!(
-                    "word '{}' declares output {:?} but its body leaves {:?}",
-                    definition.name, definition.signature.output.values, actual_output
-                ),
-                origin(source_id, source, definition.start, definition.end),
-            );
-            diagnostic.expected_types = definition.signature.output.values;
-            diagnostic.found_types = actual_output;
-            return Err(vec![diagnostic]);
+        let mut converged = true;
+        for definition in &definitions {
+            let compiled = lower_forth_ast_body_with_locals(
+                source_id,
+                source,
+                &definition.body,
+                definition.signature.input.values.clone(),
+                &local_vocabulary,
+                &functions,
+                &definition.locals,
+                &[],
+                Some(&definition.signature.output.values),
+                &definition_names,
+            )?;
+            let verified = &compiled.functions[&compiled.module.entry];
+            let mut function = compiled.module.functions[&compiled.module.entry].clone();
+            for (nested_name, nested_function) in &compiled.module.functions {
+                if nested_name != &compiled.module.entry {
+                    functions.insert(nested_name.clone(), nested_function.clone());
+                    local_vocabulary.insert(nested_name.clone(), nested_function.signature.clone());
+                }
+            }
+            let actual_output = function.signature.output.values.clone();
+            if actual_output != definition.signature.output.values {
+                let mut diagnostic = control_error(
+                    "E-FORTH-DEF-002",
+                    format!(
+                        "word '{}' declares output {:?} but its body leaves {:?}",
+                        definition.name, definition.signature.output.values, actual_output
+                    ),
+                    origin(source_id, source, definition.start, definition.end),
+                );
+                diagnostic.expected_types = definition.signature.output.values.clone();
+                diagnostic.found_types = actual_output;
+                return Err(vec![diagnostic]);
+            }
+            if definition.declares_pure && !verified.inferred_effects.is_pure() {
+                let mut diagnostic = control_error(
+                    "E-CAP-001",
+                    format!(
+                        "word '{}' declares {{}} but requires {}",
+                        definition.name, verified.inferred_effects
+                    ),
+                    origin(source_id, source, definition.start, definition.end),
+                );
+                diagnostic.found_effects = verified.inferred_effects.clone();
+                return Err(vec![diagnostic]);
+            }
+            if !definition.declares_pure
+                && effect_guess[definition.name] != verified.inferred_effects
+            {
+                converged = false;
+                effect_guess.insert(
+                    definition.name.to_owned(),
+                    verified.inferred_effects.clone(),
+                );
+            }
+            function.name = definition.name.to_owned();
+            function.documentation = definition.documentation.map(str::to_owned);
+            function.signature = definition.signature.clone();
+            function.signature.effects = verified.inferred_effects.clone();
+            function.signature.suspension = verified.inferred_suspension.clone();
+            function.signature.control = if function.signature.suspension.is_some() {
+                ControlEffect::MaySuspend
+            } else {
+                ControlEffect::Returns
+            };
+            local_vocabulary.insert(definition.name.to_owned(), function.signature.clone());
+            functions.insert(definition.name.to_owned(), function);
         }
-        if definition.declares_pure && !verified.inferred_effects.is_pure() {
-            let mut diagnostic = control_error(
-                "E-CAP-001",
-                format!(
-                    "word '{}' declares {{}} but requires {}",
-                    definition.name, verified.inferred_effects
-                ),
-                origin(source_id, source, definition.start, definition.end),
-            );
-            diagnostic.found_effects = verified.inferred_effects.clone();
-            return Err(vec![diagnostic]);
+        if converged {
+            settled = Some((functions, local_vocabulary));
+            break;
         }
-        function.name = definition.name.to_owned();
-        function.documentation = definition.documentation.map(str::to_owned);
-        function.signature = definition.signature;
-        function.signature.effects = verified.inferred_effects.clone();
-        function.signature.suspension = verified.inferred_suspension.clone();
-        function.signature.control = if function.signature.suspension.is_some() {
-            ControlEffect::MaySuspend
-        } else {
-            ControlEffect::Returns
-        };
-        local_vocabulary.insert(definition.name.to_owned(), function.signature.clone());
-        functions.insert(definition.name.to_owned(), function);
+        if round + 1 == max_rounds {
+            // Unreachable given the finite, monotonically-growing effect
+            // lattice this loop walks (see the comment above `max_rounds`);
+            // fail loudly rather than silently certifying a module whose
+            // effect signatures have not actually reached their fixpoint.
+            return Err(vec![control_error(
+                "E-FORTH-DEF-003",
+                "internal error: mutually-recursive effect inference did not \
+                 converge within the expected number of rounds",
+                origin(source_id, source, 0, source.len()),
+            )]);
+        }
     }
+    let (functions, local_vocabulary) = settled
+        .expect("the fixpoint loop runs at least one round whenever definitions is non-empty");
 
     compile_forth_ast_body_with_functions(
         source_id,
@@ -785,6 +841,7 @@ fn compile_forth_ast_body_with_functions(
         &[],
         &[],
         None,
+        &BTreeSet::new(),
     )
 }
 
@@ -800,6 +857,13 @@ fn lower_forth_ast_body_with_locals(
     locals: &[LocalBinding],
     captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
+    // Names of words in this same compilation batch whose bodies have not
+    // necessarily been lowered yet but definitely will be by the time the
+    // batch finishes (see `compile_forth_with_functions`'s fixpoint). A
+    // self- or forward-referencing call to one of these must never lower as
+    // an inline capability request, even while `linked_functions` does not
+    // yet contain it.
+    pending_functions: &BTreeSet<String>,
 ) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
@@ -900,6 +964,7 @@ fn lower_forth_ast_body_with_locals(
                 &[],
                 &visible,
                 Some(&declared_signature.output.values),
+                pending_functions,
             )?;
             let mut quote_function = compiled.module.functions[&compiled.module.entry].clone();
             if declares_pure
@@ -2660,14 +2725,21 @@ fn lower_forth_ast_body_with_locals(
                     }
                     ForthCallKind::Function
                         if signature.effects.0.len() == 1
-                            && !available_functions.contains_key(word) =>
+                            && !available_functions.contains_key(word)
+                            && !pending_functions.contains(word) =>
                     {
                         // Only a body-less core host word (for example `say`)
                         // is exactly its single capability request and may
                         // lower inline at the call site. A defined word has a
                         // lowered body and must execute through it, so the
                         // body's own pushes and stack discipline stay inside
-                        // the call.
+                        // the call. `available_functions` alone is not a
+                        // reliable "has a body" signal for a self- or
+                        // forward-referencing call within the same batch:
+                        // `pending_functions` names every word this
+                        // compilation unit will give a real body to, even
+                        // while its own (or a sibling's) body is still being
+                        // lowered.
                         Instruction::CapabilityRequest {
                             requirement: signature.effects.0.iter().next().unwrap().clone(),
                             input: concrete_signature.input.values.clone(),

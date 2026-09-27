@@ -3949,6 +3949,229 @@ mod tests {
         );
     }
 
+    // Issue #1192: a function that carries an effect signature but has no
+    // lowered body yet at the moment a call site is compiled previously
+    // lowered to an inline capability request instead of a real call. Self-
+    // and mutually-recursive calls hit exactly that window, because the
+    // callee's body does not exist yet while it is still being compiled.
+    // These four tests reproduce the failure at the `execute_source`
+    // production boundary in both frontends, for both self- and mutual
+    // recursion, matching the issue's acceptance criteria.
+    //
+    // Empirical note on the "fails before" claim: a manual pre-fix run
+    // confirmed CoLisp's self-recursive case failed exactly as described
+    // (`E-HOST-001 session.emit requires one string`, origin word
+    // `"countdown"` — the recursive call site itself — after exactly one
+    // real `say` side effect from the first invocation). Co-Forth's
+    // self-recursive case, by contrast, already executed correctly before
+    // this change: `! infer`'s declared effects are always empty at the
+    // moment a self-reference is compiled (inference completes only after
+    // the body compiles), so the buggy guard's `effects.0.len() == 1`
+    // condition never matched for a plain self-call. Co-Forth's genuine
+    // fail-before/pass-after case is mutual recursion: an `! infer` word
+    // forward-referencing a sibling not yet compiled previously failed to
+    // compile at all (`E-LINK-002 unknown Co-Forth word`), because `! infer`
+    // signatures were not predeclared as a group the way `! pure` signatures
+    // already were. `test_forth_self_recursive_effectful_word_executes_body_each_invocation`
+    // is kept as regression coverage for that already-correct behavior,
+    // which the fixpoint effect-inference rewrite below must not break.
+    #[test]
+    fn test_forth_self_recursive_effectful_word_executes_body_each_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "countdown.forth",
+            ": countdown ( S int -- S ! infer ) \
+               dup 0 <= if drop else dup s\"tick\" say drop 1 - countdown then ; \
+             3 countdown",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "a self-recursive effectful Co-Forth word must execute its body on \
+             every invocation, including the recursive ones; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output,
+            "tick".repeat(3),
+            "each of the 3 levels of recursion must run the body's own say, \
+             not drain its argument through an inlined capability request; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics,
+            result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            3,
+            "stack discipline must be preserved across recursion depth: exactly \
+             one session.emit per invocation, not zero (drained inline) or a \
+             partial/garbled count; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+        assert!(
+            result
+                .vm_side_effects
+                .iter()
+                .all(|effect| effect.origin.word.as_deref() == Some("say")),
+            "every emit must be attributed to the body's own say, never to the \
+             recursive call site; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_forth_mutually_recursive_effectful_words_execute_bodies_each_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Forth,
+            "parity.forth",
+            ": is-even ( S int -- S ! infer ) \
+               dup 0 <= if drop s\"even\" say else 1 - is-odd then ; \
+             : is-odd ( S int -- S ! infer ) \
+               dup 0 <= if drop s\"odd\" say else 1 - is-even then ; \
+             4 is-even",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "two Co-Forth words with effect signatures calling each other must \
+             compile and execute, not fail to link the forward reference or \
+             drain an argument through an inlined capability request; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "even",
+            "is-even(4) must recurse through is-odd(3), is-even(2), is-odd(1) \
+             down to is-even(0)'s base case, which says \"even\"; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            1,
+            "exactly one base-case say must fire across the whole mutual \
+             recursion chain, not once per hop and not zero; \
+             vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects[0].origin.word.as_deref(),
+            Some("say"),
+            "the emit must be attributed to the base case's own say, never to \
+             a recursive call site; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_self_recursive_effectful_function_executes_body_each_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "countdown.lisp",
+            "(begin (define (countdown (n : int)) : unit ! (session.emit) \
+                (if (<= n 0) (say \"done\") \
+                    (begin (say \"tick\") (countdown (- n 1))))) \
+             (countdown 3))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "a self-recursive effectful CoLisp function must execute its body \
+             on every invocation, including the recursive ones; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output,
+            format!("{}done", "tick".repeat(3)),
+            "each of the 3 levels of recursion must run the body's own say, \
+             not drain its argument through an inlined capability request; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics,
+            result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            4,
+            "stack discipline must be preserved across recursion depth: three \
+             tick emits plus one done emit, not fewer (drained inline) or a \
+             garbled count; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+        assert!(
+            result
+                .vm_side_effects
+                .iter()
+                .all(|effect| effect.origin.word.as_deref() == Some("say")),
+            "every emit must be attributed to the body's own say, never to the \
+             recursive call site (\"countdown\"); vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
+    #[test]
+    fn test_lisp_mutually_recursive_effectful_functions_execute_bodies_each_invocation() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute_source(
+            ProgramLanguage::Lisp,
+            "parity.lisp",
+            "(begin \
+                (define (even-report (n : int)) : unit ! (session.emit) \
+                    (if (<= n 0) (say \"even\") (odd-report (- n 1)))) \
+                (define (odd-report (n : int)) : unit ! (session.emit) \
+                    (if (<= n 0) (say \"odd\") (even-report (- n 1)))) \
+                (even-report 4))",
+            1_000,
+        );
+        assert_eq!(
+            result.status,
+            TypedExecutionStatus::Completed,
+            "two CoLisp functions with effect bounds calling each other must \
+             execute, not drain an argument through an inlined capability \
+             request at the recursive call site; \
+             diagnostics={:?}, vm_side_effects={:?}, output={:?}",
+            result.diagnostics,
+            result.vm_side_effects,
+            result.output
+        );
+        assert_eq!(
+            result.output, "even",
+            "even-report(4) must recurse through odd-report(3), \
+             even-report(2), odd-report(1) down to even-report(0)'s base \
+             case, which says \"even\"; \
+             diagnostics={:?}, vm_side_effects={:?}",
+            result.diagnostics, result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects.len(),
+            1,
+            "exactly one base-case say must fire across the whole mutual \
+             recursion chain, not once per hop and not zero; \
+             vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+        assert_eq!(
+            result.vm_side_effects[0].origin.word.as_deref(),
+            Some("say"),
+            "the emit must be attributed to the base case's own say, never to \
+             a recursive call site; vm_side_effects={:?}",
+            result.vm_side_effects
+        );
+    }
+
     #[test]
     fn missing_capability_suspends_before_stack_mutation() {
         let mut runtime = TypedRuntime::new();

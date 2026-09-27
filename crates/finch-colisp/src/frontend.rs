@@ -3502,12 +3502,23 @@ impl Compiler<'_> {
                 input: concrete_signature.input.values.clone(),
                 output: concrete_signature.output.values.clone(),
             }
-        } else if signature.effects.0.len() == 1 && !self.functions.contains_key(word) {
+        } else if signature.effects.0.len() == 1
+            && !self.functions.contains_key(word)
+            && !self.predeclared.contains_key(word)
+        {
             // Only a body-less core host word (for example `say`) is exactly
             // its single capability request and may lower inline at the call
             // site. A defined function has a lowered body and must execute
             // through it, so the body's own pushes and stack discipline stay
-            // inside the call.
+            // inside the call. `self.functions` alone is not a reliable "has
+            // a body" signal for a self- or mutually-recursive call: the
+            // predeclare pass (`predeclare_definition`) registers every
+            // return-annotated definition's name and effect bound in
+            // `self.predeclared` before ANY body compiles, so a recursive
+            // call site is compiled while its own (or a sibling's) body is
+            // still pending, before `self.functions` gains that entry. A
+            // predeclared name always gets a real body by the end of this
+            // compilation unit, so it must never lower as an inline request.
             Instruction::CapabilityRequest {
                 requirement: signature.effects.0.iter().next().unwrap().clone(),
                 input: concrete_signature.input.values.clone(),
@@ -4515,6 +4526,44 @@ mod tests {
             "the emit origin must name the body's say word, not the call-site word; \
              origin={:?}",
             say_request.origin
+        );
+    }
+
+    #[test]
+    fn test_self_recursive_effectful_call_lowers_call_not_inline_request() {
+        // Issue #1192: a self-recursive call to a predeclared effectful
+        // function previously lowered inline (`self.functions` did not yet
+        // contain the callee while its own body was still compiling), so
+        // the recursive call drained its argument as a bare capability
+        // request instead of executing the body. This pins the fix at the
+        // compiler-instruction boundary, alongside the `execute_source`
+        // production-boundary regressions in `finch-vm`.
+        let source = "(define (countdown (n : int)) : unit ! (session.emit) \
+            (if (<= n 0) (say \"done\") (begin (say \"tick\") (countdown (- n 1)))))";
+        let module = compile_lisp("countdown.lisp", source, Vec::new(), &core_vocabulary())
+            .expect("a self-recursive effectful definition must compile");
+        let body_instructions: Vec<_> = module.module.functions["countdown"]
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .collect();
+        assert!(
+            body_instructions.iter().any(|located| {
+                matches!(
+                    located.instruction,
+                    Instruction::Call { ref function } if function == "countdown"
+                )
+            }),
+            "the recursive call must lower to a real Call into countdown's own \
+             body, not an inline capability request; instructions={body_instructions:?}"
+        );
+        assert!(
+            !body_instructions.iter().any(|located| {
+                matches!(located.instruction, Instruction::CapabilityRequest { .. })
+                    && located.origin.word.as_deref() == Some("countdown")
+            }),
+            "the recursive call site must never itself become a capability \
+             request; only the body's own say may; instructions={body_instructions:?}"
         );
     }
 
