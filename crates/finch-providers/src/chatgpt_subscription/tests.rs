@@ -1871,42 +1871,78 @@ fn test_terminal_tool_usage_is_bounded_without_requiring_an_object() {
     );
 }
 
+// issue #1139: every ChatGPT Personal subscription query started failing with
+// "ChatGPT subscription terminal response contained an unknown field" once the
+// wire started sending a field outside the ~40-entry allowlist. The allowlist
+// still exists (`describe_unlisted_keys`'s `allowed` slice) and every field
+// `parse_completed` actually consumes (id, status, output, usage, tool_usage)
+// is still fully type- and presence-checked; only an ADDITIVE, unrecognized
+// top-level field is now tolerated instead of failing the whole query.
+//
+// No captured production payload of the actual offending field was available
+// (the live report did not include one); `future_provider_field` below is a
+// synthetic stand-in for "some field OpenAI added that Finch doesn't know
+// about yet," not a real observed OpenAI field name.
 #[test]
-fn test_terminal_unknown_field_error_names_the_unknown_field() {
+fn test_terminal_unlisted_field_is_tolerated_and_still_parses() {
     let terminal = json!({
-        "id":"resp-unknown-terminal",
+        "id":"resp-unlisted-terminal",
         "status":"completed",
         "model":DEFAULT_MODEL,
         "output":[],
-        "carried_context":true
+        "future_provider_field":{"anything":"the provider might add"}
     });
-    let error = parse_completed(
+    let completed = parse_completed(
         terminal.as_object().unwrap(),
         DEFAULT_MODEL,
         Some(DEFAULT_MODEL),
         &empty_tool_bindings(),
         &mut StreamAccumulator::default(),
     )
-    .err()
-    .expect("unaudited terminal semantics must remain fail closed");
-    assert_eq!(
-        error.to_string(),
-        "ChatGPT subscription terminal response contained an unknown field: \"carried_context\"",
-        "the terminal response must fail closed AND name the unknown field so provider schema \
-         drift is diagnosable; error={error:#}"
+    .unwrap_or_else(|error| {
+        panic!(
+            "a single additive, unrecognized terminal field must not fail the whole query \
+             (issue #1139); error={error:#}"
+        )
+    });
+    assert_eq!(completed.id, "resp-unlisted-terminal");
+    assert_eq!(completed.model, DEFAULT_MODEL);
+    assert!(
+        completed.blocks.is_empty(),
+        "an empty terminal output must still parse to no content blocks; blocks={:?}",
+        completed.blocks
     );
 }
 
 #[test]
-fn test_terminal_unknown_fields_error_lists_every_unknown_field() {
+fn test_terminal_multiple_unlisted_fields_are_all_tolerated() {
     let terminal = json!({
-        "id":"resp-unknown-terminal",
+        "id":"resp-unlisted-terminal",
         "status":"completed",
         "model":DEFAULT_MODEL,
         "output":[],
         "web_search":true,
         "carried_context":true
     });
+    parse_completed(
+        terminal.as_object().unwrap(),
+        DEFAULT_MODEL,
+        Some(DEFAULT_MODEL),
+        &empty_tool_bindings(),
+        &mut StreamAccumulator::default(),
+    )
+    .unwrap_or_else(|error| {
+        panic!("multiple additive, unrecognized terminal fields must all be tolerated; error={error:#}")
+    });
+}
+
+#[test]
+fn test_terminal_missing_required_id_still_fails_closed() {
+    let terminal = json!({
+        "status":"completed",
+        "model":DEFAULT_MODEL,
+        "output":[]
+    });
     let error = parse_completed(
         terminal.as_object().unwrap(),
         DEFAULT_MODEL,
@@ -1915,24 +1951,21 @@ fn test_terminal_unknown_fields_error_lists_every_unknown_field() {
         &mut StreamAccumulator::default(),
     )
     .err()
-    .expect("multiple unknown terminal fields must remain fail closed");
+    .expect("a terminal response missing the required id must remain fail closed");
     assert_eq!(
         error.to_string(),
-        "ChatGPT subscription terminal response contained unknown fields: \
-         \"carried_context\", \"web_search\"",
-        "every unknown terminal field must be named, in sorted order; error={error:#}"
+        "ChatGPT subscription response omitted a required identifier",
+        "a missing required field must still fail with an actionable diagnostic; error={error:#}"
     );
 }
 
 #[test]
-fn test_terminal_unknown_field_error_excludes_field_values() {
-    let sentinel = "sk-proj-SensitiveToken123";
+fn test_terminal_output_with_wrong_type_still_fails_closed() {
     let terminal = json!({
-        "id":"resp-unknown-terminal",
+        "id":"resp-wrong-type",
         "status":"completed",
         "model":DEFAULT_MODEL,
-        "output":[],
-        "carried_context":sentinel
+        "output":"not-an-array"
     });
     let error = parse_completed(
         terminal.as_object().unwrap(),
@@ -1942,112 +1975,108 @@ fn test_terminal_unknown_field_error_excludes_field_values() {
         &mut StreamAccumulator::default(),
     )
     .err()
-    .expect("unknown terminal semantics must remain fail closed");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("\"carried_context\""),
-        "the unknown field name must be named for diagnosability; error={rendered}"
-    );
-    assert!(
-        !rendered.contains(sentinel),
-        "the error must reflect only field NAMES, never response-body field VALUES; \
-         error={rendered}"
+    .expect("a wrong-typed consumed field must remain fail closed even though extra fields are now tolerated");
+    assert_eq!(
+        error.to_string(),
+        "ChatGPT completion output items were invalid",
+        "a wrong-typed required field must still fail with an actionable diagnostic; error={error:#}"
     );
 }
 
 #[test]
-fn test_terminal_unknown_field_error_caps_the_named_field_list() {
-    let mut terminal = json!({
-        "id":"resp-unknown-terminal",
-        "status":"completed",
-        "model":DEFAULT_MODEL,
-        "output":[]
-    });
-    terminal
-        .as_object_mut()
-        .expect("terminal fixture must be an object")
-        .extend((0..10).map(|index| (format!("field_{index:02}"), Value::Null)));
-    let error = parse_completed(
-        terminal.as_object().unwrap(),
-        DEFAULT_MODEL,
-        Some(DEFAULT_MODEL),
-        &empty_tool_bindings(),
-        &mut StreamAccumulator::default(),
-    )
-    .err()
-    .expect("many unknown terminal fields must remain fail closed");
+fn test_describe_unlisted_keys_excludes_field_values() {
+    let sentinel = "sk-proj-SensitiveToken123";
+    let mut object = Map::new();
+    object.insert("carried_context".to_string(), json!(sentinel));
+    let summary = describe_unlisted_keys(&object, &["id"], "terminal response")
+        .expect("an unlisted field must produce a summary");
     assert!(
-        error.to_string().contains(
-            "unknown fields: \"field_00\", \"field_01\", \"field_02\", \"field_03\", \
-             \"field_04\", \"field_05\", \"field_06\", \"field_07\", and 2 more"
+        summary.contains("\"carried_context\""),
+        "the unlisted field name must be named for diagnosability; summary={summary}"
+    );
+    assert!(
+        !summary.contains(sentinel),
+        "the summary must reflect only field NAMES, never response-body field VALUES; \
+         summary={summary}"
+    );
+}
+
+#[test]
+fn test_describe_unlisted_keys_caps_the_named_field_list() {
+    let object: Map<String, Value> = (0..10)
+        .map(|index| (format!("field_{index:02}"), Value::Null))
+        .collect();
+    let summary = describe_unlisted_keys(&object, &[], "terminal response")
+        .expect("unlisted fields must produce a summary");
+    assert!(
+        summary.contains(
+            "unlisted fields outside the known allowlist (tolerated as additive schema drift): \
+             \"field_00\", \"field_01\", \"field_02\", \"field_03\", \"field_04\", \"field_05\", \
+             \"field_06\", \"field_07\", and 2 more"
         ),
         "the named-field list must be bounded and say how many names were omitted; \
-         error={error:#}"
+         summary={summary}"
     );
 }
 
 #[test]
-fn test_terminal_unknown_field_error_bounds_oversized_field_names() {
+fn test_describe_unlisted_keys_bounds_oversized_field_names() {
     let oversized = "x".repeat(512);
-    let mut terminal = json!({
-        "id":"resp-unknown-terminal",
-        "status":"completed",
-        "model":DEFAULT_MODEL,
-        "output":[]
-    });
-    terminal
-        .as_object_mut()
-        .expect("terminal fixture must be an object")
-        .insert(oversized.clone(), Value::Null);
-    let error = parse_completed(
-        terminal.as_object().unwrap(),
-        DEFAULT_MODEL,
-        Some(DEFAULT_MODEL),
-        &empty_tool_bindings(),
-        &mut StreamAccumulator::default(),
-    )
-    .err()
-    .expect("an oversized unknown field name must remain fail closed");
-    let rendered = error.to_string();
+    let mut object = Map::new();
+    object.insert(oversized.clone(), Value::Null);
+    let summary = describe_unlisted_keys(&object, &[], "terminal response")
+        .expect("an unlisted field must produce a summary");
     assert!(
-        rendered.contains(&format!(
+        summary.contains(&format!(
             "\"{}\"…",
             "x".repeat(MAX_UNKNOWN_FIELD_NAME_BYTES)
         )),
-        "an oversized unknown field name must be truncated in the message; error={rendered}"
+        "an oversized unlisted field name must be truncated in the summary; summary={summary}"
     );
     assert!(
-        !rendered.contains(&oversized),
-        "the error message must not embed an unbounded daemon-controlled field name; \
-         rendered_bytes={}",
-        rendered.len()
+        !summary.contains(&oversized),
+        "the summary must not embed an unbounded daemon-controlled field name; \
+         summary_bytes={}",
+        summary.len()
     );
 }
 
 #[tokio::test]
-async fn test_streaming_boundary_names_unknown_terminal_field() {
+async fn test_streaming_boundary_tolerates_unlisted_terminal_field() {
     let terminal = json!({
-        "id":"resp-unknown-terminal-stream",
+        "id":"resp-unlisted-terminal-stream",
         "status":"completed",
         "model":DEFAULT_MODEL,
         "output":[],
         "carried_context":true
     });
-    let expected =
-        "ChatGPT subscription terminal response contained an unknown field: \"carried_context\"";
     let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
-    let buffered_error =
-        buffered.expect_err("unknown terminal semantics passed the buffered provider boundary");
-    assert_eq!(buffered_error, expected);
+    let buffered = buffered.unwrap_or_else(|error| {
+        panic!(
+            "an additive, unrecognized terminal field must not fail the buffered provider \
+             boundary (issue #1139); error={error}"
+        )
+    });
     assert!(
         matches!(
-            outcome.as_slice(),
-            [Ok(StreamChunk::TextDelta(delta)), Err(error)]
-                if delta == "hello" && error == expected
+            buffered.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello"
         ),
-        "unknown terminal semantics must end with exactly one field-naming error at the \
-         streaming boundary and no terminal metadata, usage, allowance, or completed content; \
-         outcome={outcome:?}"
+        "tolerating the unlisted terminal field must not lose buffered content; buffered={buffered:?}"
+    );
+    let error_count = outcome.iter().filter(|chunk| chunk.is_err()).count();
+    assert_eq!(
+        error_count, 0,
+        "an additive, unrecognized terminal field must not fail the streaming boundary either \
+         (issue #1139); outcome={outcome:?}"
+    );
+    assert!(
+        outcome.iter().any(|chunk| matches!(
+            chunk,
+            Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })) if text == "hello"
+        )),
+        "the streamed message content must still complete despite the additive unlisted \
+         terminal field; outcome={outcome:?}"
     );
 }
 
