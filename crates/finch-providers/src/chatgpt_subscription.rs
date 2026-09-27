@@ -1932,7 +1932,7 @@ fn parse_completed(
     allowed_tools: &ToolBindingTable,
     accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
-    exact_keys_naming_unknown(
+    if let Some(summary) = describe_unlisted_keys(
         response,
         &[
             "id",
@@ -1980,7 +1980,9 @@ fn parse_completed(
             "access_programs",
         ],
         "terminal response",
-    )?;
+    ) {
+        tracing::warn!(%summary, "chatgpt subscription terminal response schema drift");
+    }
     if let Some(tool_usage) = response.get("tool_usage") {
         if serde_json::to_vec(tool_usage)
             .context("ChatGPT terminal response tool usage metadata was invalid")?
@@ -2684,27 +2686,36 @@ fn exact_keys(object: &Map<String, Value>, allowed: &[&str], location: &'static 
     Ok(())
 }
 
-/// Terminal-response allowlist check whose failure names the unknown fields so
-/// provider-side schema drift is diagnosable from the message. Field names are
-/// bounded; values are never reflected.
-fn exact_keys_naming_unknown(
+/// Terminal-response allowlist check for fields the parser does not itself
+/// consume. Provider-side schema *additions* are common and, by themselves,
+/// carry no execution semantics here: `parse_completed` only ever reads a
+/// fixed, explicitly-validated subset of the response object (`id`, `status`,
+/// `output`, `usage`, `tool_usage`), and every field that DOES drive parsing —
+/// output items, message content, reasoning, function calls, usage sub-fields
+/// — is validated by its own exhaustive `exact_keys` call regardless of what
+/// happens here. So an allowlisted-but-unrecognized top-level field is
+/// summarized for diagnosability and tolerated rather than failing the whole
+/// query (issue #1139: a single provider-added field broke every ChatGPT
+/// Personal subscription turn). Field names are bounded; values are never
+/// reflected. Returns `None` when every key is already known.
+fn describe_unlisted_keys(
     object: &Map<String, Value>,
     allowed: &[&str],
     location: &'static str,
-) -> Result<()> {
+) -> Option<String> {
     let mut unknown: Vec<&str> = object
         .keys()
         .map(String::as_str)
         .filter(|key| !allowed.contains(key))
         .collect();
     if unknown.is_empty() {
-        return Ok(());
+        return None;
     }
     unknown.sort_unstable();
     let label = if unknown.len() == 1 {
-        "an unknown field"
+        "an unlisted field"
     } else {
-        "unknown fields"
+        "unlisted fields"
     };
     let named: Vec<String> = unknown
         .iter()
@@ -2717,10 +2728,11 @@ fn exact_keys_naming_unknown(
     } else {
         format!(", and {omitted} more")
     };
-    bail!(
-        "ChatGPT subscription {location} contained {label}: {}{suffix}",
+    Some(format!(
+        "ChatGPT subscription {location} contained {label} outside the known allowlist \
+         (tolerated as additive schema drift): {}{suffix}",
         named.join(", ")
-    );
+    ))
 }
 
 fn quoted_bounded_field_name(name: &str) -> String {
