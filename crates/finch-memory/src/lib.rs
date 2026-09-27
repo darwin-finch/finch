@@ -6923,6 +6923,12 @@ mod tests {
         let baseline_store = NamedTempFile::new()?;
         let baseline = MemorySystem::new(MemoryConfig {
             db_path: baseline_store.path().to_path_buf(),
+            // #1327's relative-margin filter defaults to active (cutoff 0.5) and this helper's
+            // corpus is only two conversations -- exactly the tiny-corpus case its own comment on
+            // RELATIVE_MARGIN_CUTOFF_DISABLED already documents as dropping the weaker candidate
+            // even at the real default cutoff. Disabled here since this margin measurement is for
+            // #1324's own gate, not #1327's.
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         baseline
@@ -6960,6 +6966,7 @@ mod tests {
             confidence_abstention: Some(ConfidenceAbstentionConfig {
                 answer_fraction: 0.1,
             }),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         strict
@@ -6989,6 +6996,7 @@ mod tests {
             confidence_abstention: Some(ConfidenceAbstentionConfig {
                 answer_fraction: 0.1,
             }),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         lenient
@@ -7024,6 +7032,7 @@ mod tests {
         let baseline_store = NamedTempFile::new()?;
         let baseline = MemorySystem::new(MemoryConfig {
             db_path: baseline_store.path().to_path_buf(),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         baseline
@@ -7047,6 +7056,7 @@ mod tests {
             confidence_abstention: Some(ConfidenceAbstentionConfig {
                 answer_fraction: 0.99,
             }),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         memory
@@ -7099,6 +7109,7 @@ mod tests {
             confidence_abstention: Some(ConfidenceAbstentionConfig {
                 answer_fraction: 0.5,
             }),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         memory
