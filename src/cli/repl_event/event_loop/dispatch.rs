@@ -1210,6 +1210,77 @@ impl EventLoop {
         drop(tui);
         self.ctrl_c_exit_hint_shown = should_show;
     }
+
+    /// Handles a `pending_escape_cancel` flag taken from the renderer once
+    /// per render tick — set by an idle (empty-composer) Escape press in
+    /// `async_input::handle_composer_shortcuts`, which cannot itself tell
+    /// "cancel the active query" apart from "exit Finch" (#1311).
+    ///
+    /// An active query, or a plan/executing overlay, is cancelled
+    /// immediately: this matches Escape's established single-press
+    /// character and must not regress into Ctrl+C's own two-press
+    /// requirement, which (unlike Escape's) also gates cancelling an active
+    /// query. Only the remaining case — no active query, not a plan
+    /// overlay, the same condition the `CancelQuery` idle branch above uses
+    /// to decide "exit Finch entirely" — arms `escape_idle_exit_armed_at`
+    /// instead of sending `CancelQuery` outright; a confirming second idle
+    /// Escape within `ESCAPE_IDLE_EXIT_WINDOW` is what actually exits.
+    pub(super) async fn handle_escape_cancel_request(&mut self) {
+        let has_active_query = self.active_query_id.read().await.is_some();
+        let mode_is_plan_overlay = self.mode.read().await.is_plan_overlay();
+        if has_active_query || mode_is_plan_overlay {
+            let _ = self.event_tx.send(ReplEvent::CancelQuery);
+            return;
+        }
+
+        let now = Instant::now();
+        let confirming = self
+            .escape_idle_exit_armed_at
+            .is_some_and(|armed| now.duration_since(armed) <= ESCAPE_IDLE_EXIT_WINDOW);
+
+        if confirming {
+            self.escape_idle_exit_armed_at = None;
+            let _ = self.event_tx.send(ReplEvent::CancelQuery);
+        } else {
+            self.escape_idle_exit_armed_at = Some(now);
+        }
+    }
+
+    /// Keep the idle-Escape exit warning (`ESCAPE_EXIT_HINT`) in sync with
+    /// the arm `handle_escape_cancel_request` maintains, polled once per
+    /// render tick — mirrors `sync_ctrl_c_exit_hint` so the warning also
+    /// clears once `ESCAPE_IDLE_EXIT_WINDOW` elapses with no second press,
+    /// or if state changes (a query starts, a plan overlay opens) while
+    /// armed, without needing a separate timer (#1311).
+    ///
+    /// Known limitation: if an idle Ctrl+C arm and an idle Escape arm are
+    /// both live in the same short window (a user would have to press both
+    /// idle-exit keys back to back), whichever hint's sync runs later this
+    /// tick overwrites the status line text of the other. Each key's own
+    /// arm/confirm state stays independently correct regardless — a
+    /// confirming press of either still-armed key exits correctly — only
+    /// the displayed wording can lag which key is "really" armed in that
+    /// narrow overlap.
+    pub(super) async fn sync_escape_exit_hint(&mut self) {
+        let armed = self
+            .escape_idle_exit_armed_at
+            .is_some_and(|armed| armed.elapsed() <= ESCAPE_IDLE_EXIT_WINDOW);
+        let should_show = armed
+            && self.active_query_id.read().await.is_none()
+            && !self.mode.read().await.is_plan_overlay();
+
+        if should_show == self.escape_idle_exit_hint_shown {
+            return;
+        }
+        let tui = self.tui_renderer.lock().await;
+        if should_show {
+            tui.set_operation_status(ESCAPE_EXIT_HINT);
+        } else {
+            tui.clear_operation_status();
+        }
+        drop(tui);
+        self.escape_idle_exit_hint_shown = should_show;
+    }
 }
 
 fn agent_lifecycle_task_id(event: &crate::scheduler::AgentEvent) -> Option<Uuid> {

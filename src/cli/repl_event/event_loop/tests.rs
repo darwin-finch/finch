@@ -7600,6 +7600,220 @@ async fn test_ctrl_c_arm_in_plan_overlay_does_not_show_exit_warning() {
         .await;
 }
 
+/// #1311 production-boundary regression: an idle, empty-composer Escape
+/// press on a SINGLE press used to send `CancelQuery` straight through,
+/// which the idle branch exits Finch on entirely, with zero warning ever
+/// shown — worse than the Ctrl+C case #1301 fixed, since that at least took
+/// two presses. This exercises the real chain the fix added:
+/// `async_input::handle_composer_shortcuts` setting `pending_escape_cancel`
+/// on an idle Escape (asserted directly in `finch-tui`'s own
+/// `test_keyboard_shortcut_table_matches_the_real_dispatch_paths`), and here
+/// the application side that flag feeds: `EventLoop::handle_escape_cancel_request`
+/// arms on the first idle press instead of exiting, `EventLoop::sync_escape_exit_hint`
+/// puts "Press Esc again to exit Finch" on the status line (reaching the real
+/// `StatusBar::status_without_session`), and only a confirming second idle
+/// press within `ESCAPE_IDLE_EXIT_WINDOW` actually dispatches `CancelQuery`.
+#[tokio::test]
+async fn test_idle_escape_arm_shows_exit_warning_then_confirms_on_second_press() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+
+            assert!(
+                !event_loop
+                    .status_bar
+                    .status_without_session()
+                    .contains("Esc again"),
+                "no warning must be showing before any Escape press"
+            );
+
+            // First idle Escape press: simulates the render tick taking
+            // `pending_escape_cancel` from the renderer and routing it here.
+            event_loop.handle_escape_cancel_request().await;
+            event_loop.sync_escape_exit_hint().await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                status.contains("Press Esc again to exit Finch"),
+                "the first idle Escape press must arm and warn, never exit \
+                 silently on a single press; status={status:?}"
+            );
+            let mut fired_after_first_press = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    fired_after_first_press = true;
+                }
+            }
+            assert!(
+                !fired_after_first_press,
+                "the first idle Escape press must not dispatch CancelQuery; \
+                 doing so is exactly the #1311 silent single-press exit"
+            );
+
+            // Confirming second idle Escape press within the window: now it
+            // actually requests the cancel that the idle CancelQuery branch
+            // turns into exiting Finch, and the warning clears.
+            event_loop.handle_escape_cancel_request().await;
+            event_loop.sync_escape_exit_hint().await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("Esc again"),
+                "the warning must clear once the confirming press has fired; \
+                 status={status:?}"
+            );
+            let mut fired_after_second_press = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    fired_after_second_press = true;
+                }
+            }
+            assert!(
+                fired_after_second_press,
+                "the confirming second idle Escape press must dispatch \
+                 CancelQuery so the user can still actually exit via Escape"
+            );
+        })
+        .await;
+}
+
+/// Escape's cancel of an ACTIVE query must stay a single, immediate press —
+/// explicitly called out as unchanged by #1311. Unlike Ctrl+C (which arms
+/// even with a query running), Escape must not gain a confirm step here:
+/// only the branch that would actually exit Finch entirely gets one.
+#[tokio::test]
+async fn test_escape_with_active_query_cancels_immediately_without_exit_warning() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_id);
+
+            event_loop.handle_escape_cancel_request().await;
+            event_loop.sync_escape_exit_hint().await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("exit Finch"),
+                "Escape cancels the active query, not Finch, on this single \
+                 press — the exit warning must not show; status={status:?}"
+            );
+
+            let mut found_cancel = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    found_cancel = true;
+                }
+            }
+            assert!(
+                found_cancel,
+                "a single idle-composer Escape press must still cancel an \
+                 active query immediately — #1311 must not regress this \
+                 into requiring a second press"
+            );
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_none(),
+                "cancelling an active query must not arm the idle-exit \
+                 confirm state — there is nothing to confirm"
+            );
+        })
+        .await;
+}
+
+/// A plan/executing overlay's Escape exits the overlay, not Finch
+/// (`ReplMode::is_plan_overlay`), so it keeps Escape's single-press
+/// character too — same reasoning as the active-query case above.
+#[tokio::test]
+async fn test_escape_in_plan_overlay_cancels_immediately_without_exit_warning() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Planning {
+                task: "investigate #1311".to_string(),
+                plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+                created_at: chrono::Utc::now(),
+            };
+
+            event_loop.handle_escape_cancel_request().await;
+            event_loop.sync_escape_exit_hint().await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                !status.contains("exit Finch"),
+                "Escape exits the plan overlay, not Finch, on this single \
+                 press; status={status:?}"
+            );
+
+            let mut found_cancel = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    found_cancel = true;
+                }
+            }
+            assert!(
+                found_cancel,
+                "a single idle-composer Escape press in a plan overlay must \
+                 still dispatch CancelQuery immediately, unchanged"
+            );
+        })
+        .await;
+}
+
+/// Mirrors `test_composer_ctrl_c_after_window_elapses_does_not_cancel_but_rearms`
+/// (finch-tui): an idle Escape press after `ESCAPE_IDLE_EXIT_WINDOW` has
+/// elapsed must not count as the confirming press of a stale arm — it
+/// starts a fresh arm instead of exiting on what looks like a lone press
+/// spread across two unrelated moments.
+#[tokio::test]
+async fn test_escape_idle_exit_arm_expires_after_window() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+
+            event_loop.handle_escape_cancel_request().await;
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_some(),
+                "the first idle Escape press must record an arm timestamp"
+            );
+
+            // Backdate the arm past the window, as if the second press
+            // arrived too late.
+            let armed_at = event_loop.escape_idle_exit_armed_at.expect("armed above");
+            event_loop.escape_idle_exit_armed_at = Some(
+                armed_at - super::ESCAPE_IDLE_EXIT_WINDOW - std::time::Duration::from_millis(1),
+            );
+
+            event_loop.handle_escape_cancel_request().await;
+
+            let mut found_cancel = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    found_cancel = true;
+                }
+            }
+            assert!(
+                !found_cancel,
+                "a press after the window elapsed must not count as the \
+                 confirming press and must not dispatch CancelQuery"
+            );
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_some(),
+                "the lapsed press must start a fresh arm rather than \
+                 leaving no arm at all"
+            );
+        })
+        .await;
+}
+
 /// AutoAccept does not inherit Planning's write restriction. The executor
 /// still runs write; the skipped dialog is the only change.
 #[tokio::test]

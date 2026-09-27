@@ -1498,12 +1498,30 @@ pub struct TuiRenderer {
     /// When Ctrl+C has nothing left to clear (empty composer draft, or a
     /// dialog not in custom-input mode), the first press arms this instead
     /// of cancelling; a second Ctrl+C within [`CTRL_C_CANCEL_WINDOW`] clears
-    /// it and performs the cancel. Escape's cancel is unaffected and stays
-    /// single-press everywhere. Shared by the async composer dispatch
+    /// it and performs the cancel. Escape's own key handling stays
+    /// single-press everywhere in this crate (see `pending_escape_cancel`
+    /// below for how the application-level idle-exit decision is kept out
+    /// of that single press, #1311). Shared by the async composer dispatch
     /// (`async_input::handle_composer_shortcuts`), `read_line`, and
     /// `show_dialog` — they run in disjoint input modes, so one field is
     /// enough.
     pub(crate) ctrl_c_armed_at: Option<Instant>,
+    /// Set by an idle (empty-composer) Escape press in
+    /// `async_input::handle_composer_shortcuts`; a non-empty composer clears
+    /// its draft immediately and never touches this field. This crate has
+    /// no visibility into whether a query is active, so it cannot tell
+    /// "cancel the running query" apart from "exit Finch" itself — both
+    /// reach the same idle composer state. The application polls and takes
+    /// this flag once per render tick and decides: an active query (or a
+    /// plan/executing overlay) is cancelled immediately, matching Escape's
+    /// established single-press character; the case that would actually
+    /// exit Finch instead requires a confirming second idle Escape within
+    /// its own window, warned on the status line first — the same
+    /// warn-before-exit shape Ctrl+C already has (#1301), reached through
+    /// its own state because Ctrl+C's arm-then-confirm is unconditional
+    /// (it also gates cancelling an active query) while Escape's must not
+    /// be (#1311).
+    pub pending_escape_cancel: bool,
 
     // Autocomplete
     pub(crate) ghost_text: Option<String>,
@@ -1647,6 +1665,7 @@ impl TuiRenderer {
             pending_cancellation: false,
             pending_dialog_result: None,
             ctrl_c_armed_at: None,
+            pending_escape_cancel: false,
             ghost_text: None,
             command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
@@ -1740,6 +1759,7 @@ impl TuiRenderer {
             pending_cancellation: false,
             pending_dialog_result: None,
             ctrl_c_armed_at: None,
+            pending_escape_cancel: false,
 
             ghost_text: None,
             command_registry: CommandRegistry::new(),
