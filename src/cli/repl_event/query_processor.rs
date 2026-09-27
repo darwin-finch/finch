@@ -468,10 +468,66 @@ fn record_wire_metric(
     }
 }
 
+/// Fixed, deliberately narrow set of phrases asserting a response reports
+/// content the model actually consulted (a file, a command's output, a
+/// search result) rather than content it composed or reasoned out itself.
+///
+/// Not a fuzzy matcher: a hallucinated claim phrased differently is not
+/// caught, by design (#1312 -- "local model hallucinates a tool result
+/// instead of calling the tool"). This exists to catch the specific,
+/// high-trust-cost shape of that failure -- a plausible, confidently
+/// formatted claim about external content -- without flagging every
+/// ordinary answer a model gives when tools happen to be available but
+/// genuinely unneeded (e.g. "what's 2+2").
+const UNVERIFIED_GROUNDING_PHRASES: &[&str] = &[
+    "the first line of",
+    "the file contains",
+    "the file says",
+    "according to the file",
+    "i read the file",
+    "after reading the file",
+    "the contents of the file",
+    "the output shows",
+    "the command output",
+    "i found in the file",
+    "based on the contents of",
+    "the search results show",
+    "i ran the command",
+];
+
+/// Caption appended to a response caught by the check above. Surfaced, never
+/// suppressed (#1312's fix decision): the turn the user is waiting on still
+/// reaches the screen, honestly captioned, rather than silently eaten.
+const UNVERIFIED_TOOL_CLAIM_CAVEAT: &str = "\n\n(unverified -- no tool was \
+    actually called this turn; this claim was not checked against a real \
+    file or command)";
+
+/// Whether `text` asserts it is reporting on content obtained by consulting
+/// an external source. See [`UNVERIFIED_GROUNDING_PHRASES`].
+fn claims_tool_grounded_fact(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    UNVERIFIED_GROUNDING_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Whether any tool actually completed during `query_id`, per the same
+/// `ToolCallHistory` loop detection already tracks (`record_completed_tool_result`).
+/// A turn with no completed tool call recorded here never actually invoked
+/// anything, regardless of what its text claims.
+async fn tool_actually_ran_for_query(tool_call_history: &ToolCallHistory, query_id: Uuid) -> bool {
+    tool_call_history
+        .read()
+        .await
+        .get(&query_id)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 /// Execute one provider wire response and, for a safe rejected program, ask
 /// the same model for precisely one source-level correction.  Each source and
 /// each output owns a separate WorkUnit, so the failed program never vanishes
 /// from scrollback when the replacement succeeds.
+#[allow(clippy::too_many_arguments)]
 async fn execute_wire_with_single_repair(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
@@ -482,6 +538,8 @@ async fn execute_wire_with_single_repair(
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    query_id: Uuid,
+    tool_call_history: &ToolCallHistory,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -625,12 +683,32 @@ async fn execute_wire_with_single_repair(
                 if !outcome.output.is_empty() {
                     wrapped_unit.present_as_assistant_prose();
                 }
+                // #1312: this branch is reached only when the model never
+                // produced a valid wire program *and* never issued a tool
+                // call for this response -- `prepared.is_empty()` at this
+                // turn's call site is what routed the response here at all.
+                // A response that also *claims* to report content it
+                // consulted, while this query's tool-call history shows no
+                // tool ever actually ran, is exactly the confidently wrong,
+                // indistinguishable-from-real-output shape #1312 reported.
+                // Caption it rather than suppress it: the turn still reaches
+                // the screen, honestly flagged as unverified.
+                let unverified = claims_tool_grounded_fact(&source)
+                    && !tool_actually_ran_for_query(tool_call_history, query_id).await;
+                if unverified {
+                    wrapped_unit.append_response(UNVERIFIED_TOOL_CLAIM_CAVEAT);
+                }
                 let _ = event_tx.send(ReplEvent::VmOutputComplete {
                     output_unit: Arc::clone(&wrapped_unit),
                 });
+                let response = if unverified {
+                    format!("{}{}", outcome.output, UNVERIFIED_TOOL_CLAIM_CAVEAT)
+                } else {
+                    outcome.output
+                };
                 WireExecution {
                     source_for_history: wrapped,
-                    response: outcome.output,
+                    response,
                     effect_journal,
                     output_unit: wrapped_unit,
                 }
@@ -2075,6 +2153,8 @@ pub(crate) async fn process_query_with_tools(
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
                     effect_audit,
+                    query_id,
+                    &tool_call_history,
                 )
                 .await;
                 if query_states
@@ -2324,6 +2404,8 @@ pub(crate) async fn process_query_with_tools(
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
                 effect_audit,
+                query_id,
+                &tool_call_history,
             )
             .await;
             if query_states
@@ -4592,6 +4674,8 @@ mod tests {
             source,
             Some(&metrics),
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -4946,6 +5030,8 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
 
@@ -5050,6 +5136,8 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
         while event_rx.try_recv().is_ok() {}
@@ -5135,6 +5223,8 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
 
@@ -5166,6 +5256,155 @@ mod tests {
              happened"
         );
         assert!(!recorded[0].terminal_failure);
+
+        drain_vm_events_as_event_loop(&mut event_rx);
+    }
+
+    // ── #1312: unverified tool-grounded claims ─────────────────────────────
+    //
+    // A local model that never calls a tool but still writes prose asserting
+    // it consulted one (a file, a command, a search) is the exact
+    // confidently-wrong, indistinguishable-from-real-output shape reported
+    // live: Gemma answered "The first line of the README.md file is: ..."
+    // without ever calling `read`. These tests drive the real
+    // `execute_wire_with_single_repair` production boundary (not just
+    // `claims_tool_grounded_fact` in isolation) to prove the caveat reaches
+    // `WireExecution.response` -- what actually becomes the visible
+    // transcript and the persisted memory text -- exactly when no tool ran
+    // for that query, and stays absent when one did.
+
+    #[test]
+    fn claims_tool_grounded_fact_matches_the_reported_hallucination_and_spares_ordinary_prose() {
+        assert!(
+            claims_tool_grounded_fact(
+                "The first line of the README.md file is:\n```\nFinch VM Wire Protocol\n```"
+            ),
+            "must catch the exact phrasing from the live #1312 report"
+        );
+        assert!(claims_tool_grounded_fact(
+            "According to the file, the answer is 42."
+        ));
+        assert!(
+            !claims_tool_grounded_fact("Sure, 2 + 2 is 4.",),
+            "an ordinary answer with no grounding claim must not match"
+        );
+        assert!(
+            !claims_tool_grounded_fact(
+                "I'm currently unable to access or inspect external repositories."
+            ),
+            "declining to have consulted anything must not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattempted_prose_claiming_file_content_gets_unverified_caveat_when_no_tool_ran() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "The first line of the README.md file is:\n```\nFinch VM Wire Protocol\n```"
+            .to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+        let query_id = Uuid::new_v4();
+        let tool_call_history = ToolCallHistory::default();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user(
+                "read the file README.md and tell me its first line",
+            )],
+            source.clone(),
+            Some(&metrics),
+            None,
+            query_id,
+            &tool_call_history,
+        )
+        .await;
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "a claim with no tool call recorded must still be the deterministic wrap, \
+             never a model repair round-trip"
+        );
+        assert!(
+            execution.response.starts_with(&source),
+            "the model's original claim must still reach the screen -- flagged, not \
+             suppressed: {:?}",
+            execution.response
+        );
+        assert!(
+            execution.response.contains(UNVERIFIED_TOOL_CLAIM_CAVEAT),
+            "a response claiming file content with an empty tool-call history for this \
+             query must carry the unverified caveat; got {:?}",
+            execution.response
+        );
+
+        drain_vm_events_as_event_loop(&mut event_rx);
+    }
+
+    #[tokio::test]
+    async fn unattempted_prose_claiming_file_content_gets_no_caveat_when_a_tool_actually_ran() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "The first line of the README.md file is:\n```\n# Finch\n```".to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+        let query_id = Uuid::new_v4();
+        let tool_call_history = ToolCallHistory::default();
+        // Simulate the `read` tool actually completing earlier in this same
+        // query -- the same bookkeeping `dispatch_tool_uses`'s real
+        // completion path performs via `record_completed_tool_result`.
+        record_completed_tool_result(
+            &tool_call_history,
+            query_id,
+            "read",
+            &serde_json::json!({"file_path": "README.md"}),
+            "# Finch\n",
+        )
+        .await;
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user(
+                "read the file README.md and tell me its first line",
+            )],
+            source.clone(),
+            Some(&metrics),
+            None,
+            query_id,
+            &tool_call_history,
+        )
+        .await;
+
+        assert_eq!(
+            execution.response, source,
+            "a real completed tool call this query must suppress the caveat entirely, \
+             not just soften it: got {:?}",
+            execution.response
+        );
+        assert!(
+            !execution.response.contains("unverified"),
+            "must not caveat a claim backed by an actually-completed tool call: {:?}",
+            execution.response
+        );
 
         drain_vm_events_as_event_loop(&mut event_rx);
     }
@@ -5238,6 +5477,8 @@ mod tests {
             "(say \"Hello\")".to_string(),
             None,
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5293,6 +5534,8 @@ mod tests {
             source,
             None,
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5344,6 +5587,8 @@ mod tests {
             source.clone(),
             None,
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
 
@@ -5381,6 +5626,8 @@ mod tests {
                     source,
                     None,
                     None,
+                    Uuid::new_v4(),
+                    &ToolCallHistory::default(),
                 )
                 .await
             })
@@ -5475,6 +5722,8 @@ mod tests {
             source.clone(),
             None,
             None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
         )
         .await;
 
