@@ -179,6 +179,35 @@ modules, including `memory_status`, are private.
   now takes `conn: &Connection`; both call sites in `lib.rs`
   (`query_with_sources`, `conversation_summary`) acquire the db lock before the tree lock, the
   same order `stats()` already used, to avoid a lock-order deadlock.
+- After the near-tie-break above and before `top_k` truncation, `RoutingMemTree::retrieve`
+  (routing_memory.rs) applies a relative-margin filter (#1327, validated research) that drops an
+  individual weak candidate judged against THIS result set's own top score, not a fixed/global
+  "beats a random document" baseline — that global-baseline framing was tested and found a near
+  no-op (a top-k list is already better than random by construction, so comparing against random
+  does not discriminate within it). A candidate below
+  `top_score - relative_margin_cutoff * (top_score - random_baseline_mean)` is dropped;
+  `relative_margin_cutoff` is `MemoryConfig::relative_margin_cutoff` (default `0.5`, an explicit
+  first-guess constant from the research, not swept against Finch's own corpus, same caveat as
+  `min_relevance_score`/`min_turn_relevance_score`). `random_baseline_mean` is
+  `RoutingMemTree::random_baseline_mean`: the mean cosine similarity between the query and a
+  deterministic, evenly-spaced sample of up to 32 of the corpus's own live points (never a fresh
+  RNG draw, for the same determinism reason `FIXED_SEED` above exists), computed fresh per query
+  rather than tracked incrementally like the Welford-style running statistics #1323/#1324
+  describe — disclosed as a reasonable later upgrade, not required for correctness today, and
+  neither of those mechanisms exists in this crate yet to share an implementation with. Applied
+  only when a query returns more than one candidate (a single candidate is trivially its own top
+  score and always survives) and skipped entirely when the sampled baseline is not strictly below
+  the top score (a degenerate case — most commonly a corpus too small for the sample to differ
+  meaningfully from the candidates it judges — where dropping everything, including the top
+  candidate, would be strictly worse than dropping nothing). This is additive to, and applied
+  before, the fixed `min_relevance_score`/`min_turn_relevance_score` floors in
+  `query_with_sources`, which are unchanged. `test_relative_margin_floor_matches_hand_worked_formula`,
+  `test_relative_margin_floor_cutoff_endpoints`,
+  `test_filter_by_relative_margin_drops_below_floor_keeps_at_or_above`,
+  `test_filter_by_relative_margin_is_a_no_op_when_baseline_is_not_below_top_score`, and the
+  production-boundary `test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one` (three
+  real candidates plus six orthogonal filler points through the real `retrieve()` path) all live
+  in `src/routing_memory/tests.rs`.
 - `counterpart_turn` (`lib.rs`, used by `query_recall`'s rendering) pairs a retrieved turn with
   its real reply/question via that same occurrence chain, not by wall-clock proximity: for a
   retrieved user turn it walks the turn's own occurrence `next` (the reply is whatever occurrence

@@ -3,6 +3,12 @@ use std::sync::Barrier;
 
 const DIM: usize = 8;
 
+/// A `relative_margin_cutoff` (#1327) large enough that [`filter_by_relative_margin`] can never
+/// drop anything, no matter how the corpus's own random-baseline sample happens to land -- for
+/// tests exercising unrelated `retrieve` behavior (the near-tie-break machinery) that predates
+/// #1327 and is not itself about margin filtering.
+const CUTOFF_DISABLED: f32 = 1000.0;
+
 fn embedding(seed: u32) -> Vec<f32> {
     let mut v = vec![0.0f32; DIM];
     v[(seed as usize) % DIM] = 1.0;
@@ -423,7 +429,7 @@ fn test_retrieve_prefers_near_tied_candidate_whose_occurrence_neighbor_matches_q
     RoutingMemTree::link_next(&conn, neighbor_b.uuid, b.uuid).expect("link neighbor_b -> b");
 
     let results = tree
-        .retrieve(&conn, &query, 2)
+        .retrieve(&conn, &query, 2, CUTOFF_DISABLED)
         .expect("retrieve must succeed");
 
     assert_eq!(
@@ -487,7 +493,7 @@ fn test_retrieve_tie_break_falls_back_gracefully_when_neither_candidate_has_occu
     let b_effect = tree.insert_with_effect("b".to_string(), b_embedding, 1, 200);
 
     let results = tree
-        .retrieve(&conn, &query, 2)
+        .retrieve(&conn, &query, 2, CUTOFF_DISABLED)
         .expect("retrieve must succeed even when no candidate has occurrence context");
 
     assert_eq!(
@@ -501,5 +507,159 @@ fn test_retrieve_tie_break_falls_back_gracefully_when_neither_candidate_has_occu
         returned_ids,
         std::collections::HashSet::from([a_effect.point_id, b_effect.point_id]),
         "both candidates must still be returned when neither has occurrence context, got {results:?}"
+    );
+}
+
+// --- #1327: relative-margin filtering of individual weak candidates -----------------------------
+
+/// The formula itself (issue #1327), checked against a hand-worked distribution: top score 0.99,
+/// random-baseline mean 0.134, cutoff 0.5 -- halfway from the baseline up to the top score is
+/// `0.99 - 0.5 * (0.99 - 0.134) = 0.562`.
+#[test]
+fn test_relative_margin_floor_matches_hand_worked_formula() {
+    let floor = relative_margin_floor(0.99, 0.134, 0.5);
+    assert!(
+        (floor - 0.562).abs() < 1e-6,
+        "relative_margin_floor(top_score=0.99, random_baseline_mean=0.134, cutoff=0.5) must equal \
+         0.99 - 0.5 * (0.99 - 0.134) = 0.562 per issue #1327's formula, got {floor}"
+    );
+}
+
+/// `cutoff=0.0` keeps only candidates tied with the top score; `cutoff=1.0` reduces to the
+/// "beats the random baseline" absolute floor #1327 replaced (the floor becomes exactly the
+/// baseline itself).
+#[test]
+fn test_relative_margin_floor_cutoff_endpoints() {
+    let top_score = 0.9;
+    let baseline = 0.2;
+    assert_eq!(
+        relative_margin_floor(top_score, baseline, 0.0),
+        top_score,
+        "cutoff=0.0 must set the floor to exactly the top score (only ties with the top survive)"
+    );
+    let floor_at_one = relative_margin_floor(top_score, baseline, 1.0);
+    assert!(
+        (floor_at_one - baseline).abs() < 1e-6,
+        "cutoff=1.0 must set the floor to (within f32 rounding of) the random baseline (the old \
+         absolute-baseline behavior #1327 replaces), got {floor_at_one} vs baseline {baseline}"
+    );
+}
+
+/// `filter_by_relative_margin` drops a candidate scoring below the floor and keeps one scoring at
+/// or above it, checked directly against the pure function (no tree/db machinery), per this
+/// crate's testing convention of asserting the formula's own behavior, not just an end-to-end
+/// outcome.
+#[test]
+fn test_filter_by_relative_margin_drops_below_floor_keeps_at_or_above() {
+    let mut results: Vec<(PointId, String, f32)> = vec![
+        (1, "top".to_string(), 0.99),
+        (2, "borderline".to_string(), 0.7),
+        (3, "weak".to_string(), 0.3),
+    ];
+    // baseline mean = 0.134, cutoff = 0.5 -> floor = 0.562 (same numbers as the hand-worked test
+    // above): "top" (0.99) and "borderline" (0.7) clear it, "weak" (0.3) does not.
+    filter_by_relative_margin(&mut results, 0.134, 0.5);
+    let kept: std::collections::HashSet<PointId> = results.iter().map(|(pid, _, _)| *pid).collect();
+    assert_eq!(
+        kept,
+        std::collections::HashSet::from([1, 2]),
+        "candidates at/above the floor (0.562) must survive and the one below it must be \
+         dropped, got kept={kept:?} from results={results:?}"
+    );
+}
+
+/// A degenerate baseline (at or above the result set's own top score -- e.g. a corpus too small
+/// for the sample to differ meaningfully from the candidates it is judging) must not drop
+/// anything, including the top candidate itself: dropping the top score over a meaningless margin
+/// would be strictly worse than doing nothing.
+#[test]
+fn test_filter_by_relative_margin_is_a_no_op_when_baseline_is_not_below_top_score() {
+    let mut results: Vec<(PointId, String, f32)> =
+        vec![(1, "top".to_string(), 0.9), (2, "second".to_string(), 0.85)];
+    let before = results.clone();
+    filter_by_relative_margin(&mut results, 0.9, 0.5); // baseline == top_score
+    assert_eq!(
+        results, before,
+        "a baseline equal to the top score must leave every candidate untouched, got {results:?}"
+    );
+
+    let mut results: Vec<(PointId, String, f32)> =
+        vec![(1, "top".to_string(), 0.9), (2, "second".to_string(), 0.85)];
+    let before = results.clone();
+    filter_by_relative_margin(&mut results, 0.95, 0.5); // baseline > top_score
+    assert_eq!(
+        results, before,
+        "a baseline above the top score must leave every candidate untouched, got {results:?}"
+    );
+}
+
+/// Production-boundary regression through the real `retrieve()` path (tree + sqlite + the real
+/// per-query random-baseline sample), at `MemoryConfig::relative_margin_cutoff`'s real default
+/// (0.5): a genuinely weak candidate is dropped, a borderline-but-real one is kept, and a clearly
+/// unrelated filler background establishes a low random baseline -- the same three-way
+/// distinction issue #1327 measured (suppressing wrong candidates while keeping true answers),
+/// not just a synthetic call to the pure formula above.
+///
+/// All embeddings are constructed as `[a, sqrt(1-a^2), 0, ...]` against the query `[1, 0, ...]`,
+/// which makes `cos(v, query) == a` exactly (both vectors are unit length by construction), so
+/// the intended cosine scores are exact rather than approximate.
+#[test]
+fn test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one() {
+    let (_dir, path) = open_schema_db();
+    let conn = Connection::open(&path).expect("open");
+    let mut tree = RoutingMemTree::new_with_dim(DIM);
+
+    let query: Vec<f32> = {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = 1.0;
+        v
+    };
+    let with_cosine = |a: f32| -> Vec<f32> {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = a;
+        v[1] = (1.0 - a * a).sqrt();
+        v
+    };
+
+    let top = tree.insert_with_effect("true answer".to_string(), with_cosine(0.99), 1, 100);
+    let borderline = tree.insert_with_effect(
+        "real but weaker match".to_string(),
+        with_cosine(0.7),
+        1,
+        101,
+    );
+    let weak = tree.insert_with_effect("wrong candidate".to_string(), with_cosine(0.3), 1, 102);
+    // Six orthogonal filler points (cos == 0.0 against the query) establish a low random
+    // baseline, using the six embedding dimensions not spent on the `a`/`sqrt(1-a^2)` pair above.
+    for dim in 2..DIM {
+        let mut filler = vec![0.0f32; DIM];
+        filler[dim] = 1.0;
+        tree.insert_with_effect(format!("filler {dim}"), filler, 1, 200 + dim as i64);
+    }
+
+    // Corpus is 3 + 6 = 9 points, all sampled by `random_baseline_mean` (well under
+    // RANDOM_BASELINE_SAMPLE_SIZE), so the baseline is the exact mean of all nine cosines:
+    // (0.99 + 0.7 + 0.3 + 6*0.0) / 9 ~= 0.2211, giving a floor of
+    // 0.99 - 0.5 * (0.99 - 0.2211) ~= 0.6056 at the real default cutoff of 0.5.
+    let results = tree
+        .retrieve(&conn, &query, 3, 0.5)
+        .expect("retrieve must succeed");
+
+    let returned_ids: std::collections::HashSet<PointId> =
+        results.iter().map(|(pid, _, _)| *pid).collect();
+    assert_eq!(
+        returned_ids,
+        std::collections::HashSet::from([top.point_id, borderline.point_id]),
+        "at cutoff=0.5 the weak candidate (cos=0.3, point_id={}) must be dropped while the top \
+         (cos=0.99, point_id={}) and borderline-but-real (cos=0.7, point_id={}) candidates \
+         survive -- got results={results:?}",
+        weak.point_id,
+        top.point_id,
+        borderline.point_id
+    );
+    assert!(
+        !returned_ids.contains(&weak.point_id),
+        "the weak candidate (point_id={}) must not appear in {results:?}",
+        weak.point_id
     );
 }

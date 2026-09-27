@@ -280,6 +280,24 @@ pub struct MemoryConfig {
     /// recalibrate per engine once real distributions are measured, not as
     /// an empirically-derived constant.
     pub min_relevance_score: f32,
+    /// Relative-margin filter (#1327): fraction of the way from a result set's own random-
+    /// baseline mean up to its own top score that an individual candidate must clear to survive,
+    /// applied inside `RoutingMemTree::retrieve` before `min_relevance_score` or `top_k`
+    /// truncation. A candidate scoring below
+    /// `top_score - relative_margin_cutoff * (top_score - random_baseline_mean)` is dropped.
+    ///
+    /// This replaces judging a candidate against a fixed/global "beats a random document"
+    /// baseline, which the validated research behind #1327 measured as a near no-op (0.5%
+    /// suppressed / 99.0% kept) -- a top-k list is already better than random by construction, so
+    /// comparing against random does not discriminate within it. Judging relative to the SAME
+    /// result set's own top score does: the same research measured 17.1% of wrong candidates
+    /// suppressed while keeping 97.1% of true answers, at this default.
+    ///
+    /// Default `0.5` is explicitly a first reasonable guess from that research, not swept against
+    /// Finch's own corpus/embedding distribution -- same caveat as `min_relevance_score` and
+    /// `min_turn_relevance_score` above. `0.0` keeps only candidates tied with the top score;
+    /// `1.0` reduces to the near-no-op absolute-baseline behavior this replaces.
+    pub relative_margin_cutoff: f32,
     /// Turn-level injection gate (#1134): when `Some(t)`, a recall turn
     /// whose *best* retrieved weighted score (`cosine_similarity *
     /// importance_boost` -- the same quantity `min_relevance_score` is
@@ -334,6 +352,7 @@ impl Default for MemoryConfig {
             use_neural_embeddings: true,
             embedding_cache_dir: home.join(".finch").join("embeddings"),
             min_relevance_score: 0.15,
+            relative_margin_cutoff: 0.5,
             min_turn_relevance_score: None,
             max_committed_memories: 8,
             stale_after_turns: 20,
@@ -1887,7 +1906,12 @@ impl MemorySystem {
             // lock-order deadlock against any other caller that takes both.
             let conn = self.db.lock().await;
             let tree = self.tree.lock().await;
-            tree.retrieve(&conn, &query_embedding, k)?
+            tree.retrieve(
+                &conn,
+                &query_embedding,
+                k,
+                self.config.relative_margin_cutoff,
+            )?
         };
         let min_score = self.config.min_relevance_score;
 
@@ -2447,7 +2471,11 @@ impl MemorySystem {
         for window in windows.iter().take(windows.len().saturating_sub(1)) {
             let slice: Vec<&Vec<f32>> = leaves.iter().take(*window).map(|(_, e, _)| e).collect();
             let centroid = average_embeddings(&slice);
-            if let Some((_, text, _)) = tree.retrieve(&conn, &centroid, 1)?.into_iter().next() {
+            if let Some((_, text, _)) = tree
+                .retrieve(&conn, &centroid, 1, self.config.relative_margin_cutoff)?
+                .into_iter()
+                .next()
+            {
                 let s = truncate_str(&text, 70);
                 if !s.trim().is_empty() && s != now_text && seen.insert(s.clone()) {
                     lines.push(s);
@@ -6461,6 +6489,13 @@ mod tests {
     /// guessing one.
     const GATE_WEAK_MEMORY: &str = "The vault for the staging repository holds a \
          different signing item than the production one.";
+    /// A `relative_margin_cutoff` (#1327) large enough that the relative-margin filter can never
+    /// drop anything, for tests below that isolate the pre-existing, unrelated
+    /// `min_relevance_score`/`min_turn_relevance_score` floors using a store seeded with only two
+    /// conversations -- a corpus that small makes the random-baseline sample dominated by the two
+    /// candidates under test, so even the real default cutoff (0.5) would drop the weaker one
+    /// regardless of the floors these tests actually mean to exercise.
+    const RELATIVE_MARGIN_CUTOFF_DISABLED: f32 = 1000.0;
 
     /// Seed one fresh store with [`GATE_SEED`] and recall [`GATE_PROBE`],
     /// returning the recalled best weighted score and result count. The
@@ -6525,6 +6560,7 @@ mod tests {
         let baseline_store = NamedTempFile::new()?;
         let baseline = MemorySystem::new(MemoryConfig {
             db_path: baseline_store.path().to_path_buf(),
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             ..Default::default()
         })?;
         baseline
@@ -6559,6 +6595,7 @@ mod tests {
         let memory = MemorySystem::new(MemoryConfig {
             db_path: gated_store.path().to_path_buf(),
             min_relevance_score: weak_score + 0.02,
+            relative_margin_cutoff: RELATIVE_MARGIN_CUTOFF_DISABLED,
             min_turn_relevance_score: Some(0.5),
             ..Default::default()
         })?;
