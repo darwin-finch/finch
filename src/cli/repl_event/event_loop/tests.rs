@@ -6979,6 +6979,211 @@ async fn test_queued_turn_defers_echo_like_fresh_query_before_streaming_complete
         .await;
 }
 
+/// A generator that always claims streaming support and answers through
+/// `generate_stream_cancellable`, never `generate()` -- the branch local
+/// models (Gemma/Qwen via `DaemonLocalGenerator`, streaming since #1216)
+/// take. `generate()` panics so a silent fallback to non-streaming would
+/// fail the test loudly instead of passing for the wrong reason.
+struct StreamingEchoGenerator;
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for StreamingEchoGenerator {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        panic!(
+            "StreamingEchoGenerator::generate must never be called -- this \
+             fixture exists to exercise the real streaming branch end to \
+             end through a genuine LlmLoop worker"
+        );
+    }
+
+    async fn generate_stream(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        self.generate_stream_cancellable(
+            messages,
+            tools,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn generate_stream_cancellable(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+        _cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(Ok(crate::generators::StreamChunk::TextDelta(
+            "(say \"ack\")".to_string(),
+        )))
+        .await
+        .expect("seed the paced stream with its one chunk");
+        drop(tx);
+        Ok(Some(rx))
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPS: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: true,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            };
+        &CAPS
+    }
+
+    fn name(&self) -> &str {
+        "streaming-echo-generator"
+    }
+}
+
+/// Content long enough to survive the memory quality classifier's noise
+/// filter and specific enough that hashed-n-gram retrieval reliably ranks it
+/// for a matching query -- mirrors `query_processor.rs`'s own
+/// `substantive_memory`/`memory_system_with_seed_for_test` test fixtures.
+async fn seeded_memory_system_for_test(tag: &str) -> Arc<finch_memory::MemorySystem> {
+    let temp = tempfile::NamedTempFile::new().expect("create temp memory db");
+    let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
+        db_path: temp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("construct test memory system");
+    memory
+        .insert_conversation(
+            "user",
+            &format!("Where is the deploy key for the {tag} environment?"),
+            None,
+            None,
+        )
+        .await
+        .expect("seed recall question");
+    memory
+        .insert_conversation(
+            "assistant",
+            &format!(
+                "The deploy key for the {tag} environment lives in the Employee \
+                 vault under the Finch signing item, not in the repository."
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("seed recall answer");
+    // Leak the tempfile for the test's lifetime: `MemorySystem` keeps the
+    // path open and a test-scoped `NamedTempFile` would delete it on drop
+    // while the `EventLoop`/`LlmLoop` under test are still using it.
+    std::mem::forget(temp);
+    Arc::new(memory)
+}
+
+/// Production-boundary regression for issue #1248: on a plain, idle,
+/// non-queued local-model turn, the memory-recall notice ("N memories
+/// retrieved") must still commit to scrollback before the user's own
+/// echoed question -- the same ordering guarantee #1194 established for the
+/// fresh-query path and #1242 extended to the queued-turn path.
+///
+/// #1194's own regression drives `process_query_with_tools` directly with
+/// hand-built arguments; #1242's drives `EventLoop::handle_event` but
+/// intercepts the `LlmRequest` off the channel before any worker consumes
+/// it. Neither exercises the real, wired-together
+/// `EventLoop::handle_event` -> `llm_tx` channel -> a genuinely spawned
+/// `LlmLoop::run()` -> `spawn_query` -> `process_query_with_tools` path --
+/// the same seam `Repl::run_event_loop` uses in production. This test
+/// closes that gap: `EventLoop::new_local_streaming_memory_test_runner`
+/// wires a real `finch_memory::MemorySystem` seeded with a matching
+/// exchange and a `StreamingEchoGenerator` that only answers through the
+/// streaming branch, `start_llm_worker()` spawns the real worker task (the
+/// same call `EventLoop::run` makes in production), and a plain
+/// `ReplEvent::UserInput` is submitted exactly as `handle_user_input` does
+/// for ordinary typed text -- never `/local`, never `??`, never a queued
+/// turn.
+#[tokio::test]
+async fn test_plain_streaming_local_turn_commits_memory_notice_before_echo() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let query_text = "Where is the deploy key for the staging environment?";
+            let memory = seeded_memory_system_for_test("staging").await;
+            let mut event_loop = EventLoop::new_local_streaming_memory_test_runner(
+                Arc::new(StreamingEchoGenerator),
+                memory,
+            );
+            let output = Arc::clone(&event_loop.output_manager);
+            output.disable_stdout();
+
+            // Spawns the real `LlmLoop::run()` worker task, exactly as
+            // `EventLoop::run` does in production -- the seam #1194's and
+            // #1242's own regressions never drove.
+            event_loop.start_llm_worker();
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: query_text.to_string(),
+                })
+                .await
+                .expect("a plain, idle submission must start a fresh query");
+
+            // The worker task, memory recall, and the streaming generation
+            // all run asynchronously now; poll for the turn to finish
+            // committing both rows instead of asserting on a fixed delay.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let messages = output.get_messages();
+                let has_echo = messages.iter().any(|m| m.content() == query_text);
+                let has_notice = messages.iter().any(|m| {
+                    m.format(&crate::theme::ColorScheme::default())
+                        .contains("retrieved")
+                });
+                if has_echo && has_notice {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "the real LlmLoop worker never committed both the echo and the \
+                         memory-recall notice within the timeout; rows={:?}",
+                        messages.iter().map(|m| m.content()).collect::<Vec<_>>()
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let messages = output.get_messages();
+            let row_previews: Vec<String> = messages.iter().map(|m| m.content()).collect();
+            let colors = crate::theme::ColorScheme::default();
+            let notice_idx = messages
+                .iter()
+                .position(|m| m.format(&colors).contains("retrieved"))
+                .unwrap_or_else(|| {
+                    panic!("expected a memory-recall notice row; rows={row_previews:?}")
+                });
+            let echo_idx = messages
+                .iter()
+                .position(|m| m.content() == query_text)
+                .unwrap_or_else(|| {
+                    panic!("expected the user's own echoed question row; rows={row_previews:?}")
+                });
+            assert!(
+                notice_idx < echo_idx,
+                "the memory-recall notice must commit to scrollback before the user's \
+                 own echoed question on a plain, idle, non-queued local-model turn \
+                 (issue #1248) -- notice_idx={notice_idx}, echo_idx={echo_idx}, \
+                 rows={row_previews:?}"
+            );
+        })
+        .await;
+}
+
 /// Cancel must not leave queued text to re-fire after a later turn completes
 /// (#463: queued turn must not execute out of order after cancel).
 #[tokio::test]
