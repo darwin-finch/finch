@@ -1,6 +1,6 @@
 // Claude generator implementation
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -197,6 +197,10 @@ impl ClaudeGenerator {
     /// `LocalGenerator::try_generate_from_pattern_with_tools`'s use of the
     /// same [`ToolCallParser`] (issue #1276/#1303). A no-op when the model
     /// did not call any tool.
+    ///
+    /// Each `<tool_use>` block is parsed independently (#1307): one
+    /// malformed block is logged and dropped, it no longer discards every
+    /// well-formed tool call the same response also proposed.
     fn parse_prompt_injected_tool_calls(response: GeneratorResponse) -> Result<GeneratorResponse> {
         if !ToolCallParser::has_tool_calls(&response.text) {
             return Ok(response);
@@ -206,11 +210,15 @@ impl ClaudeGenerator {
             metadata,
             ..
         } = response;
-        let parsed = ToolCallParser::parse(&raw_text).with_context(|| {
-            format!(
-                "failed to parse prompt-injected tool-call markup from provider output: {raw_text}"
-            )
-        })?;
+        let outcome = ToolCallParser::parse(&raw_text);
+        for malformed in &outcome.errors {
+            tracing::warn!(
+                error = %malformed.message,
+                raw_block = %malformed.raw_block,
+                "dropping malformed prompt-injected tool-call block"
+            );
+        }
+        let parsed = outcome.tool_uses;
         let text = ToolCallParser::extract_text(&raw_text);
         let mut content_blocks = Vec::new();
         if !text.is_empty() {

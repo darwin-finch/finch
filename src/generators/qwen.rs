@@ -284,8 +284,18 @@ fn proposal_from_output(output: &str, model: &str) -> Result<GeneratorResponse> 
         });
     }
 
-    let parsed = ToolCallParser::parse(output)
-        .context("Failed to parse tool calls from local model output")?;
+    // Each <tool_use> block is parsed independently (#1307): one malformed
+    // block is logged and dropped rather than discarding every well-formed
+    // tool call the same response also proposed.
+    let outcome = ToolCallParser::parse(output);
+    for malformed in &outcome.errors {
+        tracing::warn!(
+            error = %malformed.message,
+            raw_block = %malformed.raw_block,
+            "dropping malformed local tool-call block"
+        );
+    }
+    let parsed = outcome.tool_uses;
     let mut content_blocks = Vec::new();
     let text = ToolCallParser::extract_text(output);
     if !text.is_empty() {

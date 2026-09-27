@@ -69,8 +69,14 @@ fn test_tool_call_parsing_single() {
 
 Let me know if you need anything else."#;
 
-    let tool_uses = ToolCallParser::parse(output).expect("Failed to parse");
+    let outcome = ToolCallParser::parse(output);
+    assert_eq!(
+        outcome.errors,
+        vec![],
+        "unexpected diagnostics: {outcome:?}"
+    );
 
+    let tool_uses = outcome.tool_uses;
     assert_eq!(tool_uses.len(), 1);
     assert_eq!(tool_uses[0].name, "read");
     assert_eq!(tool_uses[0].input["file_path"], "/tmp/test.txt");
@@ -95,8 +101,14 @@ Then I'll grep for the pattern:
 
 Done!"#;
 
-    let tool_uses = ToolCallParser::parse(output).expect("Failed to parse");
+    let outcome = ToolCallParser::parse(output);
+    assert_eq!(
+        outcome.errors,
+        vec![],
+        "unexpected diagnostics: {outcome:?}"
+    );
 
+    let tool_uses = outcome.tool_uses;
     assert_eq!(tool_uses.len(), 2);
     assert_eq!(tool_uses[0].name, "glob");
     assert_eq!(tool_uses[0].input["pattern"], "**/*.rs");
@@ -104,13 +116,74 @@ Done!"#;
     assert_eq!(tool_uses[1].input["pattern"], "TODO");
 }
 
+/// Production-boundary regression for #1307 gap 1: a response with several
+/// well-formed `<tool_use>` blocks and one malformed block (invalid JSON
+/// parameters) must surface every well-formed tool call plus a diagnosable
+/// failure for the bad block, not discard all of them. Before the fix,
+/// `ToolCallParser::parse` propagated the first JSON error via `?` and
+/// returned `Err` for the whole response, losing the two valid calls too.
+#[test]
+fn test_tool_call_parsing_one_malformed_block_does_not_discard_the_others() {
+    let output = r#"First, I'll glob for files:
+
+<tool_use>
+  <name>glob</name>
+  <parameters>{"pattern": "**/*.rs"}</parameters>
+</tool_use>
+
+This one is malformed:
+
+<tool_use>
+  <name>bash</name>
+  <parameters>{not valid json}</parameters>
+</tool_use>
+
+Then I'll grep for the pattern:
+
+<tool_use>
+  <name>grep</name>
+  <parameters>{"pattern": "TODO", "path": "."}</parameters>
+</tool_use>
+
+Done!"#;
+
+    let outcome = ToolCallParser::parse(output);
+
+    assert_eq!(
+        outcome.tool_uses.len(),
+        2,
+        "both well-formed blocks must survive the malformed one between them: {outcome:?}"
+    );
+    assert_eq!(outcome.tool_uses[0].name, "glob");
+    assert_eq!(outcome.tool_uses[0].input["pattern"], "**/*.rs");
+    assert_eq!(outcome.tool_uses[1].name, "grep");
+    assert_eq!(outcome.tool_uses[1].input["pattern"], "TODO");
+
+    assert_eq!(
+        outcome.errors.len(),
+        1,
+        "the one malformed block must be reported as a diagnosable failure: {outcome:?}"
+    );
+    assert!(
+        outcome.errors[0].raw_block.contains("not valid json"),
+        "diagnostic must identify the malformed block: {:?}",
+        outcome.errors[0]
+    );
+}
+
 #[test]
 fn test_tool_call_parsing_compact() {
     let output =
         "<tool_use><name>bash</name><parameters>{\"command\":\"ls -la\"}</parameters></tool_use>";
 
-    let tool_uses = ToolCallParser::parse(output).expect("Failed to parse");
+    let outcome = ToolCallParser::parse(output);
+    assert_eq!(
+        outcome.errors,
+        vec![],
+        "unexpected diagnostics: {outcome:?}"
+    );
 
+    let tool_uses = outcome.tool_uses;
     assert_eq!(tool_uses.len(), 1);
     assert_eq!(tool_uses[0].name, "bash");
     assert_eq!(tool_uses[0].input["command"], "ls -la");
@@ -125,8 +198,17 @@ fn test_tool_call_parsing_invalid_json() {
 </tool_use>
 "#;
 
-    let result = ToolCallParser::parse(output);
-    assert!(result.is_err());
+    let outcome = ToolCallParser::parse(output);
+    assert_eq!(
+        outcome.tool_uses.len(),
+        0,
+        "no well-formed calls in this response: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors.len(),
+        1,
+        "the malformed block must be diagnosed, not silently dropped: {outcome:?}"
+    );
 }
 
 #[test]
@@ -151,10 +233,44 @@ Let me know if you need anything else."#;
 
 #[test]
 fn test_has_tool_calls() {
-    assert!(ToolCallParser::has_tool_calls("<tool_use>"));
-    assert!(ToolCallParser::has_tool_calls("text <tool_use> more text"));
+    assert!(ToolCallParser::has_tool_calls(
+        "<tool_use><name>x</name></tool_use>"
+    ));
+    assert!(ToolCallParser::has_tool_calls(
+        "text <tool_use><name>x</name></tool_use> more text"
+    ));
     assert!(!ToolCallParser::has_tool_calls("no tools here"));
     assert!(!ToolCallParser::has_tool_calls(""));
+}
+
+/// Production-boundary regression for #1307 gap 2: a bare, unclosed mention
+/// of the `<tool_use>` marker string -- prose describing the format, or a
+/// truncated generation with no matching close tag -- must not be detected
+/// as a real tool-call attempt. Before the fix, `has_tool_calls` was
+/// `output.contains("<tool_use>")`, a substring check with no requirement
+/// for well-formed tag structure.
+#[test]
+fn test_has_tool_calls_does_not_false_positive_on_bare_marker_mentions() {
+    let prose = "You can call a tool by writing a <tool_use> block in your response.";
+    assert!(
+        !ToolCallParser::has_tool_calls(prose),
+        "prose mentioning the marker with no closing tag must not be detected as a tool \
+         call: {prose:?}"
+    );
+
+    let truncated = "Let me use a tool.\n\n<tool_use>\n  <name>read</name>\n  <parameters>{\"fil";
+    assert!(
+        !ToolCallParser::has_tool_calls(truncated),
+        "a truncated block with no closing tag must not be detected as a tool call: \
+         {truncated:?}"
+    );
+
+    let error_message = "Error: the response did not contain a valid <tool_use> tag, please retry.";
+    assert!(
+        !ToolCallParser::has_tool_calls(error_message),
+        "an error message quoting the marker must not be detected as a tool call: \
+         {error_message:?}"
+    );
 }
 
 #[test]
@@ -171,8 +287,14 @@ fn test_tool_call_with_complex_json() {
 </tool_use>
 "#;
 
-    let tool_uses = ToolCallParser::parse(output).expect("Failed to parse");
+    let outcome = ToolCallParser::parse(output);
+    assert_eq!(
+        outcome.errors,
+        vec![],
+        "unexpected diagnostics: {outcome:?}"
+    );
 
+    let tool_uses = outcome.tool_uses;
     assert_eq!(tool_uses.len(), 1);
     assert_eq!(tool_uses[0].name, "grep");
     assert_eq!(tool_uses[0].input["pattern"], "fn main");

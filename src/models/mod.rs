@@ -45,7 +45,7 @@ pub use threshold_router::{
     QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats,
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
-pub use tool_parser::ToolCallParser; // Phase 6: Parse tool calls from model output
+pub use tool_parser::{ToolCallParseError, ToolCallParseOutcome, ToolCallParser}; // Phase 6: Parse tool calls from model output
 pub use tool_prompt::ToolPromptFormatter; // Phase 6: Format tool definitions for prompts
 pub use unified_loader::{
     FamilyEngineCapabilities, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
