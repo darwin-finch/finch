@@ -31,8 +31,7 @@ inject everything a generator needs.
 **`ClaudeGenerator` folds tools into the prompt for providers that cannot take
 them natively.** `finch-providers`' `ModelCapabilities::validate_request`
 rejects any request whose `tools` are non-empty when the provider declares
-tool calls `Unsupported` (e.g. `finch_providers::ClaudeCliProvider`, run with
-`--tools ""` by design) — and Finch attaches at least its own default tool set
+tool calls `Unsupported` — and Finch attaches at least its own default tool set
 to essentially every turn, so that gate previously failed ordinary queries
 outright (#1303). `ClaudeGenerator::split_tools_for_capability` checks
 `ClaudeClient::supports_tools()` (the provider's own capability, not a
@@ -45,7 +44,15 @@ needs the complete response before the markup can be stripped, so
 tool-bearing turn against such a provider — the same streaming-unavailable
 signal local models return — and the caller's existing fallback in
 `process_query_with_tools` drives it through the buffered `generate()` path
-instead.
+instead. `finch_providers::ClaudeCliProvider` was this fold's original
+real-world example (`--tools ""` by design) until issue #1309 gave it a real
+native-tool-calling path of its own — Finch's own tools served to the CLI over
+MCP and executed by Finch's own bridge process, never the CLI's own built-in
+tools — so it now declares tool calls `Supported` and this fold no longer
+applies to it; see `finch_providers::claude_cli`'s module doc comment and that
+crate's `AGENTS.md` for the mechanism. The fold above still exists, and is
+still tested here, for any other provider that genuinely cannot execute tool
+calls itself.
 
 **Generator names are family-truthful.** `QwenGenerator::name()` reports the
 served family path (`QWEN_LOCAL_GENERATOR_NAME`, "qwen2.5-llama-cpp"), never a bare

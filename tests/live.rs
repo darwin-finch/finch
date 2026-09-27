@@ -13,6 +13,8 @@
 //   tests/live/parity.rs     <- cross-provider behavioral parity tests
 //   tests/live/impcpd.rs     <- IMPCPD JSON contract tests
 
+#[path = "live/claude_cli_mcp_bridge.rs"]
+pub mod claude_cli_mcp_bridge;
 #[path = "live/impcpd.rs"]
 pub mod impcpd;
 #[path = "live/parity.rs"]

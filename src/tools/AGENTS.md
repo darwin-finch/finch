@@ -50,6 +50,18 @@ legacy headless `finch agent` loop calls `ToolExecutor` directly and does not ha
 `ToolLoop` admission lifecycle; see the [README](README.md) before extending this path.
 Generators and provider adapters must not import or invoke `ToolExecutor` themselves.
 
+**A third, narrower direct-dispatch caller: the Claude Code MCP bridge (issue #1309,
+`src/cli/claude_cli_bridge.rs`).** `finch_providers::ClaudeCliProvider` spawns the real `claude`
+CLI with its own built-in tools disabled and instead re-invokes this same Finch binary as an MCP
+server; that subprocess builds its own `ToolRegistry` (a fixed subset: read, write, edit, glob,
+grep, bash) and `PermissionManager::for_peer()`, then calls `tool.execute()` directly — narrower
+even than `ToolExecutor::execute_tool`, whose `AskUser` branch assumes a coordinator already
+obtained approval. This caller has no coordinator and no interactive TUI, so it checks
+`check_tool_use` itself first and only ever calls `execute()` on an explicit `Allow`; `AskUser`
+and `Deny` both return a plain-text explanation instead of executing anything. Do not route this
+caller through `ToolExecutor` without re-deriving that gate — its own `AskUser` handling would
+silently treat "needs approval" as "already approved" for a process with nothing to approve it.
+
 **Facade:** child modules are private, so the flat `pub use` list in [`mod.rs`](mod.rs) is the
 callable surface; use rustdoc for methods, not a generated signature catalog. Callers outside this directory use
 `crate::tools::Item` (or `finch::tools::Item`); they must not name `implementations`, `types`,

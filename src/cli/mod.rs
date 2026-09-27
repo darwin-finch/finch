@@ -3,6 +3,7 @@
 
 mod chatgpt_auth;
 mod claude_auth;
+mod claude_cli_bridge;
 mod commands;
 use finch_conversation as conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
@@ -37,6 +38,10 @@ pub use claude_auth::{
     save_named_credential as save_claude_named_credential, BrowserLoginPresentation,
     ClaudeAuthService,
 };
+/// The hidden Claude Code MCP bridge entry point (issue #1309); see
+/// `src/main.rs` for the argv check that routes into it and
+/// `finch_providers::claude_cli`'s doc comment for the wire contract.
+pub use claude_cli_bridge::run as run_claude_cli_mcp_bridge;
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;
 pub use diagnostic_console::register_frontend_log_path;

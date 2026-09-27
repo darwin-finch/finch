@@ -5,7 +5,8 @@
 // pipes its NDJSON events into Finch's provider-neutral wire types. The CLI
 // holds its own OAuth session; this transport never touches credentials.
 //
-// Wire contract measured against claude CLI 2.1.283 on 2026-09-25:
+// Wire contract measured against claude CLI 2.1.283 on 2026-09-25 and
+// 2026-09-27:
 // - Input: one JSON object per line, `{"type":"user","message":{"role":
 //   "user","content":[{"type":"text","text":...}]}}`. Messages-API-shaped
 //   input is silently ignored by the CLI, so every emitted line is validated
@@ -16,15 +17,37 @@
 // - `--verbose` is required for stream-json output.
 // - A conversation continues with `--resume <id>`; `--session-id <id>`
 //   errors ("already in use") once the id exists.
-// - `--tools ""` runs the session with no tools: the CLI executes nothing on
-//   its own authority, and Finch's permission system stays the only one.
+// - `--tools ""` always disables the CLI's own built-in tools (Read, Write,
+//   Edit, Bash, Grep, Glob, ...). Verified directly (issue #1309) that
+//   several of those built-ins auto-execute for real, on the CLI's own
+//   authority, before any permission hook ever runs: a file read inside the
+//   CLI's own working directory, anything under the OS temp directory
+//   (`/tmp`, independent of working directory), and read-only Bash commands
+//   per Claude Code's own permissions docs. None of that is gateable from
+//   outside the CLI, so real Finch tool calls must never go through the
+//   CLI's built-ins.
+// - Real, provider-native tool use instead comes from Finch's own tools,
+//   served to the CLI over MCP (`--mcp-config`, verified inline-JSON shape:
+//   `{"mcpServers":{"<name>":{"type":"stdio","command":...,"args":[...]}}}`,
+//   `--strict-mcp-config` so the CLI ignores the user's own personal MCP
+//   integrations). The MCP server is this same `finch` binary, re-invoked
+//   with the hidden [`CLAUDE_CLI_MCP_BRIDGE_FLAG`] (`src/cli/claude_cli_bridge.rs`
+//   in the root crate): it registers Finch's own tool implementations and
+//   really executes each call through Finch's permission policy — the CLI
+//   never touches the filesystem or a shell itself. `--allowedTools
+//   "mcp__<server>__<tool>"` (bare name) is required per tool: verified
+//   directly that an MCP tool call is otherwise denied by default with no
+//   permission host available in `--print` mode, and that a bare-name entry
+//   auto-approves every call to that tool with no further prompting — safe
+//   here because the bridge's own handler, not blanket approval, is what
+//   decides whether the call actually runs.
 
 use crate::types::{
     ModelCapabilities, ProviderAllowance, ProviderRequest, ProviderResponse, ProviderUsage,
     ReasoningCapability, StreamChunk,
 };
 use crate::wire_types::ContentBlock;
-use crate::{CapabilitySupport, ProviderBackend, ValidatedProviderRequest};
+use crate::{CapabilitySupport, ProviderBackend, ValidatedProviderRequest, WireProtocol};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -45,6 +68,37 @@ const MEASURED_SOURCE: &str =
 const MEASURED_CONTEXT_WINDOW: usize = 1_000_000;
 const MEASURED_MAX_OUTPUT_TOKENS: usize = 64_000;
 const MAX_STDERR_BYTES: usize = 8 * 1024;
+
+/// Hidden Finch subcommand flag. When `finch` is invoked with exactly this as
+/// its first argument, it runs only the stdio MCP bridge server
+/// (`src/cli/claude_cli_bridge.rs`) and exits — never the normal CLI. This
+/// crate never executes tools itself (see the crate's `AGENTS.md`); it only
+/// needs the flag's name so it can spawn its own binary
+/// (`std::env::current_exe()`) as the MCP server Claude Code calls back into.
+pub const CLAUDE_CLI_MCP_BRIDGE_FLAG: &str = "--internal-claude-cli-mcp-bridge";
+
+/// MCP server name the CLI sees in `--mcp-config`. Wire tool names are
+/// `mcp__<CLAUDE_CLI_MCP_SERVER_NAME>__<tool>`.
+pub const CLAUDE_CLI_MCP_SERVER_NAME: &str = "finch";
+
+/// Finch tool names this transport ever exposes to Claude Code. Every one of
+/// them is executed by Finch's own bridge process, under Finch's own
+/// permission policy — the CLI never runs Bash, Read, Write, Edit, Grep, or
+/// Glob on its own authority (`--tools` always stays `""`). A tool that
+/// exists in Finch but is not in this list is simply never offered to this
+/// provider; the caller sees no tool-call attempt for it, not a failure.
+pub const CLAUDE_CLI_TOOL_NAMES: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
+
+/// The MCP wire name Claude Code will call for a Finch tool name.
+pub fn claude_cli_mcp_wire_name(finch_tool_name: &str) -> String {
+    format!("mcp__{CLAUDE_CLI_MCP_SERVER_NAME}__{finch_tool_name}")
+}
+
+/// The reverse of [`claude_cli_mcp_wire_name`], for logging/observability
+/// only (the bridge process is what actually decodes and dispatches calls).
+pub fn claude_cli_tool_name_from_wire(wire_name: &str) -> Option<&str> {
+    wire_name.strip_prefix(&format!("mcp__{CLAUDE_CLI_MCP_SERVER_NAME}__"))
+}
 
 /// Whether the `claude` CLI is usable as a backend.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +142,9 @@ struct TurnRecord {
     allowance: Option<ProviderAllowance>,
     result_text: Option<String>,
     result_error: Option<String>,
+    /// Count of `tool_use` blocks seen across every `assistant` event in this
+    /// turn — observability only, see [`TurnRecord::absorb_line`].
+    tool_calls_observed: usize,
 }
 
 #[derive(Clone)]
@@ -157,8 +214,17 @@ impl ClaudeCliProvider {
     }
 
     /// Pure argument-vector builder: turn 1 mints the session with
-    /// `--session-id`, later turns continue it with `--resume`.
-    fn invocation_args(&self, resumable: bool, system: Option<&str>) -> Vec<String> {
+    /// `--session-id`, later turns continue it with `--resume`. `tool_names`
+    /// are Finch tool names to expose over MCP for this turn (already
+    /// intersected with [`CLAUDE_CLI_TOOL_NAMES`] by the caller); empty means
+    /// no tools at all. `--tools` itself is always `""`: the CLI's own
+    /// built-ins never run (see the module doc comment).
+    fn invocation_args(
+        &self,
+        resumable: bool,
+        system: Option<&str>,
+        tool_names: &[String],
+    ) -> Result<Vec<String>> {
         let mut args = vec![
             "--print".to_string(),
             "--verbose".to_string(),
@@ -170,6 +236,7 @@ impl ClaudeCliProvider {
             "--tools".to_string(),
             String::new(),
         ];
+        args.extend(self.mcp_bridge_args(tool_names)?);
         if let Some(system) = system {
             args.push("--system-prompt".to_string());
             args.push(system.to_string());
@@ -182,7 +249,65 @@ impl ClaudeCliProvider {
         args.push(self.session_id.to_string());
         args.push("--model".to_string());
         args.push(self.model.clone());
-        args
+        Ok(args)
+    }
+
+    /// `--mcp-config`/`--strict-mcp-config`/`--allowedTools` for serving
+    /// Finch's own tools over MCP (issue #1309). Empty `tool_names` means no
+    /// tool support this turn — no MCP server is registered at all, matching
+    /// the pre-#1309 `--tools ""`-only behavior exactly.
+    ///
+    /// The MCP server is this same Finch binary, re-invoked with
+    /// [`CLAUDE_CLI_MCP_BRIDGE_FLAG`]: real execution happens in that
+    /// subprocess, under Finch's own permission policy
+    /// (`src/cli/claude_cli_bridge.rs`), never inside the `claude` CLI.
+    fn mcp_bridge_args(&self, tool_names: &[String]) -> Result<Vec<String>> {
+        if tool_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let exe = std::env::current_exe()
+            .context("resolving Finch's own executable path for the Claude Code MCP bridge")?;
+        let mcp_config = json!({
+            "mcpServers": {
+                CLAUDE_CLI_MCP_SERVER_NAME: {
+                    "type": "stdio",
+                    "command": exe.to_string_lossy(),
+                    "args": [CLAUDE_CLI_MCP_BRIDGE_FLAG],
+                }
+            }
+        });
+        let allowed_tools = tool_names
+            .iter()
+            .map(|name| claude_cli_mcp_wire_name(name))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(vec![
+            "--mcp-config".to_string(),
+            mcp_config.to_string(),
+            "--strict-mcp-config".to_string(),
+            "--allowedTools".to_string(),
+            allowed_tools,
+        ])
+    }
+
+    /// Finch tool names requested for this turn, intersected with
+    /// [`CLAUDE_CLI_TOOL_NAMES`] in the CLI's own advertised order (stable
+    /// argv, better for the CLI's prompt cache). A requested tool this
+    /// transport does not support is silently omitted, not an error: the
+    /// model simply never sees or attempts it through this provider.
+    fn supported_tool_names(&self, request: &ProviderRequest) -> Vec<String> {
+        let requested: std::collections::HashSet<&str> = request
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+        CLAUDE_CLI_TOOL_NAMES
+            .iter()
+            .filter(|name| requested.contains(*name))
+            .map(|name| name.to_string())
+            .collect()
     }
 
     /// Extract (system prompt, pending input lines) from a provider request.
@@ -252,9 +377,16 @@ impl ClaudeCliProvider {
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
     ) -> Result<TurnRecord> {
         let (system, input_lines) = self.split_request(request)?;
+        let tool_names = self.supported_tool_names(request);
         let resumable = *self.resumable.lock().await;
         match self
-            .run_turn_once(resumable, system.as_deref(), &input_lines, deltas.clone())
+            .run_turn_once(
+                resumable,
+                system.as_deref(),
+                &input_lines,
+                &tool_names,
+                deltas.clone(),
+            )
             .await
         {
             Ok(record) => {
@@ -269,7 +401,7 @@ impl ClaudeCliProvider {
                 // "already in use" exit names the latter exactly.
                 if !resumable && error.to_string().contains("already in use") {
                     let retry = self
-                        .run_turn_once(true, system.as_deref(), &input_lines, deltas)
+                        .run_turn_once(true, system.as_deref(), &input_lines, &tool_names, deltas)
                         .await?;
                     self.mark_resumable().await;
                     return Ok(retry);
@@ -288,9 +420,10 @@ impl ClaudeCliProvider {
         resumable: bool,
         system: Option<&str>,
         input_lines: &[String],
+        tool_names: &[String],
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
     ) -> Result<TurnRecord> {
-        let args = self.invocation_args(resumable, system);
+        let args = self.invocation_args(resumable, system, tool_names)?;
         let mut child = tokio::process::Command::new(&self.binary)
             .args(&args)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
@@ -412,6 +545,29 @@ impl TurnRecord {
                         .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
                         .join("");
+                    // Observability only (issue #1309): a tool_use block here
+                    // was already served and really executed by Finch's own
+                    // MCP bridge process by the time this line arrives —
+                    // Claude Code folds the real tool_result back into the
+                    // same turn automatically. Logging (and the count this
+                    // module's tests assert on) is deliberately the only
+                    // effect: emitting a ToolCallComplete/ContentBlockComplete
+                    // chunk here would make the generation layer execute the
+                    // same call a second time through Finch's interactive
+                    // ToolLoop (see `finch-providers`' `AGENTS.md`: "Dual
+                    // encoding of the same id+input is one call at the
+                    // ToolLoop").
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let wire_name = block.get("name").and_then(|n| n.as_str());
+                            self.tool_calls_observed += 1;
+                            tracing::debug!(
+                                wire_name,
+                                finch_tool = wire_name.and_then(claude_cli_tool_name_from_wire),
+                                "claude CLI called a Finch tool over MCP"
+                            );
+                        }
+                    }
                 }
                 self.assistant_model = message
                     .get("model")
@@ -597,15 +753,31 @@ impl ProviderBackend for ClaudeCliProvider {
             MEASURED_ON,
             MEASURED_SOURCE,
             CapabilitySupport::Supported,
-            // The CLI runs with `--tools ""`: the model executes nothing on
-            // its own authority, so provider-native tool calls are absent by
-            // design. Finch's own ToolLoop remains the only execution path.
-            CapabilitySupport::Unsupported,
+            // Tool calls are supported, but not via the CLI's own built-in
+            // tools (`--tools` always stays `""`, so the CLI itself executes
+            // nothing on its own authority — see the module doc comment).
+            // Support here means Finch's own tools, served over MCP and
+            // executed by Finch's own bridge process (issue #1309); the
+            // prompt-injection fold in `src/generators/claude.rs` is bypassed
+            // for this provider accordingly.
+            CapabilitySupport::Supported,
             CapabilitySupport::Unsupported,
             ReasoningCapability::unsupported(MEASURED_ON, MEASURED_SOURCE),
             Some(MEASURED_CONTEXT_WINDOW),
             Some(MEASURED_MAX_OUTPUT_TOKENS),
             None,
+        )
+        // Finch's own `ToolDefinition`s compile against the Anthropic wire
+        // shape for this transport too (id/name/input `tool_use` blocks,
+        // matching the real `claude` CLI's stream-json output); the compiled
+        // table itself goes unused here — `supported_tool_names` derives the
+        // exposed tool list directly from `request.tools`, since the CLI's
+        // own `--tools`/`--allowedTools` flags take plain names, not a JSON
+        // schema.
+        .with_wire_protocol(
+            WireProtocol::AnthropicMessages,
+            MEASURED_ON,
+            MEASURED_SOURCE,
         )
     }
 }
@@ -1001,7 +1173,9 @@ printf '%s\n' \
     #[test]
     fn invocation_args_always_disable_tools_and_enable_streaming() {
         let provider = ClaudeCliProvider::new(None);
-        let args = provider.invocation_args(false, Some("SYSTEM"));
+        let args = provider
+            .invocation_args(false, Some("SYSTEM"), &[])
+            .unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("--print"));
         assert!(
@@ -1014,7 +1188,11 @@ printf '%s\n' \
         assert!(joined.contains("--system-prompt SYSTEM"));
         assert!(
             args.iter().zip(args.iter().skip(1)).any(|(flag, value)| flag == "--tools" && value.is_empty()),
-            "--tools with an empty value is what keeps the CLI from executing anything on its own authority; args: {joined}"
+            "--tools with an empty value is what keeps the CLI's own built-in tools from executing on its own authority; args: {joined}"
+        );
+        assert!(
+            !joined.contains("--mcp-config"),
+            "no tool names requested must mean no MCP server is registered at all: {joined}"
         );
         assert!(
             joined.contains("--session-id"),
@@ -1022,11 +1200,74 @@ printf '%s\n' \
         );
         assert!(!joined.contains("--resume"), "turn one must not resume");
 
-        let resume_args = provider.invocation_args(true, None);
+        let resume_args = provider.invocation_args(true, None, &[]).unwrap();
         assert!(resume_args.contains(&"--resume".to_string()));
         assert!(
             !resume_args.iter().any(|arg| arg == "--system-prompt"),
             "an absent system prompt must omit the flag, not send empty bytes"
+        );
+    }
+
+    #[test]
+    fn invocation_args_with_tools_wires_the_mcp_bridge_not_the_clis_own_builtins() {
+        let provider = ClaudeCliProvider::new(None);
+        let args = provider
+            .invocation_args(false, None, &["read".to_string(), "bash".to_string()])
+            .unwrap();
+        assert!(
+            args.iter().zip(args.iter().skip(1)).any(|(flag, value)| flag == "--tools" && value.is_empty()),
+            "the CLI's own built-in tools must stay disabled even when Finch tools are exposed over MCP: {args:?}"
+        );
+        let mcp_config_value = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--mcp-config")
+            .map(|(_, value)| value.clone())
+            .expect("tool names requested must register the Finch MCP bridge server");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp_config_value)
+            .expect("--mcp-config value must be valid inline JSON");
+        let server = &parsed["mcpServers"][CLAUDE_CLI_MCP_SERVER_NAME];
+        assert_eq!(server["type"], "stdio");
+        assert_eq!(
+            server["args"][0], CLAUDE_CLI_MCP_BRIDGE_FLAG,
+            "the MCP server command must be this same Finch binary, re-invoked with the hidden bridge flag"
+        );
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "the user's own personal MCP integrations must never be pulled into this session: {args:?}"
+        );
+        let allowed_tools = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--allowedTools")
+            .map(|(_, value)| value.clone())
+            .expect("--allowedTools must name the exposed tools so the bridge is not blocked on approval");
+        assert_eq!(
+            allowed_tools,
+            format!(
+                "{},{}",
+                claude_cli_mcp_wire_name("read"),
+                claude_cli_mcp_wire_name("bash")
+            ),
+            "allowedTools must name exactly the requested, supported tools, in CLAUDE_CLI_TOOL_NAMES order"
+        );
+    }
+
+    #[test]
+    fn supported_tool_names_intersects_with_the_safe_allowlist_and_ignores_unknown_tools() {
+        let provider = ClaudeCliProvider::new(None);
+        let mut request = simple_request();
+        request.tools = Some(vec![
+            tool_definition("bash"),
+            tool_definition("read"),
+            tool_definition("some_other_finch_tool_not_on_the_cli_allowlist"),
+        ]);
+        let names = provider.supported_tool_names(&request);
+        assert_eq!(
+            names,
+            vec!["read".to_string(), "bash".to_string()],
+            "only tools in CLAUDE_CLI_TOOL_NAMES are exposed, in that fixed order; \
+             unsupported tool names are silently dropped, not an error: {names:?}"
         );
     }
 
@@ -1099,13 +1340,19 @@ printf '%s\n' \
     }
 
     #[test]
-    fn capabilities_declare_streaming_without_tools() {
+    fn capabilities_declare_native_tools_via_the_mcp_bridge() {
         let provider = ClaudeCliProvider::new(None);
         let capabilities = provider.capabilities(CLAUDE_CLI_DEFAULT_MODEL);
         assert!(capabilities.streaming.is_supported());
         assert!(
-            !capabilities.tools.is_supported(),
-            "the backend must advertise no provider-native tools: the CLI runs with --tools \"\""
+            capabilities.tools.is_supported(),
+            "issue #1309: real tool calls are supported via Finch's own MCP bridge, \
+             even though the CLI's own built-in tools stay disabled"
+        );
+        assert_eq!(
+            capabilities.wire_protocol.protocol,
+            Some(WireProtocol::AnthropicMessages),
+            "tool bindings must compile against a known wire protocol for validation to accept a tool-bearing request"
         );
         assert_eq!(
             capabilities.context_window.max_tokens,
@@ -1117,26 +1364,68 @@ printf '%s\n' \
         );
     }
 
-    #[tokio::test]
-    async fn a_request_asking_for_tools_fails_closed_at_validation() {
-        let provider = ClaudeCliProvider::new(None);
-        let mut request = simple_request();
-        request.tools = Some(vec![crate::ToolDefinition {
-            name: "read".to_string(),
-            description: "read a file".to_string(),
+    fn tool_definition(name: &str) -> crate::ToolDefinition {
+        crate::ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} tool"),
             input_schema: crate::ToolInputSchema {
                 schema_type: "object".to_string(),
-                properties: Default::default(),
+                properties: serde_json::json!({}),
                 required: Vec::new(),
             },
-        }]);
-        let error = match crate::validate_provider_request(&provider, &request, false).await {
-            Ok(_) => panic!("tool-bearing requests must be refused by capability validation"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().to_lowercase().contains("tool"),
-            "the refusal must name the unsupported capability: {error}"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_asking_for_a_supported_tool_is_accepted_by_validation() {
+        let provider = ClaudeCliProvider::new(None);
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        crate::validate_provider_request(&provider, &request, false)
+            .await
+            .expect(
+                "issue #1309: a request for a tool this transport supports over MCP \
+                 must no longer be refused by capability validation",
+            );
+    }
+
+    #[tokio::test]
+    async fn a_full_turn_with_a_real_tool_use_block_is_observed_and_never_double_forwarded() {
+        // Reproduces the exact shape verified against the real claude CLI
+        // 2.1.283 (issue #1309): an `assistant` event's content array can
+        // contain a `tool_use` block calling this transport's own MCP bridge
+        // tool, followed later by the CLI's normal final-answer event. The
+        // bridge process has already executed the call for real by the time
+        // this line arrives — `TurnRecord` must count/log it (observability)
+        // without emitting anything the generation layer would execute a
+        // second time.
+        let mut record = TurnRecord::default();
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x"}}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.tool_calls_observed, 1,
+            "a tool_use block in an assistant event must be observed exactly once"
+        );
+        assert_eq!(
+            record.assistant_text, "",
+            "a tool_use-only assistant event carries no text of its own"
+        );
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":"Done."}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.tool_calls_observed, 1,
+            "a later text-only assistant event must not double-count the earlier tool call"
+        );
+        assert_eq!(
+            record.response_text(),
+            "Done.",
+            "the final text-only assistant event must win, overwriting the intermediate tool-use turn"
         );
     }
 }
