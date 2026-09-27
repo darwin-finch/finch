@@ -120,6 +120,15 @@ pub struct LlmGeneration {
     pub local: Arc<dyn crate::generators::Generator>,
     pub router: Arc<crate::router::Router>,
     pub state: Arc<RwLock<GeneratorState>>,
+    /// Configured provider profiles, used to tell whether the active session
+    /// generator (`cloud`, despite its name -- it is whatever `/model` last
+    /// selected, local or cloud) is a local profile, and to find a
+    /// configured cloud one to prefer for summarisation instead (#1236).
+    pub available_providers: Vec<crate::config::ProviderEntry>,
+    /// Builds a generator for a configured provider profile on demand -- the
+    /// same resolver `/model` switching already uses
+    /// (`EventLoop::apply_effective_selection`).
+    pub provider_resolver: crate::scheduler::ProviderResolver,
 }
 
 /// Tools the model may call, and what is in flight.

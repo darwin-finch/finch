@@ -1990,6 +1990,8 @@ impl EventLoop {
             LlmGeneration {
                 cloud: self.model_selection.generator_handle(),
                 local: Arc::clone(&self.qwen_gen),
+                available_providers: self.available_providers.clone(),
+                provider_resolver: self.provider_resolver.clone(),
                 router: Arc::clone(&self.router),
                 state: Arc::clone(&self.generator_state),
             },
