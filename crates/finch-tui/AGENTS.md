@@ -43,6 +43,16 @@ frontend/daemon logs and supplies a bounded snapshot; the renderer owns only the
 the transcript viewport, its visible-range indicator, and scrolling. Focused tool-result readers
 use the same viewport-above-chrome path. Filesystem paths and log retention policy stay outside
 this crate.
+`TuiRenderer::model_identity`/`set_model_identity` is the bottom status rule's provider/model text
+(`status_rule_line` renders an empty value as a bare dash rule with no identity — the #1318
+symptom). This crate's own contract for that field is narrow: hold it and render it faithfully.
+The actual invariant lives on the caller side (`EventLoop::project_model_identity` in
+`src/cli/repl_event/event_loop/commands.rs` must take the blocking `tui_renderer.lock().await`,
+never `try_lock`) because `spawn_input_task`'s own periodic `tui_renderer.lock()` in
+`async_input.rs` (held across its `crossterm::event::poll` call below) is exactly the kind of
+transient hold a `try_lock` caller can lose to, with nothing left to retry the update afterward.
+Any future caller that projects renderer state computed elsewhere (as opposed to state this crate
+owns and mutates internally) should default to the blocking lock for the same reason.
 The renderer owns its composer draft and failed-frame recovery state. Application callers use
 `restore_input_draft`, `record_render_failure`, and `take_render_failure_for_retry`; they must
 not mutate the textarea, refresh flag, or render-error slot directly. A failed process

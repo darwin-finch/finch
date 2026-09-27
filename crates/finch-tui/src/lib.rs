@@ -3006,6 +3006,16 @@ impl TuiRenderer {
         self.live_area_dirty = true;
     }
 
+    /// The provider/model identity currently projected onto the bottom
+    /// status rule (`status_rule_line`). Empty means the rule renders as a
+    /// blank line of dashes with no identity text — the #1318 symptom, which
+    /// was caused by a caller (`EventLoop::project_model_identity`) losing a
+    /// `try_lock` race against this renderer's own input-polling task and
+    /// silently never retrying `set_model_identity`.
+    pub fn model_identity(&self) -> &str {
+        &self.model_identity
+    }
+
     /// Build the static startup artifact for application output projection.
     ///
     /// This deliberately returns plain text rather than issuing crossterm
