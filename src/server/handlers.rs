@@ -2537,18 +2537,36 @@ async fn handle_message(
 
                     tracing::info!(request_id = %request_id, "Using local Qwen model");
 
-                    // Use local generator (need write lock for try_generate)
-                    let mut generator = server.local_generator().write().await;
+                    // Local generation is synchronous, CPU/GPU-bound work
+                    // (llama.cpp inference); run it on the blocking thread
+                    // pool so it cannot occupy this axum worker thread for
+                    // the full duration of a turn, matching the pattern used
+                    // for the same generator in `handle_chat_completions`/
+                    // `handle_local_only_query` (`openai_handlers.rs`,
+                    // #1271) and the streaming path's `spawn_blocking` in
+                    // `handle_chat_completions_streaming` (#1254). The write
+                    // guard is acquired and dropped entirely inside the
+                    // blocking closure, so it is never held across an
+                    // `.await` on this task.
+                    let server_for_blocking = Arc::clone(&server);
+                    let user_text_for_blocking = user_text.clone();
+                    let generation_result = tokio::task::spawn_blocking(move || {
+                        let handle = tokio::runtime::Handle::current();
+                        let mut generator = handle.block_on(async {
+                            server_for_blocking.local_generator().write().await
+                        });
+                        generator.try_generate_from_pattern(&user_text_for_blocking)
+                    })
+                    .await;
 
-                    match generator.try_generate_from_pattern(&user_text) {
-                        Ok(Some(response_text)) => (response_text, "local".to_string()),
-                        Ok(None) => {
+                    match generation_result {
+                        Ok(Ok(Some(response_text))) => (response_text, "local".to_string()),
+                        Ok(Ok(None)) => {
                             // Confidence too low, fall back to Claude
                             tracing::info!(
                                 request_id = %request_id,
                                 "Local confidence too low, falling back to Claude"
                             );
-                            drop(generator); // Release lock
 
                             let claude_request = upstream_message_request(&request);
                             let response =
@@ -2557,15 +2575,28 @@ async fn handle_message(
 
                             (text, "confidence_fallback".to_string())
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(
                                 request_id = %request_id,
                                 error = %e,
                                 "Local generation failed, falling back to Claude"
                             );
-                            drop(generator); // Release lock
 
                             // Fall back to Claude on error
+                            let claude_request = upstream_message_request(&request);
+                            let response =
+                                server.claude_client().send_message(&claude_request).await?;
+                            let text = response.text();
+
+                            (text, "local_error_fallback".to_string())
+                        }
+                        Err(join_error) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = %join_error,
+                                "Local generation task panicked, falling back to Claude"
+                            );
+
                             let claude_request = upstream_message_request(&request);
                             let response =
                                 server.claude_client().send_message(&claude_request).await?;

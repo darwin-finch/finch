@@ -5771,3 +5771,172 @@ async fn test_health_probe_work_does_not_grow_with_brain_history() {
              number of directories rather than by accumulated event history"
     );
 }
+
+// ── #1254: /v1/messages local generation must not starve concurrent tasks ──
+//
+// `handle_chat_completions`/`handle_local_only_query` (`openai_handlers.rs`)
+// were fixed under #1271 to run local generation on `tokio::task::
+// spawn_blocking`. This older, still-registered Claude-compatible endpoint
+// (`handle_message`, `POST /v1/messages`) held the exact same generator
+// write lock and called the same synchronous, CPU/GPU-bound
+// `LocalGenerator::try_generate_from_pattern` inline on whichever axum
+// worker thread was serving the request, with no `spawn_blocking` wrapper.
+//
+// Rather than compare wall-clock durations (which only catches the bug
+// probabilistically, and can pass on a fast or idle machine even with the
+// bug present), this test pins the structural fact directly, following the
+// same shape as `openai_handlers::tests::
+// local_only_generation_does_not_starve_concurrent_tasks` (the sibling
+// regression for the #1271 fix to `handle_chat_completions`/
+// `handle_local_only_query`): on a runtime with exactly one worker thread, a
+// "canary" task that needs several distinct scheduling turns is spawned
+// while a bounded, always-slow backend call is in flight, and the canary's
+// *completion order relative to generation* is the assertion -- not a raw
+// duration -- because the backend's fixed sleep bounds the worst case (the
+// test cannot hang even if the bug is present, unlike an indefinite
+// rendezvous release would). If generation ran inline on the lone worker
+// thread, the canary cannot be polled until the sleep releases that thread,
+// so it can only ever finish at or after generation; if generation is
+// properly isolated on the blocking thread pool, the worker thread stays
+// free and the canary -- needing only a handful of scheduling turns --
+// finishes first every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_local_message_generation_does_not_starve_concurrent_tasks() {
+    use crate::config::ExecutionTarget;
+    use crate::models::{
+        GeneratorConfig, GeneratorModel, GeneratorState, InferenceProvider, ModelFamily,
+        ModelLoadConfig, ModelSize, TextGeneration,
+    };
+    use crate::providers::Message;
+    use std::time::Duration;
+
+    /// A `TextGeneration` backend that blocks the calling OS thread for a
+    /// fixed, generous duration -- standing in for real llama.cpp inference,
+    /// which has this exact shape: synchronous, CPU-bound, no internal
+    /// `.await` points. The duration is bounded (never indefinite) so the
+    /// test completes deterministically even if the bug under test is
+    /// present.
+    ///
+    /// Records its own completion into `order_log` the instant the blocking
+    /// call returns, rather than after `handle_message`'s full return --
+    /// marking here measures exactly the invariant under test (was the
+    /// worker thread free to run other tasks while this specific synchronous
+    /// call was in flight) instead of depending on there being no `.await`
+    /// between generation and the handler's response.
+    struct SlowBackend {
+        order_log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl TextGeneration for SlowBackend {
+        fn generate(&mut self, _input_ids: &[u32], _max: usize) -> anyhow::Result<Vec<u32>> {
+            std::thread::sleep(Duration::from_millis(300));
+            self.order_log.lock().unwrap().push("generation");
+            Ok(b"ok response".iter().map(|byte| u32::from(*byte)).collect())
+        }
+
+        fn tokenize(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn decode_tokens(&self, tokens: &[u32]) -> anyhow::Result<String> {
+            let bytes = tokens.iter().map(|token| *token as u8).collect();
+            Ok(String::from_utf8(bytes)?)
+        }
+
+        fn name(&self) -> &str {
+            "slow test backend (#1254)"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    let order_log: Arc<std::sync::Mutex<Vec<&'static str>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+        provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Gemma2,
+        size: ModelSize::Small,
+        target: ExecutionTarget::Cpu,
+        model_path: None,
+    });
+    let model = GeneratorModel::from_test_backend(
+        Box::new(SlowBackend {
+            order_log: Arc::clone(&order_log),
+        }),
+        config,
+    );
+    let shared_model = Arc::new(tokio::sync::RwLock::new(model));
+
+    let temp = tempfile::tempdir().unwrap();
+    let authority = crate::brain::BrainCredentialAuthority::ephemeral([9; 32]);
+    let server = Arc::new(
+        AgentServer::for_brain_http_test(
+            "message-spawn-blocking-fixture.local",
+            temp.path(),
+            authority,
+        )
+        .unwrap(),
+    );
+    *server.local_generator().write().await =
+        crate::local::LocalGenerator::with_models(Some(Arc::clone(&shared_model)));
+    *server.generator_state().write().await = GeneratorState::Ready {
+        model: shared_model,
+        model_name: "slow test backend (#1254)".to_string(),
+    };
+
+    // "hello" deliberately classifies as a `Greeting` with the default 0.7
+    // confidence (`PatternClassifier::classify`), clearing `handle_message`'s
+    // pre-generation confidence gate (`try_generate_from_pattern` requires
+    // `>= 0.7`) so the call actually reaches the backend above.
+    let request = MessageRequest {
+        model: "local".to_string(),
+        messages: vec![Message::user("hello")],
+        max_tokens: None,
+        system: None,
+    };
+
+    let gen_task = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { handle_message(State(server), Json(request)).await }
+    });
+
+    let canary_order_log = Arc::clone(&order_log);
+    let canary_task = tokio::spawn(async move {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        canary_order_log.lock().unwrap().push("canary");
+    });
+
+    canary_task.await.expect("canary task panicked");
+    let response = gen_task.await.expect("generation task panicked");
+
+    match response {
+        Ok(_) => {}
+        Err(app_err) => panic!(
+            "generation must succeed against the slow test backend so the starvation \
+             assertion below is measuring the real call path; got error: {}",
+            app_err.0
+        ),
+    }
+
+    let order = order_log.lock().unwrap().clone();
+    assert_eq!(
+        order,
+        vec!["canary", "generation"],
+        "INVARIANT: local generation must run on the blocking thread pool \
+         (`tokio::task::spawn_blocking`), not inline on an async worker thread, so it \
+         cannot starve sibling tokio tasks (#1254). On this single-worker-thread \
+         runtime, a canary task needing 5 scheduling turns must complete before a \
+         300ms local-generation call finishes; observed completion order was {order:?}, \
+         which means generation held the sole worker thread instead of yielding it to \
+         the blocking pool"
+    );
+}
