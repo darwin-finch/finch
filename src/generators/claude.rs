@@ -534,9 +534,15 @@ mod tests {
     }
 
     /// Shared capability declaration for the two fixtures below: streaming
-    /// supported, tool calls unsupported, matching
-    /// `finch_providers::ClaudeCliProvider`'s real declaration (`--tools
-    /// ""`, issue #1303).
+    /// supported, tool calls unsupported. `finch_providers::ClaudeCliProvider`
+    /// was the real example this generic fold was built for (issue #1303),
+    /// but issue #1309 gave it a real native-tool-calling path (Finch's own
+    /// tools served over MCP) and it now declares tools `Supported`; this
+    /// fixture stands in for any *other* provider that still cannot execute
+    /// tool calls itself (local models take the analogous
+    /// `LocalGenerator`/`ToolPromptFormatter` fold, not this one), so the
+    /// generic capability-driven bypass in `needs_prompt_injection` stays
+    /// covered even though its original real-world example moved off it.
     #[cfg(unix)]
     fn no_native_tools_capabilities(
         name: &str,
@@ -715,11 +721,14 @@ mod tests {
 
     /// Installs a fake `claude` executable (mirrors the fixture pattern in
     /// `finch_providers::claude_cli::tests::install_fake_claude`) that emits
-    /// a canned assistant turn whose text is `<tool_use>` markup for the
-    /// `read` tool, in the wire shape measured against the real CLI.
+    /// a canned assistant turn with a real, structured `tool_use` content
+    /// block for the `read` tool, in the wire shape measured against the
+    /// real CLI 2.1.283 once it is driven through Finch's own MCP bridge
+    /// (issue #1309) rather than the pre-#1309 prompt-injected `<tool_use>`
+    /// XML shape.
     #[cfg(unix)]
-    fn install_fake_claude_emitting_tool_use(dir: &std::path::Path) -> PathBuf {
-        let bin = dir.join("fake-claude-tool-use");
+    fn install_fake_claude_emitting_real_tool_use(dir: &std::path::Path) -> PathBuf {
+        let bin = dir.join("fake-claude-real-tool-use");
         let script = r#"#!/bin/bash
 SID=""
 prev=""
@@ -730,8 +739,10 @@ done
 cat >/dev/null
 printf '%s\n' \
   '{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}' \
-  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_tool_1","role":"assistant","content":[{"type":"text","text":"<tool_use>\n<name>read</name>\n<parameters>{\"file_path\": \"/tmp/x.txt\"}</parameters>\n</tool_use>"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
-  '{"type":"result","subtype":"success","is_error":false,"result":"<tool_use>\n<name>read</name>\n<parameters>{\"file_path\": \"/tmp/x.txt\"}</parameters>\n</tool_use>","stop_reason":"end_turn"}'
+  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_tool_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x.txt"}}]}}' \
+  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}]}}' \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{"type":"text","text":"The file says: file contents"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
+  '{"type":"result","subtype":"success","is_error":false,"result":"The file says: file contents","stop_reason":"end_turn"}'
 "#;
         std::fs::write(&bin, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -739,20 +750,30 @@ printf '%s\n' \
         bin
     }
 
-    /// Production-boundary regression for issue #1303, driven through the
+    /// Production-boundary regression for issue #1309, driven through the
     /// real `finch_providers::ClaudeCliProvider` transport (a fake `claude`
     /// binary stands in for the real CLI, same fixture pattern that crate's
-    /// own tests use) rather than a same-crate mock: a tool-bearing request
-    /// must not hit `ModelCapabilities::validate_request`'s tool-calls gate,
-    /// and a `<tool_use>`-shaped CLI response must round-trip into a real
-    /// `ToolUse` Finch's `ToolLoop` can execute -- not merely "not rejected".
+    /// own tests use): now that `ClaudeCliProvider` declares tool calls
+    /// `Supported`, a tool-bearing request must go through natively
+    /// (`ProviderRequest::tools` attached) instead of `ClaudeGenerator`
+    /// folding it into the prompt as issue #1303 required for the old
+    /// `Unsupported` declaration -- and the CLI's own real, structured
+    /// `tool_use` block (already executed for real by Finch's MCP bridge by
+    /// the time it reaches this transport, per that crate's own doc comment)
+    /// must surface as plain final answer text, not `<tool_use>` markup
+    /// requiring a second, generator-side parse.
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_cli_backend_folds_tools_into_the_prompt_and_round_trips_tool_use() {
+    async fn claude_cli_backend_sends_tools_natively_and_never_reparses_tool_use_markup() {
         let temp = tempfile::TempDir::new().unwrap();
-        let binary = install_fake_claude_emitting_tool_use(temp.path());
+        let binary = install_fake_claude_emitting_real_tool_use(temp.path());
         let provider: Arc<dyn crate::providers::LlmProvider> = Arc::new(
             finch_providers::ClaudeCliProvider::with_binary(binary, None),
+        );
+        assert!(
+            provider.supports_tools(),
+            "issue #1309: ClaudeCliProvider must declare native tool support so this generator \
+             takes the native path below, not the #1303 prompt-injection fold"
         );
         let client = Arc::new(ClaudeClient::with_shared_provider(provider));
         let generator = ClaudeGenerator::new_in(client, None, None);
@@ -763,35 +784,24 @@ printf '%s\n' \
                 Some(no_native_tool_definitions()),
             )
             .await
-            .expect(
-                "a tool-bearing request must not hit ModelCapabilities::validate_request's \
-                 tool-calls gate; ClaudeCliProvider declares tool calls Unsupported by design \
-                 (--tools \"\") and ClaudeGenerator must fold them into the prompt instead of \
-                 attaching ProviderRequest::tools (#1303)",
-            );
+            .expect("a tool-bearing request against a native-tool-calling provider must succeed");
 
         assert_eq!(
-            response.tool_uses.len(),
-            1,
-            "the fake CLI's <tool_use> markup must parse back into a real ToolUse the ToolLoop \
-             can execute, not be silently dropped: tool_uses={:?} text={:?}",
-            response.tool_uses,
-            response.text
-        );
-        assert_eq!(
-            response.tool_uses[0].name, "read",
-            "the parsed ToolUse must carry the exact tool name the CLI's <tool_use> markup named: {:?}",
-            response.tool_uses[0]
-        );
-        assert_eq!(
-            response.tool_uses[0].input["file_path"], "/tmp/x.txt",
-            "the parsed ToolUse must carry the exact parameters the CLI's <tool_use> markup gave: {:?}",
-            response.tool_uses[0]
+            response.text, "The file says: file contents",
+            "the real tool_use round trip happens inside the CLI/MCP-bridge turn itself; the \
+             generator must simply surface the CLI's own final answer text: {:?}",
+            response
         );
         assert!(
-            !response.text.contains("<tool_use>"),
-            "the surfaced text must have tool-call markup stripped, matching \
-             LocalGenerator::try_generate_from_pattern_with_tools's behavior: {:?}",
+            response.tool_uses.is_empty(),
+            "the tool call was already executed for real by Finch's MCP bridge process before \
+             this response was assembled -- ClaudeGenerator must not re-parse or re-surface it \
+             as a pending ToolUse the caller's ToolLoop would execute a second time: {:?}",
+            response.tool_uses
+        );
+        assert!(
+            !response.text.contains("tool_use"),
+            "no raw tool-call markup of any kind may leak into the surfaced answer text: {:?}",
             response.text
         );
     }

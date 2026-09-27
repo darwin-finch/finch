@@ -58,7 +58,9 @@ pub use chatgpt_subscription::ChatGptSubscriptionProvider;
 #[cfg(feature = "claude")]
 pub use claude::ClaudeProvider;
 pub use claude_cli::{
-    ClaudeCliAvailability, ClaudeCliProvider, CLAUDE_CLI_DEFAULT_MODEL, CLAUDE_CLI_PROVIDER_NAME,
+    claude_cli_mcp_wire_name, claude_cli_tool_name_from_wire, ClaudeCliAvailability,
+    ClaudeCliProvider, CLAUDE_CLI_DEFAULT_MODEL, CLAUDE_CLI_MCP_BRIDGE_FLAG,
+    CLAUDE_CLI_MCP_SERVER_NAME, CLAUDE_CLI_PROVIDER_NAME, CLAUDE_CLI_TOOL_NAMES,
 };
 pub use claude_oauth::{
     claude_required_scopes, ClaudeAuthStageError, ClaudeOAuthDialect,

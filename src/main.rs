@@ -948,6 +948,15 @@ fn run_selection_status(brain: Option<String>) -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Hidden internal entry point (issue #1309): when Claude Code, spawned by
+    // `finch_providers::ClaudeCliProvider`, launches this same Finch binary
+    // as its own MCP server subprocess, run only the stdio MCP bridge and
+    // exit — never the normal startup/CLI/logging path below. Checked before
+    // clap parsing because this is not a public flag.
+    if std::env::args().nth(1).as_deref() == Some(finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG) {
+        return finch::cli::run_claude_cli_mcp_bridge().await;
+    }
+
     // Start the startup clock first, so t0 is as close to process entry as a
     // statement in `main` can be (#364).
     finch::startup::begin();

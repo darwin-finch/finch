@@ -77,6 +77,29 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   `into_request_for`. Generic OpenAI-compatible clients do not use
   ChatGPT/Codex reserved namespaces. Provider-native tools are advertised
   only with a Finch handler and grant.
+- **Claude CLI subscription tool calls run through Finch's own MCP bridge, never the CLI's own
+  built-in tools (issue #1309).** `claude_cli.rs` always spawns `claude` with `--tools ""` (its
+  own Read/Write/Edit/Bash/Grep/Glob never execute on the CLI's own authority — verified directly
+  that several of them auto-execute for real before any permission hook runs at all: a file read
+  inside the CLI's own working directory, anything under the OS temp directory regardless of
+  working directory, and read-only Bash commands per Claude Code's own permissions docs, none of
+  which is gateable from outside the CLI). `ClaudeCliProvider::capabilities().tools` is
+  `Supported`, but only because Finch's own tool implementations (a fixed, curated subset:
+  `CLAUDE_CLI_TOOL_NAMES`) are served to the CLI over MCP (`--mcp-config`, `--strict-mcp-config` so
+  the user's own personal MCP integrations never leak in, `--allowedTools
+  "mcp__finch__<tool>,..."` so the bridge is never blocked on an approval prompt with no host to
+  answer it). The MCP server is this same Finch binary, re-invoked with the hidden
+  `CLAUDE_CLI_MCP_BRIDGE_FLAG` (`src/cli/claude_cli_bridge.rs` in the root crate, outside this
+  crate's own execution-free boundary): that process really executes each call through a fresh
+  `PermissionManager::for_peer()` policy, so read/glob/grep run for real and write/edit/bash's
+  side-effecting commands are never auto-applied without interactive approval. This is why
+  `ClaudeGenerator::needs_prompt_injection` (`src/generators/claude.rs`) now bypasses its #1303
+  prompt-injection fold for this provider — `supports_tools()` derives straight from
+  `capabilities().tools`, so the two decisions cannot drift apart. `TurnRecord::absorb_line`
+  observes (counts/logs) any `tool_use` block in the CLI's own stream for visibility, but
+  deliberately emits no `StreamChunk` for it: the call was already executed for real by the bridge
+  process by the time that line arrives, and forwarding it as `ToolCallComplete` would make the
+  generation layer execute the same call a second time through the interactive `ToolLoop`.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
