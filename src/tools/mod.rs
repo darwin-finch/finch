@@ -32,9 +32,9 @@ pub use implementations::{
     ClaudeCodeDelegateTool, CodeOutlineTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
     FindCodeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
     InspectMemoryTool, InspectProgramTool, InspectVmWordTool, InspectWordTool, LLMDelegationTool,
-    ListRecentTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool,
-    SearchVmVocabularyTool, SearchVocabularyTool, SearchWordTool, SubmitProgramTool, TodoReadTool,
-    TodoWriteTool, WebFetchTool, WriteTool,
+    ListRecentTool, PatchTool, PresentPlanTool, ReadTool, RemoveMemoryTool, RestartTool,
+    SearchMemoryTool, SearchVmVocabularyTool, SearchVocabularyTool, SearchWordTool,
+    SubmitProgramTool, TodoReadTool, TodoWriteTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 pub use implementations::{

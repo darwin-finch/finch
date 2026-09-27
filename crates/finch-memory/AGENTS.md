@@ -93,9 +93,36 @@ modules, including `memory_status`, are private.
   variant and its projection are still real and tested, via
   `MemorySystem::force_degraded_for_test`, a `test-support`-gated direct-injection seam). The
   other disclosed regression of the port — the iterative parent-pointer walks in
-  `RoutingTree::remove_point`'s downdate and `insert_into`'s update using `.expect()` on a missing
-  parent — moved with the mechanism; see the [routing-tree
-  capsule](../finch-routing-tree/AGENTS.md).
+  `RoutingTree::remove_point`'s downdate using `.expect()` on a missing parent — moved with the
+  mechanism and is now **fixed**; see the [routing-tree capsule](../finch-routing-tree/AGENTS.md).
+- **`MemorySystem::remove_memory` (issue #1329)** is the first production caller of
+  `RoutingTree::remove_point`, reached through `RoutingMemTree::remove` (`src/routing_memory.rs`),
+  which is no longer `pub(crate)`-only-and-unused: it now also persists the removal, since the
+  bare tree primitive has no `Connection` of its own. It downdates the in-memory tree, drops the
+  point from `meta`/`text_index`, then writes the changed node rows and the point's `removed` flag
+  inside ONE transaction (`write_dirty_nodes_within` + `mark_point_removed`, the same atomicity
+  discipline `save_routing_occurrence` already uses for insertion) before marking the dirty set
+  persisted — so a removal a caller observed as `Ok(true)` survives a restart, not just the
+  lifetime of the `MemorySystem` that performed it
+  (`test_remove_memory_survives_a_process_restart` in `src/lib.rs`). `remove_memory` resolves its
+  `memory_id` argument exactly as `inspect_memory` does (the `node:<id>` index form, or a
+  `conversations.id` joined through `memory_sources` to its indexed point) — no new identifier
+  shape — and fails closed with `Ok(false)`, never a panic or an `Err`, for every "nothing to
+  remove" case: an already-removed point, a `memory_id` that never existed, or an out-of-range
+  `node:<id>` (`test_remove_memory_on_nonexistent_id_returns_false_not_error`,
+  `test_remove_memory_double_removal_returns_false_the_second_time` in `src/lib.rs`). `Err` is
+  reserved for a genuine failure: tree corruption detected during downdate, or a disk write
+  failure while persisting. **Disclosed, deliberate narrowing:** this removes the point from the
+  ROUTING INDEX only. The raw `conversations`/`memory_sources` row is left in place —
+  `get_recent_conversations` (what `list_recent_memories` calls) reads `conversations` directly,
+  never through the tree, and an `inspect_memory` call by the same conversation id still returns
+  the original text afterward. Purging the raw row, including unlinking it from its
+  `routing_occurrences` chain without corrupting a neighbor's `prev`/`next`, is a larger, separate
+  change that issue #1329 deliberately left out of scope. Tool-level regression coverage
+  (successful removal no longer surfacing via `search_memory`, a nonexistent id, double removal)
+  lives in `src/tools/implementations/memory_tools.rs`'s own test module (`RemoveMemoryTool`,
+  declared `ExecutionEffect::Destructive` — the same authority class `restart_session` uses,
+  requiring confirmation unlike `create_memory`'s `VmWrite`).
 
 ## Invariants and lifetimes
 

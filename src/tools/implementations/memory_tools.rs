@@ -5,6 +5,7 @@
 // - inspect_memory: Resolve a search result to its complete canonical source
 // - create_memory: Store important facts/notes explicitly
 // - list_recent: Show recent conversation history
+// - remove_memory: Remove a stored memory from the routing index (issue #1329)
 
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
@@ -301,6 +302,78 @@ impl Tool for CreateMemoryTool {
                 full_content
             }
         ))
+    }
+}
+
+/// Remove a stored memory from the routing index.
+///
+/// Destructive and irreversible: once removed, the memory can no longer surface via
+/// `search_memory`, and `inspect_memory`'s `node:<id>` form no longer resolves it. Addressed by
+/// the same `memory_id` `search_memory`/`inspect_memory` already surface -- no new identifier
+/// shape. See [`finch_memory::MemorySystem::remove_memory`] for the disclosed narrowing: this
+/// removes the point from the routing index only, not the raw stored conversation row, so
+/// `list_recent_memories` and an `inspect_memory` lookup by conversation id can still surface the
+/// original text afterward.
+pub struct RemoveMemoryTool {
+    memory_system: Arc<MemorySystem>,
+}
+
+impl RemoveMemoryTool {
+    pub fn new(memory_system: Arc<MemorySystem>) -> Self {
+        Self { memory_system }
+    }
+}
+
+#[async_trait]
+impl Tool for RemoveMemoryTool {
+    fn name(&self) -> &str {
+        "remove_memory"
+    }
+
+    /// Destructive and irreversible (issue #1329): unlike `create_memory` (`VmWrite`, an additive,
+    /// undo-by-recreating mutation), removal permanently deletes indexed content with no undo --
+    /// the same authority class `restart_session` declares, the only other tool in this codebase
+    /// using this variant. `ExecutionEffect::runs_autonomously()` excludes `Destructive`, so this
+    /// always requires confirmation rather than running silently like a VmWrite tool would.
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Destructive
+    }
+
+    fn description(&self) -> &str {
+        "Permanently remove a stored memory. Pass the exact memory_id from a search_memory or \
+         inspect_memory result. This is destructive and irreversible: the memory can no longer be \
+         found by search_memory afterward. Only call this when the user explicitly asks to forget, \
+         delete, or correct a specific stored memory -- never proactively."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: serde_json::json!({
+                "memory_id": {
+                    "type": "string",
+                    "description": "Exact stable memory_id returned by search_memory or inspect_memory"
+                }
+            }),
+            required: vec!["memory_id".to_string()],
+        }
+    }
+
+    async fn execute(&self, params: Value, _context: &ToolContext<'_>) -> Result<String> {
+        let memory_id = params["memory_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: memory_id"))?;
+
+        tracing::info!("Removing memory: memory_id={}", memory_id);
+
+        let removed = self.memory_system.remove_memory(memory_id).await?;
+        if removed {
+            Ok(format!("Memory removed: memory_id={memory_id}"))
+        } else {
+            Ok(format!(
+                "No memory found for memory_id={memory_id}; nothing was removed."
+            ))
+        }
     }
 }
 
@@ -785,6 +858,150 @@ mod tests {
 
         assert!(result.contains("Recent 3"));
         assert!(result.contains("Message 5")); // Most recent
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_memory_tool_declares_destructive_effect() {
+        // Issue #1329: removal is destructive and irreversible, unlike create_memory's VmWrite --
+        // it must require confirmation (ExecutionEffect::runs_autonomously() excludes
+        // Destructive), the same authority class restart_session already declares.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let memory = Arc::new(
+            MemorySystem::new(MemoryConfig {
+                db_path: temp.path().join("memory.db"),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .expect("memory system"),
+        );
+        let tool = RemoveMemoryTool::new(memory);
+        assert_eq!(tool.name(), "remove_memory");
+        assert_eq!(tool.effect(), ExecutionEffect::Destructive);
+    }
+
+    #[tokio::test]
+    async fn test_remove_memory_tool_removes_memory_and_search_no_longer_finds_it() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        memory
+            .insert_conversation(
+                "user",
+                "the release checklist lives in CONTRIBUTING.md",
+                Some("test"),
+                None,
+            )
+            .await?;
+
+        let search = SearchMemoryTool::new(memory.clone());
+        let context = test_context();
+        let before = search
+            .execute(
+                serde_json::json!({"query": "release checklist", "limit": 5}),
+                &context,
+            )
+            .await?;
+        assert!(
+            before.contains("memory_id="),
+            "fixture must actually be findable before removal: {before}"
+        );
+        let memory_id = before
+            .lines()
+            .find_map(|line| line.split("memory_id=").nth(1))
+            .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '(').next())
+            .expect("search result must carry a memory_id")
+            .to_string();
+
+        let remove = RemoveMemoryTool::new(memory.clone());
+        let result = remove
+            .execute(serde_json::json!({"memory_id": memory_id}), &context)
+            .await?;
+        assert!(
+            result.contains("removed"),
+            "successful removal must say so: {result}"
+        );
+
+        let after = search
+            .execute(
+                serde_json::json!({"query": "release checklist", "limit": 5}),
+                &context,
+            )
+            .await?;
+        assert!(
+            !after.contains(&memory_id),
+            "a removed memory must never surface via search_memory again: {after}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_memory_tool_on_nonexistent_id_reports_not_found_not_panic() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        let tool = RemoveMemoryTool::new(memory);
+        let context = test_context();
+
+        let result = tool
+            .execute(
+                serde_json::json!({"memory_id": "a-conversation-id-that-does-not-exist"}),
+                &context,
+            )
+            .await?;
+        assert!(
+            result.contains("No memory found"),
+            "removing a nonexistent memory_id must fail closed with a clear message, \
+             not a panic: {result}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_memory_tool_double_removal_reports_not_found_the_second_time() -> Result<()>
+    {
+        let temp = NamedTempFile::new()?;
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        // At least 20 chars: `MemoryClassifier::is_noise` discards anything shorter as
+        // unmemorable filler, independent of anything remove_memory does.
+        let content = "the double-removal test fixture value is 8675309";
+        memory
+            .insert_conversation("user", content, Some("test"), None)
+            .await?;
+        let hit = memory
+            .query_with_sources(content, Some(1))
+            .await?
+            .pop()
+            .expect("memory search result");
+
+        let tool = RemoveMemoryTool::new(memory);
+        let context = test_context();
+        let first = tool
+            .execute(serde_json::json!({"memory_id": hit.memory_id}), &context)
+            .await?;
+        assert!(first.contains("removed"), "{first}");
+
+        let second = tool
+            .execute(serde_json::json!({"memory_id": hit.memory_id}), &context)
+            .await?;
+        assert!(
+            second.contains("No memory found"),
+            "removing an already-removed memory_id a second time must fail closed, \
+             not panic or falsely report a second successful removal: {second}"
+        );
 
         Ok(())
     }

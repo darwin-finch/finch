@@ -20,7 +20,10 @@
 //! whatever order the tree's float-precision descent happened to produce.
 
 use anyhow::{Context, Result};
-use finch_routing_tree::{load_routing_tree, AdaptiveTopKResult, RoutingConfig, RoutingTree};
+use finch_routing_tree::{
+    load_routing_tree, mark_point_removed, write_dirty_nodes_within, AdaptiveTopKResult,
+    RoutingConfig, RoutingTree,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -509,11 +512,33 @@ impl RoutingMemTree {
             .map(|(&pid, m)| (pid, m, self.tree.embedding_of(pid as usize)))
     }
 
-    pub(crate) fn remove(&mut self, point_id: PointId) -> anyhow::Result<()> {
+    /// Removes a point from the routing index -- in-memory tree structure AND its durable rows --
+    /// so it can never be found by `retrieve`/`get_point` again, in this process or after a
+    /// restart.
+    ///
+    /// Downdates `real_centroid`/`real_count` via [`RoutingTree::remove_point`] (see its own docs
+    /// for the disclosed parent-chain fragility this now fails closed on instead of panicking,
+    /// issue #1329), drops the in-memory metadata/text-index entries, then persists both the
+    /// changed node rows and the point's `removed` flag inside ONE transaction -- the same
+    /// atomicity discipline `save_routing_occurrence` already uses for insertion, so a caller
+    /// never observes a centroid downdate committed without its point actually being marked
+    /// removed on disk, or vice versa. Mirrors `RoutingTree::remove_point`'s own fail-closed
+    /// contract: an unknown or already-removed `point_id` returns a named `Err`, never a panic.
+    pub(crate) fn remove(&mut self, conn: &Connection, point_id: PointId) -> anyhow::Result<()> {
         self.tree.remove_point(point_id as usize)?;
         if let Some(m) = self.meta.remove(&point_id) {
             self.text_index.remove(&m.text);
         }
+        let dirty = self.tree.dirty_node_ids();
+        let tx = conn
+            .unchecked_transaction()
+            .context("RoutingMemTree::remove: begin transaction")?;
+        write_dirty_nodes_within(&self.tree, &dirty, &tx)
+            .context("RoutingMemTree::remove: write dirty nodes")?;
+        mark_point_removed(&tx, point_id as usize)
+            .context("RoutingMemTree::remove: mark point removed")?;
+        tx.commit().context("RoutingMemTree::remove: commit")?;
+        self.tree.mark_persisted(&dirty);
         Ok(())
     }
 

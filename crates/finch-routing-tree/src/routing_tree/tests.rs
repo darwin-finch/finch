@@ -271,6 +271,81 @@ fn test_double_removal_errors_rather_than_corrupting_state() {
 }
 
 #[test]
+fn test_remove_point_out_of_range_errors_rather_than_panicking() {
+    // Issue #1329: `remove_point` is now reachable from a real user-facing tool
+    // (`remove_memory`), so a hand-typed or hallucinated `memory_id` (e.g. `node:999999`) can
+    // hand it a `point_id` no tree ever assigned. Before this fix, `self.removed_flag[point_id]`
+    // indexed a plain `Vec` and panicked (index out of bounds) instead of failing closed.
+    let points = synthetic_corpus(15);
+    let mut tree = build_tree(RoutingConfig::default(), &points);
+    let out_of_range = points.len() + 1000;
+    let result = tree.remove_point(out_of_range);
+    assert!(
+        result.is_err(),
+        "removing a point_id ({out_of_range}) the tree never assigned must return an error, not \
+         panic or silently succeed: {result:?}"
+    );
+}
+
+#[test]
+fn test_remove_point_with_corrupted_primary_parent_chain_errors_rather_than_panicking() {
+    // Issue #1329's disclosed risk: `remove_point`'s primary-walk parent lookup used to be
+    // `.expect("a non-root node always has a parent")`, which panics rather than returning a
+    // diagnosable error if `routing_nodes.parent_id` were ever corrupted on disk (the same class
+    // of problem #274 fixed for the legacy index's own parent-chain walk). This forces exactly
+    // that condition directly on the in-memory tree -- deterministic, not a disk-corruption
+    // fixture -- by clearing a non-root ancestor's `parent` link on the walk from a live point's
+    // leaf up to the root, then asserts `remove_point` fails closed instead of panicking.
+    let points = synthetic_corpus(15);
+    let mut tree = build_tree(RoutingConfig::default(), &points);
+    assert!(
+        !tree.is_leaf(tree.root()),
+        "test requires a real split so there is a non-root ancestor to corrupt"
+    );
+
+    // Find a live point whose primary leaf is not the root, and sever its leaf's parent link.
+    let pid = (0..points.len())
+        .find(|&pid| !tree.removed_flag[pid] && tree.current_leaf_of[pid] != Some(tree.root()))
+        .expect("at least one point should route to a non-root leaf after a real split");
+    let leaf = tree.current_leaf_of[pid].unwrap();
+    tree.nodes[leaf].parent = None;
+
+    let result = tree.remove_point(pid);
+    assert!(
+        result.is_err(),
+        "a corrupted parent chain (missing parent on a non-root node) must return an error, not \
+         panic: {result:?}"
+    );
+}
+
+#[test]
+fn test_remove_point_with_corrupted_dual_parent_chain_errors_rather_than_panicking() {
+    // The dual-entry counterpart of the test above: the walk from a dual leaf up to its
+    // divergence node used `.expect("a dual leaf always has a parent (it is never the root)")`.
+    // Severing that chain (instead of merely making it long) must still fail closed, not panic
+    // or loop forever.
+    let points = synthetic_corpus(15);
+    let mut cfg = RoutingConfig::default();
+    cfg.dual_insert_threshold = 0.5;
+    let mut tree = build_tree(cfg, &points);
+
+    let dual_point = (0..points.len()).find(|&pid| !tree.dual_entries_of[pid].is_empty());
+    let Some(pid) = dual_point else {
+        eprintln!("no dual-inserted point found at this threshold on this corpus; skipping");
+        return;
+    };
+    let entry_leaf = tree.dual_entries_of[pid][0].leaf_id;
+    tree.nodes[entry_leaf].parent = None;
+
+    let result = tree.remove_point(pid);
+    assert!(
+        result.is_err(),
+        "a corrupted dual parent chain (missing parent before reaching the divergence node) \
+         must return an error, not panic: {result:?}"
+    );
+}
+
+#[test]
 fn test_dual_insert_disabled_is_bit_for_bit_identical_to_no_dual_insert_support() {
     let points = synthetic_corpus(15);
     let mut cfg_zero = RoutingConfig::default();

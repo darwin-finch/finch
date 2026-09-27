@@ -10,8 +10,8 @@ use crate::tools::{
     CreateMemoryTool, EditTool, EnterPlanModeTool, FindCodeTool, GetLanguageDefinitionTool,
     GetVmStateTool, GlobTool, GrepTool, HashCompareTool, InspectMemoryTool, InspectWordTool,
     ListRecentTool, PatchTool, PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool,
-    ReadTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TaskTool,
-    TodoReadTool, TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
+    ReadTool, RemoveMemoryTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool,
+    TaskTool, TodoReadTool, TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
 };
 use finch_programs::ExecutionEffect;
 use serde_json::json;
@@ -163,7 +163,8 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(SearchMemoryTool::new(Arc::clone(&memory))),
         Box::new(InspectMemoryTool::new(Arc::clone(&memory))),
         Box::new(CreateMemoryTool::new(Arc::clone(&memory))),
-        Box::new(ListRecentTool::new(memory)),
+        Box::new(ListRecentTool::new(Arc::clone(&memory))),
+        Box::new(RemoveMemoryTool::new(memory)),
         Box::new(TodoWriteTool::new(Arc::clone(&todo_list))),
         Box::new(TodoReadTool::new(todo_list)),
         Box::new(AgentSpawnTool::new(Arc::clone(&scheduler))),
@@ -325,6 +326,12 @@ fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
         // starts (file writes, shell commands) — the same worst case
         // spawn_task already carries for an equivalent delegation.
         "delegate_to_claude_code" => ExecutionEffect::ExternalWrite,
+        // Issue #1329: permanently removes indexed content with no undo, the same authority
+        // class `restart_session` already declares (the pre-#466 table's only `Destructive`
+        // entry) -- unlike `create_memory`'s `VmWrite`, an additive mutation a user can always
+        // just re-say. `ExecutionEffect::runs_autonomously()` excludes `Destructive`, so removal
+        // always requires confirmation.
+        "remove_memory" => ExecutionEffect::Destructive,
         _ => pre_refactor_effect(tool_name),
     }
 }
@@ -635,6 +642,7 @@ fn test_always_allow_list_does_not_grant_writes() {
         "patch",
         "bash",
         "create_memory",
+        "remove_memory",
         "todo_write",
         "restart_session",
         "submit_program",
@@ -677,6 +685,7 @@ fn test_owner_repl_does_not_pre_approve_unregistered_or_write_names() {
         "view",
         "search",
         "create_memory",
+        "remove_memory",
         "write",
     ] {
         let check = permissions.check_tool_use(tool, &json!({}));
