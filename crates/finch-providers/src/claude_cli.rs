@@ -1487,7 +1487,7 @@ async fn run_capture(binary: &Path, args: &[&str]) -> Result<String> {
 /// construct and store [`ClaudeCliProvider`] unconditionally on every
 /// platform (issue #1354 grew that surface further) — this error is the
 /// single, clear failure point a caller reaches at first actual use instead
-/// of a scattered platform check at every one of those call sites.
+/// of a separate platform check at every one of those call sites.
 #[cfg(not(unix))]
 const NOT_SUPPORTED_ON_THIS_PLATFORM: &str = "Claude CLI Subscription provider is not supported \
      on this platform: its MCP tool-call bridge requires a Unix domain socket (issue #1357)";
