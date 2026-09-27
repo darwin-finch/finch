@@ -177,6 +177,43 @@ modules, including `memory_status`, are private.
   Wiring real per-turn correctness feedback into `FeedbackLogger` so the percentile-to-accuracy
   mapping can calibrate itself over time is a separate, non-blocking concern #1324 explicitly
   scoped out; this gate is a real improvement over a fixed threshold even uncalibrated.
+- Pre-indexing quality gate (#1323): `DegenerateContentGate` (`src/degenerate_gate.rs`) rejects a
+  candidate document at insertion time only when it is genuinely degenerate, independently of
+  `MemoryClassifier`'s own text-pattern `Discard` heuristic above — `project_stored_conversation_inner`
+  (`lib.rs`) runs the classifier first and offers this gate only the content the classifier already
+  kept; a rejection gets the same terminal NULL-`node_id` `memory_sources` row a classifier discard
+  does. Two independent per-document signals, each tracked via its own online
+  `WelfordStats` (`src/stats.rs`, Welford's algorithm — constant memory, no stored history):
+  DEFLATE compression ratio at max compression (`flate2`, no tokenizer), and order-0 Shannon
+  entropy over token frequency using the SAME tokenizer `HashedNgramEmbedding` uses for TF-IDF
+  (`HashedNgramEmbedding::tokenize`, `pub(crate)` specifically so this gate can share it). Rejects
+  ONLY when BOTH signals are more than 2 standard deviations below their OWN running mean, and
+  only once each baseline has already seen at least 15 prior documents (`MIN_SAMPLES`) — below
+  that the gate is permissive by construction, never rejecting, because a mean/stddev built from
+  fewer samples is noise, not a baseline. The AND-gate is load-bearing, not incidental
+  strengthening: low compression alone also catches a template (repeated structure, e.g. a fixed
+  field label) holding varied vocabulary each time, which this gate must NOT reject — only the
+  low-compression-AND-low-entropy combination (e.g. a single repeated token) is genuine spam.
+  Verdict is decided against each baseline as it stood BEFORE the candidate is folded in, so one
+  extreme document cannot dilute the very mean/stddev used to judge it, and every observed
+  document (rejected or not) still counts toward the next candidate's baseline exactly once —
+  `DegenerateContentGate::observe` must be called at most once per candidate, the same
+  single-document, single-call-site discipline `EmbeddingEngine::observe_document` documents for
+  corpus-wide TF-IDF. `test_gate_stays_permissive_below_minimum_sample_count`,
+  `test_genuinely_degenerate_content_is_rejected_once_enough_samples_exist`, and
+  `test_templated_but_varied_content_is_not_rejected` in `src/degenerate_gate.rs` pin this
+  behavior; `test_welford_mean_and_stddev_match_closed_form_calculation`,
+  `test_welford_variance_and_stddev_are_none_below_two_samples`, and
+  `test_deviations_below_mean_is_none_when_stddev_is_zero` in `src/stats.rs` pin `WelfordStats`
+  itself against an independent closed-form calculation. `WelfordStats` is deliberately a
+  standalone, domain-agnostic primitive in its own module rather than private state inside the
+  gate: issue #1324 (confidence-based retrieval abstention) wants its own streaming statistic (a
+  P² streaming percentile) and its issue body asks whoever implements it to check for a shared
+  statistics module first — `src/stats.rs` is that shared home, and a P² estimator belongs beside
+  `WelfordStats` there, not duplicated elsewhere. (#1324 landed first and shipped its own
+  self-contained `P2Quantile` in `confidence.rs` before this gate merged, since neither existed yet
+  when #1324 was written — the two statistics live in separate modules today, not sharing `stats.rs`;
+  revisit consolidating them only if a real third consumer needs the same primitive.)
 - Retrieval may proceed while the tree hydrates, but every caller must report the coverage of
   the index it actually read. Sample hydration before and after a read and use `observed`; never
   upgrade a partial read to `Ready` because hydration completed afterward.
