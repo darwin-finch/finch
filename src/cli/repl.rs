@@ -4091,11 +4091,50 @@ impl Repl {
                     routing_decision_str = "forward".to_string();
                     forward_reason = Some("model_not_ready".to_string());
                 } else {
-                    // Model is ready, proceed with local generation
-                    // Try local generation
-                    let mut gen = self.local_generator.write().await;
-                    match gen.try_generate_from_pattern(query) {
-                        Ok(Some(response_text)) => {
+                    // Model is ready, proceed with local generation.
+                    //
+                    // Local generation is synchronous, CPU/GPU-bound work
+                    // (llama.cpp inference); run it on the blocking thread
+                    // pool so it cannot occupy this REPL's tokio worker
+                    // thread for the full duration of a turn. This same task
+                    // also drives TUI rendering and input polling, so an
+                    // inline call here can wedge scrolling and produce
+                    // catch-up flicker once it unblocks (#1254). The write
+                    // guard is acquired and dropped entirely inside the
+                    // blocking closure, so it is never held across an
+                    // `.await` on this task.
+                    let local_generator_for_blocking = Arc::clone(&self.local_generator);
+                    let query_for_blocking = query.to_string();
+                    let generation_result = tokio::task::spawn_blocking(move || {
+                        let mut gen = local_generator_for_blocking.blocking_write();
+                        gen.try_generate_from_pattern(&query_for_blocking)
+                    })
+                    .await;
+
+                    // Log the two failure shapes explicitly before the match
+                    // below consumes `generation_result` by value -- a
+                    // panicked blocking task (`Err`) must be as visible in
+                    // logs/telemetry as a real generation error, not folded
+                    // silently into the same fallback path as routine
+                    // low-confidence routing (`Ok(Ok(None))`).
+                    match &generation_result {
+                        Err(join_error) => {
+                            tracing::warn!(
+                                "Local generation blocking task panicked: {}, falling back to Claude",
+                                join_error
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "Local generation failed: {}, falling back to Claude",
+                                e
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                    }
+
+                    match generation_result {
+                        Ok(Ok(Some(response_text))) => {
                             // Successfully generated locally
                             if self.is_interactive {
                                 self.output_status(format!(
@@ -4109,10 +4148,9 @@ impl Repl {
                             pattern_id = Some(local_pattern_id);
                             routing_confidence = Some(confidence);
                         }
-                        Ok(None) | Err(_) => {
-                            // Local generation insufficient or failed - forward to Claude
-                            drop(gen); // Drop the read lock before forwarding to Claude
-
+                        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                            // Local generation insufficient, failed, or the
+                            // blocking task panicked - forward to Claude.
                             if self.is_interactive {
                                 self.output_status("⚠️  Local generation insufficient confidence");
                                 self.output_status("→ Forwarding to Claude");
@@ -5060,6 +5098,289 @@ impl Repl {
         }
 
         Ok(())
+    }
+}
+
+// ── #1254: interactive-REPL local generation must not starve concurrent
+// tokio tasks ──
+//
+// `Repl::process_query`'s local-generation branch held the generator's write
+// lock and called the synchronous, CPU/GPU-bound `LocalGenerator::
+// try_generate_from_pattern` inline on this REPL's own tokio task, with no
+// `spawn_blocking` wrapper. `Repl::new` drives the whole interactive TUI
+// event loop on one shared runtime (see `main.rs`), so an inline call here
+// directly competes with the render/input-polling tasks the live session
+// reported as "wedged" while local generation was starting.
+#[cfg(test)]
+mod local_generation_blocking_tests {
+    use super::*;
+    use crate::providers::{
+        ModelCapabilities, ProviderBackend, ProviderResponse, StreamChunk, ValidatedProviderRequest,
+    };
+    use std::time::Duration;
+
+    /// Must never actually be called: this test proves local generation
+    /// completes through the REPL's local path, so a real call here means
+    /// the router fell back to the cloud unexpectedly -- a test-setup bug,
+    /// not the invariant under test.
+    struct PanicOnFallbackProvider;
+
+    #[async_trait::async_trait]
+    impl ProviderBackend for PanicOnFallbackProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            panic!(
+                "test setup bug: routing fell back to the cloud provider instead of using \
+                 local generation"
+            )
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamChunk>>> {
+            panic!(
+                "test setup bug: routing fell back to the cloud provider (streaming) instead \
+                 of using local generation"
+            )
+        }
+
+        fn name(&self) -> &str {
+            "panic-on-fallback"
+        }
+
+        fn default_model(&self) -> &str {
+            "panic-on-fallback-model"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::unknown(self.name(), model)
+        }
+    }
+
+    // As with the daemon-side regression for this issue
+    // (`openai_handlers::tests::local_only_generation_does_not_starve_concurrent_tasks`),
+    // this test proves the structural fact rather than a raw duration: a
+    // canary task needing several distinct scheduling turns is raced against
+    // a bounded, always-slow local-generation call, and the *completion
+    // order* is the assertion. The backend's sleep is bounded (never
+    // indefinite), so the test completes deterministically even with the bug
+    // present -- it cannot hang.
+    //
+    // `Repl` holds an `IpcClient` (`Rc`-based, `!Send`), so both the
+    // generation task and the canary run as `spawn_local` tasks under one
+    // `tokio::task::LocalSet` instead of plain `tokio::spawn`. This is
+    // deliberate, not incidental: a `LocalSet` cooperatively multiplexes all
+    // of its local tasks onto whichever single OS thread is currently
+    // driving it (here, the thread running this test's `block_on`, which
+    // `#[tokio::test]`'s `worker_threads` setting does not affect) --
+    // exactly the single-thread affinity `Repl::new`'s real event loop
+    // inherits from its own `LocalSet` in `main.rs` for this same reason. An
+    // earlier draft of this test spawned the canary with plain `tokio::spawn`
+    // and observed it land on a distinct runtime worker thread, unable to
+    // starve or be starved by the `LocalSet`'s thread regardless of the fix
+    // -- a structurally unsound race that could never fail. With both tasks
+    // sharing the `LocalSet`'s one thread: if generation ran inline, the
+    // canary cannot be polled until the sleep releases that thread, so it
+    // can only ever finish at or after generation; if generation is properly
+    // isolated on the blocking thread pool, the `LocalSet`'s thread stays
+    // free and the canary -- needing only a handful of scheduling turns --
+    // finishes first every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_repl_local_generation_does_not_starve_concurrent_tasks() {
+        use crate::models::{
+            GeneratorConfig, GeneratorModel, InferenceProvider, ModelFamily, ModelLoadConfig,
+            ModelSize, TextGeneration,
+        };
+
+        /// Blocks the calling OS thread for a fixed, generous duration --
+        /// standing in for real llama.cpp inference (synchronous, CPU-bound,
+        /// no internal `.await` points). Bounded so the test cannot hang.
+        ///
+        /// Records its own completion into `order_log` the instant the
+        /// blocking call returns, rather than leaving the test to record
+        /// completion after `process_query`'s full return -- `process_query`
+        /// does substantial further async work after generation (learning
+        /// the routing outcome, conversation logging, memory commitment),
+        /// each `.await` of which is a legitimate extra opportunity for the
+        /// canary to interleave regardless of whether the earlier generation
+        /// call itself blocked the worker thread. Marking completion here
+        /// measures exactly the invariant under test: was the worker thread
+        /// free to run other tasks while this specific synchronous call was
+        /// in flight.
+        struct SlowBackend {
+            order_log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        impl TextGeneration for SlowBackend {
+            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                std::thread::sleep(Duration::from_millis(300));
+                self.order_log.lock().unwrap().push("generation");
+                Ok(b"ok response".iter().map(|byte| u32::from(*byte)).collect())
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok(text.bytes().map(u32::from).collect())
+            }
+
+            fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+                let bytes = tokens.iter().map(|token| *token as u8).collect();
+                Ok(String::from_utf8(bytes)?)
+            }
+
+            fn name(&self) -> &str {
+                "slow test backend (#1254)"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+
+        let order_log: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: crate::config::ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(
+            Box::new(SlowBackend {
+                order_log: Arc::clone(&order_log),
+            }),
+            config,
+        );
+        let shared_model = Arc::new(RwLock::new(model));
+
+        let temp = tempfile::tempdir().unwrap();
+        let client = ClaudeClient::with_provider(Box::new(PanicOnFallbackProvider));
+        let provider = crate::config::ProviderEntry::Claude {
+            api_key: "unused".into(),
+            model: Some("unused-model".into()),
+            base_url: Some("http://127.0.0.1:1/provider-must-not-be-reached".into()),
+            chat_path: None,
+            models_path: None,
+            name: Some("panic-on-fallback".into()),
+        };
+        #[allow(deprecated)]
+        let config = Config {
+            credentials: Vec::new(),
+            metrics_dir: temp.path().join("metrics"),
+            streaming_enabled: false,
+            tui_enabled: false,
+            constitution_path: None,
+            active_persona: "default".to_string(),
+            active_theme: "dark".to_string(),
+            huggingface_token: None,
+            backend: crate::config::BackendConfig::default(),
+            server: crate::config::ServerConfig::default(),
+            client: crate::config::ClientConfig::default(),
+            providers: vec![provider],
+            default_provider: None,
+            colors: crate::theme::ColorScheme::default(),
+            features: crate::config::FeaturesConfig::default(),
+            mcp_servers: HashMap::new(),
+            memory: finch_memory::MemoryConfig {
+                db_path: temp.path().join("canonical-memory.db"),
+                enabled: true,
+                max_context_items: 5,
+                checkpoint_interval_secs: 300,
+                use_neural_embeddings: false,
+                embedding_cache_dir: temp.path().join("embedding-cache"),
+                ..Default::default()
+            },
+            license: crate::config::LicenseConfig::default(),
+            diagnostics: crate::config::DiagnosticsConfig::default(),
+        };
+        let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
+        let router = Router::new(crate::models::ThresholdRouter::default());
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let initialization = ReplInitialization {
+            is_interactive: false,
+            input_handler_factory: Some(Box::new(|| {
+                panic!("this regression must not touch ambient input/history state")
+            })),
+            models_dir: Some(temp.path().join("models")),
+            patterns_path: temp.path().join("tool-patterns.json"),
+            source_index_state: Some(temp.path().join("source-index")),
+            conversation_log_path: temp.path().join("conversations.jsonl"),
+            active_persona: crate::config::Persona::load_builtin("default"),
+            workspace_root,
+            project_program_root: None,
+        };
+
+        let mut repl = Repl::new_with_initialization(
+            config,
+            client,
+            router,
+            metrics,
+            None,
+            "spawn-blocking-fixture".into(),
+            initialization,
+        )
+        .await;
+
+        // Wire the REPL directly to the slow backend and mark the generator
+        // ready, bypassing the real (unavailable in tests) model
+        // download/load pipeline.
+        repl.local_generator = Arc::new(RwLock::new(LocalGenerator::with_models(Some(
+            Arc::clone(&shared_model),
+        ))));
+        *repl.bootstrap_loader.state().write().await = GeneratorState::Ready {
+            model: shared_model,
+            model_name: "slow test backend (#1254)".to_string(),
+        };
+
+        let local = tokio::task::LocalSet::new();
+        let canary_order_log = Arc::clone(&order_log);
+        local
+            .run_until(async move {
+                // "hello" deliberately classifies as a `Greeting` with the
+                // default 0.7 confidence (`PatternClassifier::classify`),
+                // clearing `try_generate_from_pattern`'s pre-generation
+                // confidence gate (`>= 0.7`) so the call actually reaches
+                // the backend above.
+                let gen_task =
+                    tokio::task::spawn_local(async move { repl.process_query("hello").await });
+
+                let canary_task = tokio::task::spawn_local(async move {
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                    canary_order_log.lock().unwrap().push("canary");
+                });
+
+                canary_task.await.expect("canary task panicked");
+                let response = gen_task.await.expect("generation task panicked");
+                response.expect(
+                    "generation must succeed against the slow test backend so the \
+                     starvation assertion below is measuring the real call path",
+                )
+            })
+            .await;
+
+        let order = order_log.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["canary", "generation"],
+            "INVARIANT: local generation must run on the blocking thread pool \
+             (`tokio::task::spawn_blocking`), not inline on this REPL's own tokio task \
+             (#1254). On this single-worker-thread runtime -- the same shape `Repl::new`'s \
+             real event loop shares with rendering and input polling -- a canary task \
+             needing 5 scheduling turns must complete before a 300ms local-generation call \
+             finishes; observed completion order was {order:?}, which means generation held \
+             the sole worker thread instead of yielding it to the blocking pool"
+        );
     }
 }
 

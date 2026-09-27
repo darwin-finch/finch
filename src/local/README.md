@@ -11,9 +11,11 @@ Two current callers show the boundary:
 
 1. The [interactive REPL](../cli/repl.rs) constructs a `LocalGenerator` with the model handle
    obtained from its trainer, then asks `try_generate_from_pattern` for a candidate when routing
-   permits local generation. `None` or an error leaves the REPL free to forward to its provider;
-   after a provider response, the REPL may pass feedback to `learn_from_claude`. The REPL owns
-   routing, provider fallback, and conversation state.
+   permits local generation, from a `tokio::task::spawn_blocking` task so the synchronous,
+   CPU/GPU-bound call cannot occupy the REPL's own tokio task -- which also drives TUI rendering
+   and input polling -- for the duration of a turn (#1254). `None` or an error leaves the REPL
+   free to forward to its provider; after a provider response, the REPL may pass feedback to
+   `learn_from_claude`. The REPL owns routing, provider fallback, and conversation state.
 2. The [Qwen compatibility adapter](../generators/qwen.rs) receives the application's shared
    generator handle. For a complete text turn it calls `try_generate_from_pattern` from a
    blocking task and wraps the result as a provider-independent `GeneratorResponse`. The adapter
@@ -22,11 +24,15 @@ Two current callers show the boundary:
 3. The daemon's OpenAI-compatible handler
    ([`src/server/openai_handlers.rs`](../server/openai_handlers.rs), `handle_local_only_query` and
    the `local_only` branch of `handle_chat_completions`) calls `try_generate_from_pattern_with_tools`
-   directly with the request's tool definitions. When tools are present, this module formats them
-   into the prompt and parses any `<tool_use>` markup the model emits back into real `tool_uses`
-   (#1276), using the same `ToolPromptFormatter`/`ToolCallParser` the Qwen adapter's own
-   tool-proposing path uses -- covering only the non-streaming daemon path; streaming tool calls
-   remain future work.
+   directly with the request's tool definitions, from a `spawn_blocking` task (#1254/#1271). When
+   tools are present, this module formats them into the prompt and parses any `<tool_use>` markup
+   the model emits back into real `tool_uses` (#1276), using the same
+   `ToolPromptFormatter`/`ToolCallParser` the Qwen adapter's own tool-proposing path uses --
+   covering only the non-streaming daemon path; streaming tool calls remain future work.
+4. The daemon's older Claude-compatible endpoint
+   ([`src/server/handlers.rs`](../server/handlers.rs), `handle_message`, `POST /v1/messages`) also
+   calls `try_generate_from_pattern` directly (no tool definitions), from a `spawn_blocking` task
+   (#1254).
 
 The [agent contract](AGENTS.md) covers dependencies and invariants. [`mod.rs`](mod.rs) is the
 flat callable facade; method signatures and return types live in Rust source/rustdoc, not a
