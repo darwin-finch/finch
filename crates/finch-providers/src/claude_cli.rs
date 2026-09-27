@@ -135,6 +135,17 @@ impl ClaudeCliAvailability {
 #[derive(Debug, Default)]
 struct TurnRecord {
     session_confirmed: Option<String>,
+    /// Concatenation of every `assistant` event's own text content seen so
+    /// far this turn, in arrival order (issue #1331). A mid-turn tool call
+    /// makes the real CLI emit more than one `assistant` event per turn — a
+    /// preamble message (which may carry its own text alongside the
+    /// `tool_use` block) followed by the final-answer message — and every
+    /// `text_delta` from both is forwarded live as a `TextDelta` chunk
+    /// (`stream_delta_text` has no per-message boundary tracking). This
+    /// field must therefore accumulate rather than overwrite: it is what
+    /// [`TurnRecord::response_text`] reports as the completed content, and
+    /// it must equal the full streamed total or `query_processor.rs`'s
+    /// streamed-vs-completed check fails the turn.
     assistant_text: String,
     assistant_model: Option<String>,
     assistant_message_id: Option<String>,
@@ -540,11 +551,18 @@ impl TurnRecord {
             Some("assistant") => {
                 let message = event.get("message").cloned().unwrap_or_default();
                 if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
-                    self.assistant_text = content
+                    // Append, never overwrite (issue #1331): a preamble
+                    // message's text must survive into the completed
+                    // content even though a later `assistant` event (the
+                    // final answer, possibly after a mid-turn tool_use in
+                    // this same message) arrives afterward. See the field
+                    // doc comment on `assistant_text`.
+                    let message_text = content
                         .iter()
                         .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
                         .join("");
+                    self.assistant_text.push_str(&message_text);
                     // Observability only (issue #1309): a tool_use block here
                     // was already served and really executed by Finch's own
                     // MCP bridge process by the time this line arrives —
@@ -619,9 +637,19 @@ impl TurnRecord {
     }
 
     fn response_text(&self) -> String {
-        self.result_text
-            .clone()
-            .unwrap_or_else(|| self.assistant_text.clone())
+        // `assistant_text` (issue #1331) is the accumulation of every
+        // `assistant` event's own text across the whole turn, so it is what
+        // the live `TextDelta` stream actually adds up to; it must win
+        // whenever any assistant message carried text. `result_text` (the
+        // terminal `result` event's own `result` field) is a fallback for
+        // the case where no assistant message carried text content at all —
+        // using it in preference to a non-empty `assistant_text` would
+        // silently drop a preamble segment again and reintroduce the
+        // streamed-vs-completed mismatch this field exists to prevent.
+        if !self.assistant_text.is_empty() {
+            return self.assistant_text.clone();
+        }
+        self.result_text.clone().unwrap_or_default()
     }
 }
 
@@ -793,7 +821,11 @@ mod tests {
     /// selected by the first argument word: default is a successful turn;
     /// `fail-in-use` fails with the CLI's id-reuse error when invoked with
     /// `--session-id` and succeeds when invoked with `--resume`; `exit-fail`
-    /// exits nonzero after one init line.
+    /// exits nonzero after one init line; `tool-preamble` reproduces the
+    /// real CLI 2.1.283 shape from issue #1331: a first `assistant` message
+    /// carrying both a preamble text block and a `tool_use` block, then a
+    /// second `assistant` message with the final answer, with every
+    /// segment's `text_delta`s streamed first as usual.
     fn install_fake_claude(home: &TempDir, behavior: &str) -> PathBuf {
         let spool = spool(home);
         let bin = home.path().join("fake-claude");
@@ -832,6 +864,18 @@ fi
 if [ "$MODE" = "fail-in-use" ] && [ "$FLAG" = "--session-id" ]; then
   echo "Error: Session ID $SID is already in use." >&2
   exit 1
+fi
+if [ "$MODE" = "tool-preamble" ]; then
+  printf '%s\n' \
+    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I will check "}}}}}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"the file."}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{{"file_path":"README.md"}}}}],"usage":{{"input_tokens":3,"output_tokens":9}}}}}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"The first "}}}}}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"line is Finch."}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}],"usage":{{"input_tokens":5,"output_tokens":6}}}}}}' \
+    '{{"type":"result","subtype":"success","is_error":false,"result":"The first line is Finch.","stop_reason":"end_turn"}}'
+  exit 0
 fi
 printf '%s\n' \
   '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
@@ -1425,7 +1469,92 @@ printf '%s\n' \
         assert_eq!(
             record.response_text(),
             "Done.",
-            "the final text-only assistant event must win, overwriting the intermediate tool-use turn"
+            "the tool_use-only event contributed no text, so the final text-only event's \
+             text is the whole accumulated response"
+        );
+    }
+
+    #[test]
+    fn a_preamble_before_a_tool_use_survives_into_the_accumulated_response_text() {
+        // Issue #1331: unlike the fixture above, the real claude CLI 2.1.283
+        // can put a preamble text block *alongside* the tool_use block in
+        // the same first `assistant` event (narrating what it's about to
+        // do). That text must not vanish when the second, final-answer
+        // `assistant` event arrives — `assistant_text` accumulates instead
+        // of being overwritten, so both segments are preserved in the order
+        // the CLI emitted them.
+        let mut record = TurnRecord::default();
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"text","text":"I'll check that file."},{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"README.md"}}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.tool_calls_observed, 1,
+            "the tool_use block sharing this event with a preamble text block must still be observed"
+        );
+        assert_eq!(
+            record.assistant_text, "I'll check that file.",
+            "a preamble text block accompanying a tool_use block must be recorded, not dropped"
+        );
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":" The first line is Finch."}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.response_text(),
+            "I'll check that file. The first line is Finch.",
+            "the completed content must be every assistant-message text segment in this turn, \
+             concatenated in arrival order — not just the last message's text"
+        );
+    }
+
+    #[tokio::test]
+    async fn preamble_text_before_a_mid_turn_tool_use_does_not_desync_streamed_from_completed_text()
+    {
+        // Production-boundary reproduction of issue #1331: every line the
+        // real claude CLI 2.1.283 emits, replayed through the real
+        // `send_message_stream` path (spawn, stream-json parse, MCP
+        // tool_use observation, terminal ContentBlockComplete) — not just a
+        // direct `TurnRecord::absorb_line` call. Before the fix, every
+        // `text_delta` (preamble + final answer) still forwarded live as a
+        // `TextDelta`, but the completed content reported only the final
+        // message's text (the preamble was overwritten), which is exactly
+        // the "Provider streaming text did not match its completed content"
+        // failure `query_processor.rs` raised against a real subscription
+        // session on the query "read the file README.md and tell me its
+        // first line".
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "tool-preamble");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+
+        let mut rx = provider
+            .send_message_stream(&simple_request())
+            .await
+            .expect("streaming must be supported");
+        let mut streamed_text = String::new();
+        let mut complete = None;
+        while let Some(chunk) = rx.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::TextDelta(text) => streamed_text.push_str(&text),
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    complete = Some(text);
+                }
+                other => panic!("unexpected chunk {other:?}"),
+            }
+        }
+        let complete = complete.expect("a ContentBlockComplete chunk must terminate the stream");
+        assert_eq!(
+            streamed_text, "I will check the file.The first line is Finch.",
+            "every text_delta across both assistant messages (preamble, then final answer) \
+             must reach the caller, matching real claude CLI 2.1.283 behavior"
+        );
+        assert_eq!(
+            complete, streamed_text,
+            "completed content must equal everything actually streamed, or \
+             query_processor.rs's streamed-vs-completed check fails the turn (issue #1331); \
+             got completed={complete:?} streamed={streamed_text:?}"
         );
     }
 }

@@ -100,6 +100,19 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   deliberately emits no `StreamChunk` for it: the call was already executed for real by the bridge
   process by the time that line arrives, and forwarding it as `ToolCallComplete` would make the
   generation layer execute the same call a second time through the interactive `ToolLoop`.
+  **A mid-turn tool call also affects text ordering, not just tool execution (issue #1331).** The
+  real CLI can put a preamble text block (e.g. "I'll check that file.") in the very same
+  `assistant` event as the `tool_use` block, then emit a second `assistant` event with the final
+  answer once the tool result folds back in — every `text_delta` from both messages still streams
+  live as an ordinary `TextDelta` chunk, with no per-message boundary signal. `TurnRecord`'s
+  `assistant_text` field therefore accumulates every `assistant` event's own text across the whole
+  turn instead of the last message overwriting the others, so `response_text()` (what
+  `ContentBlockComplete` reports as the turn's completed content) always equals the full streamed
+  total; letting the last message win silently dropped the preamble and desynced the two, which
+  `src/cli/repl_event/query_processor.rs` detects and fails the turn over ("Provider streaming text
+  did not match its completed content"). This is user-visible by design, not a side effect to hide:
+  the finished transcript now includes any preamble narration the model produced before its tool
+  call, matching exactly what streamed to the screen in real time.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
