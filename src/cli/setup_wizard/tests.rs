@@ -582,6 +582,116 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
     );
 }
 
+/// REGRESSION (#1305, follow-up from #1297): `models_section_lines`'s
+/// primary-provider description varies in physical row count across its
+/// provider-specific variants -- confirmed by an exhaustive sweep of every
+/// pair of the four variants (no-key, keyed, ChatGPT, Grok subscription)
+/// across widths 60-150 comparing each transition's incrementally-blitted
+/// screen against an independent from-scratch repaint of the same frame: at
+/// 131 columns, going from Grok subscription's primary provider to ChatGPT's
+/// (both reachable by changing the primary provider on this tab, no API key
+/// required) diverges. Grok's long description wraps to 2 physical rows at
+/// that width while ChatGPT's fits in 1, shrinking the block by one row with
+/// nothing but `wizard_boxed("AI Providers", ...)` right after it, and the
+/// row-diff blit strands both a leftover text fragment from Grok's second
+/// row where the box's top border belongs *and* a duplicate of the old
+/// "grok-sub" primary-provider row that the real repaint does not show.
+/// This test drives the real two-frame `WizardHost::paint` byte stream
+/// through the same `MiniVt` replay #1297's fix test uses, then asserts the
+/// stronger general invariant: the incrementally-painted screen must match
+/// an independent full repaint of the same final frame, not just lack one
+/// known-bad substring.
+#[test]
+fn test_models_section_grok_to_chatgpt_transition_does_not_strand_a_stale_row() {
+    let width = 131;
+    let height = 30;
+
+    let grok_sub = ModelConfig::Remote {
+        provider: "grok-sub".to_string(),
+        name: "grok-sub".to_string(),
+        api_key: String::new(),
+        model: String::new(),
+        enabled: true,
+        persisted: None,
+    };
+    let chatgpt = ModelConfig::Remote {
+        provider: "chatgpt".to_string(),
+        name: "chatgpt".to_string(),
+        api_key: String::new(),
+        model: String::new(),
+        enabled: true,
+        persisted: None,
+    };
+
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = grok_sub;
+    }
+
+    let mut host = crate::cli::tui::WizardHost::new();
+    let mut sink: Vec<u8> = Vec::new();
+
+    let view_grok = wizard_view_with_permission_target(&state, "", width, height);
+    let frame_grok = crate::cli::tui::plan_wizard_frame(&view_grok, width, height);
+    host.paint(&mut sink, &frame_grok, width, height).unwrap();
+    let mut terminal = MiniVt::new(width, height);
+    terminal.feed(&sink);
+    assert!(
+        terminal
+            .rows()
+            .iter()
+            .any(|row| row.contains("tomatically.")),
+        "sanity check: Grok's description must actually wrap to a second \
+         physical row (the raw terminal's dumb character wrap splits \
+         \"automatically.\" into \"au\" + \"tomatically.\" at 131 columns) \
+         before the primary provider changes, or this test proves nothing; \
+         screen:\n{}",
+        terminal.rows().join("\n")
+    );
+
+    // The state change a user triggers by switching the primary provider
+    // from a Grok subscription to ChatGPT on the Models tab.
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = chatgpt;
+    }
+    sink.clear();
+    let view_chatgpt = wizard_view_with_permission_target(&state, "", width, height);
+    let frame_chatgpt = crate::cli::tui::plan_wizard_frame(&view_chatgpt, width, height);
+    host.paint(&mut sink, &frame_chatgpt, width, height)
+        .unwrap();
+    terminal.feed(&sink);
+    let incremental = terminal.rows();
+
+    // The general invariant: an incrementally-blitted screen must always
+    // equal an independent from-scratch repaint of the same final frame.
+    let mut fresh_host = crate::cli::tui::WizardHost::new();
+    let mut fresh_sink: Vec<u8> = Vec::new();
+    fresh_host
+        .paint(&mut fresh_sink, &frame_chatgpt, width, height)
+        .unwrap();
+    let mut fresh_terminal = MiniVt::new(width, height);
+    fresh_terminal.feed(&fresh_sink);
+    let expected = fresh_terminal.rows();
+
+    assert_eq!(
+        incremental,
+        expected,
+        "REGRESSION (#1305): switching the primary provider from Grok \
+         subscription to ChatGPT must produce the same screen an \
+         independent full repaint would, not a screen with a stale \
+         leftover row from Grok's longer description or a duplicated \
+         primary-provider row; incremental (as actually blitted):\n{}\n\
+         expected (independent full repaint):\n{}",
+        incremental.join("\n"),
+        expected.join("\n")
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_permission_keys_separate_passive_check_from_prompt_request() {
@@ -7527,7 +7637,7 @@ fn test_local_helpers_memory_checkbox_carries_selection_contrast() {
         bytes.contains("Memory embeddings: use the neural model"),
         "the checkbox text itself must be present in the rendered frame: {bytes:?}"
     );
-    let active_run = "\x1b[1;97;40m>>> [x] Memory embeddings: use the neural model <<<";
+    let active_run = "\x1b[1;97;40m>>> ☑ Memory embeddings: use the neural model <<<";
     assert!(
         bytes.contains(active_run),
         "the memory-embeddings checkbox must paint bold bright-white on \
@@ -7735,4 +7845,89 @@ fn test_wizard_view_builders_construct_no_sgr_bytes() {
          found escape sequences at:\n{}",
         offenders.join("\n")
     );
+}
+
+/// REGRESSION (#1300, finding 1): the Themes section's on-screen instruction
+/// claimed the selected theme "shows with white background", but the real
+/// selection style (#1140, `wizard_selected`) is bold bright-white TEXT on a
+/// BLACK background -- confirmed live via `tmux capture-pane -e -p`
+/// (`\x1b[1m\x1b[97m\x1b[40m`). The help text must describe the style the
+/// wizard actually renders, not a background colour it has never painted.
+#[test]
+fn test_theme_selector_help_text_matches_actual_selection_style() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Themes;
+    let bytes = wizard_frame_bytes(&state, 100, 30);
+
+    // Scope the check to the help-text line itself: the frame legitimately
+    // contains the substring "white background" elsewhere, as part of the
+    // *Light theme's own description* ("Light - Black text on white
+    // background"), which is unrelated content this check must not flag.
+    let help_line = bytes
+        .lines()
+        .find(|line| line.contains("Press Enter to confirm."))
+        .unwrap_or_else(|| panic!("the theme selector's confirm instruction must be in the rendered frame; frame:\n{bytes}"));
+    assert!(
+        !help_line.contains("white background"),
+        "the theme selector help text must not claim a white background -- \
+         the real selection style is bold bright-white text on black; \
+         help line: {help_line:?}"
+    );
+    assert!(
+        help_line.contains("bold bright-white text on black"),
+        "the theme selector help text must describe the real selection \
+         style; help line: {help_line:?}"
+    );
+
+    // Cross-check against the actual rendered style of the selected theme
+    // row in the same frame: bold (1), bright-white foreground (97), black
+    // background (40) -- the #1140 style this help text is describing.
+    assert!(
+        bytes.contains("\x1b[1;97;40m"),
+        "the selected theme row must actually paint bold bright-white text \
+         on black so the corrected help text is true, not merely less \
+         wrong; frame:\n{bytes}"
+    );
+}
+
+/// REGRESSION (#1300, finding 2): the Local Helpers tab used `[x]`/`[ ]`
+/// bracket checkboxes while the Settings tab used a colourful `✅` emoji for
+/// "on" and a plain `☐` box for "off" -- two different glyph families for
+/// the two states of the same boolean-toggle concept, on top of a third
+/// convention (`[x]`/`[ ]`) on a different tab again. The Models tab's own
+/// per-tool checkbox already used `☑`/`☐`; every wizard checkbox now uses
+/// that one plain-text convention, which (unlike an emoji) renders
+/// consistently across terminal fonts.
+#[test]
+fn test_wizard_checkboxes_use_one_glyph_convention_across_tabs() {
+    let mut local_helpers_state = WizardState::new(None);
+    local_helpers_state.current_section = WizardSection::LocalHelpers;
+    let local_helpers_frame = wizard_frame_bytes(&local_helpers_state, 100, 30);
+
+    let mut features_state = WizardState::new(None);
+    features_state.current_section = WizardSection::Features;
+    let features_frame = wizard_frame_bytes(&features_state, 100, 30);
+
+    for (name, frame) in [
+        ("Local Helpers", &local_helpers_frame),
+        ("Settings", &features_frame),
+    ] {
+        assert!(
+            !frame.contains("[x]") && !frame.contains("[ ]"),
+            "the {name} tab must not use bracket-style checkboxes now that \
+             the wizard is unified on \u{2611}/\u{2610}; frame:\n{frame}"
+        );
+        assert!(
+            !frame.contains('\u{2705}'),
+            "the {name} tab must not use the \u{2705} emoji checkbox -- an \
+             emoji glyph isn't guaranteed monospaced or available \
+             everywhere, unlike the plain-text \u{2611}/\u{2610} pair; \
+             frame:\n{frame}"
+        );
+        assert!(
+            frame.contains('\u{2611}') || frame.contains('\u{2610}'),
+            "the {name} tab must render at least one checkbox in the \
+             unified \u{2611}/\u{2610} convention; frame:\n{frame}"
+        );
+    }
 }

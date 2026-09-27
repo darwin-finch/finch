@@ -223,7 +223,7 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
         Color::Blue,
     ));
     lines.push(wizard_bold(
-        "Selected theme shows with white background. Press Enter to confirm.",
+        "Selected theme shows as bold bright-white text on black. Press Enter to confirm.",
         Color::Blue,
     ));
     lines
@@ -268,7 +268,7 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
         Color::DarkGray,
     ));
 
-    let checkbox = if use_neural_embeddings { "[x]" } else { "[ ]" };
+    let checkbox = if use_neural_embeddings { "☑" } else { "☐" };
     let item = wizard_selected(format!(
         ">>> {checkbox} Memory embeddings: use the neural model <<<"
     ));
@@ -401,28 +401,58 @@ fn models_section_lines(
         ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
         ModelConfig::Local { .. } => true,
     };
+    const GROK_SUB_DETAIL: &str = "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically.";
+    const CHATGPT_DETAIL: &str = "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate.";
+    const NO_KEY_DETAIL: &str = "Paste your API key below (E), or add a provider with A.\n\
+         No key yet? Get one at console.anthropic.com/keys";
+    let has_key_detail = format!(
+        "Primary provider configured. Press A to add more providers ({} total).",
+        1 + tool_models.len()
+    );
     let description_text = match primary_model {
         ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok-sub") => {
-            "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically."
-                .to_string()
+            GROK_SUB_DETAIL.to_string()
         }
         ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt") => {
-            "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
-                .to_string()
+            CHATGPT_DETAIL.to_string()
         }
-        _ if has_key => format!(
-            "Primary provider configured. Press A to add more providers ({} total).",
-            1 + tool_models.len()
-        ),
-        _ => "Paste your API key below (E), or add a provider with A.\n\
-              No key yet? Get one at console.anthropic.com/keys"
-            .to_string(),
+        _ if has_key => has_key_detail.clone(),
+        _ => NO_KEY_DETAIL.to_string(),
     };
+
+    // #1305: same class of bug as #1297 -- the no-key variant is two
+    // sentences (two logical rows) while the other three variants are one,
+    // so switching primary providers or adding/removing an API key changes
+    // this block's row count and, with nothing but `wizard_boxed` right
+    // after it, strands a stale row from the longer variant under the box's
+    // top border. Declare the fixed height across all four candidate texts
+    // up front and pad every variant to it.
+    let rows_for = |text: &str| -> usize {
+        text.split('\n')
+            .map(|segment| wizard_wrap(&wizard_line(segment.trim(), Color::Blue), width).len())
+            .sum()
+    };
+    let fixed_rows = [
+        GROK_SUB_DETAIL,
+        CHATGPT_DETAIL,
+        has_key_detail.as_str(),
+        NO_KEY_DETAIL,
+    ]
+    .into_iter()
+    .map(rows_for)
+    .max()
+    .unwrap_or(1);
+
+    let mut printed_rows = 0;
     for text in description_text.split('\n') {
-        lines.push(wizard_centered(
-            wizard_line(text.trim(), Color::Blue),
-            width,
-        ));
+        for row in wizard_wrap(&wizard_line(text.trim(), Color::Blue), width) {
+            lines.push(wizard_centered(row, width));
+            printed_rows += 1;
+        }
+    }
+    while printed_rows < fixed_rows {
+        lines.push(WizardLine::blank());
+        printed_rows += 1;
     }
 
     let mut list_rows: Vec<WizardLine> = Vec::new();
@@ -699,7 +729,7 @@ fn feature_group(
     description: &str,
 ) -> Vec<WizardLine> {
     let checkbox = match enabled {
-        Some(true) => "✅ ",
+        Some(true) => "☑ ",
         Some(false) => "☐ ",
         None => "",
     };
