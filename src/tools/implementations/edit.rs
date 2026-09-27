@@ -1194,6 +1194,18 @@ mod tests {
         );
     }
 
+    /// #953: this test used to also assert that the error text contained the
+    /// exact `elided` string of a *second*, independently built `FileDiff`
+    /// (the in-memory fixture above, headed `"many-hunks.txt"`), while the
+    /// error actually comes from a diff `review_and_apply_edit` builds from
+    /// the real absolute temp-file path. Nothing requires those two
+    /// independently rendered diffs to choose identical explanatory text,
+    /// so coupling the assertion to it was a test-fixture bug, not a
+    /// production race — see `oversized_hunk_fixture_elision_reason_is_
+    /// independent_of_header_path_length` in `crates/finch-diff/src/diff.rs`
+    /// for the mechanism that made them agree by construction anyway, and
+    /// why the fixture diff below is retained only to prove the *scenario*
+    /// exceeds the renderer's capacity, not to source expected text from it.
     #[tokio::test]
     async fn test_more_than_128_separate_replacements_are_refused_before_editor() {
         let original: String = (0..129)
@@ -1226,6 +1238,14 @@ mod tests {
         assert!(
             detail.contains("incomplete or elided"),
             "refusal must name the incomplete review; error: {detail}"
+        );
+        // The refusal must still name a concrete renderer-capacity reason —
+        // not just the generic "incomplete or elided" prefix — without
+        // requiring it to match this test's separately rendered fixture
+        // diff byte-for-byte (#953).
+        assert!(
+            detail.contains("hunk limit") || detail.contains("1024 lines"),
+            "refusal must name a specific renderer-capacity bound the diff hit; error: {detail}"
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),

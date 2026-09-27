@@ -1115,6 +1115,67 @@ mod tests {
         assert_eq!(d.render(&ColorScheme::default(),DiffColorMode::NoColor),"src/old.rs → src/new.rs  +2 -1  renamed\n@@ -2,2 +2,3 @@ fn x\n2   keep\n3 - old\n3 + new\n4 + more")
     }
 
+    /// #953: `src/tools/implementations/edit.rs`'s
+    /// `test_more_than_128_separate_replacements_are_refused_before_editor`
+    /// used to assert that a fixture `FileDiff` (built in-memory with the
+    /// literal header path `"many-hunks.txt"`) and the `FileDiff` production
+    /// actually renders (built from the same original/planned text, but
+    /// headed with the real absolute temp-file path) picked the *same*
+    /// elision string. Investigation for #953 found `ingest_similar` never
+    /// reads `old_path`/`new_path` when deciding which bound to report —
+    /// only `mark_truncated_rendering`'s post-hoc char-count check does, and
+    /// this fixture never gets close to that bound — so header/path length
+    /// cannot be what moved the elision reason. The two computed values were
+    /// simply never guaranteed to agree: coupling them was a test-fixture
+    /// bug, not evidence of production nondeterminism.
+    ///
+    /// This pins the real invariant that made the coupling incidentally true
+    /// before it broke: for this fixture shape (one changed line per block,
+    /// separated by more than `2*context` unchanged lines), `ingest_similar`
+    /// always exhausts `MAX_DIFF_HUNKS` (at 128 accepted hunks contributing
+    /// 5 + 127*8 = 1021 accepted lines) strictly before `MAX_DIFF_LINES`
+    /// (1024) could ever trip, regardless of the header path supplied — a
+    /// 3-line margin, not a coincidence tied to path length. If a future
+    /// change to `MAX_DIFF_HUNKS`/`MAX_DIFF_LINES` narrows that margin to
+    /// zero, this test — not the unrelated edit-tool assertion — is where
+    /// that should surface.
+    #[test]
+    fn oversized_hunk_fixture_elision_reason_is_independent_of_header_path_length() {
+        let original: String = (0..129)
+            .map(|index| format!("TARGET {index}\n{}", "unchanged\n".repeat(10)))
+            .collect();
+        let planned = original.replace("TARGET", "REPLACED");
+
+        let short = FileDiff::from_texts("many-hunks.txt", &original, &planned);
+        // A realistic macOS `tempfile::tempdir()` absolute path is far
+        // longer than the fixture's literal header, and would previously
+        // have been blamed for shifting the elision text; it does not.
+        let long = FileDiff::from_texts(
+            "/private/var/folders/xx/T/.tmpZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/many-hunks.txt",
+            &original,
+            &planned,
+        );
+
+        assert!(
+            !short.counts_are_exact() && !long.counts_are_exact(),
+            "fixture must exceed the renderer's bounded review capacity for both header \
+             lengths; short={short:?} long={long:?}"
+        );
+        assert_eq!(
+            short.elided,
+            Some("diff exceeded hunk limit; later hunks omitted".to_string()),
+            "the short-header diff must fail closed on the hunk bound, not the line bound; \
+             elided={:?}",
+            short.elided
+        );
+        assert_eq!(
+            short.elided, long.elided,
+            "the elision reason must be a function of the original/planned text, not of the \
+             header path's length; short={:?} long={:?}",
+            short.elided, long.elided
+        );
+    }
+
     fn hunk_body(rendered: &str) -> Vec<&str> {
         rendered
             .lines()
