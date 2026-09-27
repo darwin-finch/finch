@@ -28,34 +28,47 @@
 //   CLI's built-ins.
 // - Real, provider-native tool use instead comes from Finch's own tools,
 //   served to the CLI over MCP (`--mcp-config`, verified inline-JSON shape:
-//   `{"mcpServers":{"<name>":{"type":"stdio","command":...,"args":[...]}}}`,
-//   `--strict-mcp-config` so the CLI ignores the user's own personal MCP
-//   integrations). The MCP server is this same `finch` binary, re-invoked
-//   with the hidden [`CLAUDE_CLI_MCP_BRIDGE_FLAG`] (`src/cli/claude_cli_bridge.rs`
-//   in the root crate): it registers Finch's own tool implementations and
-//   really executes each call through Finch's permission policy — the CLI
-//   never touches the filesystem or a shell itself. `--allowedTools
+//   `{"mcpServers":{"<name>":{"type":"stdio","command":...,"args":[...],
+//   "env":{...}}}}`, `--strict-mcp-config` so the CLI ignores the user's own
+//   personal MCP integrations). The MCP server is this same `finch` binary,
+//   re-invoked with the hidden [`CLAUDE_CLI_MCP_BRIDGE_FLAG`]
+//   (`src/cli/claude_cli_bridge.rs` in the root crate). `--allowedTools
 //   "mcp__<server>__<tool>"` (bare name) is required per tool: verified
 //   directly that an MCP tool call is otherwise denied by default with no
 //   permission host available in `--print` mode, and that a bare-name entry
-//   auto-approves every call to that tool with no further prompting — safe
-//   here because the bridge's own handler, not blanket approval, is what
-//   decides whether the call actually runs.
+//   auto-approves the CLI's own MCP prompt with no further prompting on that
+//   side — safe because the bridge never executes anything on its own
+//   authority (issue #1341): it is a pure JSON-RPC-to-socket translator. A
+//   `tools/call` is forwarded, line-delimited JSON, over a Unix domain socket
+//   named in the server's `env` entry ([`CLAUDE_CLI_TOOL_SOCKET_ENV`]) to
+//   *this* transport, which surfaces it as an ordinary
+//   [`crate::StreamChunk::ToolCallComplete`] in the same stream every other
+//   provider's tool calls already take, so it is executed by the frontend's
+//   real, interactive `ToolLoop` — the same authority, same approval, same
+//   file access as every other provider. The underlying `claude` child is
+//   *parked* (kept alive, not re-spawned) while that real execution runs,
+//   however long interactive approval takes; the next Finch-level round hands
+//   the real result back over the same socket connection and the parked
+//   child resumes.
 
 use crate::types::{
-    ModelCapabilities, ProviderAllowance, ProviderRequest, ProviderResponse, ProviderUsage,
-    ReasoningCapability, StreamChunk,
+    EventProvenance, ModelCapabilities, ProviderAllowance, ProviderRequest, ProviderResponse,
+    ProviderUsage, ReasoningCapability, StreamChunk,
 };
 use crate::wire_types::ContentBlock;
 use crate::{CapabilitySupport, ProviderBackend, ValidatedProviderRequest, WireProtocol};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::process::{Child, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// Default upstream model, measured as the CLI's own default on 2026-09-25
 /// (claude CLI 2.1.283, `system/init` event: `claude-sonnet-5`).
@@ -81,12 +94,13 @@ pub const CLAUDE_CLI_MCP_BRIDGE_FLAG: &str = "--internal-claude-cli-mcp-bridge";
 /// `mcp__<CLAUDE_CLI_MCP_SERVER_NAME>__<tool>`.
 pub const CLAUDE_CLI_MCP_SERVER_NAME: &str = "finch";
 
-/// Finch tool names this transport ever exposes to Claude Code. Every one of
-/// them is executed by Finch's own bridge process, under Finch's own
-/// permission policy — the CLI never runs Bash, Read, Write, Edit, Grep, or
-/// Glob on its own authority (`--tools` always stays `""`). A tool that
-/// exists in Finch but is not in this list is simply never offered to this
-/// provider; the caller sees no tool-call attempt for it, not a failure.
+/// Finch tool names this transport ever exposes to Claude Code. Every call to
+/// one of them is forwarded by the MCP bridge to the frontend and executed by
+/// Finch's real, interactive `ToolLoop` (issue #1341) — the CLI never runs
+/// Bash, Read, Write, Edit, Grep, or Glob on its own authority (`--tools`
+/// always stays `""`). A tool that exists in Finch but is not in this list is
+/// simply never offered to this provider; the caller sees no tool-call
+/// attempt for it, not a failure.
 pub const CLAUDE_CLI_TOOL_NAMES: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
 
 /// The MCP wire name Claude Code will call for a Finch tool name.
@@ -98,6 +112,35 @@ pub fn claude_cli_mcp_wire_name(finch_tool_name: &str) -> String {
 /// only (the bridge process is what actually decodes and dispatches calls).
 pub fn claude_cli_tool_name_from_wire(wire_name: &str) -> Option<&str> {
     wire_name.strip_prefix(&format!("mcp__{CLAUDE_CLI_MCP_SERVER_NAME}__"))
+}
+
+/// Environment variable the frontend sets on the MCP server entry in
+/// `--mcp-config` (never on `claude`'s own environment) naming the Unix
+/// domain socket the bridge process (`src/cli/claude_cli_bridge.rs`) must
+/// connect to for every `tools/call` it receives (issue #1341). The bridge
+/// no longer executes tools itself; this socket is how it hands a call to
+/// the frontend process that actually owns interactive approval and real
+/// file access, and gets a real result back.
+pub const CLAUDE_CLI_TOOL_SOCKET_ENV: &str = "FINCH_CLAUDE_CLI_TOOL_SOCKET";
+
+/// One `tools/call` the bridge subprocess forwards to the frontend over
+/// [`CLAUDE_CLI_TOOL_SOCKET_ENV`], line-delimited JSON. `name` is already the
+/// plain Finch tool name (the bridge resolves the MCP wire name itself before
+/// forwarding, so the frontend never needs to know the MCP namespacing
+/// convention).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClaudeCliBridgeToolRequest {
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// The frontend's answer to a [`ClaudeCliBridgeToolRequest`], translated by
+/// the bridge back into the MCP `tools/call` response for the waiting
+/// `claude` CLI subprocess.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClaudeCliBridgeToolResponse {
+    pub is_error: bool,
+    pub content: String,
 }
 
 /// Whether the `claude` CLI is usable as a backend.
@@ -158,6 +201,80 @@ struct TurnRecord {
     tool_calls_observed: usize,
 }
 
+/// Best-effort removes the bridge socket file on drop, so a paused-then-
+/// abandoned turn never leaks a stale socket path on disk. A separate type
+/// (rather than a `Drop` impl directly on [`RunningTurn`]) so `RunningTurn`'s
+/// own fields — notably `record` and `stderr_task` — can still be moved out
+/// of a completed turn; a type with its own `Drop` impl cannot be partially
+/// moved out of.
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One live `claude` child process plus everything needed to keep reading its
+/// stdout across a pause for a real tool execution (issue #1341).
+struct RunningTurn {
+    child: Child,
+    reader: BufReader<ChildStdout>,
+    stderr_task: JoinHandle<String>,
+    listener: UnixListener,
+    /// Never read again after construction; retained solely so its `Drop`
+    /// impl removes the socket file whenever this turn is dropped, whether
+    /// completed, errored, or abandoned mid-pause.
+    #[allow(dead_code)]
+    socket_path: SocketGuard,
+    record: TurnRecord,
+    /// Monotonic counter so every tool call this `claude` process makes
+    /// (across however many paused/resumed Finch-level rounds) gets a
+    /// distinct sequence number in its `EventProvenance`.
+    tool_call_sequence: u64,
+}
+
+/// A `claude` child process paused between Finch-level rounds while a real,
+/// interactive tool execution runs in the frontend (issue #1341). Nothing
+/// here spawns a new `claude` process just to answer one tool call: the same
+/// process, its MCP bridge subprocess, and this transport's own bridge
+/// listener socket stay exactly as they were the moment the bridge forwarded
+/// the `tools/call`.
+struct ParkedTurn {
+    running: RunningTurn,
+    /// Finch-minted id for the specific call the bridge is still blocked on.
+    /// The next Finch-level round must supply a matching `ToolResult`.
+    pending_id: String,
+    /// The bridge's own open connection, awaiting exactly one reply line.
+    pending_reply: UnixStream,
+}
+
+/// What a completed [`ClaudeCliProvider::execute_turn`] produced.
+enum TurnOutcome {
+    /// The `claude` process exited; `record` is the finished turn.
+    Complete(TurnRecord),
+    /// The process is parked awaiting a real tool result; the stream ends
+    /// here with no final content block, exactly like every other
+    /// provider's stream after a native tool call.
+    Paused,
+}
+
+/// What one [`drive`] pass produced.
+enum DriveOutcome {
+    Exited(std::process::ExitStatus),
+    ToolCallPending {
+        name: String,
+        input: serde_json::Value,
+        reply: UnixStream,
+    },
+}
+
+/// One queued typed-ahead round: the system prompt in effect when the user
+/// typed it, and the text itself. See
+/// [`ClaudeCliProvider::pending_followup`]/[`ClaudeCliProvider::execute_turn`]
+/// (issue #1341).
+type PendingFollowup = (Option<String>, String);
+
 #[derive(Clone)]
 pub struct ClaudeCliProvider {
     binary: PathBuf,
@@ -166,6 +283,18 @@ pub struct ClaudeCliProvider {
     /// Set once a turn has completed successfully for this session id; later
     /// turns continue the conversation with `--resume`.
     resumable: Arc<Mutex<bool>>,
+    /// A `claude` child process kept alive between Finch-level rounds while
+    /// its own MCP bridge subprocess waits on a real, interactive tool
+    /// execution result (issue #1341). `None` whenever no `claude` child is
+    /// mid-tool-call. See [`RunningTurn`]/[`pump_until_settled`].
+    parked: Arc<Mutex<Option<ParkedTurn>>>,
+    /// Text the user typed while a tool call was parked, queued (with the
+    /// system prompt in effect when it was typed) because it could never
+    /// reach that parked `claude` process directly — its stdin was already
+    /// closed at spawn time. Flushed, in order, as soon as some round on
+    /// this session next completes without pausing again (issue #1341's
+    /// typed-ahead-during-a-parked-tool-call case). See `execute_turn`.
+    pending_followup: Arc<Mutex<VecDeque<PendingFollowup>>>,
 }
 
 impl ClaudeCliProvider {
@@ -179,6 +308,8 @@ impl ClaudeCliProvider {
             model: model.unwrap_or_else(|| CLAUDE_CLI_DEFAULT_MODEL.to_string()),
             session_id: uuid::Uuid::new_v4(),
             resumable: Arc::new(Mutex::new(false)),
+            parked: Arc::new(Mutex::new(None)),
+            pending_followup: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -235,6 +366,7 @@ impl ClaudeCliProvider {
         resumable: bool,
         system: Option<&str>,
         tool_names: &[String],
+        tool_socket_path: Option<&Path>,
     ) -> Result<Vec<String>> {
         let mut args = vec![
             "--print".to_string(),
@@ -247,7 +379,7 @@ impl ClaudeCliProvider {
             "--tools".to_string(),
             String::new(),
         ];
-        args.extend(self.mcp_bridge_args(tool_names)?);
+        args.extend(self.mcp_bridge_args(tool_names, tool_socket_path)?);
         if let Some(system) = system {
             args.push("--system-prompt".to_string());
             args.push(system.to_string());
@@ -269,13 +401,21 @@ impl ClaudeCliProvider {
     /// the pre-#1309 `--tools ""`-only behavior exactly.
     ///
     /// The MCP server is this same Finch binary, re-invoked with
-    /// [`CLAUDE_CLI_MCP_BRIDGE_FLAG`]: real execution happens in that
-    /// subprocess, under Finch's own permission policy
-    /// (`src/cli/claude_cli_bridge.rs`), never inside the `claude` CLI.
-    fn mcp_bridge_args(&self, tool_names: &[String]) -> Result<Vec<String>> {
+    /// [`CLAUDE_CLI_MCP_BRIDGE_FLAG`]. `tool_socket_path` (always `Some` when
+    /// `tool_names` is non-empty) is embedded as an `env` entry on the server
+    /// spec itself, never on `claude`'s own environment: it names the Unix
+    /// domain socket [`CLAUDE_CLI_TOOL_SOCKET_ENV`] the bridge connects to for
+    /// every `tools/call` (issue #1341) instead of executing anything itself.
+    fn mcp_bridge_args(
+        &self,
+        tool_names: &[String],
+        tool_socket_path: Option<&Path>,
+    ) -> Result<Vec<String>> {
         if tool_names.is_empty() {
             return Ok(Vec::new());
         }
+        let socket_path = tool_socket_path
+            .context("issue #1341: a tool-serving turn always binds a bridge socket first")?;
         let exe = std::env::current_exe()
             .context("resolving Finch's own executable path for the Claude Code MCP bridge")?;
         let mcp_config = json!({
@@ -284,6 +424,9 @@ impl ClaudeCliProvider {
                     "type": "stdio",
                     "command": exe.to_string_lossy(),
                     "args": [CLAUDE_CLI_MCP_BRIDGE_FLAG],
+                    "env": {
+                        CLAUDE_CLI_TOOL_SOCKET_ENV: socket_path.to_string_lossy(),
+                    },
                 }
             }
         });
@@ -382,43 +525,148 @@ impl ClaudeCliProvider {
         Ok((system, lines))
     }
 
+    /// If a parked turn is waiting on exactly this request's trailing tool
+    /// result, takes it out of `self.parked` and returns it with that
+    /// result's content/error flag. `None` when there is no parked turn, or
+    /// the request's tail does not match its pending call — in which case
+    /// the stale parked turn (if any) is dropped right here (its child
+    /// killed via `kill_on_drop`, its socket file removed by `RunningTurn`'s
+    /// `Drop`) rather than left to hang or silently double-park later
+    /// (issue #1341's cancel/retry hostile-timing case).
+    async fn take_matching_parked_turn(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<(ParkedTurn, String, bool, Vec<String>)> {
+        let mut guard = self.parked.lock().await;
+        let parked = guard.take()?;
+        match tail_tool_result(request, &parked.pending_id) {
+            Some((content, is_error, extra_text)) => Some((parked, content, is_error, extra_text)),
+            None => {
+                tracing::warn!(
+                    pending_id = %parked.pending_id,
+                    "issue #1341: abandoning a parked claude CLI turn whose pending tool call \
+                     was never answered by the next round (query cancelled or retried)"
+                );
+                None
+            }
+        }
+    }
+
     async fn execute_turn(
         &self,
         request: &ProviderRequest,
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
-    ) -> Result<TurnRecord> {
-        let (system, input_lines) = self.split_request(request)?;
-        let tool_names = self.supported_tool_names(request);
-        let resumable = *self.resumable.lock().await;
-        match self
-            .run_turn_once(
-                resumable,
-                system.as_deref(),
-                &input_lines,
-                &tool_names,
-                deltas.clone(),
-            )
-            .await
+    ) -> Result<TurnOutcome> {
+        let mut outcome = if let Some((parked, content, is_error, extra_text)) =
+            self.take_matching_parked_turn(request).await
         {
-            Ok(record) => {
-                self.mark_resumable().await;
-                Ok(record)
+            write_bridge_response(
+                parked.pending_reply,
+                &ClaudeCliBridgeToolResponse { is_error, content },
+            )
+            .await?;
+            if !extra_text.is_empty() {
+                // The user typed ahead while this tool call was pending
+                // (`ConversationHistory::append_text_blocks_to_last_user_message`
+                // folds it into this same trailing message rather than a new
+                // one). It can never reach *this* `claude` process directly —
+                // its stdin was already written and closed at spawn time,
+                // long before this tool call happened — so it is queued to
+                // become its own follow-up round the moment some round on
+                // this session next completes without pausing again (issue
+                // #1341). Silently dropping it here, or treating the round as
+                // an unmatched/abandoned parked turn because the trailing
+                // message no longer looks like a bare `ToolResult`, would
+                // discard a real, already-approved tool result and kill a
+                // live, healthy `claude` process for no reason.
+                self.pending_followup
+                    .lock()
+                    .await
+                    .push_back((extract_system_prompt(request), extra_text.join("\n")));
             }
-            Err(error) => {
-                // A session id only becomes resumable once the CLI has
-                // persisted it. A first turn that failed before persisting
-                // must retry as a fresh session, while a mid-conversation
-                // failure may have left the id already stored. The CLI's
-                // "already in use" exit names the latter exactly.
-                if !resumable && error.to_string().contains("already in use") {
-                    let retry = self
-                        .run_turn_once(true, system.as_deref(), &input_lines, &tool_names, deltas)
-                        .await?;
-                    self.mark_resumable().await;
-                    return Ok(retry);
+            self.pump_until_settled(parked.running, deltas.clone())
+                .await?
+        } else {
+            let (system, input_lines) = self.split_request(request)?;
+            let tool_names = self.supported_tool_names(request);
+            let resumable = *self.resumable.lock().await;
+            match self
+                .run_turn_once(
+                    resumable,
+                    system.as_deref(),
+                    &input_lines,
+                    &tool_names,
+                    deltas.clone(),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // A session id only becomes resumable once the CLI has
+                    // persisted it. A first turn that failed before persisting
+                    // must retry as a fresh session, while a mid-conversation
+                    // failure may have left the id already stored. The CLI's
+                    // "already in use" exit names the latter exactly.
+                    if !resumable && error.to_string().contains("already in use") {
+                        self.run_turn_once(
+                            true,
+                            system.as_deref(),
+                            &input_lines,
+                            &tool_names,
+                            deltas.clone(),
+                        )
+                        .await?
+                    } else {
+                        return Err(error);
+                    }
                 }
-                Err(error)
             }
+        };
+
+        // Drain any queued typed-ahead text the moment a round completes
+        // cleanly, regardless of whether *this* call reached completion via
+        // the parked-resume branch above or an ordinary fresh spawn — a
+        // round can complete cleanly right after a second, nested tool call
+        // resolves too, and the queue must still flush then. Each iteration
+        // spawns its own `claude` process for its own `--resume` round, but
+        // from `query_processor.rs`'s perspective this is still exactly one
+        // Finch-level round: every one of these chained invocations' own
+        // `text_delta`s already streamed live through the same `deltas` sink,
+        // so `combined` accumulates their completed content the same way
+        // `TurnRecord::assistant_text` already accumulates multiple
+        // `assistant` events *within* one invocation (issue #1331) — losing
+        // an earlier invocation's text here would desync exactly the
+        // streamed-vs-completed check that fix exists to satisfy.
+        let mut combined: Option<TurnRecord> = None;
+        loop {
+            let record = match outcome {
+                TurnOutcome::Complete(record) => record,
+                TurnOutcome::Paused => return Ok(TurnOutcome::Paused),
+            };
+            self.mark_resumable().await;
+            let record = match combined.take() {
+                Some(mut acc) => {
+                    acc.absorb_followup(record);
+                    acc
+                }
+                None => record,
+            };
+            let Some((system, text)) = self.pending_followup.lock().await.pop_front() else {
+                return Ok(TurnOutcome::Complete(record));
+            };
+            combined = Some(record);
+            // Deliberately offers no tools: this round exists only to
+            // deliver text the user already typed, on a brand-new `claude`
+            // process (the parked one already exited), and threading the
+            // original turn's tool catalog through here is unneeded
+            // complexity for what is already a rare, secondary path — the
+            // model can still ask for a tool in its own reply, which
+            // surfaces as an ordinary next round with tools offered again,
+            // same as any other turn.
+            let wire_line = user_input_line(&text)?;
+            outcome = self
+                .run_turn_once(true, system.as_deref(), &[wire_line], &[], deltas.clone())
+                .await?;
         }
     }
 
@@ -426,15 +674,57 @@ impl ClaudeCliProvider {
         *self.resumable.lock().await = true;
     }
 
-    async fn run_turn_once(
+    /// Bind a fresh, uniquely-named Unix domain socket for the bridge
+    /// subprocess this `claude` invocation will spawn (issue #1341). Bound
+    /// unconditionally (even for a tool-less turn, where nothing will ever
+    /// connect) so [`RunningTurn`]'s shape and [`drive`]'s control flow stay
+    /// uniform; the cost is one idle listener and one socket file cleaned up
+    /// by `RunningTurn`'s `Drop`.
+    async fn bind_tool_socket(&self) -> Result<(UnixListener, PathBuf)> {
+        // `sockaddr_un.sun_path` is a fixed, short buffer (104 bytes on
+        // macOS/BSD, 108 on Linux) — `bind` fails outright past that, and
+        // `std::env::temp_dir()` (Finch's per-user `$TMPDIR` on macOS) is
+        // frequently long enough on its own to blow the whole budget once any
+        // filename is appended. `/tmp` is short on every target this project
+        // ships for and is the standard workaround for exactly this limit;
+        // the filename itself stays short (one hex-simple uuid) for the same
+        // reason, deliberately not the longer hyphenated form or the session
+        // id.
+        let path =
+            PathBuf::from("/tmp").join(format!("fcb-{}.sock", uuid::Uuid::new_v4().simple()));
+        let listener = UnixListener::bind(&path).with_context(|| {
+            format!("binding Claude CLI MCP bridge socket at {}", path.display())
+        })?;
+        // This socket carries real `tools/call` requests that get real,
+        // interactive execution authority once accepted — `read_bridge_request`
+        // trusts any well-formed request on any accepted connection, and does
+        // not verify the peer is actually the bridge subprocess `claude`
+        // spawned. `/tmp` is world-listable and a live listener's default mode
+        // is world-connectable (verified: 0o755 under a standard 0o022 umask),
+        // so an unhardened socket here would let *any* local process on the
+        // machine act as the bridge for the lifetime of this turn — able to
+        // read (at minimum) any workspace file the auto-approved
+        // `ExecutionEffect::WorkspaceRead` tier permits with no human
+        // approval. Owner-only mode closes that hole the same way
+        // `src/server/ipc.rs`'s `harden_ipc_socket_permissions` already does
+        // for the structurally identical unauthenticated local-socket pattern
+        // (issue #911's rationale applies verbatim here).
+        harden_bridge_socket_permissions(&path)?;
+        Ok((listener, path))
+    }
+
+    /// Spawn a brand-new `claude` child process for a fresh Finch-level turn.
+    /// Never used to answer a pending tool call on an already-running
+    /// process — see [`Self::execute_turn`]'s parked-turn branch for that.
+    async fn spawn_running_turn(
         &self,
         resumable: bool,
         system: Option<&str>,
         input_lines: &[String],
         tool_names: &[String],
-        deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
-    ) -> Result<TurnRecord> {
-        let args = self.invocation_args(resumable, system, tool_names)?;
+    ) -> Result<RunningTurn> {
+        let (listener, socket_path) = self.bind_tool_socket().await?;
+        let args = self.invocation_args(resumable, system, tool_names, Some(&socket_path))?;
         let mut child = tokio::process::Command::new(&self.binary)
             .args(&args)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
@@ -480,38 +770,108 @@ impl ClaudeCliProvider {
             String::from_utf8_lossy(&bounded).to_string()
         });
 
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut record = TurnRecord::default();
-        let mut line = String::new();
+        Ok(RunningTurn {
+            child,
+            reader: BufReader::new(stdout),
+            stderr_task,
+            listener,
+            socket_path: SocketGuard(socket_path),
+            record: TurnRecord::default(),
+            tool_call_sequence: 0,
+        })
+    }
+
+    /// Spawn a fresh `claude` process and drive it to either completion or a
+    /// paused tool call. The "already in use" retry in [`Self::execute_turn`]
+    /// wraps this whole spawn-and-drive sequence, matching the pre-#1341
+    /// behavior of retrying the entire turn, not just the drive loop.
+    async fn run_turn_once(
+        &self,
+        resumable: bool,
+        system: Option<&str>,
+        input_lines: &[String],
+        tool_names: &[String],
+        deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
+    ) -> Result<TurnOutcome> {
+        let running = self
+            .spawn_running_turn(resumable, system, input_lines, tool_names)
+            .await?;
+        self.pump_until_settled(running, deltas).await
+    }
+
+    /// Drive a (possibly just-resumed) `claude` process until it either
+    /// exits (`TurnOutcome::Complete`) or makes another `tools/call` that
+    /// needs real, interactive execution (`TurnOutcome::Paused`, with the
+    /// process parked in `self.parked`) — issue #1341.
+    async fn pump_until_settled(
+        &self,
+        mut running: RunningTurn,
+        deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
+    ) -> Result<TurnOutcome> {
         loop {
-            line.clear();
-            let read = reader.read_line(&mut line).await?;
-            if read == 0 {
-                break;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(delta) = record.absorb_line(trimmed)? {
-                if let Some(deltas) = &deltas {
+            match drive(&mut running, deltas.as_ref()).await? {
+                DriveOutcome::Exited(status) => {
+                    let stderr_text = running.stderr_task.await.unwrap_or_default();
+                    if !status.success() {
+                        bail!(
+                            "claude CLI exited with {status}; stderr: {}",
+                            bounded_text(&stderr_text)
+                        );
+                    }
+                    running.record.validated(self.session_id)?;
+                    return Ok(TurnOutcome::Complete(running.record));
+                }
+                DriveOutcome::ToolCallPending { name, input, reply } => {
+                    running.tool_call_sequence += 1;
+                    let Some(deltas) = deltas.as_ref() else {
+                        // No streaming sink: there is no interactive host to
+                        // route real approval through for this call (the
+                        // non-streaming `send_message` path). Answer the
+                        // bridge with a clear, actionable error and keep
+                        // driving the same `claude` process — it decides how
+                        // to continue on its own, exactly as it would for
+                        // any other tool error. This never falls back to
+                        // local execution.
+                        write_bridge_response(
+                            reply,
+                            &ClaudeCliBridgeToolResponse {
+                                is_error: true,
+                                content: "Finch cannot service this tool call: the Claude CLI \
+                                          subscription transport was invoked without a \
+                                          streaming sink, so no interactive approval host is \
+                                          available (issue #1341)."
+                                    .to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    };
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let provenance = EventProvenance {
+                        provider: CLAUDE_CLI_PROVIDER_NAME.to_string(),
+                        model: self.model.clone(),
+                        event: "tool_call".to_string(),
+                        sequence: running.tool_call_sequence,
+                        opaque_replay: None,
+                    };
                     deltas
-                        .send(Ok(StreamChunk::TextDelta(delta)))
+                        .send(Ok(StreamChunk::ToolCallComplete {
+                            id: id.clone(),
+                            name,
+                            input,
+                            provenance,
+                        }))
                         .await
                         .map_err(|error| anyhow!("claude CLI stream sink closed: {error}"))?;
+                    *self.parked.lock().await = Some(ParkedTurn {
+                        running,
+                        pending_id: id,
+                        pending_reply: reply,
+                    });
+                    return Ok(TurnOutcome::Paused);
                 }
             }
         }
-        let status = child.wait().await?;
-        let stderr_text = stderr_task.await.unwrap_or_default();
-        if !status.success() {
-            bail!(
-                "claude CLI exited with {status}; stderr: {}",
-                bounded_text(&stderr_text)
-            );
-        }
-        record.validated(self.session_id)?;
-        Ok(record)
     }
 
     fn response_from(&self, record: &TurnRecord, requested_model: &str) -> ProviderResponse {
@@ -534,7 +894,229 @@ impl ClaudeCliProvider {
     }
 }
 
+/// Read `claude`'s stdout, racing it against the bridge's own listener
+/// socket, until either the process exits or a `tools/call` arrives that
+/// needs real execution (issue #1341). `deltas` is only consulted for text
+/// output; the caller (`pump_until_settled`) decides what to do with a
+/// pending tool call, including the no-streaming-sink fallback.
+async fn drive(
+    turn: &mut RunningTurn,
+    deltas: Option<&mpsc::Sender<Result<StreamChunk>>>,
+) -> Result<DriveOutcome> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        tokio::select! {
+            read_result = turn.reader.read_line(&mut line) => {
+                let read = read_result.context("reading claude CLI stdout")?;
+                if read == 0 {
+                    let status = turn
+                        .child
+                        .wait()
+                        .await
+                        .context("waiting for claude CLI to exit")?;
+                    return Ok(DriveOutcome::Exited(status));
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(delta) = turn.record.absorb_line(trimmed)? {
+                    if let Some(deltas) = deltas {
+                        deltas
+                            .send(Ok(StreamChunk::TextDelta(delta)))
+                            .await
+                            .map_err(|error| anyhow!("claude CLI stream sink closed: {error}"))?;
+                    }
+                }
+            }
+            accept_result = turn.listener.accept() => {
+                let (stream, _addr) = accept_result
+                    .context("accepting Claude CLI MCP bridge tool-call connection")?;
+                let (request, reply) = read_bridge_request(stream).await?;
+                return Ok(DriveOutcome::ToolCallPending {
+                    name: request.name,
+                    input: request.input,
+                    reply,
+                });
+            }
+        }
+    }
+}
+
+/// Read one line-delimited [`ClaudeCliBridgeToolRequest`] from a freshly
+/// accepted bridge connection, returning the connection back so the reply
+/// can be written to it later (potentially much later — real interactive
+/// approval has no timeout).
+async fn read_bridge_request(
+    mut stream: UnixStream,
+) -> Result<(ClaudeCliBridgeToolRequest, UnixStream)> {
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("reading MCP bridge tool-call request")?;
+        if read == 0 {
+            bail!("MCP bridge closed its tool-call connection before sending a request");
+        }
+    }
+    let request = serde_json::from_str(line.trim()).with_context(|| {
+        format!(
+            "malformed MCP bridge tool-call request: {}",
+            bounded_text(line.trim())
+        )
+    })?;
+    Ok((request, stream))
+}
+
+/// Write one line-delimited [`ClaudeCliBridgeToolResponse`] back to the
+/// bridge's still-open connection.
+async fn write_bridge_response(
+    mut stream: UnixStream,
+    response: &ClaudeCliBridgeToolResponse,
+) -> Result<()> {
+    let mut payload =
+        serde_json::to_string(response).context("encode MCP bridge tool-call response")?;
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .context("writing MCP bridge tool-call response")?;
+    stream
+        .flush()
+        .await
+        .context("flushing MCP bridge tool-call response")?;
+    Ok(())
+}
+
+/// Owner-only mode for the bridge tool-call socket, matching
+/// `src/server/ipc.rs`'s `IPC_SOCKET_MODE` for the structurally identical
+/// unauthenticated local-socket pattern (issue #911's rationale, applied here
+/// for issue #1341).
+#[cfg(unix)]
+const BRIDGE_SOCKET_MODE: u32 = 0o600;
+
+/// Restrict the freshly bound bridge socket to the owning user. See
+/// [`ClaudeCliProvider::bind_tool_socket`]'s call site for why this is
+/// mandatory, not defense-in-depth: without it, any local process can
+/// connect and be answered as if it were the real bridge.
+#[cfg(unix)]
+fn harden_bridge_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(BRIDGE_SOCKET_MODE))
+        .with_context(|| {
+            format!(
+                "hardening Claude CLI MCP bridge socket at {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn harden_bridge_socket_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Whether `request`'s trailing message contains a `ToolResult` matching
+/// `pending_id` — the shape `finalize_tool_execution` produces for the very
+/// next round after a tool call, and the only shape that may resume a parked
+/// turn (issue #1341). Any other `ContentBlock::Text` in that same message is
+/// text the user typed while the tool call was pending
+/// (`ConversationHistory::append_text_blocks_to_last_user_message` folds it
+/// into this same message rather than a new one) and is returned separately
+/// so a caller can queue it instead of silently discarding it. A block that
+/// is neither `ToolResult` nor `Text`, or a second, mismatched `ToolResult`,
+/// is not a shape this function recognizes — it fails closed (`None`) rather
+/// than guess.
+fn tail_tool_result(
+    request: &ProviderRequest,
+    pending_id: &str,
+) -> Option<(String, bool, Vec<String>)> {
+    let last = request.messages.last()?;
+    if last.role != "user" || last.content.is_empty() {
+        return None;
+    }
+    let mut matched = None;
+    let mut extra_text = Vec::new();
+    for block in &last.content {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                if matched.is_some() || tool_use_id != pending_id {
+                    return None;
+                }
+                matched = Some((content.clone(), is_error.unwrap_or(false)));
+            }
+            ContentBlock::Text { text } => {
+                if !text.trim().is_empty() {
+                    extra_text.push(text.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (content, is_error) = matched?;
+    Some((content, is_error, extra_text))
+}
+
+/// System-role content from a request, independent of
+/// [`ClaudeCliProvider::split_request`]'s stricter "must have a pending user
+/// turn to send" invariant — needed for a synthetic follow-up round (issue
+/// #1341's typed-ahead-during-a-parked-tool-call case) built from queued text
+/// alone, where that invariant does not apply.
+fn extract_system_prompt(request: &ProviderRequest) -> Option<String> {
+    let mut parts = Vec::new();
+    for message in &request.messages {
+        if message.role == "system" {
+            parts.extend(
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| block.as_text().map(str::to_string)),
+            );
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 impl TurnRecord {
+    /// Merge a chained follow-up invocation's record into this one (issue
+    /// #1341: typed-ahead text queued during a parked tool call is delivered
+    /// as its own `claude` process, but the caller sees exactly one
+    /// Finch-level round). `assistant_text` accumulates for the same reason
+    /// it already accumulates across multiple `assistant` events within one
+    /// invocation (issue #1331): every `text_delta` that streamed live must
+    /// still be reflected in what `response_text()` reports as complete.
+    /// Both invocations share one `--resume` session, so `session_confirmed`
+    /// is left as the first invocation's (already validated); other fields
+    /// take the follow-up's value when it has one, since it is the more
+    /// recent state.
+    fn absorb_followup(&mut self, next: TurnRecord) {
+        self.assistant_text.push_str(&next.assistant_text);
+        if next.assistant_model.is_some() {
+            self.assistant_model = next.assistant_model;
+        }
+        if next.assistant_message_id.is_some() {
+            self.assistant_message_id = next.assistant_message_id;
+        }
+        if next.usage.is_some() {
+            self.usage = next.usage;
+        }
+        if next.allowance.is_some() {
+            self.allowance = next.allowance;
+        }
+        if next.result_text.is_some() {
+            self.result_text = next.result_text;
+        }
+        self.result_error = next.result_error;
+        self.tool_calls_observed += next.tool_calls_observed;
+    }
+
     fn absorb_line(&mut self, line: &str) -> Result<Option<String>> {
         let event: serde_json::Value = serde_json::from_str(line).with_context(|| {
             format!("claude CLI emitted a non-JSON line: {}", bounded_text(line))
@@ -563,18 +1145,25 @@ impl TurnRecord {
                         .collect::<Vec<_>>()
                         .join("");
                     self.assistant_text.push_str(&message_text);
-                    // Observability only (issue #1309): a tool_use block here
-                    // was already served and really executed by Finch's own
-                    // MCP bridge process by the time this line arrives —
-                    // Claude Code folds the real tool_result back into the
-                    // same turn automatically. Logging (and the count this
-                    // module's tests assert on) is deliberately the only
-                    // effect: emitting a ToolCallComplete/ContentBlockComplete
-                    // chunk here would make the generation layer execute the
-                    // same call a second time through Finch's interactive
-                    // ToolLoop (see `finch-providers`' `AGENTS.md`: "Dual
-                    // encoding of the same id+input is one call at the
-                    // ToolLoop").
+                    // Re-derived for issue #1341 (previously: "observability
+                    // only, because the bridge already executed this for
+                    // real" — no longer true, the bridge never executes
+                    // anything now). This function still emits no
+                    // `StreamChunk` for a `tool_use` block: the *real*
+                    // `ToolCallComplete` for this call is emitted by
+                    // `pump_until_settled`/`drive`, driven by the bridge's own
+                    // forwarded socket request, not by parsing this line. The
+                    // two are deliberately decoupled — this stdout line and
+                    // the bridge's MCP request are two independent views of
+                    // the same event delivered over two different pipes, with
+                    // no guaranteed ordering between them — so correlating
+                    // them here would be guesswork. Emitting a *second*
+                    // `ToolCallComplete` from this stdout-observation path
+                    // would violate "dual encoding of the same id+input is
+                    // one call at the ToolLoop" (`finch-providers`'
+                    // `AGENTS.md`) by handing the ToolLoop two different ids
+                    // for what a human sees as one call. The counter below
+                    // remains observability/debug-logging only.
                     for block in content {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             let wire_name = block.get("name").and_then(|n| n.as_str());
@@ -737,8 +1326,15 @@ impl ProviderBackend for ClaudeCliProvider {
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
         let (request, _bindings) = request.into_request_for(self)?;
-        let record = self.execute_turn(&request, None).await?;
-        Ok(self.response_from(&record, &request.model))
+        match self.execute_turn(&request, None).await? {
+            TurnOutcome::Complete(record) => Ok(self.response_from(&record, &request.model)),
+            TurnOutcome::Paused => bail!(
+                "claude CLI subscription transport paused mid-turn with no streaming sink; \
+                 execute_turn's non-streaming branch must always answer a pending tool call \
+                 itself rather than pausing (issue #1341 — this indicates a bug, not a \
+                 recoverable runtime condition)"
+            ),
+        }
     }
 
     async fn send_message_stream_validated(
@@ -751,12 +1347,19 @@ impl ProviderBackend for ClaudeCliProvider {
         tokio::spawn(async move {
             let result = worker.execute_turn(&request, Some(tx.clone())).await;
             match result {
-                Ok(record) => {
+                Ok(TurnOutcome::Complete(record)) => {
                     let _ = tx
                         .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::text(
                             record.response_text(),
                         ))))
                         .await;
+                }
+                Ok(TurnOutcome::Paused) => {
+                    // The stream ends here, exactly like every other
+                    // provider's stream after a native tool call: the
+                    // frontend's real ToolLoop executes the pending call and
+                    // the next Finch-level round resumes this same `claude`
+                    // process (issue #1341).
                 }
                 Err(error) => {
                     let _ = tx.send(Err(error)).await;
@@ -784,10 +1387,11 @@ impl ProviderBackend for ClaudeCliProvider {
             // Tool calls are supported, but not via the CLI's own built-in
             // tools (`--tools` always stays `""`, so the CLI itself executes
             // nothing on its own authority — see the module doc comment).
-            // Support here means Finch's own tools, served over MCP and
-            // executed by Finch's own bridge process (issue #1309); the
-            // prompt-injection fold in `src/generators/claude.rs` is bypassed
-            // for this provider accordingly.
+            // Support here means Finch's own tools, served over MCP, forwarded
+            // by the bridge, and executed by Finch's real interactive
+            // `ToolLoop` in the frontend (issue #1341); the prompt-injection
+            // fold in `src/generators/claude.rs` is bypassed for this
+            // provider accordingly.
             CapabilitySupport::Supported,
             CapabilitySupport::Unsupported,
             ReasoningCapability::unsupported(MEASURED_ON, MEASURED_SOURCE),
@@ -825,7 +1429,18 @@ mod tests {
     /// real CLI 2.1.283 shape from issue #1331: a first `assistant` message
     /// carrying both a preamble text block and a `tool_use` block, then a
     /// second `assistant` message with the final answer, with every
-    /// segment's `text_delta`s streamed first as usual.
+    /// segment's `text_delta`s streamed first as usual. `mcp-tool-call`
+    /// (issue #1341) extracts the bridge socket path this transport embedded
+    /// in `--mcp-config`'s `env` entry into `$SPOOL/socket_path`, emits a
+    /// `tool_use` block, then blocks (stdout stays open, no EOF) until the
+    /// test creates `$SPOOL/proceed` — giving the test a window to connect to
+    /// that socket directly and play the bridge's role itself, exercising
+    /// this transport's real pause/resume state machine without needing the
+    /// real bridge subprocess (which has its own tests). The *same* `claude`
+    /// binary also answers a later invocation carrying no `--mcp-config`
+    /// (i.e. `execute_turn`'s synthetic typed-ahead follow-up round, issue
+    /// #1341) by echoing back the text it actually received on stdin,
+    /// instead of repeating the tool_use dance.
     fn install_fake_claude(home: &TempDir, behavior: &str) -> PathBuf {
         let spool = spool(home);
         let bin = home.path().join("fake-claude");
@@ -835,9 +1450,11 @@ SPOOL="{spool}"
 MODE="{behavior}"
 SID=""
 FLAG=""
+MCP_CONFIG=""
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--session-id" ] || [ "$prev" = "--resume" ]; then SID="$a"; FLAG="$prev"; fi
+  if [ "$prev" = "--mcp-config" ]; then MCP_CONFIG="$a"; fi
   prev="$a"
 done
 if [ "$1" = "--version" ]; then
@@ -848,12 +1465,13 @@ if [ "$1" = "auth" ]; then
   echo '{{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty"}}'
   exit 0
 fi
+STDIN_CONTENT=$(cat)
 {{
   echo "FLAGS: $FLAG"
   echo "SID: $SID"
   echo "ARGS: $*"
   echo "STDIN:"
-  cat
+  printf '%s\n' "$STDIN_CONTENT"
   echo "END-CALL"
 }} >> "$SPOOL/calls.log"
 if [ "$MODE" = "exit-fail" ]; then
@@ -864,6 +1482,37 @@ fi
 if [ "$MODE" = "fail-in-use" ] && [ "$FLAG" = "--session-id" ]; then
   echo "Error: Session ID $SID is already in use." >&2
   exit 1
+fi
+if [ "$MODE" = "mcp-tool-call" ]; then
+  if [ -z "$MCP_CONFIG" ]; then
+    # No MCP server registered this round: this is the synthetic follow-up
+    # round `execute_turn` sends to deliver text the user typed while a
+    # tool call was pending (issue #1341), not the original tool-offering
+    # round above. Reflect the received text back so a test can assert the
+    # real queued content actually arrived, on the same --resume session.
+    echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+    ECHOED=$(printf '%s' "$STDIN_CONTENT" | grep -oE '"text":"[^"]*"' | tail -1 | cut -d'"' -f4)
+    echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_followup","role":"assistant","content":[{{"type":"text","text":"followup received: '"$ECHOED"'"}}]}}}}'
+    echo '{{"type":"result","subtype":"success","is_error":false,"result":"followup received: '"$ECHOED"'","stop_reason":"end_turn"}}'
+    exit 0
+  fi
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
+  printf '%s' "$SOCK" > "$SPOOL/socket_path"
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
+  # This process must stay alive (stdout not yet at EOF) until the test has
+  # finished acting as the bridge over the socket above -- otherwise
+  # `drive`'s stdout-EOF branch could win the race against its listener
+  # `accept()` branch and the pause this test exists to exercise would never
+  # happen. The test signals completion by creating this file.
+  tries=0
+  while [ ! -f "$SPOOL/proceed" ] && [ "$tries" -lt 500 ]; do
+    sleep 0.02
+    tries=$((tries + 1))
+  done
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"tool call handled"}}]}}}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"tool call handled","stop_reason":"end_turn"}}'
+  exit 0
 fi
 if [ "$MODE" = "tool-preamble" ]; then
   printf '%s\n' \
@@ -1218,7 +1867,7 @@ printf '%s\n' \
     fn invocation_args_always_disable_tools_and_enable_streaming() {
         let provider = ClaudeCliProvider::new(None);
         let args = provider
-            .invocation_args(false, Some("SYSTEM"), &[])
+            .invocation_args(false, Some("SYSTEM"), &[], None)
             .unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("--print"));
@@ -1244,7 +1893,7 @@ printf '%s\n' \
         );
         assert!(!joined.contains("--resume"), "turn one must not resume");
 
-        let resume_args = provider.invocation_args(true, None, &[]).unwrap();
+        let resume_args = provider.invocation_args(true, None, &[], None).unwrap();
         assert!(resume_args.contains(&"--resume".to_string()));
         assert!(
             !resume_args.iter().any(|arg| arg == "--system-prompt"),
@@ -1255,8 +1904,14 @@ printf '%s\n' \
     #[test]
     fn invocation_args_with_tools_wires_the_mcp_bridge_not_the_clis_own_builtins() {
         let provider = ClaudeCliProvider::new(None);
+        let socket_path = std::path::Path::new("/tmp/finch-test-claude-cli-bridge.sock");
         let args = provider
-            .invocation_args(false, None, &["read".to_string(), "bash".to_string()])
+            .invocation_args(
+                false,
+                None,
+                &["read".to_string(), "bash".to_string()],
+                Some(socket_path),
+            )
             .unwrap();
         assert!(
             args.iter().zip(args.iter().skip(1)).any(|(flag, value)| flag == "--tools" && value.is_empty()),
@@ -1275,6 +1930,12 @@ printf '%s\n' \
         assert_eq!(
             server["args"][0], CLAUDE_CLI_MCP_BRIDGE_FLAG,
             "the MCP server command must be this same Finch binary, re-invoked with the hidden bridge flag"
+        );
+        assert_eq!(
+            server["env"][CLAUDE_CLI_TOOL_SOCKET_ENV],
+            socket_path.to_string_lossy().to_string(),
+            "issue #1341: the bridge must learn the tool-call socket path via its own MCP \
+             server env entry, never via claude's own environment: {server:?}"
         );
         assert!(
             args.contains(&"--strict-mcp-config".to_string()),
@@ -1555,6 +2216,492 @@ printf '%s\n' \
             "completed content must equal everything actually streamed, or \
              query_processor.rs's streamed-vs-completed check fails the turn (issue #1331); \
              got completed={complete:?} streamed={streamed_text:?}"
+        );
+    }
+
+    /// Bounded poll for a file the fake `claude` process (or the transport
+    /// itself) writes asynchronously. Not a correctness oracle — the actual
+    /// assertions are on the values read, not on timing — just a liveness
+    /// bound so a genuine hang fails fast with a named cause instead of
+    /// blocking the suite.
+    async fn wait_for_text_file(path: &Path) -> String {
+        for _ in 0..500 {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if !contents.trim().is_empty() {
+                    return contents;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "timed out waiting for {} to be published — see install_fake_claude's \
+             mcp-tool-call mode",
+            path.display()
+        );
+    }
+
+    /// Build the two trailing messages `finalize_tool_execution` produces for
+    /// the very next round after a tool call: the staged assistant `ToolUse`
+    /// and the real `ToolResult`. This is the only shape that can resume a
+    /// parked turn (issue #1341).
+    fn with_tool_result(
+        mut request: ProviderRequest,
+        call_id: &str,
+        call_name: &str,
+        call_input: serde_json::Value,
+        content: &str,
+        is_error: bool,
+    ) -> ProviderRequest {
+        request.messages.push(crate::Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: call_id.to_string(),
+                name: call_name.to_string(),
+                input: call_input,
+            }],
+        });
+        request.messages.push(crate::Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call_id.to_string(),
+                content: content.to_string(),
+                is_error: Some(is_error),
+            }],
+        });
+        request
+    }
+
+    #[tokio::test]
+    async fn parked_turn_pauses_then_resumes_with_a_real_tool_result() {
+        // Production-boundary reproduction of issue #1341's core mechanism:
+        // a `tools/call` forwarded over the bridge socket must surface as an
+        // ordinary `StreamChunk::ToolCallComplete` (the same shape every
+        // other provider's tool calls take), end the stream exactly like a
+        // native tool_use stop reason, and — once the next Finch-level round
+        // supplies a real `ToolResult` — the reply must reach the *exact*
+        // bridge connection that made the request, and the same underlying
+        // `claude` process must resume and finish, never spawning a second
+        // one.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+
+        let mut rx = provider
+            .send_message_stream(&request)
+            .await
+            .expect("streaming must be supported");
+
+        // Play the bridge's role directly: connect to the socket this
+        // transport bound and told the fake `claude` process about (via
+        // --mcp-config's env entry), then send exactly the shape a real
+        // bridge forwards for one `tools/call`.
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id, call_name, call_input) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!(
+                "expected a real ToolCallComplete translated from the bridge's socket \
+                 request, got {other:?}"
+            ),
+        };
+        assert_eq!(call_name, "probe_tool");
+        assert_eq!(call_input, json!({"key": "value"}));
+        assert!(
+            rx.recv().await.is_none(),
+            "the stream must end right after the tool call with no trailing \
+             ContentBlockComplete, exactly like every other provider's stream after a \
+             native tool_use stop reason"
+        );
+
+        let followup = with_tool_result(
+            request.clone(),
+            &call_id,
+            &call_name,
+            call_input,
+            "real tool output",
+            false,
+        );
+        let mut rx2 = provider
+            .send_message_stream(&followup)
+            .await
+            .expect("resuming a parked turn must still return a stream");
+
+        // The reply must land on the exact bridge connection that made the
+        // request, carrying the real result content.
+        let mut reader = BufReader::new(&mut bridge_stream);
+        let mut reply_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut reply_line),
+        )
+        .await
+        .expect("the resumed round must answer the still-open bridge connection")
+        .unwrap();
+        let reply: ClaudeCliBridgeToolResponse = serde_json::from_str(reply_line.trim()).unwrap();
+        assert_eq!(reply.content, "real tool output");
+        assert!(!reply.is_error);
+
+        // Let the fake claude process finish now that the bridge has its
+        // answer — proving the *same* process resumed rather than a second
+        // one being spawned (there is no second `--session-id`/`--resume`
+        // invocation logged anywhere this test can see; the only process
+        // that ever ran is this one, still blocked on $SPOOL/proceed).
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+
+        let mut complete = None;
+        while let Some(chunk) = rx2.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    complete = Some(text);
+                }
+                other => panic!("unexpected chunk on the resumed stream: {other:?}"),
+            }
+        }
+        assert_eq!(
+            complete.as_deref(),
+            Some("tool call handled"),
+            "the resumed claude process must run to completion after the real tool result lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_disconnecting_mid_call_fails_the_resume_cleanly_not_a_hang_or_panic() {
+        // Hostile timing (issue #1341): the bridge subprocess can die between
+        // forwarding a tools/call and the frontend answering it (its parent
+        // `claude` process crashed, was killed, or the bridge itself
+        // panicked). The resume attempt must fail with a named error, not
+        // hang forever waiting on a socket nothing will ever read again, and
+        // must not panic.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim()).await.unwrap();
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id, call_name, call_input) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete, got {other:?}"),
+        };
+        assert!(rx.recv().await.is_none());
+
+        // Simulate the bridge process dying before this transport ever gets
+        // a chance to answer it.
+        drop(bridge_stream);
+
+        let followup = with_tool_result(
+            request.clone(),
+            &call_id,
+            &call_name,
+            call_input,
+            "real tool output",
+            false,
+        );
+        let mut rx2 = provider.send_message_stream(&followup).await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("a dead bridge connection must fail fast, not hang the resume");
+        match outcome {
+            Some(Err(error)) => {
+                let message = error.to_string().to_lowercase();
+                assert!(
+                    message.contains("bridge")
+                        || message.contains("broken")
+                        || message.contains("pipe")
+                        || message.contains("reset"),
+                    "the error should name what happened, not a bare generic failure: {error}"
+                );
+            }
+            other => panic!("expected an Err reporting the dead bridge connection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_bridge_request_fails_the_turn_with_a_named_error_not_a_panic() {
+        // Hostile input (issue #1341): the bridge is trusted Finch code today,
+        // but the socket protocol itself must still fail closed and
+        // diagnosably on a malformed line rather than panicking the whole
+        // provider task.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim()).await.unwrap();
+        bridge_stream.write_all(b"not json at all\n").await.unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a malformed request must fail the turn promptly, not hang");
+        match outcome {
+            Some(Err(error)) => {
+                assert!(
+                    error.to_string().contains("malformed"),
+                    "the error must name the malformed request, not a bare failure: {error}"
+                );
+            }
+            other => panic!("expected an Err naming the malformed bridge request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_every_provider_clone_while_parked_cleans_up_child_and_socket() {
+        // Hostile timing (issue #1341): the whole query (and therefore this
+        // provider instance) can be cancelled or torn down while a real
+        // approval decision is still pending — nobody ever calls
+        // `execute_turn` again for this session. The parked child and its
+        // bridge socket file must not leak: `kill_on_drop` reaps the child
+        // and `SocketGuard::drop` removes the socket file as soon as the
+        // last clone of the provider (and therefore the last `Arc` holding
+        // the parked state) goes away.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let socket_path = PathBuf::from(socket_path_text.trim());
+        let mut bridge_stream = UnixStream::connect(&socket_path).await.unwrap();
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete { .. } => {}
+            other => panic!("expected ToolCallComplete, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        assert!(
+            socket_path.exists(),
+            "the bridge socket file must exist while the turn is parked"
+        );
+
+        drop(provider);
+        drop(bridge_stream);
+
+        for _ in 0..200 {
+            if !socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !socket_path.exists(),
+            "dropping every clone of a provider with a parked turn must remove its bridge \
+             socket file, proving the parked child and listener were torn down rather than \
+             leaked (issue #1341)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_bridge_socket_is_hardened_to_owner_only_permissions() {
+        // Security regression (issue #1341, found in independent review):
+        // `read_bridge_request` trusts any well-formed request on any
+        // accepted connection with no peer verification. A world-connectable
+        // socket in `/tmp` would let *any* local process act as the bridge
+        // and receive real tool-execution results -- the same
+        // unauthenticated-local-socket pattern `src/server/ipc.rs` already
+        // hardens (issue #911). Verified directly: `UnixListener::bind`
+        // leaves the socket file at the ambient umask (0o755 under a
+        // standard 0o022 umask) unless hardened.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let _rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let socket_path = PathBuf::from(socket_path_text.trim());
+        let mode = std::fs::metadata(&socket_path)
+            .expect("the bridge socket file must exist once its path was published")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the bridge socket must be owner-only, matching src/server/ipc.rs's \
+             IPC_SOCKET_MODE for the same unauthenticated local-socket pattern; got mode {mode:o}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_ahead_text_during_a_parked_tool_call_is_delivered_not_lost() {
+        // Correctness regression (issue #1341, found in independent review):
+        // `ConversationHistory::append_text_blocks_to_last_user_message`
+        // folds any text the user types while a tool call is pending into
+        // the *same* trailing message as the eventual `ToolResult`, so the
+        // next round's tail can be `[ToolResult, Text]`, not a bare
+        // `ToolResult`. Before this fix, `tail_tool_result` required exactly
+        // one content block and treated that shape as an abandoned/mismatched
+        // parked turn -- silently discarding the real, already-approved tool
+        // result and killing the still-live `claude` process for no reason.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider
+            .send_message_stream(&request)
+            .await
+            .expect("streaming must be supported");
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id, call_name, call_input) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete, got {other:?}"),
+        };
+        assert!(rx.recv().await.is_none());
+
+        // Build exactly the shape `commit_tool_round_and_continue` /
+        // `append_text_blocks_to_last_user_message` produce when the user
+        // typed something while this tool call was pending: the ToolResult
+        // plus a trailing Text block in the *same* user message.
+        let mut followup = with_tool_result(
+            request.clone(),
+            &call_id,
+            &call_name,
+            call_input,
+            "real tool output",
+            false,
+        );
+        let last = followup
+            .messages
+            .last_mut()
+            .expect("with_tool_result always appends a trailing user message");
+        last.content.push(ContentBlock::Text {
+            text: "please also check the other file".to_string(),
+        });
+
+        let mut rx2 = provider
+            .send_message_stream(&followup)
+            .await
+            .expect("a ToolResult plus queued text must still resume the parked turn");
+
+        // The real tool result must still reach the bridge -- proving the
+        // parked turn was resumed, not abandoned/killed.
+        let mut reader = BufReader::new(&mut bridge_stream);
+        let mut reply_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut reply_line),
+        )
+        .await
+        .expect("the resumed round must still answer the still-open bridge connection")
+        .unwrap();
+        let reply: ClaudeCliBridgeToolResponse = serde_json::from_str(reply_line.trim()).unwrap();
+        assert_eq!(
+            reply.content, "real tool output",
+            "the real, already-approved tool result must not be discarded"
+        );
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+
+        // The tool-answer round and the queued-text follow-up round are two
+        // separate `claude` invocations (the tool result can only be
+        // answered over the socket, never via stdin on an already-running
+        // process), but from this stream's perspective they must appear as
+        // exactly one completed Finch-level round — the queued text must
+        // never surface as a second, separate `ContentBlockComplete`, or
+        // query_processor.rs would try to stage two assistant messages for
+        // what the caller staged as one tool round.
+        let mut complete = None;
+        while let Some(chunk) = rx2.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    assert!(
+                        complete.is_none(),
+                        "the chained follow-up round must merge into one completed content \
+                         block, not surface as a second one"
+                    );
+                    complete = Some(text);
+                }
+                other => panic!("unexpected chunk on the resumed stream: {other:?}"),
+            }
+        }
+        let complete = complete.expect("a ContentBlockComplete chunk must terminate the stream");
+        assert!(
+            complete.contains("tool call handled"),
+            "the original parked claude process's own real answer must survive the merge: \
+             {complete:?}"
+        );
+        assert!(
+            complete.contains("please also check the other file"),
+            "typed-ahead text queued during the parked tool call must be delivered and merged \
+             into the completed content, not lost: {complete:?}"
         );
     }
 }

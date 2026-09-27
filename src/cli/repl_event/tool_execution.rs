@@ -725,6 +725,7 @@ mod tests {
         PermissionManager, Tool, ToolExecutor, ToolInputSchema, ToolRegistry, ToolUse,
     };
     use finch_programs::ExecutionEffect;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     struct AutoAcceptWriteProbe;
 
@@ -852,5 +853,266 @@ mod tests {
             }
             other => panic!("Normal must emit ToolApprovalNeeded for write, not {other:?}"),
         }
+    }
+
+    /// Writes its input to disk for real — unlike `AutoAcceptWriteProbe`
+    /// above, this proves genuine file access, not just that the approval
+    /// gate was reached.
+    struct RealWriteProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for RealWriteProbe {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn effect(&self) -> ExecutionEffect {
+            ExecutionEffect::WorkspaceWrite
+        }
+
+        fn description(&self) -> &str {
+            "issue #1341 production-boundary probe: writes its input for real"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            ToolInputSchema::simple(vec![("file_path", "target"), ("content", "bytes")])
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: &crate::tools::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            let path = input["file_path"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing file_path"))?;
+            let content = input["content"].as_str().unwrap_or_default();
+            std::fs::write(path, content)?;
+            Ok(format!("wrote {} bytes to {path}", content.len()))
+        }
+    }
+
+    /// Production-boundary proof for issue #1341: the real, compiled
+    /// bridge's own real JSON-RPC request handler (`handle_request`, the
+    /// exact function the compiled binary's stdio loop calls per line — see
+    /// `tests/claude_cli_bridge_subprocess.rs` for the companion test that
+    /// drives the real, separately-spawned bridge *binary*, proving the
+    /// process boundary itself) is driven with a raw MCP `tools/call`, the
+    /// way the real `claude` CLI would. The call must reach this crate's
+    /// real `ToolExecutionCoordinator` — a real `ReplEvent::ToolApprovalNeeded`
+    /// fires, and only once *this test* answers it (playing the human) does
+    /// real `Tool::execute` run and really write a file on disk. This is the
+    /// thing #1341 exists to prove: the bridge is no longer its own
+    /// execution authority.
+    #[tokio::test]
+    async fn a_tool_call_through_the_real_bridge_handler_executes_through_the_real_interactive_path(
+    ) {
+        let workdir = tempfile::tempdir().expect("workspace for the real write");
+        let target_file = workdir.path().join("target.txt");
+        std::fs::write(&target_file, "original\n").expect("seed the target file");
+
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_path = socket_dir.path().join("bridge.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("bind the bridge socket exactly as ClaudeCliProvider does");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RealWriteProbe));
+        let pattern_dir = tempfile::tempdir().expect("isolated tool-pattern store");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            pattern_dir.path().join("patterns.json"),
+        )
+        .expect("construct the real executor");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::new(OutputManager::new(ColorScheme::default())),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+
+        // Plays the role of the frontend process that owns this turn: accept
+        // the bridge's forwarded request, run it through the real
+        // interactive path, and answer the bridge's still-open connection
+        // with the real result — exactly what `ClaudeCliProvider`'s
+        // pump_until_settled/parked-turn mechanism does in production
+        // (`crates/finch-providers/src/claude_cli.rs`), simplified here to a
+        // single request/response since this test is proving the
+        // *execution* boundary, not that transport's own pause/resume state
+        // machine (covered by that crate's own tests).
+        let target_file_for_frontend = target_file.clone();
+        let frontend_task = tokio::spawn(async move {
+            let target_file = target_file_for_frontend;
+            let (stream, _addr) = listener
+                .accept()
+                .await
+                .expect("accept the bridge connection");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read the bridge's forwarded tools/call");
+            let request: finch_providers::ClaudeCliBridgeToolRequest =
+                serde_json::from_str(line.trim())
+                    .expect("the bridge's request must be well-formed");
+            assert_eq!(request.name, "write");
+
+            let query_id = Uuid::new_v4();
+            let tool_use = ToolUse::new(request.name.clone(), request.input.clone());
+            let tool_id = tool_use.id.clone();
+            let round_token = conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::ToolUse {
+                            id: tool_id,
+                            name: tool_use.name.clone(),
+                            input: tool_use.input.clone(),
+                        }],
+                    },
+                )
+                .expect("stage the forwarded round");
+            let work_unit = coordinator.output_manager.start_work_unit("write");
+            let row_idx = work_unit.add_row("write");
+            coordinator.spawn_tool_execution(
+                query_id,
+                round_token,
+                tool_use,
+                work_unit,
+                row_idx,
+                None,
+            );
+
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("a real ToolApprovalNeeded must fire for this write call")
+                .expect("event channel must stay open");
+            let response_tx = match approval {
+                ReplEvent::ToolApprovalNeeded {
+                    tool_use,
+                    response_tx,
+                    ..
+                } => {
+                    assert_eq!(tool_use.name, "write");
+                    response_tx
+                }
+                other => panic!("expected a real ToolApprovalNeeded, got {other:?}"),
+            };
+            assert_eq!(
+                std::fs::read_to_string(&target_file).unwrap(),
+                "original\n",
+                "nothing may execute before this test answers the real approval prompt"
+            );
+            response_tx
+                .send(ConfirmationResult::ApproveOnce)
+                .expect("answer the real approval prompt");
+
+            let result_event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("a real ToolResult must follow real approval")
+                    .expect("event channel must stay open");
+            let content = match result_event {
+                ReplEvent::ToolResult { result, .. } => {
+                    result.expect("real execution through the real ToolExecutor must succeed")
+                }
+                other => panic!("expected a real ToolResult, got {other:?}"),
+            };
+
+            let mut stream = reader.into_inner();
+            let mut payload =
+                serde_json::to_string(&finch_providers::ClaudeCliBridgeToolResponse {
+                    is_error: false,
+                    content,
+                })
+                .expect("encode the real response");
+            payload.push('\n');
+            stream
+                .write_all(payload.as_bytes())
+                .await
+                .expect("answer the bridge's still-open connection");
+            stream.flush().await.expect("flush the response");
+        });
+
+        // Drive the bridge's own real request handler directly (the exact
+        // function the compiled binary's stdio loop calls per JSON-RPC
+        // line), with the real socket path set exactly as `ClaudeCliProvider`
+        // sets it (an env entry on the bridge's own process/config, never on
+        // `claude`'s environment). `tests/claude_cli_bridge_subprocess.rs` is
+        // the companion test that spawns the real, compiled bridge *binary*
+        // as a genuine second OS process and proves that process boundary
+        // itself; `ToolExecutionCoordinator` used there is reached through
+        // the public `finch::tools` surface instead, since this crate's own
+        // event-loop internals are not part of that boundary.
+        let mut bridge_registry = ToolRegistry::new();
+        crate::cli::claude_cli_bridge::register_tool_schemas(&mut bridge_registry);
+        let socket_path_str = socket_path.to_str().unwrap().to_string();
+
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05"},
+        });
+        crate::cli::claude_cli_bridge::handle_request(
+            &bridge_registry,
+            Some(&socket_path_str),
+            &init,
+        )
+        .await
+        .expect("the real bridge must answer initialize");
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "write",
+                "arguments": {
+                    "file_path": target_file.to_string_lossy(),
+                    "content": "written-through-the-real-interactive-path",
+                },
+            },
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::cli::claude_cli_bridge::handle_request(
+                &bridge_registry,
+                Some(&socket_path_str),
+                &call,
+            ),
+        )
+        .await
+        .expect("the real bridge handler must answer once real interactive execution completes")
+        .expect("tools/call must produce a JSON-RPC response");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a text content block");
+        assert!(
+            text.contains("wrote"),
+            "the real bridge must relay the real ToolExecutor's own success text, not a \
+             fabricated one: {text}"
+        );
+
+        frontend_task
+            .await
+            .expect("the frontend-side task must not panic");
+
+        assert_eq!(
+            std::fs::read_to_string(&target_file).expect("read the target file back"),
+            "written-through-the-real-interactive-path",
+            "issue #1341: a tools/call through the real bridge handler must reach this crate's \
+             real, interactive ToolExecutionCoordinator/ToolExecutor and really write the file \
+             for real, only after a real approval decision — never a bypass, and never a second, \
+             disconnected execution authority inside the bridge process itself"
+        );
     }
 }

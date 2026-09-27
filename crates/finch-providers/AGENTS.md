@@ -78,28 +78,71 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   ChatGPT/Codex reserved namespaces. Provider-native tools are advertised
   only with a Finch handler and grant.
 - **Claude CLI subscription tool calls run through Finch's own MCP bridge, never the CLI's own
-  built-in tools (issue #1309).** `claude_cli.rs` always spawns `claude` with `--tools ""` (its
-  own Read/Write/Edit/Bash/Grep/Glob never execute on the CLI's own authority — verified directly
-  that several of them auto-execute for real before any permission hook runs at all: a file read
-  inside the CLI's own working directory, anything under the OS temp directory regardless of
-  working directory, and read-only Bash commands per Claude Code's own permissions docs, none of
-  which is gateable from outside the CLI). `ClaudeCliProvider::capabilities().tools` is
-  `Supported`, but only because Finch's own tool implementations (a fixed, curated subset:
-  `CLAUDE_CLI_TOOL_NAMES`) are served to the CLI over MCP (`--mcp-config`, `--strict-mcp-config` so
-  the user's own personal MCP integrations never leak in, `--allowedTools
-  "mcp__finch__<tool>,..."` so the bridge is never blocked on an approval prompt with no host to
-  answer it). The MCP server is this same Finch binary, re-invoked with the hidden
-  `CLAUDE_CLI_MCP_BRIDGE_FLAG` (`src/cli/claude_cli_bridge.rs` in the root crate, outside this
-  crate's own execution-free boundary): that process really executes each call through a fresh
-  `PermissionManager::for_peer()` policy, so read/glob/grep run for real and write/edit/bash's
-  side-effecting commands are never auto-applied without interactive approval. This is why
-  `ClaudeGenerator::needs_prompt_injection` (`src/generators/claude.rs`) now bypasses its #1303
-  prompt-injection fold for this provider — `supports_tools()` derives straight from
-  `capabilities().tools`, so the two decisions cannot drift apart. `TurnRecord::absorb_line`
-  observes (counts/logs) any `tool_use` block in the CLI's own stream for visibility, but
-  deliberately emits no `StreamChunk` for it: the call was already executed for real by the bridge
-  process by the time that line arrives, and forwarding it as `ToolCallComplete` would make the
-  generation layer execute the same call a second time through the interactive `ToolLoop`.
+  built-in tools (issue #1309), and the bridge is a pure translator, not an execution authority
+  (issue #1341).** `claude_cli.rs` always spawns `claude` with `--tools ""` (its own
+  Read/Write/Edit/Bash/Grep/Glob never execute on the CLI's own authority — verified directly that
+  several of them auto-execute for real before any permission hook runs at all: a file read inside
+  the CLI's own working directory, anything under the OS temp directory regardless of working
+  directory, and read-only Bash commands per Claude Code's own permissions docs, none of which is
+  gateable from outside the CLI). `ClaudeCliProvider::capabilities().tools` is `Supported`, but
+  only because Finch's own tool implementations (a fixed, curated subset: `CLAUDE_CLI_TOOL_NAMES`)
+  are served to the CLI over MCP (`--mcp-config`, `--strict-mcp-config` so the user's own personal
+  MCP integrations never leak in, `--allowedTools "mcp__finch__<tool>,..."` so the bridge is never
+  blocked on an approval prompt with no host to answer it). The MCP server is this same Finch
+  binary, re-invoked with the hidden `CLAUDE_CLI_MCP_BRIDGE_FLAG` (`src/cli/claude_cli_bridge.rs`
+  in the root crate, outside this crate's own execution-free boundary). That process no longer
+  executes anything itself (the original #1309 shape built its own `PermissionManager::for_peer()`
+  and dispatched directly — wrong, because it duplicated execution/approval authority that already
+  exists and works correctly for every other provider, and it could never actually prompt a human):
+  it resolves the MCP wire name to a plain Finch tool name and forwards `{name, input}`,
+  line-delimited JSON, over a Unix domain socket named by `CLAUDE_CLI_TOOL_SOCKET_ENV` — an `env`
+  entry this crate puts on the MCP server's own spec in `--mcp-config`, never on `claude`'s own
+  environment — back to *this* transport, running in the frontend process that owns the Brain's
+  turn. `ClaudeCliBridgeToolRequest`/`ClaudeCliBridgeToolResponse` are the wire shape for that
+  socket. This transport surfaces the forwarded call as an ordinary `StreamChunk::ToolCallComplete`
+  in the same stream every other provider's tool calls already take (`pump_until_settled` in
+  `claude_cli.rs`), so the frontend's real, interactive `ToolLoop` executes it — real approval, real
+  file access, the same authority as every other provider. Because a single `claude` subprocess
+  invocation is one long-lived process (not the discrete request/response shape every other
+  provider's turn has), and Claude Code's own internal MCP round trip blocks that process until the
+  bridge answers, the underlying child is **parked** (`RunningTurn`/`ParkedTurn`, kept alive, never
+  re-spawned) for however long real interactive approval takes; `ClaudeCliProvider::execute_turn`
+  recognizes the next Finch-level round's trailing `ToolResult` as the answer to a specific parked
+  call, replies to the bridge's still-open connection, and resumes reading the same child's stdout
+  — matching the same "observe the whole stream, batch-execute, re-invoke with the result appended"
+  round-trip every other provider already goes through, with no changes needed to `ToolLoop`,
+  `ToolExecutionCoordinator`, or `query_processor.rs`. This is why `ClaudeGenerator::needs_prompt_injection`
+  (`src/generators/claude.rs`) now bypasses its #1303 prompt-injection fold for this provider —
+  `supports_tools()` derives straight from `capabilities().tools`, so the two decisions cannot drift
+  apart. `TurnRecord::absorb_line` still observes (counts/logs) any `tool_use` block in the CLI's
+  own stdout for visibility, but deliberately emits no `StreamChunk` for it there — the *real*
+  `ToolCallComplete` is emitted by `pump_until_settled`, driven by the bridge's own forwarded socket
+  request, a decoupled and differently-ordered signal delivered over a different pipe; emitting a
+  second one from the stdout-observation path would violate "dual encoding of the same id+input is
+  one call at the ToolLoop" by handing the ToolLoop two different ids for what is one real call.
+  **The bridge socket is hardened to owner-only (0o600), not merely bound (issue #1341, found in
+  independent review).** `read_bridge_request`/`forward_tool_call` trust any well-formed request on
+  any accepted connection with no peer verification, and `/tmp` (where the socket lives, chosen for
+  `sockaddr_un.sun_path`'s ~104-byte limit) is world-listable; an unhardened socket would let *any*
+  local process connect and be answered as if it were the real bridge for the lifetime of the turn.
+  `bind_tool_socket` chmods immediately after bind, mirroring `src/server/ipc.rs`'s
+  `harden_ipc_socket_permissions` for the identical unauthenticated-local-socket pattern (issue
+  #911's rationale applies verbatim).
+  **Text typed while a tool call is parked is queued and delivered as a merged follow-up round, not
+  discarded (issue #1341, found in independent review).**
+  `ConversationHistory::append_text_blocks_to_last_user_message` folds any text the user types while
+  a tool call is executing into the *same* trailing message as the eventual `ToolResult`, so the next
+  round's tail can be `[ToolResult, Text]`, not a bare `ToolResult`. `tail_tool_result` extracts the
+  matching `ToolResult` (for the bridge reply) and any accompanying `Text` blocks separately; the
+  text can never reach the parked `claude` process directly (its stdin was already written and closed
+  at spawn time), so it queues in `ClaudeCliProvider::pending_followup` and is sent as its own
+  `--resume` round — wrapped through `user_input_line` like any other input line — the moment some
+  round on the session next completes without pausing again. Because that is a second `claude`
+  process for what the caller sees as one Finch-level round, `TurnRecord::absorb_followup` merges its
+  record into the original one (accumulating `assistant_text`, the same pattern issue #1331 already
+  established for multiple `assistant` events within one invocation) rather than letting
+  `execute_turn` return the follow-up's outcome on its own, which would silently drop the first
+  round's completed text and desync it from what actually streamed live.
   **A mid-turn tool call also affects text ordering, not just tool execution (issue #1331).** The
   real CLI can put a preamble text block (e.g. "I'll check that file.") in the very same
   `assistant` event as the `tool_use` block, then emit a second `assistant` event with the final
