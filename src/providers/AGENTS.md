@@ -12,8 +12,22 @@ dialects, wire types, dispatch, and adapter tests live in
 outside this directory use `crate::providers::Item`. Do not recreate a signature catalog.
 
 **Dependencies:** `finch-providers` (transports and contracts), `config` (application
-`Config` / `ProviderEntry`). Do not add Brain, TUI, daemon, or tool
-execution here.
+`Config` / `ProviderEntry`). Do not add Brain, TUI, or tool execution here.
+
+**Narrow daemon exception (issue #1354):** `claude_cli_daemon.rs`'s `DaemonClaudeCliProvider`
+depends on `crate::client::ipc::IpcClient` — the one daemon-connection dependency this capsule
+otherwise forbids. It exists because `finch-providers` itself must never depend on the daemon or
+IPC (see that crate's own `AGENTS.md`), so a thin, daemon-backed `ProviderBackend` that fronts a
+daemon-owned Claude CLI Subscription session cannot live there; mapping "which concrete
+`ProviderBackend` a Brain's configuration selects" onto a constructor is exactly this capsule's own
+job, whether that constructor spawns locally (`finch_providers::ClaudeCliProvider`, still
+available and used for the non-daemon/standalone case) or proxies to the daemon
+(`DaemonClaudeCliProvider`). `IpcClient` is `!Send`/`!Sync` (capnp-rpc), so
+`DaemonClaudeCliProvider` never holds one directly; it holds a `Send + Sync`
+`DaemonClaudeCliHandle` — a channel to a dedicated `spawn_local` task that owns the real
+connection — matching the same actor-behind-a-`Send`-safe-handle shape
+`src/server/brain_runner.rs`'s `BrainRunnerBroker` already uses daemon-side for the identical
+`!Send` constraint.
 
 **Owns the compatibility path** `crate::providers::Message` for the universal wire
 types. The Claude HTTP client in `src/claude` must not re-export that trio.

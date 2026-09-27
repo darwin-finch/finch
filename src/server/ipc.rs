@@ -125,6 +125,7 @@ struct BrainRpcService {
     lifecycle: crate::server::BrainLifecycleService,
     runners: crate::server::BrainRunnerBroker,
     connection_id: uuid::Uuid,
+    claude_cli_sessions: crate::server::ClaudeCliSessionRegistry,
 }
 
 impl BrainRpcService {
@@ -1603,6 +1604,81 @@ impl brain_service::Server for BrainRpcService {
         }
     }
 
+    // ---- claudeCliRound (issue #1354) -------------------------------------
+    //
+    // Drives one Finch-level round of a daemon-owned Claude CLI Subscription
+    // session for `brain`. The daemon looks up (or lazily creates) that
+    // Brain's persistent `finch_providers::ClaudeCliProvider` — the exact
+    // same, unmodified type the frontend used to own and drive directly
+    // before #1354 — and calls its already-public `send_message_stream`,
+    // exactly as `query_stream` above already does for the Brain-less
+    // surface. Only *where* that call happens moved; tool execution and
+    // approval still happen wherever this RPC's caller runs its own
+    // `ToolLoop`, because a paused round reports the pending call back to
+    // the caller (as a `claudeCliToolCallPending` chunk, with no trailing
+    // `done`) instead of ever being answered here.
+    fn claude_cli_round(
+        self: capnp::capability::Rc<Self>,
+        params: brain_service::ClaudeCliRoundParams,
+        _results: brain_service::ClaudeCliRoundResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        let p = pry!(params.get());
+        let brain = pry!(p.get_brain()).to_str().unwrap_or("").to_string();
+        let messages = pry!(crate::brain::decode_messages(pry!(p.get_messages()))
+            .map_err(|error| capnp::Error::failed(error.to_string())));
+        let tools = pry!(read_tools(pry!(p.get_tools())));
+        let receiver = pry!(p.get_receiver());
+        // Consulted by `sessions.get_or_create` only the first time this
+        // Brain's session is created (issue #1354's independent review:
+        // this was previously silently dropped — no wire field existed for
+        // it at all, so a Brain's configured Claude CLI model was always
+        // ignored for a daemon-owned session).
+        let model = if p.get_has_model() {
+            Some(pry!(p.get_model()).to_str().unwrap_or("").to_string())
+        } else {
+            None
+        };
+        let lifecycle = self.lifecycle.clone();
+        let sessions = self.claude_cli_sessions.clone();
+
+        // Drive the round on its own `spawn_local` task, decoupled from
+        // *this* RPC call's own future (issue #1354's disconnect-safety
+        // requirement). If the calling frontend disconnects, capnp-rpc
+        // drops this method's returned future — if the round were driven
+        // inline here, that would release `session`'s mutex guard (below)
+        // the instant the drop happens, potentially *before* the
+        // provider's own already-detached `execute_turn` task (spawned
+        // inside `send_message_stream_validated`) has actually finished,
+        // letting a reattaching frontend's next call race a second
+        // `claude` process into existence for the same Brain. Spawning the
+        // real work onto its own task means only *this* oneshot channel
+        // gets abandoned on disconnect; the spawned task keeps running,
+        // still holding the per-Brain lock, until the round genuinely
+        // settles.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), capnp::Error>>();
+        tokio::task::spawn_local(
+            async move {
+                let outcome = drive_claude_cli_round(
+                    lifecycle, sessions, brain, messages, tools, receiver, model,
+                )
+                .await;
+                let _ = done_tx.send(outcome);
+            }
+            .instrument(ipc_call_span("claude_cli_round")),
+        );
+
+        Promise::from_future(async move {
+            match done_rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(capnp::Error::failed(
+                    "claudeCliRound: the round-driving task ended without reporting an outcome \
+                     (this indicates a bug, not a recoverable runtime condition)"
+                        .into(),
+                )),
+            }
+        })
+    }
+
     fn claim_runner_identity(
         self: capnp::capability::Rc<Self>,
         params: brain_service::ClaimRunnerIdentityParams,
@@ -1687,6 +1763,296 @@ fn parse_runner_handoff_id(
 // ---------------------------------------------------------------------------
 // Helper: read tool definitions
 // ---------------------------------------------------------------------------
+
+/// Whether [`encode_common_stream_chunk`] filled in the capnp `StreamChunk`
+/// builder it was given.
+enum EncodedChunk {
+    /// The builder now holds this chunk; the caller should send it.
+    Encoded,
+    /// This chunk kind is not encoded by this shared helper — the caller
+    /// decides what (if anything) to do with it. Only
+    /// `ThinkingDelta`/`ToolCallDelta`/`ToolCallComplete` reach this arm
+    /// today: neither `query_stream` (IPC projection for native tool-call
+    /// deltas is #776/#777, unrelated to this method) nor
+    /// `drive_claude_cli_round` (which gives `ToolCallComplete` its own,
+    /// entirely different pause-and-return handling before ever reaching
+    /// this function) send them through here.
+    NotHandled,
+}
+
+/// Encode the wire-representable common subset of [`StreamChunk`] into an
+/// already-`init_chunk()`ed capnp builder — shared by `query_stream` and
+/// `drive_claude_cli_round`, which previously each carried their own,
+/// independently-maintained copy of this match (issue #1354's independent
+/// review: the two had already started to diverge). Pure and synchronous:
+/// no RPC send happens here, and neither caller's own error-handling policy
+/// (propagate vs. best-effort-and-keep-draining) is decided here — only
+/// `Err` for a chunk that can never be sent at all (an invalid
+/// `ResponseMetadata` model, or a `ContentBlockComplete(ToolUse)` whose
+/// input fails to encode as JSON) is common to both.
+fn encode_common_stream_chunk(
+    chunk: &crate::generators::StreamChunk,
+    mut builder: finch_ipc::finch_ipc_capnp::stream_chunk::Builder<'_>,
+) -> Result<EncodedChunk, capnp::Error> {
+    use crate::generators::StreamChunk;
+    match chunk {
+        StreamChunk::TextDelta(delta) => {
+            builder.set_text_delta(delta.as_str());
+        }
+        StreamChunk::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            let mut upd = builder.init_usage_update();
+            upd.set_input_tokens(*input_tokens);
+            upd.set_output_tokens(*output_tokens);
+        }
+        StreamChunk::ResponseMetadata { model } => {
+            crate::generators::validate_response_model(model).map_err(|_| {
+                capnp::Error::failed("IPC response model metadata was invalid".into())
+            })?;
+            builder.init_response_metadata().set_model(model.as_str());
+        }
+        StreamChunk::Allowance {
+            primary_used_percent,
+            secondary_used_percent,
+        } => {
+            let mut allowance = builder.init_allowance_update();
+            allowance.set_has_primary(primary_used_percent.is_some());
+            allowance.set_primary_used_percent(primary_used_percent.unwrap_or_default());
+            allowance.set_has_secondary(secondary_used_percent.is_some());
+            allowance.set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
+        }
+        StreamChunk::ContentBlockComplete(block) => {
+            let mut encoded = builder.init_content_block_complete();
+            match block {
+                crate::providers::ContentBlock::Text { text } => encoded.set_text(text),
+                crate::providers::ContentBlock::Image { source } => {
+                    let mut image = encoded.init_image();
+                    image.set_source_type(&source.source_type);
+                    image.set_media_type(&source.media_type);
+                    image.set_data(&source.data);
+                }
+                crate::providers::ContentBlock::ToolUse { id, name, input } => {
+                    let mut tool = encoded.init_tool_use();
+                    tool.set_id(id);
+                    tool.set_name(name);
+                    crate::ipc::encode_json_value(tool.reborrow().init_input(), input)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                }
+                crate::providers::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let mut result = encoded.init_tool_result();
+                    result.set_tool_use_id(tool_use_id);
+                    result.set_content(content);
+                    result.set_is_error(is_error.unwrap_or(false));
+                }
+                crate::providers::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                    encoded.set_thinking(encrypted_content);
+                }
+            }
+        }
+        StreamChunk::ThinkingDelta { .. }
+        | StreamChunk::ToolCallDelta { .. }
+        | StreamChunk::ToolCallComplete { .. } => return Ok(EncodedChunk::NotHandled),
+    }
+    Ok(EncodedChunk::Encoded)
+}
+
+/// The real work behind `BrainRpcService::claude_cli_round`, running on its
+/// own `spawn_local` task so a disconnecting caller can never cut this
+/// short — see that method's own doc comment for why. `receiver` is a
+/// capability bound to the *calling* connection: once that connection is
+/// gone, every `on_chunk_request().send()` below starts failing. This loop
+/// treats that as "stop trying to deliver chunks," never as "stop driving
+/// the round" — `receiver_alive` latches false on the first failure, and
+/// the per-Brain lock (held by `provider` for this whole function) is
+/// released only once the underlying round genuinely settles (paused or
+/// complete), exactly matching the real duration of
+/// `ClaudeCliProvider::execute_turn`'s already-detached task, regardless of
+/// whether anyone is still listening.
+async fn drive_claude_cli_round(
+    lifecycle: crate::server::BrainLifecycleService,
+    sessions: crate::server::ClaudeCliSessionRegistry,
+    brain: String,
+    messages: Vec<crate::providers::Message>,
+    tools: Vec<crate::tools::ToolDefinition>,
+    receiver: finch_ipc::finch_ipc_capnp::stream_receiver::Client,
+    model: Option<String>,
+) -> Result<(), capnp::Error> {
+    // Brain visibility check, matching every other per-Brain BrainService
+    // method (`pendingEffectDelivery`, `inspectRun`, ...). This does *not*
+    // reject a nonexistent/archived Brain the way the comment here once
+    // claimed: `BrainStore::snapshot` -> `ensure_loaded` silently creates a
+    // fresh, empty Brain on first reference for *any* per-Brain
+    // BrainService method (the same resurrection behavior already tracked
+    // for schedules, issue #383) — this call site inherits that, it does
+    // not introduce it. A `claudeCliRound` for an archived or typo'd Brain
+    // name therefore still spawns a real `claude` child, which nothing
+    // currently tears back down (`ClaudeCliSessionRegistry::remove` is only
+    // called from the real archive path, which this resurrected Brain never
+    // goes through again). Tracked as a known gap, not fixed here: fixing
+    // it for this one call site without also fixing every other per-Brain
+    // BrainService method's identical `snapshot`-based existence check
+    // would make this method inconsistent with its siblings for no real
+    // gain.
+    lifecycle
+        .snapshot(&brain)
+        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+
+    let session = sessions.get_or_create(&brain, claude_cli_binary_path(), model);
+    let provider = session.lock().await;
+
+    use finch_providers::LlmProvider as _;
+    let mut req = crate::providers::ProviderRequest::new(messages);
+    if !tools.is_empty() {
+        req = req.with_tools(tools);
+    }
+
+    // Fail closed on a mismatched round *before* ever calling
+    // send_message_stream (issue #1354). A daemon-owned session can be
+    // reached by more than one frontend connection over its lifetime (that
+    // is the whole point of relocating ownership here); a reattaching
+    // frontend that does not yet know about a pending tool call could
+    // otherwise send a request whose tail does not answer it.
+    // `ClaudeCliProvider::execute_turn`'s own internal handling of that
+    // same mismatch shape is correct for the *single-frontend* case this
+    // type was originally built for (issue #1341: the same frontend
+    // cancelled or retried, so silently abandoning the parked turn and
+    // starting fresh is the right call) — but applied uninformed here, it
+    // would silently kill a live, possibly mid-human-approval `claude`
+    // child. See `ClaudeCliProvider::parked_call_match`'s own doc comment.
+    match provider.parked_call_match(&req).await {
+        finch_providers::ParkedCallMatch::NoPendingCall
+        | finch_providers::ParkedCallMatch::Matches => {}
+        finch_providers::ParkedCallMatch::Mismatch { pending_id } => {
+            return Err(capnp::Error::failed(format!(
+                "claudeCliRound: brain '{brain}' has a real tool call ({pending_id}) still \
+                 pending real interactive execution; this request's tail does not answer it. \
+                 The pending call is untouched and still resumable — resend it with the \
+                 matching ToolResult appended instead of a fresh or reconstructed request."
+            )));
+        }
+    }
+
+    use crate::generators::StreamChunk;
+    let mut rx = provider
+        .send_message_stream(&req)
+        .await
+        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+    // The lock is held for exactly this round's spawn/resume through
+    // pause-or-completion, then released once this function returns —
+    // never across the (potentially unbounded) wait for the *next* round
+    // to answer a paused call. A second frontend calling this method for
+    // the same Brain while a round is in flight queues here rather than
+    // racing a second `claude` process into existence.
+
+    let mut receiver_alive = true;
+
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(StreamChunk::ToolCallComplete {
+                id,
+                name,
+                input,
+                provenance,
+            }) => {
+                // The round is paused, not done: relay the pending call
+                // (best effort — see `receiver_alive`) and stop draining.
+                // No `done` chunk follows — the frontend distinguishes
+                // "paused" from "complete" by whether this chunk, rather
+                // than `done`, was the last one observed before the RPC
+                // resolved.
+                if receiver_alive {
+                    let mut r = receiver.on_chunk_request();
+                    let mut pending = r.get().init_chunk().init_claude_cli_tool_call_pending();
+                    pending.set_id(&id);
+                    pending.set_name(&name);
+                    if let Err(error) =
+                        crate::ipc::encode_json_value(pending.reborrow().init_input(), &input)
+                    {
+                        return Err(capnp::Error::failed(error.to_string()));
+                    }
+                    pending.set_provider(&provenance.provider);
+                    pending.set_model(&provenance.model);
+                    pending.set_event(&provenance.event);
+                    pending.set_sequence(provenance.sequence);
+                    pending.set_has_opaque_replay(provenance.opaque_replay.is_some());
+                    pending.set_opaque_replay(provenance.opaque_replay.as_deref().unwrap_or(""));
+                    // Best effort: whether or not this send lands, the
+                    // round itself is genuinely paused now (the real
+                    // `claude` child is parked, waiting on the bridge
+                    // socket) — that is true independent of this RPC's
+                    // outcome, so this function returns either way.
+                    let _ = r.send().promise.await;
+                }
+                return Ok(());
+            }
+            Ok(chunk) => {
+                // Every remaining `Ok` chunk kind — TextDelta, Usage,
+                // ResponseMetadata, Allowance, ContentBlockComplete,
+                // ThinkingDelta/ToolCallDelta (not emitted by
+                // ClaudeCliProvider today; see its module doc comment) —
+                // shares one encoder with `query_stream` (issue #1354's
+                // independent review: the two had already started to
+                // diverge). A `NotHandled` chunk is simply skipped, never
+                // sent and never counted against `receiver_alive`.
+                if receiver_alive {
+                    let mut r = receiver.on_chunk_request();
+                    match encode_common_stream_chunk(&chunk, r.get().init_chunk())? {
+                        EncodedChunk::Encoded => {
+                            if r.send().promise.await.is_err() {
+                                // The calling connection is gone. Stop
+                                // trying to deliver further chunks, but
+                                // keep draining `rx` below so this
+                                // function's return — and therefore the
+                                // per-Brain lock's release — still lines up
+                                // with the round's real completion, not
+                                // this cancellation.
+                                receiver_alive = false;
+                            }
+                        }
+                        EncodedChunk::NotHandled => {}
+                    }
+                }
+            }
+            Err(e) => {
+                if receiver_alive {
+                    let mut r = receiver.on_chunk_request();
+                    r.get().init_chunk().set_error(e.to_string().as_str());
+                    let _ = r.send().promise.await;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // The channel closed with no pending-tool-call chunk sent: the turn
+    // genuinely finished (`TurnOutcome::Complete`).
+    if receiver_alive {
+        let mut r = receiver.on_chunk_request();
+        r.get().init_chunk().set_done(());
+        let _ = r.send().promise.await;
+    }
+    Ok(())
+}
+
+/// The `claude` binary a daemon-owned Claude CLI Subscription session
+/// spawns (issue #1354). Production always uses the real CLI on `PATH`
+/// (`finch_providers::ClaudeCliProvider::new`'s own default); the
+/// integration test suite substitutes a fake binary via
+/// `FINCH_TEST_CLAUDE_CLI_BINARY`, mirroring the same env-var-indirection
+/// pattern the rest of this suite's isolated daemon fixtures already use to
+/// point production code at test doubles rather than modifying production
+/// selection logic per test.
+fn claude_cli_binary_path() -> std::path::PathBuf {
+    std::env::var_os("FINCH_TEST_CLAUDE_CLI_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("claude"))
+}
 
 fn read_tools(
     list: capnp::struct_list::Reader<finch_ipc_capnp::tool_definition::Owned>,
@@ -1899,99 +2265,23 @@ impl finch_daemon::Server for FinchDaemonImpl {
                     .await
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-                use crate::generators::StreamChunk;
+                // Shares its chunk encoding with `drive_claude_cli_round`
+                // (issue #1354's independent review: the two had already
+                // started to diverge). This surface never emits a
+                // `ToolCallComplete`/`ThinkingDelta`/`ToolCallDelta` chunk
+                // today (native-tool-call IPC projection is #776/#777,
+                // unrelated to this method), so every `NotHandled` chunk is
+                // simply skipped, matching the pre-refactor `continue`.
                 while let Some(result) = rx.recv().await {
                     match result {
-                        Ok(StreamChunk::TextDelta(delta)) => {
+                        Ok(chunk) => {
                             let mut r = receiver.on_chunk_request();
-                            r.get().init_chunk().set_text_delta(delta.as_str());
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::Usage {
-                            input_tokens,
-                            output_tokens,
-                        }) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut upd = r.get().init_chunk().init_usage_update();
-                            upd.set_input_tokens(input_tokens);
-                            upd.set_output_tokens(output_tokens);
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::ResponseMetadata { model }) => {
-                            crate::generators::validate_response_model(&model).map_err(|_| {
-                                capnp::Error::failed(
-                                    "IPC response model metadata was invalid".into(),
-                                )
-                            })?;
-                            let mut r = receiver.on_chunk_request();
-                            r.get()
-                                .init_chunk()
-                                .init_response_metadata()
-                                .set_model(model.as_str());
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::Allowance {
-                            primary_used_percent,
-                            secondary_used_percent,
-                        }) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut allowance = r.get().init_chunk().init_allowance_update();
-                            allowance.set_has_primary(primary_used_percent.is_some());
-                            allowance
-                                .set_primary_used_percent(primary_used_percent.unwrap_or_default());
-                            allowance.set_has_secondary(secondary_used_percent.is_some());
-                            allowance.set_secondary_used_percent(
-                                secondary_used_percent.unwrap_or_default(),
-                            );
-                            r.send().promise.await?;
-                        }
-                        Ok(StreamChunk::ThinkingDelta { .. })
-                        | Ok(StreamChunk::ToolCallDelta { .. })
-                        | Ok(StreamChunk::ToolCallComplete { .. }) => {
-                            // Adapters do not emit these yet. IPC projection is #776/#777;
-                            // this schema is unchanged.
-                            continue;
-                        }
-                        Ok(StreamChunk::ContentBlockComplete(block)) => {
-                            let mut r = receiver.on_chunk_request();
-                            let mut encoded = r.get().init_chunk().init_content_block_complete();
-                            match block {
-                                crate::providers::ContentBlock::Text { text } => {
-                                    encoded.set_text(&text)
+                            match encode_common_stream_chunk(&chunk, r.get().init_chunk())? {
+                                EncodedChunk::Encoded => {
+                                    r.send().promise.await?;
                                 }
-                                crate::providers::ContentBlock::Image { source } => {
-                                    let mut image = encoded.init_image();
-                                    image.set_source_type(&source.source_type);
-                                    image.set_media_type(&source.media_type);
-                                    image.set_data(&source.data);
-                                }
-                                crate::providers::ContentBlock::ToolUse { id, name, input } => {
-                                    let mut tool = encoded.init_tool_use();
-                                    tool.set_id(&id);
-                                    tool.set_name(&name);
-                                    crate::ipc::encode_json_value(
-                                        tool.reborrow().init_input(),
-                                        &input,
-                                    )
-                                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                                }
-                                crate::providers::ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } => {
-                                    let mut result = encoded.init_tool_result();
-                                    result.set_tool_use_id(&tool_use_id);
-                                    result.set_content(&content);
-                                    result.set_is_error(is_error.unwrap_or(false));
-                                }
-                                crate::providers::ContentBlock::OpaqueReasoning {
-                                    encrypted_content,
-                                } => {
-                                    encoded.set_thinking(&encrypted_content);
-                                }
+                                EncodedChunk::NotHandled => continue,
                             }
-                            r.send().promise.await?;
                         }
                         Err(e) => {
                             let mut r = receiver.on_chunk_request();
@@ -2196,6 +2486,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
             lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
             runners: self.server.brain_runners().clone(),
             connection_id: self.connection_id,
+            claude_cli_sessions: self.server.claude_cli_sessions().clone(),
         });
         results.get().set_service(service);
         Promise::ok(())

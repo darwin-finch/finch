@@ -59,7 +59,7 @@ pub use chatgpt_subscription::ChatGptSubscriptionProvider;
 pub use claude::ClaudeProvider;
 pub use claude_cli::{
     claude_cli_mcp_wire_name, claude_cli_tool_name_from_wire, ClaudeCliAvailability,
-    ClaudeCliBridgeToolRequest, ClaudeCliBridgeToolResponse, ClaudeCliProvider,
+    ClaudeCliBridgeToolRequest, ClaudeCliBridgeToolResponse, ClaudeCliProvider, ParkedCallMatch,
     CLAUDE_CLI_DEFAULT_MODEL, CLAUDE_CLI_MCP_BRIDGE_FLAG, CLAUDE_CLI_MCP_SERVER_NAME,
     CLAUDE_CLI_PROVIDER_NAME, CLAUDE_CLI_TOOL_NAMES, CLAUDE_CLI_TOOL_SOCKET_ENV,
 };

@@ -155,6 +155,11 @@ pub(super) async fn archive_named_brain(
         .brain_store()
         .archive(&name)
         .map_err(|error| AppError(error).into_response())?;
+    // #1354: an archived Brain's daemon-owned Claude CLI Subscription
+    // session (if any) must not keep its `claude` child alive past the
+    // Brain it belonged to. Dropping the registry's last strong reference
+    // to the provider tears the process/socket down via its own Drop chain.
+    server.claude_cli_sessions().remove(&name);
     Ok(Json(ArchiveNamedBrainResponse {
         name,
         archived_to: archived_to.map(|path| path.display().to_string()),

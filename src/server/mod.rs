@@ -4,6 +4,7 @@
 mod brain_approval;
 mod brain_runner;
 mod brain_service;
+mod claude_cli_session;
 mod feedback_handler;
 mod handlers;
 mod ipc;
@@ -28,6 +29,7 @@ pub(crate) use brain_runner::{
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
+pub use claude_cli_session::ClaudeCliSessionRegistry;
 #[cfg(test)]
 pub(crate) use handlers::{
     authorize_pending_remote_attachment, create_remote_brain_router,
@@ -160,6 +162,12 @@ pub struct AgentServer {
     brain_runners: BrainRunnerBroker,
     /// Pending approval continuations keyed to their exact Brain attachment.
     brain_approvals: BrainApprovalBroker,
+    /// Daemon-owned Claude CLI Subscription `claude` processes and their MCP
+    /// bridge sockets, keyed by Brain name (issue #1354). Tool execution and
+    /// approval stay on whichever frontend calls `BrainService.claudeCliRound`;
+    /// only process/transport ownership lives here. See
+    /// `claude_cli_session.rs` for the lifecycle contract.
+    claude_cli_sessions: ClaudeCliSessionRegistry,
     /// Persistent signer and revocation ledger for scoped remote participants.
     brain_credentials: crate::brain::BrainCredentialAuthority,
     /// Application-owned MCP configuration and lazily connected transport for
@@ -491,6 +499,7 @@ impl AgentServer {
             ),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
+            claude_cli_sessions: ClaudeCliSessionRegistry::default(),
             brain_credentials,
             mcp_servers: std::collections::HashMap::new(),
             mcp_client: tokio::sync::OnceCell::new(),
@@ -544,6 +553,7 @@ impl AgentServer {
             brain_store: store,
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
+            claude_cli_sessions: ClaudeCliSessionRegistry::default(),
             brain_credentials: credentials,
             mcp_servers: std::collections::HashMap::new(),
             mcp_client: tokio::sync::OnceCell::new(),
@@ -624,6 +634,7 @@ impl AgentServer {
             brain_store: crate::brain::BrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
+            claude_cli_sessions: ClaudeCliSessionRegistry::default(),
             brain_credentials,
             mcp_servers,
             mcp_client: tokio::sync::OnceCell::new(),
@@ -963,6 +974,12 @@ impl AgentServer {
 
     pub fn brain_approvals(&self) -> &BrainApprovalBroker {
         &self.brain_approvals
+    }
+
+    /// Daemon-owned Claude CLI Subscription sessions, keyed by Brain name
+    /// (issue #1354). See `claude_cli_session.rs` for the lifecycle contract.
+    pub fn claude_cli_sessions(&self) -> &ClaudeCliSessionRegistry {
+        &self.claude_cli_sessions
     }
 
     /// Return the daemon-owned MCP transport, connecting it on first use.

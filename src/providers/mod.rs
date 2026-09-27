@@ -5,9 +5,11 @@
 //! mapping in Finch.
 
 mod catalog;
+mod claude_cli_daemon;
 mod factory;
 
 pub use catalog::refresh_from_config;
+pub use claude_cli_daemon::DaemonClaudeCliProvider;
 pub use factory::preflight_provider_config;
 pub use factory::{
     create_provider_from_config, create_provider_from_entries, create_provider_from_entry,

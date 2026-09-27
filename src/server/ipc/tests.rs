@@ -2069,6 +2069,7 @@ impl super::finch_ipc_capnp::finch_daemon::Server for BrainTestDaemon {
                 lifecycle: self.lifecycle.clone(),
                 runners: self.runners.clone(),
                 connection_id: self.connection_id,
+                claude_cli_sessions: crate::server::ClaudeCliSessionRegistry::default(),
             });
         results.get().set_service(service);
         capnp::capability::Promise::ok(())
@@ -2206,6 +2207,7 @@ async fn disconnected_ipc_connection_rebinds_its_durable_runner_lease() {
         lifecycle: lifecycle.clone(),
         runners: runners.clone(),
         connection_id: first_connection,
+        claude_cli_sessions: crate::server::ClaudeCliSessionRegistry::default(),
     };
     let lease = first
         .acquire_connection_runner("shared", subject, &environment, None, 60_000)
@@ -2223,6 +2225,7 @@ async fn disconnected_ipc_connection_rebinds_its_durable_runner_lease() {
         lifecycle,
         runners: runners.clone(),
         connection_id: replacement_connection,
+        claude_cli_sessions: crate::server::ClaudeCliSessionRegistry::default(),
     };
     let renewed = replacement
         .acquire_connection_runner(

@@ -59,6 +59,24 @@ struct ToolUse {
   input     @2 :JsonValue;
 }
 
+# A tool call paused mid-turn by a daemon-owned Claude CLI Subscription
+# session (#1354), carrying the same EventProvenance the frontend's real
+# ToolLoop needs to record the call in ConversationHistory. Distinct from
+# ToolUse (the Brain-less FinchDaemon.query/queryStream surface's
+# client-executed tool calls, #776/#777): those carry no provenance because
+# nothing there reconstructs Finch's own conversation history from them.
+struct ClaudeCliPendingToolCall {
+  id              @0 :Text;
+  name            @1 :Text;
+  input           @2 :JsonValue;
+  provider        @3 :Text;
+  model           @4 :Text;
+  event           @5 :Text;
+  sequence        @6 :UInt64;
+  hasOpaqueReplay @7 :Bool;
+  opaqueReplay    @8 :Text;
+}
+
 # ---------------------------------------------------------------------------
 # Query / response
 # ---------------------------------------------------------------------------
@@ -82,6 +100,10 @@ struct StreamChunk {
     responseMetadata @5 :StreamResponseMetadata;
     allowanceUpdate  @6 :AllowanceUpdate;
     contentBlockComplete @7 :ContentBlock;
+    # #1354: a daemon-owned Claude CLI Subscription round paused for real,
+    # interactive tool execution. See ClaudeCliPendingToolCall and
+    # BrainService.claudeCliRound.
+    claudeCliToolCallPending @8 :ClaudeCliPendingToolCall;
   }
 }
 
@@ -1700,6 +1722,40 @@ interface BrainService {
                                  clientId :Text,
                                  executionId :Text,
                                  throughSequence :UInt64) -> (applied :Bool);
+
+  # Drive one Finch-level round of a daemon-owned Claude CLI Subscription
+  # session for `brain` (#1354). The daemon owns the `claude` subprocess and
+  # its MCP bridge socket (crates/finch-providers's existing
+  # ClaudeCliProvider, reused unchanged, now constructed and driven here
+  # instead of in the frontend); real tool execution and approval still
+  # happen wherever this method is called from, through that caller's own
+  # real ToolLoop, exactly as before #1354 — only process/transport
+  # ownership moved. `messages` is the full conversation increment for this
+  # round, matching the pre-existing local round convention: to answer a
+  # paused call, resend the same messages with the resolved ToolResult
+  # appended and call again. A round that pauses for real execution streams
+  # exactly one claudeCliToolCallPending chunk over `receiver` and returns
+  # with no trailing `done` chunk; a round that finishes the turn streams
+  # ordinary text/usage/contentBlockComplete chunks then `done`, exactly
+  # like queryStream. The session is created lazily on the first round for a
+  # Brain and stays alive, independent of any one frontend connection, until
+  # the Brain is archived/deleted or the daemon process itself exits — so a
+  # frontend that disconnects mid-round and a different frontend that later
+  # reattaches to the same Brain both drive the same live process and
+  # conversation state.
+  # `hasModel`/`model` name the Brain's configured Claude CLI Subscription
+  # model, consulted only the first time this Brain's session is created
+  # (an already-live daemon-owned session keeps whatever model it started
+  # with, since switching models mid `claude --resume` conversation is not
+  # supported); `hasModel = false` means "use ClaudeCliProvider's own
+  # default". A later round for an already-live session may resend a
+  # different value here with no effect — the session was already created.
+  claudeCliRound @20 (brain :Text,
+                      messages :List(Message),
+                      tools :List(ToolDefinition),
+                      receiver :StreamReceiver,
+                      hasModel :Bool,
+                      model :Text) -> ();
 }
 
 # ---------------------------------------------------------------------------
