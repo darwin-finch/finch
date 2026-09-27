@@ -1209,6 +1209,7 @@ integration_inventory="$(
   rg -l -i 'brain|daemon|IpcClient' tests --glob '*.rs' | sort
 )"
 expected_integration_inventory="$(cat <<'EOF'
+tests/claude_cli_daemon_session_test.rs
 tests/daemon_integration_test.rs
 tests/daemon_log_rotation.rs
 tests/daemon_status_live_socket.rs

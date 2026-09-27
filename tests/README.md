@@ -114,6 +114,28 @@ Finch child PID and never sends a signal by process name.
 2. **`test_daemon_query`** - Tests full query flow through daemon
 3. **`test_daemon_config_parsing`** - Validates isolated endpoint configuration
 
+### Daemon-owned Claude CLI Subscription session tests (`claude_cli_daemon_session_test.rs`, issue #1354)
+
+Real spawned-daemon-subprocess, real Cap'n Proto IPC production-boundary tests for
+`BrainService.claudeCliRound` — the daemon owns the `claude` process/MCP bridge socket while
+tool execution/approval stay frontend-side. Drives a fake `claude` binary
+(`FINCH_TEST_CLAUDE_CLI_BINARY`) through the real bridge-socket protocol, no real Claude
+subscription login required:
+
+```bash
+./scripts/test_brains.sh cargo test --test claude_cli_daemon_session_test -- --ignored
+```
+
+1. **`production_boundary_claude_cli_round_fails_closed_on_a_mismatched_reattach`** - A
+   reattaching frontend whose request doesn't answer the real pending call gets a named error;
+   the parked call survives and still completes correctly afterward.
+2. **`production_boundary_frontend_disconnect_mid_pending_tool_call_does_not_lose_the_session`** -
+   The originating frontend disconnects while a tool call is parked; a fresh frontend resumes and
+   completes it, with the underlying `claude` process invoked exactly once.
+3. **`production_boundary_daemon_restart_kills_the_live_claude_child_with_no_orphan`** - A real
+   SIGTERM to the daemon (the same signal `finch daemon-stop` sends) reaps its live, parked
+   `claude` child with no orphan.
+
 ### TUI Tests (`tui_integration_test.rs`)
 
 1. **`test_tui_initialization`** - Verifies TUI starts without crashing

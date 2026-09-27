@@ -51,6 +51,21 @@ hand every process they are responsible for to a launcher that is isolated.
 
 ## Rust test entrypoints
 
+- `tests/claude_cli_daemon_session_test.rs` (issue #1354) fails closed without
+  authenticated supervisor proof, mirroring `daemon_integration_test.rs`'s own
+  `TestDaemon` harness shape: its spawned daemon receives the sealed HOME,
+  password, and IPC socket via `finch::brain::isolated_test_proof()`/
+  `FINCH_TEST_IPC_SOCKET`, and every test connects a real `IpcClient` over
+  that same sealed socket rather than the default `~/.finch/daemon.sock`. A
+  fake `claude` binary is substituted in per daemon instance via
+  `FINCH_TEST_CLAUDE_CLI_BINARY` (a test-only env-var indirection consulted
+  by `claude_cli_binary_path()` in `src/server/ipc.rs`); each `TestDaemon`
+  uses its own uniquely-named spool directory under the shared sealed HOME so
+  concurrently-run tests in this binary cannot read one another's leftover
+  `socket_path`/`pid`/`call_order.log` files. All three tests are `#[ignore]`d
+  (they spawn the built daemon binary) and run only through
+  `./scripts/test_brains.sh cargo test --test claude_cli_daemon_session_test
+  -- --ignored`.
 - `tests/daemon_integration_test.rs` fails closed without authenticated
   supervisor proof. Its daemon receives the sealed HOME, password, IPC socket,
   and inherited kernel-assigned listener.
