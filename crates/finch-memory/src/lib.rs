@@ -6,11 +6,13 @@
 //! the method signatures without a generated interface catalog.
 
 mod confidence;
+mod degenerate_gate;
 mod embeddings;
 mod memory_status;
 mod program_registry;
 mod quality;
 mod routing_memory;
+mod stats;
 
 pub use embeddings::{
     average_embeddings, cosine_similarity, EmbeddingEngine, HashedNgramEmbedding,
@@ -28,6 +30,7 @@ pub type NodeId = u64;
 pub use quality::{MemoryClassifier, MemoryImportance};
 
 use confidence::{retrieval_margin, P2Quantile};
+use degenerate_gate::DegenerateContentGate;
 use finch_routing_tree::{save_point, write_dirty_nodes_within};
 use routing_memory::{LinkNextError, Occurrence, PointId, RoutingMemTree};
 
@@ -695,6 +698,14 @@ pub struct MemorySystem {
     /// racing when the daemon retries one completed Brain run.
     insert_lock: Arc<Mutex<()>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
+    /// Pre-indexing quality gate (#1323): independent of `MemoryClassifier`'s
+    /// text-pattern `Discard` heuristic, this rejects a candidate document
+    /// only when it is genuinely degenerate by BOTH a compression-ratio and
+    /// a Shannon-entropy signal. One instance per `MemorySystem`, observing
+    /// every projected turn exactly once, in insertion order -- see
+    /// `DegenerateContentGate`'s own doc for why it must not be shared
+    /// across corpora or fed the same document twice.
+    degenerate_gate: Arc<Mutex<DegenerateContentGate>>,
     config: MemoryConfig,
     /// Streaming P² percentile tracker backing the confidence-based
     /// retrieval abstention gate (#1324, `confidence.rs`). `None` inside
@@ -741,6 +752,8 @@ struct ProjectionContext {
     embedding_engine: Arc<dyn EmbeddingEngine>,
     insert_lock: Arc<Mutex<()>>,
     needs_projection_sweep: Arc<AtomicBool>,
+    /// See `MemorySystem::degenerate_gate`.
+    degenerate_gate: Arc<Mutex<DegenerateContentGate>>,
 }
 
 /// A durably stored conversation with no `memory_sources` row: stored, never
@@ -1289,6 +1302,7 @@ impl MemorySystem {
         // flag, as the store this function is about to return.
         let insert_lock = Arc::new(Mutex::new(()));
         let needs_projection_sweep = Arc::new(AtomicBool::new(true));
+        let degenerate_gate = Arc::new(Mutex::new(DegenerateContentGate::new()));
         let projection = ProjectionContext {
             db: Arc::clone(&db),
             tree: Arc::clone(&tree),
@@ -1296,6 +1310,7 @@ impl MemorySystem {
             embedding_engine: Arc::clone(&embedding_engine),
             insert_lock: Arc::clone(&insert_lock),
             needs_projection_sweep: Arc::clone(&needs_projection_sweep),
+            degenerate_gate: Arc::clone(&degenerate_gate),
         };
         let mut hydration_task = None;
 
@@ -1385,6 +1400,7 @@ impl MemorySystem {
             hydration_task,
             insert_lock,
             embedding_engine,
+            degenerate_gate,
             config,
             confidence_tracker: Mutex::new(None),
         })
@@ -1574,6 +1590,7 @@ impl MemorySystem {
             embedding_engine: Arc::clone(&self.embedding_engine),
             insert_lock: Arc::clone(&self.insert_lock),
             needs_projection_sweep: Arc::clone(&self.needs_projection_sweep),
+            degenerate_gate: Arc::clone(&self.degenerate_gate),
         }
     }
 
@@ -1634,7 +1651,26 @@ impl MemorySystem {
         // Low-signal content (acks, greetings) is skipped in MemTree but still
         // written to the conversations table above for raw history.
         let classifier = MemoryClassifier::new();
-        if let Some((key_content, importance)) = classifier.process(role, content) {
+        let classified = classifier.process(role, content);
+
+        // Pre-indexing degeneracy gate (#1323): a second, independent check
+        // alongside the classifier's own text-pattern `Discard` heuristic
+        // above, not a replacement for it -- only content the classifier
+        // already decided to keep is offered to this gate. Rejects only
+        // when BOTH a compression-ratio and a Shannon-entropy signal are
+        // more than two standard deviations below their own running mean
+        // (see `DegenerateContentGate`'s doc for why both, not either).
+        // `observe` folds this document's metrics into the running
+        // baselines exactly once, regardless of the verdict, so it must run
+        // at most once per candidate -- gated on `classified` being `Some`
+        // the same way `observe_document` below is gated on it, and reusing
+        // the SAME `key_content` `observe_document`/`embed` will use.
+        let is_degenerate = match &classified {
+            Some((key_content, _)) => ctx.degenerate_gate.lock().await.observe(key_content),
+            None => false,
+        };
+
+        if let Some((key_content, importance)) = classified.filter(|_| !is_degenerate) {
             // Insertion, not query: record this turn as one newly indexed
             // document BEFORE computing its embedding, so its own terms
             // count toward the corpus-wide statistics `embed` reads (real
@@ -1701,7 +1737,8 @@ impl MemorySystem {
                 return Err(error);
             }
         } else {
-            // A classifier-discarded turn is TERMINAL, not pending.
+            // A classifier-discarded turn, OR one the degeneracy gate above
+            // rejected, is TERMINAL, not pending.
             //
             // This row, with its NULL `node_id`, is the only thing that lets
             // "no `memory_sources` row" mean "never projected". Drop it and

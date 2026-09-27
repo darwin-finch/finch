@@ -1829,6 +1829,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "finch-routing-tree",
+ "flate2",
  "rusqlite",
  "serde",
  "tempfile",

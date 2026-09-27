@@ -133,7 +133,12 @@ impl HashedNgramEmbedding {
     /// dropped. Shared by both `embed_text` and `observe_document_text` so
     /// document-frequency counting and embedding always agree on what a
     /// "term" is.
-    fn tokenize(text: &str) -> Vec<String> {
+    ///
+    /// `pub(crate)` so the pre-indexing degeneracy gate (`degenerate_gate.rs`,
+    /// #1323) can compute order-0 Shannon entropy over the SAME notion of
+    /// "term" this embedding uses for TF-IDF, instead of maintaining a
+    /// second, potentially-diverging tokenizer.
+    pub(crate) fn tokenize(text: &str) -> Vec<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|w| w.len() >= 2)

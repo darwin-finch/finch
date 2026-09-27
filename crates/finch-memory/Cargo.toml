@@ -12,6 +12,11 @@ repository = "https://github.com/darwin-finch/finch"
 anyhow = "1.0"
 chrono = "0.4"
 dirs = "5.0"
+# Pre-indexing quality gate (#1323): one of the gate's two independent
+# degeneracy signals is a DEFLATE-compressed-size ratio, the same
+# pure-Rust backend the root crate's recall-summarization gate already
+# uses for the same kind of redundancy signal (`src/cli/repl_event/recall_gate.rs`).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 finch-routing-tree = { path = "../finch-routing-tree" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
