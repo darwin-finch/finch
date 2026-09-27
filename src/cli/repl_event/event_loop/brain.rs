@@ -167,6 +167,126 @@ impl EventLoop {
         )
     }
 
+    /// A headless `EventLoop` wired for a plain, non-Brain turn with
+    /// streaming enabled and a real memory system attached -- unlike
+    /// `new_test_runner`/`new_named_brain_test_runner`, which hardcode
+    /// `streaming_enabled: false` and `memory_system: None`.
+    ///
+    /// Issue #1248 (memory-recall notice landing after the user's own echo
+    /// on a plain, idle, non-queued local-model turn): neither #1194's own
+    /// regression (`test_memory_notice_commits_before_user_echo_in_scrollback`)
+    /// nor #1242's (`test_queued_turn_defers_echo_like_fresh_query_before_
+    /// streaming_complete`) drives a real `LlmLoop::run()` worker task --
+    /// the former calls `process_query_with_tools` directly with hand-built
+    /// arguments, and the latter intercepts `LlmRequest` off the channel
+    /// before any worker consumes it. This constructor, paired with calling
+    /// the private `start_llm_worker()` (accessible here as a same-module-
+    /// tree descendant), closes that gap: a test built on it drives
+    /// `EventLoop::handle_event` -> the real `llm_tx` channel -> a real
+    /// spawned `LlmLoop::run()` -> `spawn_query` -> `process_query_with_tools`,
+    /// the exact same wiring `Repl::run_event_loop` uses in production.
+    ///
+    /// `generator` backs both the resolved "cloud" handle
+    /// (`ModelSelection::from_handle` via `ProviderResolver`) and `qwen_gen`
+    /// (`GenerationParts::generator`), so it runs regardless of which way
+    /// `process_query_with_tools`'s own Step 1 routing decision falls.
+    #[cfg(test)]
+    pub(crate) fn new_local_streaming_memory_test_runner(
+        generator: Arc<dyn Generator>,
+        memory_system: Arc<finch_memory::MemorySystem>,
+    ) -> Self {
+        let colors = crate::theme::ColorScheme::default();
+        let output_manager = Arc::new(OutputManager::new(colors.clone()));
+        let status_bar = Arc::new(StatusBar::new());
+        let tui_renderer =
+            TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
+        let mention_port = crate::cli::mention_session::MentionSession::new(".")
+            as Arc<dyn crate::cli::tui::MentionPort>;
+        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let (_todo_writer, todo_target, todo_receiver) =
+            crate::tools::todo_journal(Arc::clone(&todo_list));
+        let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (memory_commitment_writer, memory_commitment_target, memory_commitment_receiver) =
+            crate::cli::repl_event::memory_commitment::memory_commitment_journal(Arc::clone(
+                &committed_memories,
+            ));
+        let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
+        let program_runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let agent_scheduler = crate::scheduler::AgentScheduler::new(
+            provider_resolver.clone(),
+            Arc::clone(&program_runtime),
+        );
+        program_runtime.attach_agent_scheduler(&agent_scheduler);
+        let tempdir =
+            tempfile::tempdir().expect("local-streaming-memory fixture: isolated tool state");
+        let tool_executor = crate::tools::ToolExecutor::new(
+            crate::tools::ToolRegistry::new(),
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("local-streaming-memory fixture: construct inert tool executor");
+        std::mem::forget(tempdir);
+        use crate::cli::repl_event::parts::{
+            ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts,
+            UiParts,
+        };
+        Self::new(
+            SessionParts {
+                conversation: Arc::new(RwLock::new(ConversationHistory::new())),
+                active_persona: Arc::new(RwLock::new(crate::config::Persona::default())),
+                mode: Arc::new(RwLock::new(ReplMode::Normal)),
+                label: "local-streaming-memory-test".into(),
+            },
+            GenerationParts {
+                generator,
+                router: Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+                state: Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+                resolver: provider_resolver,
+                available: Vec::new(),
+                active_index: 0,
+                default_provider: None,
+                cli_model: None,
+                cli_provider: None,
+            },
+            UiParts {
+                renderer: tui_renderer,
+                output: output_manager,
+                status_bar,
+                streaming_enabled: true,
+                mention_port,
+            },
+            ToolParts {
+                definitions: Vec::new(),
+                executor: Arc::new(Mutex::new(tool_executor)),
+                todo_list,
+                todo_journal_target: todo_target,
+                todo_journal_receiver: todo_receiver,
+                memory_commitment_target,
+                memory_commitment_receiver,
+            },
+            DaemonParts {
+                ipc_client: None,
+                ipc_error: None,
+                client: None,
+                base_url: None,
+            },
+            ContextLimits {
+                lines: 0,
+                max_verbatim_messages: 0,
+                recall_k: 3,
+                enable_summarization: false,
+                auto_compact: false,
+            },
+            RuntimeParts {
+                program_runtime,
+                agent_scheduler,
+                memory_system: Some(memory_system),
+                committed_memories,
+                memory_commitment_writer,
+            },
+        )
+    }
+
     /// A minimal, headless event loop for exercising `/provider` switching
     /// (`handle_provider_switch`) against a real `DaemonClient` pointed at a
     /// test HTTP server, so `local_model_status` runs the same request path
