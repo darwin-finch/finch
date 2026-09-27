@@ -27,7 +27,7 @@
 //! disclosed extra complexity (`ccipcaAccum`/`ccipcaUpdate`) for a mechanism nothing here currently
 //! calls. Portable later if a concrete need for it shows up; a disclosed gap, not a silent one.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 /// Config knobs, with defaults matching the D reference's own validated recommendations
 /// (`BUILD_ARCHITECTURE.md` §8), not its literal code defaults (which keep some of these off for
@@ -944,41 +944,100 @@ impl RoutingTree {
     /// as fit even once the points that justified it are removed. The tree remains structurally
     /// valid and searchable either way; whether stale axes measurably hurt routing quality after
     /// heavy real-corpus editing is a disclosed, unmeasured limitation, not a bug.
+    ///
+    /// Fails closed with a named `Err` -- never panics or infinite-loops -- on every input this
+    /// function cannot safely act on: an out-of-range or already-removed `point_id`, or a
+    /// `routing_nodes.parent_id` chain that does not reach the root (or, for a dual entry, its own
+    /// divergence node) within a bounded number of steps. That last case used to be an `.expect()`
+    /// on a missing parent, a disclosed regression from the original port (see this crate's
+    /// `AGENTS.md`) that stayed dormant only because nothing called removal in production; issue
+    /// #1329 exposes this method through a real user-facing tool for the first time, so a
+    /// corrupted or hand-crafted tree can now reach this path from ordinary tool use, and the
+    /// fix mirrors #274's own precedent for the identical class of problem in the legacy index:
+    /// detect and name it, return `Err`, never panic or loop forever.
     pub fn remove_point(&mut self, point_id: usize) -> Result<()> {
+        if point_id >= self.points.len() {
+            bail!(
+                "remove_point: point {point_id} does not exist (tree holds {} points)",
+                self.points.len()
+            );
+        }
         if self.removed_flag[point_id] {
             bail!("remove_point: point {point_id} already removed");
         }
         let pt = self.points[point_id].clone();
+        // One step per node in the tree is always enough to reach the root (or a dual entry's
+        // divergence node) along a genuine parent chain; more than that means the chain is
+        // corrupt -- a cycle, or a link that never arrives -- and the bound below turns that into
+        // a diagnosable error instead of spinning forever.
+        let max_steps = self.nodes.len().max(1);
 
         {
-            let mut cur = self.current_leaf_of[point_id]
-                .expect("a never-removed point always has a primary leaf");
+            let leaf = self.current_leaf_of[point_id].ok_or_else(|| {
+                anyhow!(
+                    "remove_point: point {point_id} has no primary leaf recorded (never-removed \
+                     points always have one) -- current_leaf_of is corrupt"
+                )
+            })?;
+            let mut cur = leaf;
+            let mut steps = 0usize;
             loop {
                 downdate_centroid(&mut self.nodes[cur], &pt, self.dim);
                 self.dirty.insert(cur);
                 if cur == self.root_id {
                     break;
                 }
-                cur = self.nodes[cur]
-                    .parent
-                    .expect("a non-root node always has a parent");
+                steps += 1;
+                if steps > max_steps {
+                    bail!(
+                        "remove_point: point {point_id}'s primary parent chain from leaf {leaf} \
+                         did not reach the root ({}) within {max_steps} steps -- \
+                         routing_nodes.parent_id is corrupt (cycle or dangling link)",
+                        self.root_id
+                    );
+                }
+                cur = self.nodes[cur].parent.ok_or_else(|| {
+                    anyhow!(
+                        "remove_point: node {cur} on point {point_id}'s primary parent chain \
+                         from leaf {leaf} has no parent but is not the root ({}) -- \
+                         routing_nodes.parent_id is corrupt",
+                        self.root_id
+                    )
+                })?;
             }
-            self.remove_from_bucket(self.current_leaf_of[point_id].unwrap(), point_id)?;
+            self.remove_from_bucket(leaf, point_id)?;
         }
 
         let dual_entries = self.dual_entries_of[point_id].clone();
         for entry in dual_entries {
             let mut cur = entry.leaf_id;
+            let mut steps = 0usize;
             loop {
                 downdate_centroid(&mut self.nodes[cur], &pt, self.dim);
                 self.dirty.insert(cur);
-                let parent = self.nodes[cur]
-                    .parent
-                    .expect("a dual leaf always has a parent (it is never the root)");
+                let parent = self.nodes[cur].parent.ok_or_else(|| {
+                    anyhow!(
+                        "remove_point: node {cur} on point {point_id}'s dual parent chain from \
+                         leaf {} has no parent before reaching divergence node {} -- \
+                         routing_nodes.parent_id is corrupt",
+                        entry.leaf_id,
+                        entry.divergence_node_id
+                    )
+                })?;
                 if parent == entry.divergence_node_id {
                     break; // the shared divergence ancestor was already downdated once, by the primary walk above
                 }
                 cur = parent;
+                steps += 1;
+                if steps > max_steps {
+                    bail!(
+                        "remove_point: point {point_id}'s dual parent chain from leaf {} did not \
+                         reach its divergence node {} within {max_steps} steps -- \
+                         routing_nodes.parent_id is corrupt (cycle or dangling link)",
+                        entry.leaf_id,
+                        entry.divergence_node_id
+                    );
+                }
             }
             self.remove_from_bucket(entry.leaf_id, point_id)?;
         }

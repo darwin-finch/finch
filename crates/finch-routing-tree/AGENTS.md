@@ -48,11 +48,25 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
 - Load is atomic in shape: `load_routing_tree` either returns a fully linked tree or `Err`; there
   is no partial tree. What hydration *scheduling* (background, partial reads, degradation) looks
   like is the caller's lifecycle, not this crate's.
-- A real, disclosed regression carried from the port, not yet fixed: the iterative parent-pointer
-  walks in `remove_point`'s downdate and `insert_into`'s update use `.expect()` on a missing
-  parent, which panics rather than returning a diagnosable `Result` if `routing_nodes.parent_id`
-  were ever corrupted on disk — the memory index's earlier cycle-detect-and-return-`Err` fix for
-  this exact class of problem was not replicated here.
+- **Fixed (issue #1329):** `remove_point`'s two iterative parent-pointer walks (the primary
+  root-leaf downdate and the dual-entry-to-divergence-node downdate) used to `.expect()` a
+  missing parent and panic if `routing_nodes.parent_id` were ever corrupted on disk — dormant only
+  because nothing called removal in production before #1329 exposed it through a real
+  user-facing tool (`memory_remove`/`remove_memory`). Both walks now fail closed with a named
+  `Err` instead, mirroring #274's own precedent for the identical class of problem in the legacy
+  index (detect and name it, return `Err`, never panic), and are bounded to `nodes.len()` steps so
+  a corrupt cycle returns an error instead of looping forever. `remove_point` also now rejects an
+  out-of-range `point_id` up front (`self.removed_flag[point_id]`'s own `Vec` indexing used to
+  panic on one, and a `memory_id` a caller hands `remove_memory` — e.g. a hand-typed or
+  hallucinated `node:999999` — is exactly the kind of external input that can produce one).
+  `test_remove_point_out_of_range_errors_rather_than_panicking`,
+  `test_remove_point_with_corrupted_primary_parent_chain_errors_rather_than_panicking`,
+  `test_remove_point_with_corrupted_dual_parent_chain_errors_rather_than_panicking` in
+  `src/routing_tree/tests.rs` force each condition directly on the in-memory tree (not a disk
+  fixture) and assert `Err`, not a panic. `insert_into`'s own `.expect()`
+  (`"dual insert must carry its divergence node"`) is a different, narrower case — the one call
+  site always passes `Some`, so it stays provably unreachable by construction and was out of
+  scope here.
 - No test-support feature exists: no cross-crate test seam is needed — nothing pauses the tree.
   All tests are plain `#[cfg(test)]` within this crate.
 - `RoutingConfig::default()`'s `dual_insert_threshold` is `0.10`, not `0.0` (issue #1322, corrected

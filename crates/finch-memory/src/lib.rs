@@ -2005,6 +2005,69 @@ impl MemorySystem {
         }))
     }
 
+    /// Remove a stored memory from the routing index, by the same `memory_id` [`inspect_memory`]
+    /// accepts and returns (its own docs describe the two resolution forms: the explicit
+    /// `node:<id>` index reference, or a `conversations.id` joined through `memory_sources` to its
+    /// indexed point).
+    ///
+    /// Returns `Ok(true)` when a live indexed point was found and removed, `Ok(false)` when
+    /// `memory_id` does not resolve to one (already removed, never indexed, or does not exist at
+    /// all) -- fails closed, never a panic, for exactly the case issue #1329 calls out ("removing
+    /// a nonexistent `memory_id`"). `Err` is reserved for a real failure: a corrupted
+    /// `routing_nodes.parent_id` chain detected during downdate (see
+    /// [`RoutingTree::remove_point`](finch_routing_tree::RoutingTree::remove_point)'s own docs for
+    /// what that means and why it now fails closed instead of panicking), or a disk write failure
+    /// while persisting the removal.
+    ///
+    /// Takes the db lock before the tree lock, matching every other caller that holds both
+    /// (`query_with_sources`, `save_routing_occurrence`, `stats`), to avoid a lock-order deadlock.
+    ///
+    /// **Disclosed, deliberate narrowing (issue #1329):** this removes the point from the ROUTING
+    /// INDEX only, so it can never surface via `search_memory` or `inspect_memory`'s `node:<id>`
+    /// form again. The raw `conversations`/`memory_sources` row is left in place:
+    /// `get_recent_conversations` (what `list_recent_memories` calls) reads `conversations`
+    /// directly, never through the tree, and an `inspect_memory` call by the SAME conversation id
+    /// still returns the original text afterward. Purging the raw row -- including unlinking it
+    /// from its `routing_occurrences` chain without corrupting a neighbor's `prev`/`next` -- is a
+    /// larger, separate change; see this crate's `AGENTS.md`.
+    pub async fn remove_memory(&self, memory_id: &str) -> Result<bool> {
+        let memory_id = memory_id.trim();
+
+        let conn = self.db.lock().await;
+        let mut tree = self.tree.lock().await;
+
+        let node_id: Option<NodeId> = if let Some(node_id) = memory_id.strip_prefix("node:") {
+            Some(
+                node_id
+                    .parse::<NodeId>()
+                    .with_context(|| format!("invalid memory node reference '{memory_id}'"))?,
+            )
+        } else {
+            conn.query_row(
+                "SELECT ms.node_id FROM conversations c
+                 LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
+                 WHERE c.id = ?1",
+                params![memory_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .context("remove_memory: query conversations/memory_sources by id")?
+            .flatten()
+            .map(|value| value as NodeId)
+        };
+
+        let Some(node_id) = node_id else {
+            return Ok(false);
+        };
+        if tree.get_point(node_id as PointId).is_none() {
+            // Already removed, or a `node:<id>` past the end of the tree -- a normal "nothing to
+            // remove" outcome, not an error.
+            return Ok(false);
+        }
+        tree.remove(&conn, node_id as PointId)?;
+        Ok(true)
+    }
+
     /// Get recent conversations (for context window)
     pub async fn get_recent_conversations(&self, limit: usize) -> Result<Vec<(String, String)>> {
         let conn = self.db.lock().await;
@@ -6706,4 +6769,150 @@ mod tests {
     // disabled mid-capture and silently drop the very line being asserted.
     // A dedicated integration binary gives the capture window the process
     // to itself, making the proof deterministic.
+
+    // ── #1329: remove_memory ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_memory_removes_a_point_so_search_no_longer_finds_it() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation(
+                "user",
+                "the deploy key lives in 1Password",
+                Some("test"),
+                None,
+            )
+            .await?;
+        let hit = memory
+            .query_with_sources("deploy key location", Some(1))
+            .await?
+            .pop()
+            .expect("the memory should be findable before removal");
+
+        let removed = memory.remove_memory(&hit.memory_id).await?;
+        assert!(
+            removed,
+            "remove_memory must report true for a live, indexed memory_id"
+        );
+
+        let after = memory
+            .query_with_sources("deploy key location", Some(5))
+            .await?;
+        assert!(
+            after.iter().all(|r| r.memory_id != hit.memory_id),
+            "a removed memory must never surface via search_memory again: {after:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_memory_on_nonexistent_id_returns_false_not_error() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let removed = memory
+            .remove_memory("a-conversation-id-that-does-not-exist")
+            .await?;
+        assert!(
+            !removed,
+            "removing a memory_id that never existed must fail closed with Ok(false), \
+             not an Err and not a panic"
+        );
+
+        // The `node:<id>` index form, past the end of an empty tree.
+        let removed_node = memory.remove_memory("node:999999").await?;
+        assert!(
+            !removed_node,
+            "removing an out-of-range node:<id> must fail closed with Ok(false), \
+             not an Err and not a panic"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_memory_double_removal_returns_false_the_second_time() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        // At least 20 chars: `MemoryClassifier::is_noise` discards anything shorter as
+        // unmemorable filler, which would make this fixture never get indexed at all
+        // (independent of anything `remove_memory` does).
+        let content = "the double-removal test fixture value is 8675309";
+        memory
+            .insert_conversation("user", content, Some("test"), None)
+            .await?;
+        let hit = memory
+            .query_with_sources(content, Some(1))
+            .await?
+            .pop()
+            .expect("the memory should be findable before removal");
+
+        assert!(memory.remove_memory(&hit.memory_id).await?);
+        let second = memory.remove_memory(&hit.memory_id).await?;
+        assert!(
+            !second,
+            "removing an already-removed memory_id a second time must return Ok(false), \
+             not an Err and not a panic"
+        );
+        Ok(())
+    }
+
+    /// The production boundary this exists for: a memory removed in one process must stay
+    /// removed after a full restart, not merely for the lifetime of the `MemorySystem` that
+    /// removed it. `RoutingMemTree::remove` persists the point's `removed` flag and its downdated
+    /// node rows inside one transaction specifically so this holds.
+    #[tokio::test]
+    async fn test_remove_memory_survives_a_process_restart() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+        let memory_id = {
+            let memory = MemorySystem::new(MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })?;
+            memory
+                .insert_conversation(
+                    "user",
+                    "a memory that will be removed before restart",
+                    Some("test"),
+                    None,
+                )
+                .await?;
+            let hit = memory
+                .query_with_sources("memory that will be removed", Some(1))
+                .await?
+                .pop()
+                .expect("the memory should be findable before removal");
+            assert!(memory.remove_memory(&hit.memory_id).await?);
+            hit.memory_id
+            // `memory` (and its background hydration task) drops here.
+        };
+
+        let reopened = MemorySystem::new(MemoryConfig {
+            db_path,
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let after_restart = reopened
+            .query_with_sources("memory that will be removed", Some(5))
+            .await?;
+        assert!(
+            after_restart.iter().all(|r| r.memory_id != memory_id),
+            "a removal must survive a process restart, not just the lifetime of the \
+             MemorySystem that performed it: {after_restart:?}"
+        );
+        Ok(())
+    }
 }
