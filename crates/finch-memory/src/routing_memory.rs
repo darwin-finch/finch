@@ -36,10 +36,13 @@ use uuid::Uuid;
 const NEAR_TIE_EPSILON: f32 = 0.01;
 
 /// How many live corpus points [`RoutingMemTree::random_baseline_mean`] samples per query
-/// (#1327), evenly spaced across sorted point ids for determinism rather than a fresh RNG draw --
-/// the same reason [`FIXED_SEED`] exists: the same store must answer identically on every process
-/// that opens it. Bounded so the sample's cost stays a small constant no matter how large the
-/// corpus grows.
+/// (#1327), selected by the smallest deterministic hash-based rank key rather than a fresh RNG
+/// draw -- the same reason [`FIXED_SEED`] exists: the same store must answer identically on every
+/// process that opens it. The number of cosine comparisons and retained samples is bounded by
+/// this constant regardless of corpus size; the one-pass rank-key scan of the corpus needed to
+/// find them is still `O(corpus size)`, since nothing shorter than visiting every live point can
+/// pick a representative sample from it without an incremental structure (a disclosed
+/// simplification -- see that method's doc comment).
 const RANDOM_BASELINE_SAMPLE_SIZE: usize = 32;
 
 /// The score floor a candidate must clear, relative to the RESULT SET's own top score and random
@@ -442,11 +445,18 @@ impl RoutingMemTree {
     }
 
     /// Mean cosine similarity between `query_embedding` and a deterministic sample of this
-    /// corpus's own live points -- #1327's `randomBaselineMean`, an approximation of how an
-    /// unrelated/"random" memory would score against this query, drawn from the real corpus
-    /// rather than synthesized. Sampled evenly across sorted point ids (see
-    /// [`RANDOM_BASELINE_SAMPLE_SIZE`]) rather than truly randomly, for the same determinism
-    /// reason [`FIXED_SEED`] exists.
+    /// corpus's own live, non-Discard points -- #1327's `randomBaselineMean`, an approximation of
+    /// how an unrelated/"random" memory would score against this query, drawn from the real
+    /// corpus rather than synthesized. Discard (importance=0) content is excluded from the
+    /// sample, matching `retrieve`'s own candidate filter above (module doc): content that could
+    /// never itself be returned must not skew the baseline other candidates are judged against.
+    ///
+    /// Selected by the smallest [`RANDOM_BASELINE_SAMPLE_SIZE`] deterministic hash-based rank
+    /// keys (`DefaultHasher` over the point id -- fixed, non-randomized keys, so stable within one
+    /// build) rather than a fresh RNG draw or a full sort of every point id, for the same
+    /// determinism reason [`FIXED_SEED`] exists: the same store must answer identically on every
+    /// process that opens it, at a bounded number of retained samples and cosine comparisons
+    /// regardless of corpus size (see that constant's doc comment).
     ///
     /// Computed fresh per query rather than tracked incrementally -- a disclosed simplification.
     /// An incremental running estimate, mirroring the Welford-style streaming statistics issues
@@ -456,20 +466,50 @@ impl RoutingMemTree {
     ///
     /// `None` when the corpus has no live points to sample (nothing to compare against).
     fn random_baseline_mean(&self, query_embedding: &[f32]) -> Option<f32> {
-        let mut points: Vec<(PointId, &[f32])> =
-            self.iter_points().map(|(pid, _, e)| (pid, e)).collect();
-        if points.is_empty() {
+        use std::hash::{Hash, Hasher};
+
+        // Deterministic per-point rank key: `DefaultHasher` uses fixed, non-randomized keys (unlike
+        // the `HashMap`/`self.meta` iteration order it reads from), so the same point id always
+        // ranks the same way within one build -- the determinism `FIXED_SEED` above needs, without
+        // collecting and fully sorting the whole corpus just to pick a small sample from it. A
+        // single pass keeps the smallest `RANDOM_BASELINE_SAMPLE_SIZE` keys seen so far, so the
+        // number of retained samples (and cosine comparisons below) never grows with corpus size,
+        // unlike a full sort.
+        fn rank_key(point_id: PointId) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            point_id.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let mut sample: Vec<(u64, &[f32])> = Vec::with_capacity(RANDOM_BASELINE_SAMPLE_SIZE + 1);
+        for (pid, meta, embedding) in self.iter_points() {
+            // Discard (importance=0) is a real content-safety exclusion (module doc): `retrieve`'s
+            // own candidate list already excludes it, and the baseline this filter judges
+            // candidates against must not be skewed by content that could never itself be returned.
+            if meta.importance == 0 {
+                continue;
+            }
+            let key = rank_key(pid);
+            match sample.last() {
+                Some((worst, _))
+                    if sample.len() >= RANDOM_BASELINE_SAMPLE_SIZE && key >= *worst =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            let pos = sample.partition_point(|(k, _)| *k < key);
+            sample.insert(pos, (key, embedding));
+            sample.truncate(RANDOM_BASELINE_SAMPLE_SIZE);
+        }
+        if sample.is_empty() {
             return None;
         }
-        points.sort_unstable_by_key(|(pid, _)| *pid);
-        let sample_size = RANDOM_BASELINE_SAMPLE_SIZE.min(points.len());
-        let stride = points.len() as f64 / sample_size as f64;
-        let mut total = 0.0f64;
-        for i in 0..sample_size {
-            let idx = ((i as f64 * stride) as usize).min(points.len() - 1);
-            total += crate::cosine_similarity(query_embedding, points[idx].1) as f64;
-        }
-        Some((total / sample_size as f64) as f32)
+        let total: f64 = sample
+            .iter()
+            .map(|(_, e)| crate::cosine_similarity(query_embedding, e) as f64)
+            .sum();
+        Some((total / sample.len() as f64) as f32)
     }
 
     /// Reorder every near-tied run within `results` (already sorted descending by cosine score,

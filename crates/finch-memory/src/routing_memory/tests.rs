@@ -663,3 +663,52 @@ fn test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one() {
         weak.point_id
     );
 }
+
+/// `random_baseline_mean` must exclude Discard (importance=0) points from its sample, matching
+/// `retrieve`'s own candidate filter (module doc: Discard is a real content-safety exclusion, the
+/// one filter this facade keeps). A Discard point that scores HIGH against the query is planted
+/// deliberately: if it leaked into the sample it would pull the baseline mean up sharply (toward
+/// the query's own near-duplicate), which would raise `relative_margin_floor` and could drop
+/// legitimate candidates that would otherwise have survived -- content that can never itself be
+/// returned must not be able to skew what other candidates are judged against.
+#[test]
+fn test_random_baseline_mean_excludes_discard_content() {
+    let (_dir, path) = open_schema_db();
+    let conn = Connection::open(&path).expect("open");
+    let mut tree = RoutingMemTree::new_with_dim(DIM);
+
+    let query: Vec<f32> = {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = 1.0;
+        v
+    };
+    let with_cosine = |a: f32| -> Vec<f32> {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = a;
+        v[1] = (1.0 - a * a).sqrt();
+        v
+    };
+
+    tree.insert_with_effect("normal one".to_string(), with_cosine(0.2), 1, 100);
+    tree.insert_with_effect("normal two".to_string(), with_cosine(0.3), 1, 101);
+    // Discard content, deliberately near-identical to the query (cos=0.99) so it would dominate
+    // the mean if it leaked into the sample.
+    tree.insert_with_effect(
+        "discarded near-duplicate".to_string(),
+        with_cosine(0.99),
+        0,
+        102,
+    );
+
+    let baseline = tree
+        .random_baseline_mean(&query)
+        .expect("corpus has live (non-Discard) points to sample");
+    let expected = (0.2 + 0.3) / 2.0;
+    assert!(
+        (baseline - expected).abs() < 1e-5,
+        "random_baseline_mean must equal the mean of only the two non-Discard points \
+         ((0.2 + 0.3) / 2 = {expected}), got {baseline} -- a value near \
+         (0.2 + 0.3 + 0.99) / 3 = {} would mean the Discard point leaked into the sample",
+        (0.2 + 0.3 + 0.99) / 3.0
+    );
+}
