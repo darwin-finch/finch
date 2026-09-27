@@ -1850,6 +1850,35 @@ async fn supervise_generator_loader_task(
     }
 }
 
+/// Resolve on SIGTERM (issue #1354's `run_daemon` shutdown fix — see that
+/// call site's own comment). Unix only: SIGTERM is not a signal on other
+/// platforms, so this simply never resolves there, leaving `ctrl_c()` and
+/// the task-exit branches as the only ways `run_daemon`'s `select!` ends on
+/// those platforms — unchanged from before this fix.
+async fn wait_for_sigterm() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not register a SIGTERM handler; a real `finch daemon-stop` will fall \
+                     back to the OS default action (immediate termination, skipping graceful \
+                     shutdown) for this process"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::daemon::DaemonLifecycle;
     use finch::local::LocalGenerator;
@@ -2217,10 +2246,30 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal (Ctrl+C or SIGTERM)
+    // Wait for shutdown signal (Ctrl+C or SIGTERM).
+    //
+    // Issue #1354: `DaemonLifecycle::stop_daemon` (the real `finch
+    // daemon-stop`/operator-restart path) sends SIGTERM first and only
+    // escalates to SIGKILL if the process does not exit within its own
+    // timeout. Before this fix, nothing here actually registered a SIGTERM
+    // handler — only `ctrl_c()` (SIGINT) — so a real `finch daemon-stop`
+    // never reached this block at all: the OS's default SIGTERM action
+    // terminated the process immediately, skipping the managed-transfer
+    // stop, IPC shutdown, mDNS stop, and PID/instance release below (not
+    // only this issue's new `ClaudeCliSessionRegistry` cleanup — every
+    // resource this block owns). `wait_for_sigterm` closes that gap; this
+    // function is not itself unit-testable (it spawns real HTTP/IPC
+    // listeners), so the regression coverage is the production-boundary
+    // `production_boundary_daemon_restart_kills_the_live_claude_child_with_no_orphan`
+    // test in `tests/claude_cli_daemon_session_test.rs`, which sends a real
+    // SIGTERM to a real spawned daemon subprocess and asserts its live
+    // `claude` child is reaped, not orphaned.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received SIGINT, shutting down gracefully");
+        }
+        _ = wait_for_sigterm() => {
+            tracing::info!("Received SIGTERM, shutting down gracefully");
         }
         result = &mut server_handle => {
             match result {

@@ -209,8 +209,11 @@ impl IpcClient {
     }
 
     /// Connect to an explicitly isolated daemon socket. This is used by the
-    /// daemon-upgrade shadow preflight; ordinary clients always use `connect`.
-    pub(crate) async fn connect_path(path: std::path::PathBuf) -> Result<Self> {
+    /// daemon-upgrade shadow preflight and by the isolated integration-test
+    /// suite's real-daemon-subprocess fixtures (`tests/`), which need to
+    /// name a sealed test socket outside `sock_path()`'s own
+    /// `~/.finch/daemon.sock` default; ordinary clients always use `connect`.
+    pub async fn connect_path(path: std::path::PathBuf) -> Result<Self> {
         let stream = tokio::net::UnixStream::connect(&path)
             .await
             .with_context(|| format!("IPC connect failed: {}", path.display()))?;
@@ -325,6 +328,66 @@ impl IpcClient {
         let request = self.client.brain_service_request();
         let reply = request.send().promise.await?;
         Ok(reply.get()?.get_service()?)
+    }
+
+    /// One Finch-level round of a daemon-owned Claude CLI Subscription
+    /// session for `brain` (issue #1354). Mirrors [`Self::query_stream`]'s
+    /// shape exactly, scoped to a Brain's persistent session instead of a
+    /// one-off Brain-less request: to answer a paused round, call again with
+    /// the same messages plus the resolved `ToolResult` appended. Reuses
+    /// `StreamReceiverImpl`, so a `StreamChunk::ToolCallComplete` decoded
+    /// from the wire's `claudeCliToolCallPending` chunk (see that decoder's
+    /// module doc comment) is indistinguishable downstream from one the
+    /// local, non-daemon `ClaudeCliProvider` would have produced directly.
+    pub async fn brain_claude_cli_round(
+        &self,
+        brain: &str,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<mpsc::UnboundedReceiver<Result<StreamChunk>>> {
+        let service = self.brain_service().await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let error_tx = tx.clone();
+
+        let receiver_impl = StreamReceiverImpl { tx };
+        let receiver_client: stream_receiver::Client = capnp_rpc::new_client(receiver_impl);
+
+        let mut req = service.claude_cli_round_request();
+        {
+            let mut p = req.get();
+            p.set_brain(brain);
+            crate::brain::encode_messages(
+                p.reborrow().init_messages(messages.len() as u32),
+                &messages,
+            )?;
+            write_tools(p.reborrow().init_tools(tools.len() as u32), &tools);
+            p.set_receiver(receiver_client);
+        }
+
+        // Fire and forget, exactly like `query_stream`: the server calls
+        // back on `receiver` as chunks are produced, live, for however long
+        // this round takes (unbounded — real interactive approval on the
+        // far side of a paused round has no timeout). Awaiting the request
+        // here instead would buffer every chunk until the whole round
+        // finished before the caller ever saw one, defeating live streaming.
+        // The caller learns whether the round paused or completed by
+        // watching `rx` itself (a `ToolCallComplete` item means paused;
+        // the channel closing with no such item means complete).
+        //
+        // The spawned task keeps its own clone of `tx` so a *top-level* RPC
+        // rejection — the daemon returning `Err` before ever calling
+        // `receiver.onChunk` at all, e.g. `claudeCliRound`'s mismatched-
+        // reattach fail-closed error (issue #1354) — still reaches the
+        // caller as one `Err` item, instead of silently closing `rx` with
+        // no chunks at all (indistinguishable from a round that happened
+        // to produce none).
+        tokio::task::spawn_local(async move {
+            if let Err(error) = req.send().promise.await {
+                let _ = error_tx.send(Err(anyhow::anyhow!("{error}")));
+            }
+        });
+
+        Ok(rx)
     }
 
     pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::BrainSnapshot> {
@@ -1808,6 +1871,66 @@ impl stream_receiver::Server for StreamReceiverImpl {
                 .and_then(decode_stream_content_block)
                 .map(StreamChunk::ContentBlockComplete)
                 .map_err(|error| anyhow::anyhow!("{}", error)),
+            // #1354: a daemon-owned Claude CLI Subscription round paused for
+            // real interactive tool execution. Decodes back into the exact
+            // same `StreamChunk::ToolCallComplete` the local (non-daemon)
+            // `ClaudeCliProvider::pump_until_settled` already emits, so a
+            // caller downstream of this receiver (the ToolLoop) cannot tell
+            // whether the chunk crossed a socket read or this IPC hop.
+            Ok(Which::ClaudeCliToolCallPending(pending)) => pending
+                .and_then(|pending| {
+                    let id = pending
+                        .get_id()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let name = pending
+                        .get_name()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let input = crate::ipc::decode_json_value(pending.get_input()?)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    let provider = pending
+                        .get_provider()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let model = pending
+                        .get_model()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let event = pending
+                        .get_event()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let opaque_replay = if pending.get_has_opaque_replay() {
+                        Some(
+                            pending
+                                .get_opaque_replay()?
+                                .to_str()
+                                .map_err(|e| capnp::Error::failed(e.to_string()))?
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    Ok(StreamChunk::ToolCallComplete {
+                        id,
+                        name,
+                        input,
+                        provenance: crate::providers::EventProvenance {
+                            provider,
+                            model,
+                            event,
+                            sequence: pending.get_sequence(),
+                            opaque_replay,
+                        },
+                    })
+                })
+                .map_err(|e: capnp::Error| anyhow::anyhow!("{}", e)),
             Ok(Which::Done(())) => {
                 // Close the channel by dropping tx — but we don't have ownership.
                 // Signal done by sending a synthetic error; caller checks for it.

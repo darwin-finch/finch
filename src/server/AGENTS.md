@@ -4,9 +4,11 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 
 **Owns** `src/server/`: Axum router construction, HTTP authentication and rate limiting,
 OpenAI-compatible request/response types, named-Brain HTTP handlers, runner callbacks, approval
-bridging, the daemon-side Cap'n Proto RPC adapter and listener lifecycle, and server lifecycle
-state. Daemon process lifecycle belongs to `src/daemon`; durable Brain state belongs to
-`crates/finch-brain`; the domain-neutral schema/protocol/socket core belongs to `crates/finch-ipc`.
+bridging, the daemon-side Cap'n Proto RPC adapter and listener lifecycle, server lifecycle
+state, and — since issue #1354 — the daemon-owned Claude CLI Subscription `claude`
+process/MCP-bridge-socket lifecycle per Brain (`claude_cli_session.rs`). Daemon process lifecycle
+belongs to `src/daemon`; durable Brain state belongs to `crates/finch-brain`; the domain-neutral
+schema/protocol/socket core belongs to `crates/finch-ipc`.
 
 **Facade:** callers outside this directory use flat `crate::server::Item` imports from the
 `pub use` list in [`mod.rs`](mod.rs); they must not name `server::handlers` or
@@ -49,6 +51,29 @@ implies the other. `DaemonLocalGenerator` (used when a daemon connection exists)
 because it only makes an async HTTP call to the daemon, a separate OS process; the in-process
 fallback (`QwenGenerator`, used only when no daemon connection exists) already wraps its own
 blocking calls the same way (`src/generators/qwen.rs`).
+
+**Daemon-owned Claude CLI Subscription sessions (issue #1354).** `BrainService.claudeCliRound`
+looks up (or lazily creates) a per-Brain `finch_providers::ClaudeCliProvider` in
+`ClaudeCliSessionRegistry` and drives it directly — tool execution and approval stay wherever the
+*caller* runs its own real `ToolLoop`, exactly as #1341/#1350 already built; only process/transport
+ownership moved. The round-driving work (`drive_claude_cli_round`) runs on its own
+`spawn_local` task, decoupled from the calling RPC's own future: capnp-rpc drops that future on a
+client disconnect, and driving inline would release the per-Brain lock — and could race a second
+`claude` process into existence — before the provider's own already-detached `execute_turn` task
+(spawned inside `send_message_stream_validated`) had actually finished. A request that does not
+correctly answer a currently parked tool call is rejected before ever touching
+`send_message_stream` (`ClaudeCliProvider::parked_call_match`), so an uninformed reattaching
+frontend cannot silently abandon a live, possibly mid-human-approval `claude` child.
+`ClaudeCliSessionRegistry::remove` (called on Brain archive, `src/server/handlers/lifecycle.rs`)
+is the only explicit teardown; a live child otherwise survives until the daemon process itself
+exits, and `run_daemon`'s SIGTERM handler (`src/main.rs`, itself part of this issue's fix — SIGTERM
+previously had no handler at all, so a real `finch daemon-stop` skipped every graceful-shutdown
+step in that function, not only this one) is what lets that happen on an ordinary restart; a
+SIGKILL/crash genuinely orphans a live child, which is an OS-level fact no software here can
+prevent. Covered end-to-end by real spawned-daemon-subprocess tests in
+`tests/claude_cli_daemon_session_test.rs`: a mismatched reattach fails closed and leaves the real
+parked call resumable, a frontend disconnect mid-pending-tool-call does not lose the session, and a
+graceful SIGTERM restart reaps the live `claude` child with no orphan.
 
 **Extension rule:** put domain-neutral wire contracts in `finch-ipc` and durable Brain rules in
 `finch-brain`; add a flat server export only for a real application caller. Do not move root

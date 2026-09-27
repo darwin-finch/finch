@@ -173,6 +173,20 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   did not match its completed content"). This is user-visible by design, not a side effect to hide:
   the finished transcript now includes any preamble narration the model produced before its tool
   call, matching exactly what streamed to the screen in real time.
+  **Since issue #1354, this transport can be driven by more than one caller connection over its
+  own lifetime — the daemon now owns and constructs it (`src/server/claude_cli_session.rs` in the
+  root crate), reused unchanged; this crate's own process-management logic did not move or
+  change.** `execute_turn`'s internal `take_matching_parked_turn` still silently abandons a
+  non-matching parked turn and starts fresh — correct for the single-frontend cancel/retry case
+  this type was originally built for (issue #1341), where the same frontend made that decision
+  itself — but a caller reachable from more than one connection over the session's lifetime must
+  not let an uninformed request hit that path uninformed. `ClaudeCliProvider::parked_call_match`
+  is a non-destructive peek (`self.parked.lock().await`, `.as_ref()`, never `.take()`) such a
+  caller uses to reject a mismatched request *before* calling `execute_turn` at all, reporting
+  `ParkedCallMatch::Mismatch { pending_id }` instead of silently killing a live, possibly
+  mid-human-approval `claude` child. `parked_call_match_reports_mismatch_and_leaves_the_parked_turn_alive`
+  and `parked_call_match_is_a_non_destructive_peek_that_never_abandons_a_correct_resume` (both in
+  `claude_cli.rs`) prove the peek never disturbs the parked state either way.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.

@@ -249,6 +249,20 @@ struct ParkedTurn {
     pending_reply: UnixStream,
 }
 
+/// The result of [`ClaudeCliProvider::parked_call_match`]: whether a request
+/// correctly answers this session's currently parked tool call, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParkedCallMatch {
+    /// No call is currently parked; any well-formed request may start (or
+    /// continue) a fresh round.
+    NoPendingCall,
+    /// A call is parked and this request's tail correctly answers it.
+    Matches,
+    /// A call is parked, but this request's tail does not answer it — the id
+    /// of the call actually waiting.
+    Mismatch { pending_id: String },
+}
+
 /// What a completed [`ClaudeCliProvider::execute_turn`] produced.
 enum TurnOutcome {
     /// The `claude` process exited; `record` is the finished turn.
@@ -316,6 +330,34 @@ impl ClaudeCliProvider {
     /// The session id every turn of this provider instance resumes.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    /// Whether `request`'s tail correctly answers this session's currently
+    /// parked tool call, if any — a non-destructive peek a caller can use to
+    /// reject a mismatched round *before* calling `execute_turn` (via
+    /// [`LlmProvider::send_message`]/`send_message_stream`), instead of
+    /// discovering the mismatch only after `execute_turn`'s own
+    /// [`Self::take_matching_parked_turn`] has already abandoned the parked
+    /// turn — silently killing a live, possibly mid-human-approval `claude`
+    /// child and starting an unrelated fresh one (issue #1341's original
+    /// query-cancelled-or-retried case, where that is the *correct*
+    /// behavior because the single frontend driving the turn made that
+    /// decision itself). A caller that can be handed a request from a
+    /// source that never saw the pending call — issue #1354's daemon-owned
+    /// session, reachable by more than one frontend connection over its
+    /// lifetime — must not let an uninformed request silently take that
+    /// same path.
+    pub async fn parked_call_match(&self, request: &ProviderRequest) -> ParkedCallMatch {
+        let guard = self.parked.lock().await;
+        let Some(parked) = guard.as_ref() else {
+            return ParkedCallMatch::NoPendingCall;
+        };
+        match tail_tool_result(request, &parked.pending_id) {
+            Some(_) => ParkedCallMatch::Matches,
+            None => ParkedCallMatch::Mismatch {
+                pending_id: parked.pending_id.clone(),
+            },
+        }
     }
 
     /// Whether the CLI is installed and logged in. Read-only probes only;
@@ -2416,6 +2458,207 @@ printf '%s\n' \
             Some("tool call handled"),
             "the resumed claude process must run to completion after the real tool result lands"
         );
+    }
+
+    #[tokio::test]
+    async fn parked_call_match_reports_no_pending_call_before_any_turn() {
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        assert_eq!(
+            provider.parked_call_match(&simple_request()).await,
+            ParkedCallMatch::NoPendingCall,
+            "a provider that never started a turn has nothing parked to mismatch against"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_call_match_is_a_non_destructive_peek_that_never_abandons_a_correct_resume() {
+        // Issue #1354: calling parked_call_match to *check* whether a
+        // request answers the pending call must never itself consume or
+        // abandon the parked turn — a caller (the daemon-owned session
+        // registry) checks before deciding whether to proceed, and the
+        // subsequent real resume must still work exactly as if the check
+        // had never happened.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id, call_name, call_input) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete, got {other:?}"),
+        };
+
+        let correct_followup = with_tool_result(
+            request.clone(),
+            &call_id,
+            &call_name,
+            call_input.clone(),
+            "real tool output",
+            false,
+        );
+
+        // Peek twice — neither call may disturb the parked state.
+        assert_eq!(
+            provider.parked_call_match(&correct_followup).await,
+            ParkedCallMatch::Matches
+        );
+        assert_eq!(
+            provider.parked_call_match(&correct_followup).await,
+            ParkedCallMatch::Matches,
+            "a second peek must report the identical answer; the first peek must not have \
+             consumed the parked turn"
+        );
+
+        // The real resume must still work normally after those peeks.
+        let mut rx2 = provider
+            .send_message_stream(&correct_followup)
+            .await
+            .expect("resuming after non-destructive peeks must still return a stream");
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+        let mut complete = None;
+        while let Some(chunk) = rx2.recv().await {
+            if let StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) = chunk.unwrap() {
+                complete = Some(text);
+            }
+        }
+        assert_eq!(
+            complete.as_deref(),
+            Some("tool call handled"),
+            "peeking with parked_call_match must never prevent a correct real resume from \
+             completing normally afterward"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_call_match_reports_mismatch_and_leaves_the_parked_turn_alive() {
+        // Issue #1354's core reattach-safety fix: a request that does not
+        // answer the currently parked call (e.g. a reattaching frontend
+        // that never saw the pending tool call and just resent its own
+        // reconstructed conversation) must be reported as a clear
+        // mismatch, and — unlike `execute_turn`'s own internal
+        // `take_matching_parked_turn`, whose intentional behavior for the
+        // single-frontend cancel/retry case is to silently abandon a
+        // non-matching parked turn — the parked turn itself must remain
+        // alive and resumable afterward. A caller must check this *before*
+        // ever invoking execute_turn with the mismatched request, never
+        // discover the mismatch by watching a real turn silently restart.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider.send_message_stream(&request).await.unwrap();
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let (real_call_id, call_name, call_input) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete, got {other:?}"),
+        };
+
+        // A request answering some *other* call id entirely — exactly what
+        // an uninformed reattaching frontend could plausibly send.
+        let mismatched = with_tool_result(
+            request.clone(),
+            "some-other-call-id-the-parked-turn-never-asked-for",
+            &call_name,
+            call_input,
+            "wrong answer",
+            false,
+        );
+        match provider.parked_call_match(&mismatched).await {
+            ParkedCallMatch::Mismatch { pending_id } => {
+                assert_eq!(
+                    pending_id, real_call_id,
+                    "the reported pending id must name the call that is actually parked"
+                );
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+
+        // The parked turn must still be exactly where it was: answerable
+        // with the *correct* result, on the same still-open bridge
+        // connection, with the same underlying process.
+        let correct_followup = with_tool_result(
+            request,
+            &real_call_id,
+            &call_name,
+            json!({"key": "value"}),
+            "real tool output",
+            false,
+        );
+        let mut rx2 = provider
+            .send_message_stream(&correct_followup)
+            .await
+            .expect("the parked turn must still be resumable after a mismatched peek");
+
+        let mut reader = BufReader::new(&mut bridge_stream);
+        let mut reply_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut reply_line),
+        )
+        .await
+        .expect(
+            "a mismatched peek must not have answered or dropped the bridge's still-open \
+             connection",
+        )
+        .unwrap();
+        let reply: ClaudeCliBridgeToolResponse = serde_json::from_str(reply_line.trim()).unwrap();
+        assert_eq!(
+            reply.content, "real tool output",
+            "the eventual real answer must reach the bridge, proving the mismatched peek never \
+             consumed or answered the pending call itself"
+        );
+
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+        let mut complete = None;
+        while let Some(chunk) = rx2.recv().await {
+            if let StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) = chunk.unwrap() {
+                complete = Some(text);
+            }
+        }
+        assert_eq!(complete.as_deref(), Some("tool call handled"));
     }
 
     #[tokio::test]
