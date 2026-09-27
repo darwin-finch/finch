@@ -1179,36 +1179,28 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Whether the `CancelQuery` idle branch above would exit Finch entirely
+    /// right now: no active query, and not a plan/executing overlay. Shared
+    /// by every idle-exit call site below so a future change to what "idle"
+    /// means cannot update one copy and silently drift from the others
+    /// (#1311 review).
+    async fn is_idle_for_exit(&self) -> bool {
+        self.active_query_id.read().await.is_none() && !self.mode.read().await.is_plan_overlay()
+    }
+
     /// Keep the idle-Ctrl+C exit warning (`CTRL_C_EXIT_HINT`) in sync with
     /// the renderer's live arm state, polled once per render tick (#1301).
     ///
     /// `ctrl_c_exit_armed` reports only that a first "nothing to clear"
     /// Ctrl+C press is still within its confirming window — the renderer
     /// does not know whether a confirming second press would actually exit
-    /// Finch. That depends on the same two conditions the `CancelQuery`
-    /// idle branch above uses to decide between "exit Finch" and "exit the
-    /// plan/executing overlay": no active query, and not a plan overlay.
-    /// Showing the hint only when both hold keeps it truthful; clearing it
-    /// on every other tick means it disappears the moment the arm expires,
-    /// the user types something else, or the second press lands — without
-    /// a separate timer, mirroring the time-boxed check `ctrl_c_should_cancel`
-    /// already performs on `ctrl_c_armed_at`.
+    /// Finch. That depends on [`Self::is_idle_for_exit`], the same two
+    /// conditions the `CancelQuery` idle branch above uses to decide
+    /// between "exit Finch" and "exit the plan/executing overlay".
     pub(super) async fn sync_ctrl_c_exit_hint(&mut self, ctrl_c_exit_armed: bool) {
-        let should_show = ctrl_c_exit_armed
-            && self.active_query_id.read().await.is_none()
-            && !self.mode.read().await.is_plan_overlay();
-
-        if should_show == self.ctrl_c_exit_hint_shown {
-            return;
-        }
-        let tui = self.tui_renderer.lock().await;
-        if should_show {
-            tui.set_operation_status(CTRL_C_EXIT_HINT);
-        } else {
-            tui.clear_operation_status();
-        }
-        drop(tui);
-        self.ctrl_c_exit_hint_shown = should_show;
+        let should_show = ctrl_c_exit_armed && self.is_idle_for_exit().await;
+        self.apply_idle_exit_hint(IdleExitHintKey::CtrlC, should_show, CTRL_C_EXIT_HINT)
+            .await;
     }
 
     /// Handles a `pending_escape_cancel` flag taken from the renderer once
@@ -1220,15 +1212,22 @@ impl EventLoop {
     /// immediately: this matches Escape's established single-press
     /// character and must not regress into Ctrl+C's own two-press
     /// requirement, which (unlike Escape's) also gates cancelling an active
-    /// query. Only the remaining case — no active query, not a plan
-    /// overlay, the same condition the `CancelQuery` idle branch above uses
-    /// to decide "exit Finch entirely" — arms `escape_idle_exit_armed_at`
-    /// instead of sending `CancelQuery` outright; a confirming second idle
-    /// Escape within `ESCAPE_IDLE_EXIT_WINDOW` is what actually exits.
+    /// query. Only the remaining case — [`Self::is_idle_for_exit`], the
+    /// same condition the `CancelQuery` idle branch above uses to decide
+    /// "exit Finch entirely" — arms `escape_idle_exit_armed_at` instead of
+    /// sending `CancelQuery` outright; a confirming second idle Escape
+    /// within `ESCAPE_IDLE_EXIT_WINDOW` is what actually exits.
+    ///
+    /// Taking the immediate branch also clears any stale
+    /// `escape_idle_exit_armed_at` left over from an earlier, unrelated
+    /// idle press (#1311 review): without this, arming at t0, cancelling an
+    /// active query at t0+200ms (which doesn't touch the arm), and then a
+    /// third, logically unrelated idle press at t0+400ms would read the
+    /// stale arm as the confirming second press and exit Finch — for a
+    /// press that never got its own warning.
     pub(super) async fn handle_escape_cancel_request(&mut self) {
-        let has_active_query = self.active_query_id.read().await.is_some();
-        let mode_is_plan_overlay = self.mode.read().await.is_plan_overlay();
-        if has_active_query || mode_is_plan_overlay {
+        if !self.is_idle_for_exit().await {
+            self.escape_idle_exit_armed_at = None;
             let _ = self.event_tx.send(ReplEvent::CancelQuery);
             return;
         }
@@ -1252,34 +1251,50 @@ impl EventLoop {
     /// clears once `ESCAPE_IDLE_EXIT_WINDOW` elapses with no second press,
     /// or if state changes (a query starts, a plan overlay opens) while
     /// armed, without needing a separate timer (#1311).
-    ///
-    /// Known limitation: if an idle Ctrl+C arm and an idle Escape arm are
-    /// both live in the same short window (a user would have to press both
-    /// idle-exit keys back to back), whichever hint's sync runs later this
-    /// tick overwrites the status line text of the other. Each key's own
-    /// arm/confirm state stays independently correct regardless — a
-    /// confirming press of either still-armed key exits correctly — only
-    /// the displayed wording can lag which key is "really" armed in that
-    /// narrow overlap.
     pub(super) async fn sync_escape_exit_hint(&mut self) {
         let armed = self
             .escape_idle_exit_armed_at
             .is_some_and(|armed| armed.elapsed() <= ESCAPE_IDLE_EXIT_WINDOW);
-        let should_show = armed
-            && self.active_query_id.read().await.is_none()
-            && !self.mode.read().await.is_plan_overlay();
+        let should_show = armed && self.is_idle_for_exit().await;
+        self.apply_idle_exit_hint(IdleExitHintKey::Escape, should_show, ESCAPE_EXIT_HINT)
+            .await;
+    }
 
-        if should_show == self.escape_idle_exit_hint_shown {
-            return;
-        }
-        let tui = self.tui_renderer.lock().await;
+    /// Shared status-line coordinator for the idle-exit warnings: Ctrl+C's
+    /// (#1301) and Escape's (#1311) both write the same single-slot
+    /// `OperationStatus` line (`TuiRenderer::set_operation_status`/
+    /// `clear_operation_status`), so `idle_exit_hint_owner` records which
+    /// key currently owns whatever text is displayed there.
+    ///
+    /// A key only writes its own text when it doesn't already own the slot,
+    /// and only clears the slot when it is the current owner — so one key's
+    /// arm expiring can never blank the *other* key's still-valid,
+    /// still-armed warning (#1311 review: the earlier independent-bool
+    /// version let exactly this happen — Escape's expiry-driven
+    /// `clear_operation_status()` wiped Ctrl+C's still-armed warning off
+    /// the status line with no code path left to redraw it, so a following
+    /// Ctrl+C press could exit with nothing currently visible). When both
+    /// are armed at once, the slot's wording reflects whichever became true
+    /// more recently rather than showing both; that overlap needs pressing
+    /// both idle-exit keys within the same short window and is a cosmetic,
+    /// deliberately accepted wording choice — a confirming press of either
+    /// still-armed key exits correctly regardless of which text is shown.
+    async fn apply_idle_exit_hint(
+        &mut self,
+        key: IdleExitHintKey,
+        should_show: bool,
+        text: &'static str,
+    ) {
         if should_show {
-            tui.set_operation_status(ESCAPE_EXIT_HINT);
-        } else {
-            tui.clear_operation_status();
+            if self.idle_exit_hint_owner == Some(key) {
+                return;
+            }
+            self.tui_renderer.lock().await.set_operation_status(text);
+            self.idle_exit_hint_owner = Some(key);
+        } else if self.idle_exit_hint_owner == Some(key) {
+            self.tui_renderer.lock().await.clear_operation_status();
+            self.idle_exit_hint_owner = None;
         }
-        drop(tui);
-        self.escape_idle_exit_hint_shown = should_show;
     }
 }
 

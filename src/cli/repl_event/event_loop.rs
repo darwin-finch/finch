@@ -78,6 +78,14 @@ const ESCAPE_EXIT_HINT: &str = "Press Esc again to exit Finch";
 /// application layer, not in the renderer.
 const ESCAPE_IDLE_EXIT_WINDOW: Duration = Duration::from_millis(1500);
 
+/// Which idle-exit warning currently owns the shared single-slot status
+/// line — see `EventLoop::apply_idle_exit_hint` (#1311 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleExitHintKey {
+    CtrlC,
+    Escape,
+}
+
 fn append_pending_user_messages(
     history: &mut ConversationHistory,
     pending_user_messages: &[String],
@@ -354,11 +362,13 @@ pub struct EventLoop {
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
-    /// Whether the idle-Ctrl+C exit warning (`CTRL_C_EXIT_HINT`) is
-    /// currently on the status line, so the periodic tick only calls
-    /// `set_operation_status`/`clear_operation_status` on a state change
-    /// rather than every tick (#1301).
-    ctrl_c_exit_hint_shown: bool,
+    /// Which idle-exit warning (Ctrl+C's `CTRL_C_EXIT_HINT`, #1301, or
+    /// Escape's `ESCAPE_EXIT_HINT`, #1311) currently owns the shared
+    /// single-slot status line, so the periodic tick only calls
+    /// `set_operation_status`/`clear_operation_status` on a real change and
+    /// so one key's arm expiring can never blank the other's still-armed
+    /// warning — see `EventLoop::apply_idle_exit_hint`.
+    idle_exit_hint_owner: Option<IdleExitHintKey>,
 
     /// When an idle (no active query, not a plan overlay) Escape press has
     /// nothing to cancel, the first press arms this instead of exiting;
@@ -368,10 +378,6 @@ pub struct EventLoop {
     /// the renderer does not have — unlike Ctrl+C's arm, which is
     /// unconditional and can live in the renderer.
     escape_idle_exit_armed_at: Option<Instant>,
-
-    /// Whether the idle-Escape exit warning (`ESCAPE_EXIT_HINT`) is
-    /// currently on the status line, mirroring `ctrl_c_exit_hint_shown`.
-    escape_idle_exit_hint_shown: bool,
 
     /// User turns submitted while a provider/VM turn is active.  The legacy
     /// code overwrote `active_query_id`, leaving the earlier turn unable to
@@ -2239,9 +2245,8 @@ impl EventLoop {
             agent_scheduler,
             provider_resolver,
             active_query_id: Arc::new(RwLock::new(None)),
-            ctrl_c_exit_hint_shown: false,
+            idle_exit_hint_owner: None,
             escape_idle_exit_armed_at: None,
-            escape_idle_exit_hint_shown: false,
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),

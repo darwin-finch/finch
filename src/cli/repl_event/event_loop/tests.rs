@@ -7814,6 +7814,124 @@ async fn test_escape_idle_exit_arm_expires_after_window() {
         .await;
 }
 
+/// #1311 code-review regression: an idle-exit arm left over from an earlier
+/// press must not survive an intervening active-query cancel. Before this
+/// fix, `handle_escape_cancel_request`'s immediate-cancel branch (active
+/// query or plan overlay) never touched `escape_idle_exit_armed_at`, so a
+/// LATER, logically unrelated idle Escape press within the original arm's
+/// window would read the stale arm as its own confirming second press and
+/// exit Finch — for a press that had no warning shown for it specifically.
+#[tokio::test]
+async fn test_escape_active_query_cancel_clears_a_stale_idle_arm() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+
+            // First idle Escape press: arms the idle-exit confirm state.
+            event_loop.handle_escape_cancel_request().await;
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_some(),
+                "the first idle Escape press must arm"
+            );
+
+            // A query starts and an Escape press cancels it — unrelated to
+            // the idle-exit gesture above, but reachable within the same
+            // arm window in real usage.
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_id);
+            event_loop.handle_escape_cancel_request().await;
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_none(),
+                "cancelling an active query must clear any stale idle-exit \
+                 arm left over from an earlier, unrelated idle press"
+            );
+            *event_loop.active_query_id.write().await = None;
+            while event_loop.event_rx.try_recv().is_ok() {}
+
+            // A later idle Escape press, still inside the ORIGINAL arm's
+            // window, must be treated as a fresh first press (arm again, do
+            // not exit) rather than confirming the stale arm.
+            event_loop.handle_escape_cancel_request().await;
+            let mut found_cancel = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::CancelQuery) {
+                    found_cancel = true;
+                }
+            }
+            assert!(
+                !found_cancel,
+                "a later idle Escape press must not silently exit Finch by \
+                 confirming a stale arm left over from an unrelated \
+                 intervening query cancel"
+            );
+            assert!(
+                event_loop.escape_idle_exit_armed_at.is_some(),
+                "the later idle press must (re)arm instead of exiting"
+            );
+        })
+        .await;
+}
+
+/// #1311 code-review regression: Ctrl+C's and Escape's idle-exit warnings
+/// share one status-line slot. Before this fix, each tracked its own
+/// independent `bool`, so one key's arm expiring called
+/// `clear_operation_status()` unconditionally and blanked the *other* key's
+/// still-armed, still-valid warning off the status line with no code path
+/// left to redraw it — meaning a following press of that still-armed key
+/// could exit Finch with no warning currently visible.
+#[tokio::test]
+async fn test_ctrl_c_and_escape_idle_hints_do_not_clobber_each_other() {
+    use crate::cli::tui::TuiStatusPort;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Normal;
+
+            // Escape arms and shows its warning first.
+            event_loop.handle_escape_cancel_request().await;
+            event_loop.sync_escape_exit_hint().await;
+            assert!(
+                event_loop
+                    .status_bar
+                    .status_without_session()
+                    .contains("Esc again"),
+                "escape's warning must show first"
+            );
+
+            // Ctrl+C arms too and takes over the shared slot's wording —
+            // an accepted cosmetic overlap, not the bug under test.
+            event_loop.sync_ctrl_c_exit_hint(true).await;
+            assert!(
+                event_loop
+                    .status_bar
+                    .status_without_session()
+                    .contains("Ctrl+C again"),
+                "ctrl+c's warning may take over the wording while both keys \
+                 are armed at once"
+            );
+
+            // Escape's own arm now expires with no confirming press. This
+            // must NOT blank Ctrl+C's still-armed, still-valid warning.
+            let armed_at = event_loop
+                .escape_idle_exit_armed_at
+                .expect("escape armed above");
+            event_loop.escape_idle_exit_armed_at = Some(
+                armed_at - super::ESCAPE_IDLE_EXIT_WINDOW - std::time::Duration::from_millis(1),
+            );
+            event_loop.sync_escape_exit_hint().await;
+
+            let status = event_loop.status_bar.status_without_session();
+            assert!(
+                status.contains("exit Finch"),
+                "Ctrl+C's still-armed warning must remain visible after \
+                 Escape's own, unrelated arm expires; status={status:?}"
+            );
+        })
+        .await;
+}
+
 /// AutoAccept does not inherit Planning's write restriction. The executor
 /// still runs write; the skipped dialog is the only change.
 #[tokio::test]
