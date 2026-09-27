@@ -7,13 +7,64 @@ modules, including `memory_status`, are private.
 
 ## Dependencies and extension rules
 
-- This crate owns the SQLite schema and hydration, the hashed-n-gram fallback embedding
-  (`HashedNgramEmbedding`, `src/embeddings.rs` — feature-hashed, weighted word/character-n-gram
-  bag, not TF-IDF: it has no corpus-level document-frequency statistic), and opaque `ProgramIndexRecord`
-  rows. The `RoutingTree` mechanism itself lives in `crates/finch-routing-tree` — a dependency-free
+- This crate owns the SQLite schema and hydration, the hashed fallback embedding
+  (`HashedNgramEmbedding`, `src/embeddings.rs`), and opaque `ProgramIndexRecord` rows. The
+  `RoutingTree` mechanism itself lives in `crates/finch-routing-tree` — a dependency-free
   foundational crate this crate depends on (its only production dependency on another Finch crate;
   the tree depends on nothing Finch-side, so no cycle). Callers inject an `EmbeddingEngine`;
   `src/models/neural_embedding.rs` owns neural model loading.
+- `HashedNgramEmbedding` is now REAL corpus-wide TF-IDF, not a proxy — a reversal of the
+  `TfIdfEmbedding` → `HashedNgramEmbedding` rename's own premise (that rename existed specifically
+  because the old length-based weight proxy was NOT real TF-IDF). A measured ablation on 1475 real
+  (query, answer) pairs pulled from real session transcripts drove three changes together: real
+  corpus-wide TF-IDF weighting (`tf(word, doc) * idf(word)`, smoothed
+  `idf = ln((N - df + 0.5) / (df + 0.5) + 1.0)`) replacing the old `(word.len() + 1).ln()` proxy
+  scored 30.2% exact-match@1 for unhashed sparse TF-IDF vs. 10.8% for the old proxy-weighted,
+  unsigned-hash, n-gram fallback (roughly half the gap); switching the FNV-64 hash from unsigned to
+  signed (sign from bit 63 of the SAME hash used for bucket placement, not a second hash) and
+  dropping character bigram/trigram hashing entirely (whole words only, into the existing 4 slots —
+  n-grams dilute the fixed 2048-dim space more than they help once real IDF is in place) recovered
+  most of the rest, landing the shipped, hashed, fixed-2048-dim representation at 23.4%. See
+  `test_real_tf_idf_and_signed_hash_beat_length_proxy_weighting_on_real_qa_pairs` in
+  `src/embeddings.rs` for a live, deterministic before/after regression against a smaller real
+  fixture (24/36 vs. 19/36 exact-match@1 measured there).
+  `EmbeddingEngine::observe_document(&self, text: &str) -> Result<()>` (default no-op) is the
+  insert-vs-query distinction: `HashedNgramEmbedding` maintains a running document count `N` and
+  per-term document frequency `df` (`RwLock<CorpusStats>`, incremented one document at a time, no
+  bulk corpus or rescans needed) that only `observe_document` mutates; `embed()` stays read-only and
+  safe to call at query time arbitrarily often. `project_stored_conversation_inner` (`src/lib.rs`)
+  is the one production insertion call site and calls `observe_document(&key_content)` immediately
+  before `embed(&key_content)` for the same text; every other `embed()` call site
+  (`query_with_sources`, `conversation_summary`) is query/read-time-only and must never call
+  `observe_document` — doing so would corrupt corpus statistics on every retrieval. Disclosed,
+  measured, and NOT a defect: a young corpus's idf is noisier than a mature one's (~7 points of
+  exact-match@1 in the same ablation), and a query term never observed in the corpus gets the
+  maximum idf weight, which can swamp a real but weaker signal from a term the query DOES share with
+  a very small corpus (`test_insert_and_query` in `tests/memory_integration_test.rs` was rebased
+  onto in-vocabulary query wording for exactly this reason). There is deliberately no
+  minimum-corpus-size gate before real IDF is used. `NeuralEmbeddingEngine`
+  (`src/models/neural_embedding.rs`) has no corpus-wide statistic to track and relies on the
+  trait's no-op default rather than implementing anything for it.
+- Same root cause, a different downstream symptom: because an embedding is a snapshot of `N`/`df`
+  frozen at THAT point's insertion time, byte-IDENTICAL text inserted at two different corpus
+  maturities no longer necessarily embeds identically, even though nothing about the text changed —
+  growing the corpus in between shifts the RELATIVE idf weight across that text's own words (a term
+  shared with every other document so far trends toward 0 as `df` tracks `N`; a term unique to that
+  one repeated document trends upward), rotating the vector's direction. This can push two
+  occurrences of the exact same text outside `RoutingMemTree::retrieve`'s `NEAR_TIE_EPSILON`, so the
+  occurrence-chain tie-break above never runs for them and raw cosine order picks whichever copy was
+  embedded closer in corpus-time to the query — not necessarily the more informative one.
+  `src/cli/repl_event/query_processor.rs`'s
+  `test_memory_re_spliced_after_falling_out_of_the_active_window` hit exactly this: its turn 1 asks
+  the SAME question already seeded as a memory, which (correctly) re-indexes that literal text as a
+  brand-new point; turn 2 used to re-query with that identical text too, which after this fix
+  reliably out-scored the original seed occurrence outright (no tie to break) and surfaced turn 1's
+  own paired reply ("ack", too short to classify, so it has no occurrence link and
+  `counterpart_turn` fell back to nearest-timestamp) instead of the substantive seed answer. Rebased
+  turn 2 onto a paraphrase built from vocabulary unique to the seed answer ("Employee vault Finch
+  signing item") so it has no competing fresh duplicate to lose to, while still exercising the same
+  invariant (a memory that fell out of the active window is recalled and re-spliced). Disclosed, not
+  a defect, and not something to "fix" by tuning `NEAR_TIE_EPSILON` or gating on corpus size.
 - The root [`src/program_registry.rs`](../../src/program_registry.rs) maps program definitions to
   memory's opaque rows and owns canonical authored source files and VM manifests. Brain event
   journals belong to `finch-brain`, not this crate.

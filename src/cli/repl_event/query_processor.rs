@@ -9128,11 +9128,40 @@ mod tests {
     /// splice mechanism need no separate cap/staleness machinery: falling
     /// out of the window and coming back is handled by the same check that
     /// decides "worth splicing" in the first place.
+    ///
+    /// Turn 2 re-queries with `requery_text`, a paraphrase that leans on the
+    /// SEED ANSWER's own vocabulary ("Employee vault Finch signing item"),
+    /// rather than literally repeating turn 1's exact question text.
+    /// `HashedNgramEmbedding` now weights by real corpus-wide TF-IDF, and its
+    /// embeddings are frozen at insertion time under whatever `N`/`df` the
+    /// corpus had THEN: turn 1's own live turn re-inserts the identical
+    /// question text into the corpus as a new point (this is normal --
+    /// every real turn gets indexed), so a literal turn-2 requery of that
+    /// same text now scores a clean, non-tied win against that FRESH
+    /// duplicate (embedded under nearly the same live corpus stats as the
+    /// query) over the ORIGINAL seed occurrence (embedded much earlier,
+    /// under different stats) -- outside `NEAR_TIE_EPSILON`, so the
+    /// occurrence-chain tie-break that used to disambiguate this exact
+    /// scenario (see `RoutingMemTree::retrieve`'s doc) never runs, and the
+    /// fresh duplicate's own paired reply ("ack", too short to classify, so
+    /// it has no occurrence link and `counterpart_turn` falls back to
+    /// nearest-timestamp) wins instead of the substantive seed answer. This
+    /// is the disclosed consequence of frozen-at-insert-time real TF-IDF
+    /// (`HashedNgramEmbedding`'s doc, `crates/finch-memory/src/embeddings.rs`)
+    /// applied to byte-identical repeated text, not a defect: paraphrasing
+    /// turn 2's requery around vocabulary unique to the seed answer
+    /// ("employee", "vault", "finch", "signing", "item" appear nowhere else
+    /// in this test's corpus, so there is no competing fresh duplicate to
+    /// out-rank it) exercises the exact same production invariant --a
+    /// memory that fell out of the active window is recalled and re-spliced
+    /// -- without the confound of the query ALSO being the literal text of
+    /// something the test's own turn 1 just re-inserted.
     #[tokio::test]
     async fn test_memory_re_spliced_after_falling_out_of_the_active_window() {
         let recorder = Arc::new(RecordingTurnGenerator::default());
         let (memory, _memory_db) = memory_system_with_paired_seed_for_test("staging").await;
         let query_text = "Where is the deploy key for the staging environment?";
+        let requery_text = "Employee vault Finch signing item";
         let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
         let inert = crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert;
         let max_verbatim = 4;
@@ -9181,7 +9210,7 @@ mod tests {
 
         let turn2 = spawn_turn_with_memory_and_window(
             Arc::clone(&conversation),
-            query_text,
+            requery_text,
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&memory),
             1,
