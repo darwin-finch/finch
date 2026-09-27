@@ -187,10 +187,13 @@ cannot leak into the caller.
 
 Use `! pure` to assert purity or `! infer` to accept the transitively inferred capability set in
 the current frontend. A false purity
-assertion rejects the entire submission and does not modify the dictionary. Declared-pure definitions are predeclared as a group, so they may be self- or
-mutually-recursive in one submission; `! infer` definitions remain sequential until their inferred
-effects can be represented in a forward signature. Typed definitions are persistent and immediately
-callable from Finch Lisp.
+assertion rejects the entire submission and does not modify the dictionary. Every definition's name
+is predeclared as a group before any body compiles, so both `! pure` and `! infer` definitions may
+be self- or mutually-recursive in one submission. A declared-pure signature's effects are fixed at
+empty immediately; an `! infer` signature's effects are not known until its body compiles, and one
+`! infer` definition's effects can depend on another's under mutual recursion, so the compiler
+reaches a fixpoint over the whole submission's definitions before compiling the executable body that
+follows them. Typed definitions are persistent and immediately callable from Finch Lisp.
 
 Put a public doc comment immediately before a typed definition when it should be discoverable from
 the shared VM without reparsing source:
