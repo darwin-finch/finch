@@ -673,8 +673,8 @@ fn test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one() {
 /// returned must not be able to skew what other candidates are judged against.
 #[test]
 fn test_random_baseline_mean_excludes_discard_content() {
-    let (_dir, path) = open_schema_db();
-    let conn = Connection::open(&path).expect("open");
+    // No db connection needed: `insert_with_effect` and `random_baseline_mean` are both
+    // pure in-memory `RoutingTree` operations, unlike `retrieve`'s occurrence-chain tie-break.
     let mut tree = RoutingMemTree::new_with_dim(DIM);
 
     let query: Vec<f32> = {
@@ -710,5 +710,56 @@ fn test_random_baseline_mean_excludes_discard_content() {
          ((0.2 + 0.3) / 2 = {expected}), got {baseline} -- a value near \
          (0.2 + 0.3 + 0.99) / 3 = {} would mean the Discard point leaked into the sample",
         (0.2 + 0.3 + 0.99) / 3.0
+    );
+}
+
+/// `retrieve(top_k=1)` must return the SAME single candidate no matter what
+/// `relative_margin_cutoff` is: `results` is sorted descending and `filter_by_relative_margin`'s
+/// `retain` never reorders, so the pool's own top score (which always clears its own floor by
+/// construction) is always still first -- and the only survivor -- after `truncate(1)`, whether
+/// or not the margin filter ran at all. This is the invariant `retrieve`'s `top_k > 1` guard
+/// relies on to skip the (otherwise wasted) `O(corpus size)` random-baseline sample for every
+/// `top_k=1` caller (`conversation_summary`'s per-window centroid queries).
+#[test]
+fn test_retrieve_top_k_one_is_invariant_to_relative_margin_cutoff() {
+    let (_dir, path) = open_schema_db();
+    let conn = Connection::open(&path).expect("open");
+    let mut tree = RoutingMemTree::new_with_dim(DIM);
+
+    let query: Vec<f32> = {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = 1.0;
+        v
+    };
+    let with_cosine = |a: f32| -> Vec<f32> {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = a;
+        v[1] = (1.0 - a * a).sqrt();
+        v
+    };
+    let top = tree.insert_with_effect("true answer".to_string(), with_cosine(0.99), 1, 100);
+    tree.insert_with_effect("weaker match".to_string(), with_cosine(0.4), 1, 101);
+    tree.insert_with_effect("weakest match".to_string(), with_cosine(0.1), 1, 102);
+
+    // An aggressive cutoff (0.0, floor == top_score: only exact ties with the top survive) and a
+    // fully permissive one (1000.0) must both return the exact same single candidate.
+    let aggressive = tree
+        .retrieve(&conn, &query, 1, 0.0)
+        .expect("retrieve must succeed at cutoff=0.0");
+    let permissive = tree
+        .retrieve(&conn, &query, 1, CUTOFF_DISABLED)
+        .expect("retrieve must succeed at cutoff=CUTOFF_DISABLED");
+
+    assert_eq!(
+        aggressive, permissive,
+        "retrieve(top_k=1) must be invariant to relative_margin_cutoff -- got {aggressive:?} at \
+         cutoff=0.0 vs {permissive:?} at cutoff={CUTOFF_DISABLED}"
+    );
+    assert_eq!(
+        aggressive.first().map(|(pid, _, _)| *pid),
+        Some(top.point_id),
+        "the single returned candidate must be the true top-scoring point (point_id={}), got \
+         {aggressive:?}",
+        top.point_id
     );
 }

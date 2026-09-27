@@ -201,17 +201,25 @@ modules, including `memory_status`, are private.
   mean up. Computed fresh per query rather than tracked incrementally like the Welford-style
   running statistics #1323/#1324 describe — disclosed as a reasonable later upgrade, not required
   for correctness today, and neither of those mechanisms exists in this crate yet to share an
-  implementation with. Applied only when a query returns more than one candidate (a single
-  candidate is trivially its own top score and always survives) and skipped entirely when the
-  sampled baseline is not strictly below the top score (a degenerate case — most commonly a corpus
-  too small for the sample to differ meaningfully from the candidates it judges — where dropping
-  everything, including the top candidate, would be strictly worse than dropping nothing). This is
-  additive to, and applied before, the fixed `min_relevance_score`/`min_turn_relevance_score`
-  floors in `query_with_sources`, which are unchanged. `test_relative_margin_floor_matches_hand_worked_formula`,
+  implementation with. Applied only when `top_k > 1` (not merely when the pre-truncation pool has
+  more than one candidate): `results` is sorted descending and `filter_by_relative_margin`'s
+  `retain` never reorders, so for `top_k <= 1` the pool's own top score — which always clears its
+  own floor by construction — is always still first, and the only element left, after
+  `results.truncate(top_k)` regardless of whether filtering ran at all; sampling the baseline (an
+  `O(corpus size)` scan) for a truncation it cannot affect was pure waste, paid on every
+  `conversation_summary` per-window centroid query (`top_k=1`) as the corpus grew —
+  `test_retrieve_top_k_one_is_invariant_to_relative_margin_cutoff` pins the invariant the skip
+  relies on. Also skipped entirely when the sampled baseline is not strictly below the top score
+  (a degenerate case — most commonly a corpus too small for the sample to differ meaningfully from
+  the candidates it judges — where dropping everything, including the top candidate, would be
+  strictly worse than dropping nothing). This is additive to, and applied before, the fixed
+  `min_relevance_score`/`min_turn_relevance_score` floors in `query_with_sources`, which are
+  unchanged. `test_relative_margin_floor_matches_hand_worked_formula`,
   `test_relative_margin_floor_cutoff_endpoints`,
   `test_filter_by_relative_margin_drops_below_floor_keeps_at_or_above`,
   `test_filter_by_relative_margin_is_a_no_op_when_baseline_is_not_below_top_score`,
-  `test_random_baseline_mean_excludes_discard_content`, and the production-boundary
+  `test_random_baseline_mean_excludes_discard_content`,
+  `test_retrieve_top_k_one_is_invariant_to_relative_margin_cutoff`, and the production-boundary
   `test_retrieve_drops_weak_candidate_and_keeps_borderline_real_one` (three real candidates plus
   six orthogonal filler points through the real `retrieve()` path) all live in
   `src/routing_memory/tests.rs`.

@@ -432,9 +432,13 @@ impl RoutingMemTree {
         self.break_near_ties(conn, query_embedding, &mut results)
             .context("retrieve: neighbor-context tie-break")?;
 
-        // #1327: a single candidate IS the result set's own top score, so it always survives the
-        // margin filter trivially -- skip sampling the baseline for nothing.
-        if results.len() > 1 {
+        // #1327: filtering can never change a `top_k <= 1` result. `results` is sorted
+        // descending and `filter_by_relative_margin`'s `retain` never reorders, so whichever
+        // candidate is already first (the pool's own top score, which always clears its own
+        // floor by construction) is still first -- and still the ONLY element left -- after
+        // `results.truncate(top_k)` below, whether or not filtering ran. Skip sampling the
+        // baseline (an O(corpus size) scan) for a result truncation cannot let it affect.
+        if top_k > 1 && results.len() > 1 {
             if let Some(baseline) = self.random_baseline_mean(query_embedding) {
                 filter_by_relative_margin(&mut results, baseline, relative_margin_cutoff);
             }
