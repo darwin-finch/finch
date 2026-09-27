@@ -111,7 +111,24 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   call, replies to the bridge's still-open connection, and resumes reading the same child's stdout
   — matching the same "observe the whole stream, batch-execute, re-invoke with the result appended"
   round-trip every other provider already goes through, with no changes needed to `ToolLoop`,
-  `ToolExecutionCoordinator`, or `query_processor.rs`. This is why `ClaudeGenerator::needs_prompt_injection`
+  `ToolExecutionCoordinator`, or `query_processor.rs`.
+  **Disclosed limitation: multiple tools requested in one turn are handled sequentially, one
+  Finch-level round per tool, and this is not verified against the real CLI (issue #1351).**
+  `pump_until_settled`/`drive` accept and pause on exactly one bridge connection at a time. The
+  bridge's own JSON-RPC loop is already single-threaded and sequential (`claude_cli_bridge.rs`'s
+  `run()` fully awaits one `tools/call`'s round trip, including the real interactive approval wait,
+  before reading its next stdin line — true before and after #1341), so this transport never
+  deadlocks or cross-talks between two tool calls in the same turn:
+  `mcp-two-tool-calls`'s test fixture (`claude_cli.rs`) proves the *sequential* case — a second
+  tool requested only after the first one's real result returns — completes correctly across two
+  pause/resume cycles. What is not reproduced or verified is whether the real `claude` CLI's own
+  MCP client ever pipelines two `tools/call` requests before reading the first reply (true
+  concurrent dispatch for a "parallel" tool-calling turn); if it does, this transport still answers
+  each sequentially but records them as separate `[assistant: ToolUse]`/`[user: ToolResult]` round
+  pairs in Finch's own `ConversationHistory`, rather than one combined round the way a native
+  HTTP-based provider produces for the same case. No real-CLI login was available to verify this
+  directly; issue #1351 tracks confirming the real behavior and revisiting this note.
+  This is why `ClaudeGenerator::needs_prompt_injection`
   (`src/generators/claude.rs`) now bypasses its #1303 prompt-injection fold for this provider —
   `supports_tools()` derives straight from `capabilities().tools`, so the two decisions cannot drift
   apart. `TurnRecord::absorb_line` still observes (counts/logs) any `tool_use` block in the CLI's

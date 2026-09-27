@@ -724,8 +724,26 @@ mod tests {
     /// a canned assistant turn with a real, structured `tool_use` content
     /// block for the `read` tool, in the wire shape measured against the
     /// real CLI 2.1.283 once it is driven through Finch's own MCP bridge
-    /// (issue #1309) rather than the pre-#1309 prompt-injected `<tool_use>`
-    /// XML shape.
+    /// (issue #1309), followed directly by the CLI's own final-answer
+    /// message — matching exactly what `absorb_line` in
+    /// `finch_providers::claude_cli` actually parses from real stdout
+    /// (`Some("assistant") | Some("result")`; a synthetic `"user"`/
+    /// `tool_result` stdout line, present in an earlier version of this
+    /// fixture, is not a shape the real CLI is known to emit to its own
+    /// `--output-format stream-json` and `absorb_line`'s match has no arm
+    /// for `"user"` at all — it fell through to the no-op catch-all, so
+    /// removing it changes nothing this test observes). Real tool-call
+    /// *execution* is no longer the bridge's own job (issue #1341): a real
+    /// call is forwarded over a socket to the frontend's interactive
+    /// `ToolLoop`, tested in `finch_providers::claude_cli`'s own module and
+    /// in `tests/claude_cli_bridge_subprocess.rs`. This fixture never drives
+    /// that real socket path at all (there is no `--mcp-config` parsing
+    /// here) — its `tool_use` block exists solely so this generator-level
+    /// test can confirm `ClaudeGenerator` treats the CLI's own structured
+    /// `tool_use` content as inert history, never re-parsing it as pending
+    /// `<tool_use>` markup the caller's `ToolLoop` would try to execute a
+    /// second time (the concern issue #1303's fold existed to prevent for
+    /// non-native-tool-calling providers).
     #[cfg(unix)]
     fn install_fake_claude_emitting_real_tool_use(dir: &std::path::Path) -> PathBuf {
         let bin = dir.join("fake-claude-real-tool-use");
@@ -740,7 +758,6 @@ cat >/dev/null
 printf '%s\n' \
   '{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}' \
   '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_tool_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x.txt"}}]}}' \
-  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}]}}' \
   '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{"type":"text","text":"The file says: file contents"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
   '{"type":"result","subtype":"success","is_error":false,"result":"The file says: file contents","stop_reason":"end_turn"}'
 "#;
@@ -758,10 +775,17 @@ printf '%s\n' \
     /// (`ProviderRequest::tools` attached) instead of `ClaudeGenerator`
     /// folding it into the prompt as issue #1303 required for the old
     /// `Unsupported` declaration -- and the CLI's own real, structured
-    /// `tool_use` block (already executed for real by Finch's MCP bridge by
-    /// the time it reaches this transport, per that crate's own doc comment)
-    /// must surface as plain final answer text, not `<tool_use>` markup
-    /// requiring a second, generator-side parse.
+    /// `tool_use` block must surface as plain final answer text, not
+    /// `<tool_use>` markup requiring a second, generator-side parse. This is
+    /// a generator-level concern only: how a real `tool_use` block actually
+    /// gets resolved (forwarded over a socket to the frontend's real,
+    /// interactive `ToolLoop`, issue #1341) is this fixture's job to *not*
+    /// exercise -- it never opens a real bridge socket at all, and that real
+    /// resolution path has its own tests in `finch_providers::claude_cli` and
+    /// `tests/claude_cli_bridge_subprocess.rs`. `ClaudeGenerator` must not
+    /// care how the round resolved; it must simply never re-surface an
+    /// already-structured `tool_use` block as pending `<tool_use>` markup the
+    /// caller's `ToolLoop` would try to execute a second time.
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_cli_backend_sends_tools_natively_and_never_reparses_tool_use_markup() {
@@ -788,15 +812,18 @@ printf '%s\n' \
 
         assert_eq!(
             response.text, "The file says: file contents",
-            "the real tool_use round trip happens inside the CLI/MCP-bridge turn itself; the \
-             generator must simply surface the CLI's own final answer text: {:?}",
+            "whatever mechanism actually resolved the tool_use round (a real interactive \
+             ToolLoop execution in production, issue #1341 -- this fixture never opens a real \
+             bridge socket, so nothing here exercises that resolution itself), the generator \
+             must simply surface the CLI's own final answer text: {:?}",
             response
         );
         assert!(
             response.tool_uses.is_empty(),
-            "the tool call was already executed for real by Finch's MCP bridge process before \
-             this response was assembled -- ClaudeGenerator must not re-parse or re-surface it \
-             as a pending ToolUse the caller's ToolLoop would execute a second time: {:?}",
+            "ClaudeGenerator must not re-parse or re-surface an already-structured tool_use \
+             block from the CLI's own stdout as a pending ToolUse the caller's ToolLoop would \
+             try to execute a second time, regardless of how that call was actually resolved: \
+             {:?}",
             response.tool_uses
         );
         assert!(

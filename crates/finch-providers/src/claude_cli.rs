@@ -1440,7 +1440,13 @@ mod tests {
     /// binary also answers a later invocation carrying no `--mcp-config`
     /// (i.e. `execute_turn`'s synthetic typed-ahead follow-up round, issue
     /// #1341) by echoing back the text it actually received on stdin,
-    /// instead of repeating the tool_use dance.
+    /// instead of repeating the tool_use dance. `mcp-two-tool-calls` (issue
+    /// #1341, independent review) is the same pause/resume dance run twice
+    /// on one process: it asks for a second tool only after the first one's
+    /// real result comes back over the same still-live socket/listener --
+    /// the *sequential* multi-tool-call case. See issue #1351 for what this
+    /// deliberately does not cover (whether the real CLI ever pipelines two
+    /// `tools/call` requests before reading the first reply).
     fn install_fake_claude(home: &TempDir, behavior: &str) -> PathBuf {
         let spool = spool(home);
         let bin = home.path().join("fake-claude");
@@ -1512,6 +1518,35 @@ if [ "$MODE" = "mcp-tool-call" ]; then
   done
   echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"tool call handled"}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"tool call handled","stop_reason":"end_turn"}}'
+  exit 0
+fi
+if [ "$MODE" = "mcp-two-tool-calls" ]; then
+  # Issue #1341's independent review: does this transport handle a turn
+  # where the model asks for more than one tool? This mode reproduces the
+  # sequential case -- one `claude` process asks for a second tool only
+  # after the first one's real result comes back, over the *same* still-live
+  # bridge socket/listener, spanning two separate pause/resume cycles.
+  # (Whether the real CLI ever pipelines two `tools/call` requests to its
+  # MCP server before reading the first reply -- true concurrent dispatch --
+  # is NOT reproduced here and is not verified against the real CLI; see the
+  # disclosed limitation in this crate's AGENTS.md and issue #1351.)
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
+  printf '%s' "$SOCK" > "$SPOOL/socket_path"
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_tool1","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"n":"1"}}}}]}}}}'
+  tries=0
+  while [ ! -f "$SPOOL/proceed1" ] && [ "$tries" -lt 500 ]; do
+    sleep 0.02
+    tries=$((tries + 1))
+  done
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_tool2","role":"assistant","content":[{{"type":"tool_use","id":"toolu_2","name":"mcp__finch__probe_tool","input":{{"n":"2"}}}}]}}}}'
+  tries=0
+  while [ ! -f "$SPOOL/proceed2" ] && [ "$tries" -lt 500 ]; do
+    sleep 0.02
+    tries=$((tries + 1))
+  done
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"both tools handled"}}]}}}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"both tools handled","stop_reason":"end_turn"}}'
   exit 0
 fi
 if [ "$MODE" = "tool-preamble" ]; then
@@ -2702,6 +2737,171 @@ printf '%s\n' \
             complete.contains("please also check the other file"),
             "typed-ahead text queued during the parked tool call must be delivered and merged \
              into the completed content, not lost: {complete:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sequential_tool_calls_in_one_turn_each_get_their_own_pause_resume_cycle() {
+        // Independent-review follow-up for issue #1341 (tracked further in
+        // issue #1351): real Claude models commonly request more than one
+        // tool in a turn. This proves the *sequential* case -- the model
+        // asks for a second tool only once the first one's real result comes
+        // back -- works correctly across two separate pause/resume cycles on
+        // the *same* underlying `claude` process and its *same* still-live
+        // bridge socket/listener: no deadlock, no cross-talk between the two
+        // calls' results, and the turn still completes normally afterward.
+        // Whether the real CLI ever pipelines two `tools/call` requests
+        // before reading the first reply (true concurrent dispatch) is not
+        // reproduced here -- see issue #1351 and this crate's AGENTS.md.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-two-tool-calls");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+        let mut rx = provider
+            .send_message_stream(&request)
+            .await
+            .expect("streaming must be supported");
+
+        // --- Tool call #1 ---
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let socket_path = socket_path_text.trim().to_string();
+        let mut bridge_stream_1 = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to the live bridge socket for the first tool call");
+        let request_line_1 = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"n": "1"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream_1
+            .write_all(request_line_1.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id_1, call_name_1, call_input_1) = match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete for the first tool call, got {other:?}"),
+        };
+        assert_eq!(call_input_1, json!({"n": "1"}));
+        assert!(
+            rx.recv().await.is_none(),
+            "the stream must end right after the first tool call, before the second is ever \
+             requested"
+        );
+
+        let followup_1 = with_tool_result(
+            request.clone(),
+            &call_id_1,
+            &call_name_1,
+            call_input_1,
+            "result-1",
+            false,
+        );
+        let mut rx2 = provider
+            .send_message_stream(&followup_1)
+            .await
+            .expect("resuming after the first tool call must still return a stream");
+
+        let mut reader_1 = BufReader::new(&mut bridge_stream_1);
+        let mut reply_line_1 = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader_1.read_line(&mut reply_line_1),
+        )
+        .await
+        .expect("the resumed round must answer the first bridge connection")
+        .unwrap();
+        let reply_1: ClaudeCliBridgeToolResponse =
+            serde_json::from_str(reply_line_1.trim()).unwrap();
+        assert_eq!(
+            reply_1.content, "result-1",
+            "the first tool call's own real result must reach its own bridge connection"
+        );
+        std::fs::write(spool_dir.join("proceed1"), b"go").unwrap();
+
+        // --- Tool call #2, on the SAME process, over the SAME socket path ---
+        let mut bridge_stream_2 = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to the still-live bridge socket for the second tool call");
+        let request_line_2 = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"n": "2"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream_2
+            .write_all(request_line_2.as_bytes())
+            .await
+            .unwrap();
+
+        let (call_id_2, call_name_2, call_input_2) = match rx2.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete {
+                id, name, input, ..
+            } => (id, name, input),
+            other => panic!("expected ToolCallComplete for the second tool call, got {other:?}"),
+        };
+        assert_eq!(
+            call_input_2,
+            json!({"n": "2"}),
+            "the second tool call's own input must not be confused with the first's"
+        );
+        assert_ne!(
+            call_id_2, call_id_1,
+            "each tool call in the same turn must get its own distinct id"
+        );
+        assert!(rx2.recv().await.is_none());
+
+        let followup_2 = with_tool_result(
+            followup_1,
+            &call_id_2,
+            &call_name_2,
+            call_input_2,
+            "result-2",
+            false,
+        );
+        let mut rx3 = provider
+            .send_message_stream(&followup_2)
+            .await
+            .expect("resuming after the second tool call must still return a stream");
+
+        let mut reader_2 = BufReader::new(&mut bridge_stream_2);
+        let mut reply_line_2 = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader_2.read_line(&mut reply_line_2),
+        )
+        .await
+        .expect("the resumed round must answer the second bridge connection")
+        .unwrap();
+        let reply_2: ClaudeCliBridgeToolResponse =
+            serde_json::from_str(reply_line_2.trim()).unwrap();
+        assert_eq!(
+            reply_2.content, "result-2",
+            "the second tool call's own real result must reach its own bridge connection, not \
+             the first's"
+        );
+        std::fs::write(spool_dir.join("proceed2"), b"go").unwrap();
+
+        let mut complete = None;
+        while let Some(chunk) = rx3.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    complete = Some(text);
+                }
+                other => panic!("unexpected chunk on the final resumed stream: {other:?}"),
+            }
+        }
+        assert_eq!(
+            complete.as_deref(),
+            Some("both tools handled"),
+            "the same underlying claude process must run to completion after both sequential \
+             tool calls resolve, with no deadlock and no cross-talk between them"
         );
     }
 }
