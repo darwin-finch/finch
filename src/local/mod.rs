@@ -755,4 +755,169 @@ mod tests {
         );
         assert_eq!(response.text.trim(), "I'll read that file.");
     }
+
+    /// Live, real-model verification for #1312: with the actual `read` tool
+    /// definition and a system prompt carrying the real VM wire protocol
+    /// text (`vocabulary/BOOT.md`, the same text `inject_vm_manifest` puts
+    /// in front of every interactive turn), the configured local GGUF must
+    /// call `read` for an instruction that explicitly asks it to read a
+    /// file and report on it, rather than answering from an unverified
+    /// guess -- the failure #1312 reported live. `FINCH_TEST_QUERY` lets
+    /// this be re-run against several phrasings (#1312's own investigation
+    /// ask) without recompiling; unset, it defaults to the exact phrasing
+    /// reported live.
+    ///
+    /// This is the empirical check the #1312 fix decision required before
+    /// shipping a wording change to `ToolPromptFormatter`'s "Important
+    /// Rules": run this same test at two commits (before and after the
+    /// wording fix) across several query phrasings and compare tool-call
+    /// outcomes -- not a single anecdote, and not a claim that clearer
+    /// wording alone is assumed to help.
+    #[test]
+    #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
+    fn real_gguf_chat_calls_the_read_tool_instead_of_guessing_file_content() {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+        };
+        use crate::tools::ToolInputSchema;
+        use std::path::PathBuf;
+
+        let path =
+            PathBuf::from(std::env::var("FINCH_TEST_GGUF_CHAT").expect("set FINCH_TEST_GGUF_CHAT"));
+        let query = std::env::var("FINCH_TEST_QUERY")
+            .unwrap_or_else(|_| "read the file README.md and tell me its first line".to_string());
+        let family = match std::env::var("FINCH_TEST_MODEL_FAMILY").as_deref() {
+            Ok("Qwen2") => ModelFamily::Qwen2,
+            _ => ModelFamily::Gemma2,
+        };
+        let model = GeneratorModel::new(GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family,
+            size: ModelSize::Medium,
+            // Forced CPU: GPU (Metal) offload on this machine intermittently
+            // fails with an out-of-memory command-buffer error under
+            // concurrent load, unrelated to this test's actual subject
+            // (tool-call reliability). CPU is slower but deterministic.
+            target: ExecutionTarget::Cpu,
+            model_path: Some(path),
+        }))
+        .expect("load configured GGUF");
+        let name = model.name().to_string();
+        let shared = Arc::new(RwLock::new(model));
+        let mut local_generator = LocalGenerator::with_models(Some(shared));
+
+        // Real production shape: a system message carrying the active
+        // Brain's VM wire protocol boot capsule, the way
+        // `inject_vm_manifest` assembles it (`## Finch VM wire protocol`
+        // plus `VmManifest::prompt_block`'s own `BOOT_CAPSULE`-led text).
+        // The tool-definitions block is injected on top of this by
+        // `try_generate_from_pattern_with_tools` itself via the real,
+        // currently-checked-out `ToolPromptFormatter` -- that's the exact
+        // thing this test compares across commits.
+        let boot_capsule = finch_programs::BOOT_CAPSULE;
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: format!(
+                        "You are Shammah, a helpful coding assistant. Be concise and accurate.\n\n\
+                         ## Finch VM wire protocol\n{boot_capsule}\nEffects: session.emit, vm.read\n"
+                    ),
+                }],
+            },
+            Message::user(query.clone()),
+        ];
+        // A single-tool catalog is not representative of production: #1310
+        // measured 36 registered tools injected on every real local-model
+        // turn (compacted, but still real bulk, by #1315). Approximate that
+        // shape with a realistic-sized filler catalog around the real
+        // `read` tool, since the theorized failure mode (#1312) is the
+        // wording contradiction compounding with catalog bulk, not either
+        // alone -- a single-tool prompt under-tests both this fix and the
+        // regression it guards against.
+        fn filler_tool(name: &str, description: &str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema: ToolInputSchema::simple(vec![("input", "Tool-specific input")]),
+            }
+        }
+        let mut tools = vec![
+            filler_tool("write", "Write content to a new or existing file."),
+            filler_tool(
+                "edit",
+                "Make a targeted string replacement in an existing file.",
+            ),
+            filler_tool("bash", "Execute a shell command in the workspace."),
+            filler_tool("glob", "Find files matching a glob pattern."),
+            filler_tool("grep", "Search file contents with a regular expression."),
+            filler_tool("todo_write", "Update the session-local task checklist."),
+            filler_tool("todo_read", "Read the session-local task checklist."),
+            filler_tool("present_plan", "Present a plan to the user for approval."),
+            filler_tool("ask_user_question", "Ask the user a clarifying question."),
+            filler_tool("code_outline", "Summarize the structure of a source file."),
+            filler_tool(
+                "find_code",
+                "Search the workspace's code index by symbol or keyword.",
+            ),
+            filler_tool("patch", "Apply a multi-file unified diff to the workspace."),
+            filler_tool(
+                "propose",
+                "Propose a script for the user to review before running.",
+            ),
+            filler_tool(
+                "background_bash",
+                "Run a shell command as a background task.",
+            ),
+            filler_tool("background_poll", "Poll a background task for output."),
+            filler_tool("background_stop", "Stop a running background task."),
+            filler_tool("spawn_task", "Delegate a task to a subagent."),
+            filler_tool("submit_program", "Submit a Finch VM program for execution."),
+        ];
+        tools.push(ToolDefinition {
+            name: "read".to_string(),
+            description: "Read the contents of a file. Use offset and limit to read a specific \
+                range of lines (e.g., offset=100 limit=50 reads lines 100-149). Without them, \
+                reads the whole file up to 50,000 characters."
+                .to_string(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".to_string(),
+                properties: serde_json::json!({
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to read"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line number to start reading from (1-indexed, optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read (optional)"
+                    }
+                }),
+                required: vec!["file_path".to_string()],
+            },
+        });
+
+        let response = local_generator
+            .try_generate_from_pattern_with_tools(&messages, Some(tools))
+            .expect("real GGUF generation must not error")
+            .expect("neural backend is configured, so a response must be produced");
+
+        eprintln!(
+            "[#1312 live check] model={name:?} query={query:?} tool_uses={:?} text={:?}",
+            response.tool_uses, response.text
+        );
+
+        assert!(
+            !response.tool_uses.is_empty(),
+            "the configured local model must call `read` for an instruction that explicitly \
+             asks it to read a file, not answer from a guess -- got tool_uses=[] and \
+             text={:?}",
+            response.text
+        );
+        assert_eq!(response.tool_uses[0].name, "read");
+    }
 }
