@@ -134,12 +134,10 @@ impl EventLoop {
                     let local_identity = effective.identity_label();
                     let token = self.model_selection.begin_pending(target_index).await;
                     let active_name = self.model_selection.generator().await.name().to_string();
-                    if let Ok(mut tui) = self.tui_renderer.try_lock() {
-                        tui.set_model_identity(format!(
-                            "{active_name} · active while {} starts",
-                            entry.profile_name()
-                        ));
-                    }
+                    self.tui_renderer.lock().await.set_model_identity(format!(
+                        "{active_name} · active while {} starts",
+                        entry.profile_name()
+                    ));
                     let local_generator: Arc<dyn Generator> =
                         Arc::new(crate::generators::DaemonLocalGenerator::new(
                             Arc::clone(&client),
@@ -240,16 +238,25 @@ impl EventLoop {
                 }
             }
         }
-        self.project_model_identity();
+        self.project_model_identity().await;
         Ok(())
     }
 
-    fn project_model_identity(&self) {
+    /// Project the effective provider/model identity onto the bottom status
+    /// rule (`crates/finch-tui`'s `status_rule_line`). Always takes the
+    /// blocking lock rather than `try_lock`: this used to drop the update
+    /// silently whenever `spawn_input_task`'s own periodic
+    /// `tui_renderer.lock()` (`crates/finch-tui/src/async_input.rs`) held the
+    /// mutex at the exact moment this ran, most visibly at startup — nothing
+    /// else ever retries, so a single lost race left the divider a blank
+    /// line of dashes for the rest of the session (#1318). This runs only on
+    /// startup hydration and explicit `/provider`/`/model` commands, never
+    /// on a per-frame path, so a brief wait for the lock is not a
+    /// responsiveness concern.
+    async fn project_model_identity(&self) {
         if let Ok(effective) = self.effective_selection() {
             let identity = effective.identity_label();
-            if let Ok(mut tui) = self.tui_renderer.try_lock() {
-                tui.set_model_identity(identity);
-            }
+            self.tui_renderer.lock().await.set_model_identity(identity);
         }
     }
 
@@ -569,10 +576,10 @@ impl EventLoop {
                         self.output_manager.write_info(format!(
                             "⚠️  Provider is active for this process but could not be persisted on this Brain: {error}"
                         ));
-                        self.project_model_identity();
+                        self.project_model_identity().await;
                         return self.render_tui().await;
                     }
-                    self.project_model_identity();
+                    self.project_model_identity().await;
                     self.output_manager.write_info(format!(
                         "✓ Provider {} · {} (persisted on this Brain)",
                         entry.profile_name(),
@@ -715,10 +722,10 @@ impl EventLoop {
                         self.output_manager.write_info(format!(
                             "⚠️  Provider is active for this process but could not be persisted on this Brain: {error}"
                         ));
-                        self.project_model_identity();
+                        self.project_model_identity().await;
                         return self.render_tui().await;
                     }
-                    self.project_model_identity();
+                    self.project_model_identity().await;
                     self.output_manager.write_info(format!(
                         "✓ Provider {} · {} (persisted on this Brain)",
                         entry.profile_name(),

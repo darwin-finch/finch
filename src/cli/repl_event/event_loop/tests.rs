@@ -9095,6 +9095,110 @@ async fn hydrate_brain_selection_fails_closed_when_daemon_already_runs_a_differe
     );
 }
 
+/// #1318: on a fresh session, the bottom status rule (`status_rule_line` in
+/// `crates/finch-tui/src/lib.rs`) rendered as a blank line of dashes with no
+/// provider/model text — reproduced live, persisting through multiple
+/// completed turns. `EventLoop::project_model_identity` (called by
+/// `hydrate_brain_selection` -> `apply_effective_selection` on every
+/// startup) used `tui_renderer.try_lock()`; if `async_input::spawn_input_task`'s
+/// own periodic `tui_renderer.lock()` (`crates/finch-tui/src/async_input.rs`,
+/// polling `crossterm::event::poll` under the lock) held the mutex at that
+/// exact moment, the `try_lock` failed silently and nothing ever retried, so
+/// `model_identity` stayed empty for the rest of the session. This predates
+/// and is unrelated to #1313/#1314/#1315 (none of those PRs touch
+/// `model_identity`, `project_model_identity`, or `status_rule_line`); it is
+/// a pre-existing race from #988 that a live session happened to lose.
+///
+/// This test forces the contention deterministically — holding the renderer
+/// lock across the entire `hydrate_brain_selection` call, standing in for
+/// the input task's hold — so it fails reliably against the pre-fix
+/// `try_lock` and passes reliably once `project_model_identity` blocks on
+/// the lock instead. `status_rule_never_wraps_and_keeps_identity_on_the_left`
+/// in `crates/finch-tui/src/lib.rs` separately pins that a populated
+/// `model_identity` always renders as visible divider text; this test pins
+/// that real startup hydration actually populates it under contention.
+#[tokio::test]
+async fn hydrate_brain_selection_sets_model_identity_despite_renderer_lock_contention() {
+    tokio::task::LocalSet::new()
+        .run_until(
+            hydrate_brain_selection_sets_model_identity_despite_renderer_lock_contention_scenario(),
+        )
+        .await;
+}
+
+async fn hydrate_brain_selection_sets_model_identity_despite_renderer_lock_contention_scenario() {
+    let mut daemon = mockito::Server::new_async().await;
+    let selection_mock = daemon
+        .mock("GET", "/v1/brains/named/provider-switch-test/selection")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::json!({}).to_string())
+        .create_async()
+        .await;
+    let status_mock = daemon
+        .mock("GET", "/v1/status")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "generator": {
+                    "state": "ready",
+                    "model_size": "Gemma 2 9b (LlamaCpp; requested Auto)"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let gemma = provider_switch_local_entry(
+        crate::models::ModelFamily::Gemma2,
+        crate::models::ModelSize::Medium,
+    );
+    let expected_display_name = gemma.display_name().to_string();
+
+    let daemon_client = Arc::new(crate::client::DaemonClient::for_test(daemon.url()));
+    let mut event_loop =
+        super::EventLoop::new_provider_switch_test_runner(vec![gemma], 0, Some(daemon_client));
+    event_loop.output_manager.disable_stdout();
+
+    // Take the renderer lock up front (as an owned guard so it can move into
+    // a spawned task) and only release it well after `hydrate_brain_selection`
+    // should have finished, so every lock acquisition inside it — including
+    // the fixed `project_model_identity` — must wait rather than get lucky.
+    let guard = Arc::clone(&event_loop.tui_renderer).lock_owned().await;
+    let hold_task = tokio::task::spawn_local(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(guard);
+    });
+
+    event_loop
+        .hydrate_brain_selection()
+        .await
+        .expect("a fresh Brain with a matching ready local model must hydrate cleanly");
+
+    hold_task
+        .await
+        .expect("the simulated input-task lock hold must not panic");
+
+    selection_mock.assert_async().await;
+    status_mock.assert_async().await;
+
+    let identity = event_loop
+        .tui_renderer
+        .lock()
+        .await
+        .model_identity()
+        .to_string();
+    assert!(
+        identity.contains(&expected_display_name) && identity.contains("local"),
+        "the bottom status rule's provider/model identity must be set even when \
+         startup hydration had to wait out a contended renderer lock (#1318 — a lost \
+         try_lock race left this permanently blank); expected_display_name={expected_display_name:?}, \
+         identity={identity:?}"
+    );
+}
+
 #[tokio::test]
 async fn provider_list_shows_each_local_entry_its_own_model_not_the_bare_local_tag() {
     tokio::task::LocalSet::new()
