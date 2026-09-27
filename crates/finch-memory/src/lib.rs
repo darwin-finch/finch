@@ -1557,6 +1557,14 @@ impl MemorySystem {
         // written to the conversations table above for raw history.
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
+            // Insertion, not query: record this turn as one newly indexed
+            // document BEFORE computing its embedding, so its own terms
+            // count toward the corpus-wide statistics `embed` reads (real
+            // TF-IDF for `HashedNgramEmbedding`; a no-op default for engines
+            // with no such statistic, e.g. `NeuralEmbeddingEngine`). Every
+            // other `embed()` call site in this crate is query-time-only and
+            // must NOT call `observe_document` -- see `EmbeddingEngine`'s doc.
+            ctx.embedding_engine.observe_document(&key_content)?;
             let embedding = ctx.embedding_engine.embed(&key_content)?;
             // The occurrence chain's `prev`, resolved durably rather than from an in-memory
             // cache: a plain `SELECT` over `conversations`/`memory_sources`/`routing_occurrences`
@@ -6440,14 +6448,19 @@ mod tests {
          in the Employee vault under the Finch signing item, not in the repository.";
     const GATE_PROBE: &str = "The deploy key for the production environment lives \
          in the Employee vault";
-    /// A deliberately weak-but-not-sub-floor memory. The hashed-n-gram fallback
-    /// embeds character n-grams, so even a topic-disjoint English sentence
-    /// shares enough letter pairs to clear the 0.15 default floor -- which
-    /// is exactly the leak family the turn-level gate addresses. Weak
-    /// entries are measured, never assumed: tests set floors just above a
-    /// baseline-measured score instead of guessing one.
-    const GATE_WEAK_MEMORY: &str =
-        "Zebra herds migrate across vast savannah plains during seasonal rains.";
+    /// A deliberately weak-but-not-sub-floor memory. `HashedNgramEmbedding`
+    /// now weights whole words by real corpus-wide TF-IDF instead of hashing
+    /// character n-grams, so a topic-DISJOINT sentence (sharing no words with
+    /// [`GATE_SEED`]) scores ~0 and no longer clears the floor at all -- a
+    /// topic-disjoint text can no longer stand in for "weak". This text
+    /// instead shares a handful of [`GATE_SEED`]'s exact words ("vault",
+    /// "repository", "signing", "item", "the", "production") in a materially
+    /// different sentence, which is what a real weak-but-nonzero recall looks
+    /// like under real TF-IDF. Weak entries are measured, never assumed:
+    /// tests set floors just above a baseline-measured score instead of
+    /// guessing one.
+    const GATE_WEAK_MEMORY: &str = "The vault for the staging repository holds a \
+         different signing item than the production one.";
 
     /// Seed one fresh store with [`GATE_SEED`] and recall [`GATE_PROBE`],
     /// returning the recalled best weighted score and result count. The
@@ -6523,7 +6536,7 @@ mod tests {
         let base_results = baseline.query_with_sources(GATE_SEED, Some(5)).await?;
         let weak_score = base_results
             .iter()
-            .find(|r| r.text.contains("Zebra"))
+            .find(|r| r.text.contains("staging"))
             .map(|r| r.score)
             .with_context(|| {
                 format!(
@@ -6564,7 +6577,7 @@ mod tests {
              {results:?}"
         );
         assert!(
-            results.iter().all(|r| !r.text.contains("Zebra")),
+            results.iter().all(|r| !r.text.contains("staging")),
             "on an allowed turn the per-result floor must still drop the weak \
              entry (measured score {weak_score} vs floor {}); got texts {:?}",
             weak_score + 0.02,
