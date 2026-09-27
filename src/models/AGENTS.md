@@ -84,13 +84,62 @@ arithmetic without a real GGUF; the production-boundary proof against the real n
 (`#[ignore]`-gated on `FINCH_TEST_GGUF_CHAT`, since only the real llama.cpp binding can
 reproduce or disprove a native abort).
 
-**Known gap, not covered by the above:** `neural_embedding.rs`'s `NeuralEmbeddingEngine::embed()`
-builds one unchunked `LlamaBatch` sized to the full tokenized input and calls `decode()` once,
-with no `n_batch` set explicitly and no length cap before the call. It is the same crash shape
-this invariant fixes for chat generation, just not yet fixed here: embedding text long enough to
-exceed the context's resolved batch size can hit the same native abort. Fix it the same way
-(chunk `embed()`'s `decode()` call, or cap and reject an over-length input before it) before
-claiming this invariant covers the whole capsule instead of only `LlamaCppGenerator`.
+**A chunked `decode()` call that keeps failing transiently gets a bounded retry, not an
+unbounded one and not a bare surfaced error (#1317).** Post-#1295, a chunked prompt decode
+(cold, no cache hit, well under `n_batch` per chunk) intermittently failed with a native
+`Decode Error -3: unknown` from `context.decode()`, then succeeded on a bare retry of the
+identical query moments later. Investigation ruled out two Finch-side bugs before adding any
+mitigation: same-model `decode()` calls are serialized behind a single `RwLock`/`Mutex` chain
+from the daemon and CLI request paths down to `GeneratorModel` (no two decode() calls against
+one loaded chat model can ever run concurrently), and `llama_backend_init()` is idempotent and
+self-guarded at the native level (`ggml_backend_load_all()` only runs
+`if (!ggml_backend_reg_count())`), so this capsule's two independent per-module `LlamaBackend`
+`OnceCell`s (chat vs. embedding, see `neural_embedding.rs`'s own comment on that gap) do not
+corrupt shared state by both calling it. llama.cpp's own contract for `llama_decode`'s return
+value (`llama.h`) says any value other than `1` (`NoKvCacheSlot`) or `2` (aborted) rolls the
+context's memory state back to what it was before the call, making a bare retry of the same
+batch safe. `decode_with_retry` (`llama_cpp.rs`) retries up to `DECODE_RETRY_ATTEMPTS` (3)
+times, only for that safe-to-retry class (`is_retryable_decode_error`: a fatal `Unknown` code
+below `-1`) -- never `NoKvCacheSlot` (a deterministic capacity condition that would fail
+identically every retry) or `NTokensZero` (a Finch-side empty-batch bug no retry can fix).
+Proof: `test_is_retryable_decode_error_only_accepts_fatal_unknown_codes`,
+`test_decode_with_retry_recovers_from_a_transient_failure_within_budget`,
+`test_decode_with_retry_does_not_retry_a_non_retryable_error`, and
+`test_decode_with_retry_gives_up_after_exactly_max_attempts` cover the predicate and the bound's
+exact-once terminal state without a real GGUF; the intermittent native failure itself is not
+independently reproducible on demand, so there is no production-boundary test forcing the exact
+native fault -- this is a scoped, evidence-based mitigation for a confirmed-separate issue from
+#1292/#1296 above (#1317 is a clean `Result::Err`, both before and after #1295's chunking fix,
+never a `SIGABRT`), not a claim that the underlying native flakiness is fully understood or
+eliminated.
+
+**`NeuralEmbeddingEngine::embed()`'s prompt `decode()` call never exceeds the embedding
+context's batch size (#1296).** Same crash class as the invariant above, different loader,
+confirmed via a real crash backtrace (`ggml_abort` <- `llama_context::encode` <- `llama_decode`
+<- `NeuralEmbeddingEngine::embed` <- `MemorySystem::query_with_sources`) from embedding an
+ordinary ~700-word memory-recall query, and independently reproduced pre-fix in this repo
+(`signal: 6, SIGABRT`) against the real bge-small-en-v1.5 GGUF. The exact native assertion
+differs from `LlamaCppGenerator`'s: this bidirectional, CLS-pooling model's `decode()` call
+dispatches internally to llama.cpp's *encoder* path, which asserts
+`GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")`
+(`llama-context.cpp:1447`) -- gated on `n_ubatch`, not `n_batch` as the causal decoder path is.
+The fix is truncation (`truncate_to_batch`), not `LlamaCppGenerator`'s multi-call chunking: a
+`decode()` call commits its tokens' key/value state to the KV cache and freezes their hidden
+states, so an earlier chunk's tokens could never attend forward into a later chunk's content --
+fine for causal chat generation, which only ever needs the prompt's final token's logits, but
+incompatible with this model's bidirectional pooling, which requires every token to attend to
+every other token simultaneously (and which the encoder path's own `n_ubatch >= n_tokens`
+assertion rules out even attempting across multiple calls). `context_params()` now sets
+`n_batch`/`n_ubatch` explicitly to `EMBEDDING_N_BATCH` (512, matching bge-small-en-v1.5's own
+trained max sequence length, not an arbitrary Finch choice), and `embed()` truncates any
+tokenized input past that length before building the batch, logging a `tracing::warn!` when it
+does. Proof: `test_truncate_to_batch_caps_over_length_input`,
+`test_truncate_to_batch_leaves_short_input_unchanged`, and
+`test_context_params_sets_explicit_batch_sizes_matching_n_ctx` cover the cap and batch-size
+arithmetic without a real GGUF; the production-boundary proof against the real native `decode()`
+call is `test_real_gguf_embed_over_length_input_does_not_abort` (`#[ignore]`-gated on
+`FINCH_TEST_EMBEDDING_GGUF`), confirmed against this exact test to abort pre-fix and pass
+post-fix.
 
 **`ToolPromptFormatter::format_tools_for_prompt`'s injected block stays bounded, not a fixed
 multi-thousand-token tax (#1310).** Issue #1292/#1295 fixed the chunked-`decode()` crash above;

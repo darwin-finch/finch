@@ -8,11 +8,12 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
+use llama_cpp_2::{DecodeError, LlamaStateSeqFlags, SeqState};
 use once_cell::sync::OnceCell;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::super::generator_new::{TextGeneration, TokenCallback};
 
@@ -222,6 +223,88 @@ fn plan_prompt_decode_chunks(
         .collect()
 }
 
+/// Total attempts (including the first) a chunked `decode()` call gets
+/// before a retryable failure (see `is_retryable_decode_error`) is finally
+/// surfaced to the caller. Issue #1317 reported an intermittent native
+/// `Decode Error -3: unknown` from `context.decode()` in this exact chunked
+/// prompt-decode loop, on a cold (no cache hit) multi-chunk decode well
+/// under `n_batch` per chunk, that succeeded on a bare retry of the
+/// identical query moments later. Investigation ruled out two Finch-side
+/// bugs: same-model decode calls are serialized behind a single
+/// `RwLock`/`Mutex` chain from the daemon and CLI request paths down to
+/// `GeneratorModel` (no two decode() calls against one loaded chat model can
+/// run concurrently), and `llama_backend_init()` is idempotent and
+/// self-guarded at the native level (`ggml_backend_load_all()` only runs
+/// `if (!ggml_backend_reg_count())`), so this repo's two independent
+/// per-module `LlamaBackend` `OnceCell`s (chat vs. embedding) do not
+/// corrupt shared state by both calling it. The surviving, evidence-backed
+/// explanation is genuine transient native resource pressure (the reporter
+/// noted heavy concurrent build activity at the time), which a bounded
+/// retry can absorb.
+const DECODE_RETRY_ATTEMPTS: u32 = 3;
+
+/// Delay between a retried chunk decode attempt, chosen to be long enough to
+/// let a transient resource spike (e.g. concurrent build activity
+/// contending for compute/memory) clear without meaningfully slowing down
+/// the ordinary, overwhelmingly common non-retried case.
+const DECODE_RETRY_DELAY: Duration = Duration::from_millis(15);
+
+/// Whether a failed `decode()` call is safe and worth retrying with the
+/// exact same batch.
+///
+/// llama.cpp's own contract for `llama_decode`'s return value (`llama.h`)
+/// says a value other than `1` (`NoKvCacheSlot`) or `2` (aborted) rolls the
+/// context's memory state back to what it was before the call -- so retrying
+/// a fatal-but-rolled-back failure resubmits a batch the context has never
+/// partially applied, not a corrupt or duplicated one. `NoKvCacheSlot` is
+/// excluded because it is a deterministic capacity condition
+/// ("try reducing the size of the batch or increase the context"): retrying
+/// the identical batch against the identical context will fail identically
+/// every time, so retrying it would only delay a real, actionable error.
+/// `NTokensZero` is excluded because an empty batch is a Finch-side batch
+/// construction bug, not a native fault a retry could ever fix.
+fn is_retryable_decode_error(error: &DecodeError) -> bool {
+    matches!(error, DecodeError::Unknown(code) if *code < -1)
+}
+
+/// Retries `attempt` up to `max_attempts` times total (the first call plus
+/// up to `max_attempts - 1` retries), sleeping `delay` between attempts,
+/// while it keeps failing with a [`is_retryable_decode_error`] error. Any
+/// other error, or exhausting `max_attempts`, returns immediately. Generic
+/// over the decode call so the retry policy itself -- the attempt bound, the
+/// retryable-error predicate, and exact-once terminal state -- is unit
+/// testable (issue #1317) without a real llama.cpp context.
+fn decode_with_retry<F>(
+    max_attempts: u32,
+    delay: Duration,
+    mut attempt: F,
+) -> Result<(), DecodeError>
+where
+    F: FnMut() -> Result<(), DecodeError>,
+{
+    let max_attempts = max_attempts.max(1);
+    for attempt_number in 1..=max_attempts {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_decode_error(&error) && attempt_number < max_attempts => {
+                tracing::warn!(
+                    error = %error,
+                    attempt = attempt_number,
+                    max_attempts,
+                    "retrying transient GGUF decode failure"
+                );
+                std::thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!(
+        "the loop above always returns: every iteration either succeeds, retries (only when \
+         attempt_number < max_attempts), or returns Err -- the final iteration (attempt_number \
+         == max_attempts) can never take the retry arm, so it always returns"
+    )
+}
+
 impl LlamaCppGenerator {
     /// Load a local chat GGUF under the configured family and offload policy.
     pub(in crate::models) fn load_with_offload(
@@ -331,9 +414,10 @@ impl LlamaCppGenerator {
                     wants_logits,
                 )?;
             }
-            context
-                .decode(&mut batch)
-                .context("decode GGUF prompt chunk")?;
+            decode_with_retry(DECODE_RETRY_ATTEMPTS, DECODE_RETRY_DELAY, || {
+                context.decode(&mut batch)
+            })
+            .context("decode GGUF prompt chunk")?;
         }
         let state = context
             .state_seq_get(0, LlamaStateSeqFlags::empty())
@@ -371,9 +455,10 @@ impl LlamaCppGenerator {
             }
             batch.clear();
             batch.add(token, (input_ids.len() + step) as i32, &[0], true)?;
-            context
-                .decode(&mut batch)
-                .context("decode generated GGUF token")?;
+            decode_with_retry(DECODE_RETRY_ATTEMPTS, DECODE_RETRY_DELAY, || {
+                context.decode(&mut batch)
+            })
+            .context("decode generated GGUF token")?;
         }
         if !pending_utf8.is_empty() {
             bail!("GGUF token stream ended in an incomplete UTF-8 sequence");
@@ -439,6 +524,109 @@ impl TextGeneration for LlamaCppGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// Regression for issue #1317's retry predicate: only a fatal, non-`-1`
+    /// `Unknown` code is retryable. `NoKvCacheSlot` is a deterministic
+    /// capacity condition (retrying it would fail identically every time)
+    /// and `NTokensZero` is a Finch-side batch-construction bug (retrying it
+    /// can never help), so neither may be retried.
+    #[test]
+    fn test_is_retryable_decode_error_only_accepts_fatal_unknown_codes() {
+        assert!(
+            is_retryable_decode_error(&DecodeError::Unknown(-3)),
+            "a fatal error code (< -1) must be retryable -- this is the exact class \
+             issue #1317 reported ('Decode Error -3: unknown')"
+        );
+        assert!(
+            !is_retryable_decode_error(&DecodeError::Unknown(-1)),
+            "-1 must not reach this predicate as Unknown at all (it maps to NTokensZero), \
+             but if it ever did, it must not be retried"
+        );
+        assert!(
+            !is_retryable_decode_error(&DecodeError::NoKvCacheSlot),
+            "NoKvCacheSlot is a deterministic capacity condition, not a transient fault -- \
+             retrying it would fail identically every time"
+        );
+        assert!(
+            !is_retryable_decode_error(&DecodeError::NTokensZero),
+            "NTokensZero is a Finch-side empty-batch bug -- no retry can ever fix it"
+        );
+    }
+
+    /// Core regression for issue #1317: a transient (retryable) failure on
+    /// an earlier attempt must not surface as an error at all once a later
+    /// attempt within the bound succeeds -- the exact "failed once, succeeded
+    /// on retry" shape reported live (same query, nearly identical prompt
+    /// size, failed then succeeded moments later).
+    #[test]
+    fn test_decode_with_retry_recovers_from_a_transient_failure_within_budget() {
+        let calls = Cell::new(0);
+        let result = decode_with_retry(DECODE_RETRY_ATTEMPTS, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < DECODE_RETRY_ATTEMPTS {
+                Err(DecodeError::Unknown(-3))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            result.is_ok(),
+            "a decode that only fails transiently before the attempt budget is exhausted \
+             must ultimately succeed: {result:?}"
+        );
+        assert_eq!(
+            calls.get(),
+            DECODE_RETRY_ATTEMPTS,
+            "must have retried exactly up to (not past) the point of success"
+        );
+    }
+
+    /// A non-retryable error must return immediately on the very first
+    /// attempt, never retried even once -- retrying a deterministic,
+    /// actionable error only delays it.
+    #[test]
+    fn test_decode_with_retry_does_not_retry_a_non_retryable_error() {
+        let calls = Cell::new(0);
+        let result = decode_with_retry(DECODE_RETRY_ATTEMPTS, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err(DecodeError::NoKvCacheSlot)
+        });
+        assert_eq!(
+            result,
+            Err(DecodeError::NoKvCacheSlot),
+            "a non-retryable error must be returned verbatim, not swallowed or replaced"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "a non-retryable error must fail on the very first attempt, with no retry"
+        );
+    }
+
+    /// Exact-once terminal state for the bound itself: a failure that stays
+    /// retryable on every attempt must fail after exactly `max_attempts`
+    /// calls, never more (an unbounded retry loop) and never fewer (giving
+    /// up early on a still-retryable error).
+    #[test]
+    fn test_decode_with_retry_gives_up_after_exactly_max_attempts() {
+        let calls = Cell::new(0);
+        let result = decode_with_retry(DECODE_RETRY_ATTEMPTS, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err(DecodeError::Unknown(-3))
+        });
+        assert_eq!(
+            result,
+            Err(DecodeError::Unknown(-3)),
+            "exhausting the retry budget on an always-retryable error must surface that error"
+        );
+        assert_eq!(
+            calls.get(),
+            DECODE_RETRY_ATTEMPTS,
+            "must attempt exactly DECODE_RETRY_ATTEMPTS ({DECODE_RETRY_ATTEMPTS}) times total, \
+             not more (unbounded retry) and not fewer (giving up early)"
+        );
+    }
 
     #[test]
     fn test_missing_gguf_fails_before_native_initialization() {

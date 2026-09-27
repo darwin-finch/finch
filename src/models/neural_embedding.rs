@@ -29,13 +29,14 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::token::LlamaToken;
 use once_cell::sync::OnceCell;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::bootstrap::GeneratorState;
 use super::gguf_download::{
@@ -185,10 +186,68 @@ pub fn select_memory_embedding_engine(use_neural_embeddings: bool) -> Arc<dyn Em
     }
 }
 
+/// Context window for the embedding model, and also the most tokens this
+/// engine will ever submit to a single `decode()` call (see
+/// `EMBEDDING_N_BATCH` below). 512 is bge-small-en-v1.5's own trained max
+/// sequence length -- not an arbitrary Finch choice -- so a context this
+/// size already covers every input the model can meaningfully embed.
+const EMBEDDING_N_CTX: u32 = 512;
+
+/// Logical and physical batch size (`n_batch`/`n_ubatch`) for the embedding
+/// context, deliberately set equal to `EMBEDDING_N_CTX` rather than left to
+/// `LlamaContextParams::default()`. For this bidirectional, CLS-pooling
+/// (`bert.pooling_type=2`) model, `decode()` dispatches internally to
+/// llama.cpp's *encoder* path (`llama_context::encode`, confirmed from a
+/// real crash backtrace: `ggml_abort` <- `llama_context::encode` <-
+/// `llama_decode` <- `NeuralEmbeddingEngine::embed` <-
+/// `MemorySystem::query_with_sources`), and the encoder path cannot split a
+/// batch across sub-passes the way causal decoding's `n_ubatch` splitting
+/// does -- it asserts the *physical* batch size covers every input token in
+/// one shot: `GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires
+/// n_ubatch >= n_tokens")` (`llama-context.cpp:1447`, confirmed by
+/// reproducing this exact abort, `signal: 6, SIGABRT`, pre-fix, against a
+/// real ~700-word memory-recall query -- the same crash class
+/// `LlamaCppGenerator::generate_inner` was fixed for in #1292/#1295, just
+/// reachable at a much lower token count here since this context's `n_ctx`
+/// (512) is far smaller than the chat generator's, and gated on `n_ubatch`
+/// rather than `n_batch`).
+///
+/// Unlike that chat-generation fix, the fix here is truncation
+/// (`truncate_to_batch`), not multi-call chunking. A `decode()` call commits
+/// its tokens' key/value state to the KV cache and freezes their hidden
+/// states; a later `decode()` call's tokens can attend back into that frozen
+/// cache, but earlier tokens can never attend forward into content that
+/// didn't exist yet when they were computed. `LlamaCppGenerator`'s causal
+/// chat generation only ever needs the prompt's *final* token's logits, so
+/// that one-directional limitation is invisible to it. This engine's
+/// bidirectional pooling requires every token to attend to every other token
+/// simultaneously, which chunking cannot provide (and which the encoder
+/// path's own `n_ubatch >= n_tokens` assertion rules out even attempting) --
+/// also confirmed against llama.cpp's contract for its two batch-processing
+/// entry points (`llama.h`: `llama_decode` "Requires the context to have a
+/// memory [KV cache]" vs. `llama_encode` "this call does not use KV
+/// cache"); this engine intentionally still calls `decode()`, matching real
+/// llama.cpp embedding usage. So a prompt longer than `EMBEDDING_N_BATCH` is
+/// truncated to fit one `decode()` call rather than split across several,
+/// matching how other sentence-embedding pipelines handle input past a
+/// BERT-family model's trained max sequence length.
+const EMBEDDING_N_BATCH: u32 = EMBEDDING_N_CTX;
+
 fn context_params() -> LlamaContextParams {
     LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(512))
+        .with_n_ctx(NonZeroU32::new(EMBEDDING_N_CTX))
+        .with_n_batch(EMBEDDING_N_BATCH)
+        .with_n_ubatch(EMBEDDING_N_BATCH)
         .with_embeddings(true)
+}
+
+/// Caps `tokens` at `max_tokens`, truncating any excess from the end. A pure
+/// function so the cap is unit-testable without a real GGUF. See
+/// `EMBEDDING_N_BATCH`'s doc comment for why truncation, not chunking, is
+/// the correct fix for this engine's bidirectional pooling.
+fn truncate_to_batch(mut tokens: Vec<LlamaToken>, max_tokens: usize) -> Vec<LlamaToken> {
+    tokens.truncate(max_tokens.max(1));
+    tokens
 }
 
 fn memory_embedding_model_params() -> LlamaModelParams {
@@ -206,6 +265,18 @@ impl EmbeddingEngine for NeuralEmbeddingEngine {
             .context("tokenize embedding input")?;
         if tokens.is_empty() {
             return Ok(vec![0.0; EMBEDDING_DIM]);
+        }
+        let n_batch = usize::try_from(EMBEDDING_N_BATCH).context("EMBEDDING_N_BATCH overflow")?;
+        let original_len = tokens.len();
+        let tokens = truncate_to_batch(tokens, n_batch);
+        if tokens.len() < original_len {
+            warn!(
+                original_tokens = original_len,
+                truncated_tokens = tokens.len(),
+                n_batch,
+                "embedding input exceeded the embedding model's batch size and was truncated; \
+                 bge-small-en-v1.5's trained max sequence length is 512 tokens"
+            );
         }
 
         // The mutex is held for the whole decode+extract, not just context
@@ -286,6 +357,57 @@ mod tests {
         assert_eq!(EMBEDDING_DIM, 384);
     }
 
+    /// Regression for issue #1296's chunking-vs-truncation decision: the
+    /// embedding context's batch size must actually be set to the deliberate
+    /// constant, not left to `LlamaContextParams::default()` (which -- like
+    /// the pre-#1295 chat context -- would leave `n_batch` at a value never
+    /// checked against before `decode()`).
+    #[test]
+    fn test_context_params_sets_explicit_batch_sizes_matching_n_ctx() {
+        let params = context_params();
+        assert_eq!(
+            params.n_ctx(),
+            NonZeroU32::new(EMBEDDING_N_CTX),
+            "embedding context size must be the deliberate EMBEDDING_N_CTX constant"
+        );
+    }
+
+    /// Core regression for issue #1296: text tokenizing to more than
+    /// `EMBEDDING_N_BATCH` tokens must be truncated to fit exactly one
+    /// `decode()` call, not silently passed through whole (which is what
+    /// aborted the process before this fix -- see
+    /// `test_real_gguf_embed_over_length_input_does_not_abort` for the
+    /// production-boundary proof against the real native call).
+    #[test]
+    fn test_truncate_to_batch_caps_over_length_input() {
+        let tokens: Vec<LlamaToken> = (0..600).map(LlamaToken).collect();
+        let truncated = truncate_to_batch(tokens, 512);
+        assert_eq!(
+            truncated.len(),
+            512,
+            "600 input tokens over a 512 batch cap must be truncated to exactly 512, got {}",
+            truncated.len()
+        );
+        assert_eq!(
+            truncated,
+            (0..512).map(LlamaToken).collect::<Vec<_>>(),
+            "truncation must keep the leading prefix unchanged, not reorder or sample tokens"
+        );
+    }
+
+    /// An input already within the batch size must pass through unchanged --
+    /// this is the ordinary, ubiquitous case and must not be affected by the
+    /// over-length guard.
+    #[test]
+    fn test_truncate_to_batch_leaves_short_input_unchanged() {
+        let tokens: Vec<LlamaToken> = (0..10).map(LlamaToken).collect();
+        let truncated = truncate_to_batch(tokens.clone(), 512);
+        assert_eq!(
+            truncated, tokens,
+            "input under the batch size must not be modified"
+        );
+    }
+
     #[test]
     fn memory_embedding_model_stays_off_metal() {
         assert_eq!(memory_embedding_model_params().n_gpu_layers(), 0);
@@ -327,6 +449,65 @@ mod tests {
         // This test is expected to return None in CI (nothing pre-seeded in
         // the managed GGUF cache). It should never panic.
         let _result = NeuralEmbeddingEngine::find_in_cache();
+    }
+
+    /// Production-boundary regression for issue #1296: before the fix,
+    /// `embed()` built one `LlamaBatch` sized to the full tokenized input and
+    /// called `decode()` once with no cap, so any text tokenizing to more
+    /// than the embedding context's batch size (512, matching
+    /// bge-small-en-v1.5's own trained max sequence length) aborted the
+    /// whole process with llama.cpp's native `GGML_ASSERT` (`SIGABRT`, not a
+    /// catchable Rust panic or `Result::Err`) -- the same crash class #1292
+    /// fixed for chat generation, confirmed live via a real crash backtrace
+    /// (`ggml_abort` <- `llama_context::encode` <- `llama_decode` <-
+    /// `NeuralEmbeddingEngine::embed` <- `MemorySystem::query_with_sources`)
+    /// triggered by embedding an ordinary ~700-word memory-recall query.
+    /// Confirmed against this exact test, pre-fix: aborted with llama.cpp's
+    /// native `GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires
+    /// n_ubatch >= n_tokens")` (`llama-context.cpp:1447` -- the embedding
+    /// engine's encoder path asserts on `n_ubatch`, not `n_batch` as the
+    /// causal chat decoder path does) and process exit `signal: 6, SIGABRT`.
+    /// Post-fix, this passes because `embed()`
+    /// truncates any input longer than the resolved batch size instead of
+    /// submitting it to `decode()` whole -- truncation, not multi-call
+    /// chunking, because a bidirectional/CLS-pooling embedding model cannot
+    /// have its input split across successive `decode()` calls the way
+    /// `LlamaCppGenerator::generate_inner`'s causal chat chunking (#1295)
+    /// does: each `decode()` call commits its tokens' key/value state to the
+    /// KV cache and freezes their hidden states, so an earlier chunk's
+    /// tokens can never attend forward into a later chunk's content, which
+    /// breaks correct BERT-style pooling (every token must attend to every
+    /// other token in one pass). See `truncate_to_batch`'s doc comment.
+    #[test]
+    #[ignore = "requires FINCH_TEST_EMBEDDING_GGUF pointing to a local bge-small-en-v1.5 GGUF"]
+    fn test_real_gguf_embed_over_length_input_does_not_abort() {
+        let path =
+            std::env::var("FINCH_TEST_EMBEDDING_GGUF").expect("set FINCH_TEST_EMBEDDING_GGUF");
+        let engine = NeuralEmbeddingEngine::load(Path::new(&path)).expect("load embedding GGUF");
+        // Repeat a short phrase well past the embedding context's resolved
+        // batch size (512) so this exercises the over-length guard rather
+        // than the ordinary short-input path.
+        let long_text =
+            "The quick brown fox jumps over the lazy dog and keeps running. ".repeat(80);
+        let tokens = engine
+            .model
+            .str_to_token(&long_text, AddBos::Always)
+            .expect("tokenize over-length probe text");
+        assert!(
+            tokens.len() > 512,
+            "test text ({} tokens) must exceed the embedding batch size (512) to exercise the \
+             over-length guard",
+            tokens.len()
+        );
+
+        let embedding = engine
+            .embed(&long_text)
+            .expect("an over-length embedding input must be truncated and embedded, not abort");
+        assert_eq!(
+            embedding.len(),
+            EMBEDDING_DIM,
+            "a truncated over-length input must still produce a full-dimension embedding"
+        );
     }
 
     /// Full load + inference requires the actual model file; mark as
