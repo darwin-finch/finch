@@ -24,13 +24,13 @@ pub struct WorkStats {
     /// Cumulative response latency in milliseconds
     pub total_latency_ms: u64,
     /// Node start time
-    pub started_at: Option<DateTime<Utc>>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
     /// Last query time
-    pub last_query_at: Option<DateTime<Utc>>,
+    pub(crate) last_query_at: Option<DateTime<Utc>>,
 }
 
 impl WorkStats {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started_at: Some(Utc::now()),
             ..Default::default()
@@ -100,20 +100,6 @@ impl WorkTracker {
             started_at: Some(self.started_at),
             last_query_at: if total > 0 { Some(Utc::now()) } else { None },
         }
-    }
-
-    /// Save snapshot to ~/.finch/work_stats.json
-    pub fn persist(&self) -> Result<()> {
-        let stats = self.snapshot();
-        let path = stats_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json =
-            serde_json::to_string_pretty(&stats).context("Failed to serialize work stats")?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("Failed to write work stats to {}", path.display()))?;
-        Ok(())
     }
 
     /// Load previously persisted stats (for cumulative totals across restarts)

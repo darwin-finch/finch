@@ -14,7 +14,7 @@ mod stats;
 mod tls;
 
 pub use identity::{NodeIdentity, NodeSigningIdentity};
-pub use node_name::{load_or_create, NAME};
+pub use node_name::NAME;
 pub use stats::{WorkStats, WorkTracker};
 pub use tls::{install_crypto_provider, NodeTlsIdentity};
 
@@ -249,7 +249,7 @@ impl Drop for IsolatedNodeRootSwap {
 /// Returns `(cpu_cores, ram_mb, bench_ms)`, where `bench_ms` is the time for
 /// ten million wrapping integer additions. This belongs to node discovery,
 /// not either Finch language runtime.
-pub fn collect_machine_specs() -> (u32, u64, u64) {
+pub(crate) fn collect_machine_specs() -> (u32, u64, u64) {
     use sysinfo::System;
 
     let mut system = System::new();
@@ -311,7 +311,7 @@ impl NodeCapabilities {
         }
     }
 
-    pub fn is_cloud_only(&self) -> bool {
+    pub(crate) fn is_cloud_only(&self) -> bool {
         self.local_model.is_none()
     }
 }
