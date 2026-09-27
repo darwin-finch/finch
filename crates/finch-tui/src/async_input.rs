@@ -167,14 +167,19 @@ const COMPOSER_CTRL_C: KeyboardShortcut = KeyboardShortcut {
     authority: ShortcutAuthority::ComposerShortcut,
 };
 
-/// Escape: clear the draft, or cancel the running query immediately (single
-/// press) when it is empty. Unlike Ctrl+C, Escape never requires a second
-/// press.
+/// Escape: clear the draft (single press, immediate, unchanged). When it is
+/// already empty, this crate cannot tell "cancel the active query" apart
+/// from "exit Finch" — both are the same idle composer state, and only the
+/// application knows which one applies (#1311). Cancelling an active query
+/// stays a single, immediate press; the idle case that would actually exit
+/// Finch requires a confirming second press within its own window, warned
+/// on the status line first, decided entirely on the application side (see
+/// `TuiRenderer::pending_escape_cancel`).
 const COMPOSER_ESCAPE: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::Esc,
     requires: KeyModifiers::NONE,
     label: "Esc",
-    description: "Clear the draft; cancel the query when empty",
+    description: "Clear the draft; cancel the query, or press again to exit when idle",
     submit: None,
     authority: ShortcutAuthority::ComposerShortcut,
 };
@@ -382,11 +387,15 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
             (true, None)
         }
     } else if COMPOSER_ESCAPE.owns(&key) {
-        // Escape: Clear input if non-empty, otherwise cancel query
-        // immediately on a single press — unchanged by this task.
+        // Escape: clear input if non-empty (unchanged, single press,
+        // immediate). When it's already empty, request a cancel — this
+        // crate has no visibility into whether a query is active, so
+        // whether that request cancels a query (single press, unchanged)
+        // or would exit Finch (needs a confirming second press, #1311) is
+        // decided by the application from `pending_escape_cancel`.
         let content = tui.input_textarea.lines().join("");
         if content.trim().is_empty() {
-            tui.pending_cancellation = true;
+            tui.pending_escape_cancel = true;
             tui.ctrl_c_armed_at = None;
             (false, None)
         } else {
@@ -1080,13 +1089,19 @@ mod tests {
                         "{why}: the draft must be cleared"
                     );
                     assert!(
-                        !renderer.pending_cancellation,
-                        "{why}: a non-empty draft is cleared, never cancelled"
+                        !renderer.pending_escape_cancel,
+                        "{why}: a non-empty draft is cleared, never treated as \
+                         a cancel request"
                     );
 
-                    // INVARIANT: unlike Ctrl+C below, Escape cancels an empty
-                    // draft immediately on a single press — this task must
-                    // not change that.
+                    // INVARIANT (#1311): Escape's own key handling stays
+                    // single-press and immediate on an empty draft — it
+                    // always sets pending_escape_cancel unconditionally.
+                    // Whether that ends up cancelling an active query
+                    // immediately or (when idle) arming the application's
+                    // confirm-to-exit step is decided by the application,
+                    // since this crate has no active-query visibility and
+                    // must not guess.
                     let mut renderer = headless_renderer();
                     let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
                     assert!(
@@ -1094,8 +1109,14 @@ mod tests {
                         "{why}: with an empty draft nothing is submitted or modified"
                     );
                     assert!(
-                        renderer.pending_cancellation,
-                        "{why}: Escape must cancel an empty draft on a single press"
+                        renderer.pending_escape_cancel,
+                        "{why}: Escape must request a cancel on an empty draft \
+                         on a single press, unconditionally"
+                    );
+                    assert!(
+                        !renderer.pending_cancellation,
+                        "{why}: Escape must never set Ctrl+C's own \
+                         pending_cancellation flag"
                     );
                 }
                 ("Ctrl+C", ShortcutAuthority::ComposerShortcut) => {

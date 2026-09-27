@@ -25,6 +25,16 @@ visibility into the application state (active query, plan/executing overlay) tha
 a confirming second press would exit Finch. The application polls this snapshot once per render
 tick and calls `set_operation_status`/`clear_operation_status` to keep the idle-exit warning in
 sync — see `EventLoop::sync_ctrl_c_exit_hint` in `src/cli/repl_event/event_loop/dispatch.rs`.
+Escape's own idle-exit warning (#1311) cannot reuse that same arm-then-confirm shape: Ctrl+C's
+arm is unconditional (it also gates cancelling an active query, which is an accepted behavior
+change from #1301), but Escape must still cancel an active query on a single, immediate press,
+unchanged. So `pending_escape_cancel` (set by `async_input::handle_composer_shortcuts` on every
+idle, empty-composer Escape press, one-shot like `pending_dialog_result`) hands the decision to
+the application instead of arming here: `EventLoop::handle_escape_cancel_request` cancels
+immediately when a query is active or the mode is a plan overlay, and only arms its own
+`escape_idle_exit_armed_at` (with the matching `EventLoop::sync_escape_exit_hint`) for the
+remaining idle case that would actually exit Finch, requiring a confirming second idle Escape
+within `ESCAPE_IDLE_EXIT_WINDOW`.
 `TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
 retains message identity, controls stdout, and accepts settled dialog records. Production TUI
 code must not import `OutputManager`; blit and canonical commit read its message snapshots.

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use crossterm::style::Stylize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
@@ -62,6 +62,29 @@ const MAX_TERMINAL_AGENT_ROOTS: usize = 1024;
 /// entirely (#1301) — matching Node's REPL convention of naming the exit
 /// gesture before the confirming keystroke lands, instead of exiting silently.
 const CTRL_C_EXIT_HINT: &str = "Press Ctrl+C again to exit Finch";
+
+/// Warning shown on the status line while an idle, empty-composer Escape
+/// press stays armed for a confirming second press that would exit Finch
+/// entirely (#1311) — the same warn-before-exit shape Ctrl+C has, reached
+/// through its own arm state (see `escape_idle_exit_armed_at`) because
+/// Escape, unlike Ctrl+C, must still cancel an active query on a single,
+/// unconfirmed press.
+const ESCAPE_EXIT_HINT: &str = "Press Esc again to exit Finch";
+
+/// How long a first idle Escape press stays armed for a confirming second
+/// press before it exits Finch (#1311). Matches `CTRL_C_CANCEL_WINDOW`
+/// (`finch-tui`, crate-private) so the two warn-before-exit gestures feel
+/// consistent; kept as its own constant because this arm lives at the
+/// application layer, not in the renderer.
+const ESCAPE_IDLE_EXIT_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Which idle-exit warning currently owns the shared single-slot status
+/// line — see `EventLoop::apply_idle_exit_hint` (#1311 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleExitHintKey {
+    CtrlC,
+    Escape,
+}
 
 fn append_pending_user_messages(
     history: &mut ConversationHistory,
@@ -339,11 +362,22 @@ pub struct EventLoop {
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
-    /// Whether the idle-Ctrl+C exit warning (`CTRL_C_EXIT_HINT`) is
-    /// currently on the status line, so the periodic tick only calls
-    /// `set_operation_status`/`clear_operation_status` on a state change
-    /// rather than every tick (#1301).
-    ctrl_c_exit_hint_shown: bool,
+    /// Which idle-exit warning (Ctrl+C's `CTRL_C_EXIT_HINT`, #1301, or
+    /// Escape's `ESCAPE_EXIT_HINT`, #1311) currently owns the shared
+    /// single-slot status line, so the periodic tick only calls
+    /// `set_operation_status`/`clear_operation_status` on a real change and
+    /// so one key's arm expiring can never blank the other's still-armed
+    /// warning — see `EventLoop::apply_idle_exit_hint`.
+    idle_exit_hint_owner: Option<IdleExitHintKey>,
+
+    /// When an idle (no active query, not a plan overlay) Escape press has
+    /// nothing to cancel, the first press arms this instead of exiting;
+    /// only a confirming second Escape within `ESCAPE_IDLE_EXIT_WINDOW`
+    /// exits Finch (#1311). Lives here rather than on `TuiRenderer` because
+    /// deciding "idle" at all requires `active_query_id` and `mode`, which
+    /// the renderer does not have — unlike Ctrl+C's arm, which is
+    /// unconditional and can live in the renderer.
+    escape_idle_exit_armed_at: Option<Instant>,
 
     /// User turns submitted while a provider/VM turn is active.  The legacy
     /// code overwrote `active_query_id`, leaving the earlier turn unable to
@@ -2211,7 +2245,8 @@ impl EventLoop {
             agent_scheduler,
             provider_resolver,
             active_query_id: Arc::new(RwLock::new(None)),
-            ctrl_c_exit_hint_shown: false,
+            idle_exit_hint_owner: None,
+            escape_idle_exit_armed_at: None,
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
@@ -2686,13 +2721,14 @@ impl EventLoop {
 
                     // Single mutex acquisition: read all pending TUI state in one lock.
                     // Reduces contention with spawn_input_task from 3-4 round-trips to 1 per tick.
-                    let (pending_cancel, dialog_result, pending_feedback, ctrl_c_exit_armed) = {
+                    let (pending_cancel, dialog_result, pending_feedback, ctrl_c_exit_armed, pending_escape_cancel) = {
                         let mut tui = self.tui_renderer.lock().await;
                         (
                             std::mem::take(&mut tui.pending_cancellation),
                             tui.pending_dialog_result.take(),
                             tui.pending_feedback.take(),
                             tui.ctrl_c_exit_armed(),
+                            std::mem::take(&mut tui.pending_escape_cancel),
                         )
                     };
 
@@ -2700,7 +2736,12 @@ impl EventLoop {
                         let _ = self.event_tx.send(ReplEvent::CancelQuery);
                     }
 
+                    if pending_escape_cancel {
+                        self.handle_escape_cancel_request().await;
+                    }
+
                     self.sync_ctrl_c_exit_hint(ctrl_c_exit_armed).await;
+                    self.sync_escape_exit_hint().await;
 
                     // Route pending dialog result (tool approval, brain question, ShowDialog oneshot, etc.)
                     if let Some(dialog_result) = dialog_result {
