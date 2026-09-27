@@ -45,6 +45,26 @@ modules, including `memory_status`, are private.
   minimum-corpus-size gate before real IDF is used. `NeuralEmbeddingEngine`
   (`src/models/neural_embedding.rs`) has no corpus-wide statistic to track and relies on the
   trait's no-op default rather than implementing anything for it.
+- Same root cause, a different downstream symptom: because an embedding is a snapshot of `N`/`df`
+  frozen at THAT point's insertion time, byte-IDENTICAL text inserted at two different corpus
+  maturities no longer necessarily embeds identically, even though nothing about the text changed —
+  growing the corpus in between shifts the RELATIVE idf weight across that text's own words (a term
+  shared with every other document so far trends toward 0 as `df` tracks `N`; a term unique to that
+  one repeated document trends upward), rotating the vector's direction. This can push two
+  occurrences of the exact same text outside `RoutingMemTree::retrieve`'s `NEAR_TIE_EPSILON`, so the
+  occurrence-chain tie-break above never runs for them and raw cosine order picks whichever copy was
+  embedded closer in corpus-time to the query — not necessarily the more informative one.
+  `src/cli/repl_event/query_processor.rs`'s
+  `test_memory_re_spliced_after_falling_out_of_the_active_window` hit exactly this: its turn 1 asks
+  the SAME question already seeded as a memory, which (correctly) re-indexes that literal text as a
+  brand-new point; turn 2 used to re-query with that identical text too, which after this fix
+  reliably out-scored the original seed occurrence outright (no tie to break) and surfaced turn 1's
+  own paired reply ("ack", too short to classify, so it has no occurrence link and
+  `counterpart_turn` fell back to nearest-timestamp) instead of the substantive seed answer. Rebased
+  turn 2 onto a paraphrase built from vocabulary unique to the seed answer ("Employee vault Finch
+  signing item") so it has no competing fresh duplicate to lose to, while still exercising the same
+  invariant (a memory that fell out of the active window is recalled and re-spliced). Disclosed, not
+  a defect, and not something to "fix" by tuning `NEAR_TIE_EPSILON` or gating on corpus size.
 - The root [`src/program_registry.rs`](../../src/program_registry.rs) maps program definitions to
   memory's opaque rows and owns canonical authored source files and VM manifests. Brain event
   journals belong to `finch-brain`, not this crate.
