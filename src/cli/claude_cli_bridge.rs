@@ -1,4 +1,4 @@
-// The Claude Code MCP bridge (issue #1309).
+// The Claude Code MCP bridge (issue #1309, corrected by issue #1341).
 //
 // `finch_providers::ClaudeCliProvider` spawns the official `claude` CLI with
 // `--tools ""` (its own built-in tools always stay off — see that module's
@@ -8,47 +8,49 @@
 // `finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG` as its only argument (see
 // `src/main.rs`); from there control never returns to the ordinary CLI.
 //
-// This module is the actual execution authority for that path. It speaks a
-// minimal stdio JSON-RPC subset of MCP (initialize, notifications/initialized,
-// tools/list, tools/call — verified directly against the real `claude` CLI
-// 2.1.283 on 2026-09-27) and dispatches each `tools/call` through a fresh,
-// non-interactive `PermissionManager`/`ToolRegistry` pair built the same way
-// as the rest of Finch's tool surface, never a duplicate implementation.
+// This module is a pure JSON-RPC-to-socket translator, never an execution
+// authority. It speaks a minimal stdio JSON-RPC subset of MCP (initialize,
+// notifications/initialized, tools/list, tools/call — verified directly
+// against the real `claude` CLI 2.1.283 on 2026-09-27). A `tools/call` is
+// resolved to a plain Finch tool name (using `ToolRegistry` purely for name
+// validation and `tools/list` schema advertisement — never for execution),
+// then forwarded, line-delimited JSON, over a Unix domain socket named by
+// `finch_providers::CLAUDE_CLI_TOOL_SOCKET_ENV` (an env entry the frontend
+// puts on this MCP server's own spec in `--mcp-config`, never on `claude`'s
+// own environment) to `finch_providers::ClaudeCliProvider`, which is running
+// in the frontend process that actually owns the Brain's turn. That process
+// executes the call for real through the interactive `ToolLoop` — real
+// approval, real file access, the same authority every other provider's tool
+// calls already have — and this bridge relays the real result back to
+// `claude` once it arrives, however long real interactive approval takes.
 //
-// Permission policy: `PermissionManager::for_peer()` — read/glob/grep run for
-// real, write/edit/bash-with-side-effects are not auto-applied. There is no
-// interactive TUI in this process to ask a human, so this bridge itself
-// checks `check_tool_use` before dispatch and only ever executes on an
-// explicit `Allow`; `AskUser` and `Deny` both return a plain-text result
-// explaining that the action needs interactive approval in the Finch session,
-// never a bypass. `--allowedTools` on the `claude` side only decides whether
-// Claude Code will call this server without an approval prompt of its own —
-// this manager's own decision is what actually gates execution.
+// This process previously built its own `PermissionManager::for_peer()` and
+// executed calls directly (issue #1309's original shape). That was wrong: it
+// duplicated execution/approval authority that already exists and works
+// correctly for every other provider, and it could never actually prompt a
+// human (there is no interactive TUI in this process). It has no separate
+// permission policy left to fall back to; a socket failure fails the call
+// closed with a named error, never a local execution.
 
-use crate::tools::{
-    resolve_workspace_root, BashTool, EditTool, GlobTool, GrepTool, PermissionCheck,
-    PermissionManager, ReadTool, ToolContext, ToolRegistry, WriteTool,
+use finch_providers::{
+    claude_cli_tool_name_from_wire, ClaudeCliBridgeToolRequest, ClaudeCliBridgeToolResponse,
+    CLAUDE_CLI_TOOL_SOCKET_ENV,
 };
+
+use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// Run the stdio MCP bridge loop until stdin closes. Exit code 0 either way:
 /// a malformed request gets a JSON-RPC error reply, not a crash, so Claude
 /// Code always receives a clean disconnect rather than a broken pipe.
 pub async fn run() -> Result<()> {
-    let workspace_root = resolve_workspace_root(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    );
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadTool));
-    registry.register(Box::new(WriteTool));
-    registry.register(Box::new(EditTool));
-    registry.register(Box::new(GlobTool));
-    registry.register(Box::new(GrepTool));
-    registry.register(Box::new(BashTool));
-    let permissions = PermissionManager::for_peer().with_workspace_root(workspace_root);
+    register_tool_schemas(&mut registry);
+    let socket_path = std::env::var(CLAUDE_CLI_TOOL_SOCKET_ENV).ok();
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -60,7 +62,7 @@ pub async fn run() -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(trimmed) {
-            Ok(request) => handle_request(&registry, &permissions, &request).await,
+            Ok(request) => handle_request(&registry, socket_path.as_deref(), &request).await,
             Err(error) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": Value::Null,
@@ -76,11 +78,23 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// The tool implementations this bridge advertises over `tools/list` — never
+/// executed here. Real execution happens in the frontend, over the socket.
+pub(crate) fn register_tool_schemas(registry: &mut ToolRegistry) {
+    use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+    registry.register(Box::new(ReadTool));
+    registry.register(Box::new(WriteTool));
+    registry.register(Box::new(EditTool));
+    registry.register(Box::new(GlobTool));
+    registry.register(Box::new(GrepTool));
+    registry.register(Box::new(BashTool));
+}
+
 /// Handle one JSON-RPC request. Returns `None` for a notification (no `id`,
 /// no reply expected — e.g. `notifications/initialized`).
-async fn handle_request(
+pub(crate) async fn handle_request(
     registry: &ToolRegistry,
-    permissions: &PermissionManager,
+    socket_path: Option<&str>,
     request: &Value,
 ) -> Option<Value> {
     let id = request.get("id").cloned();
@@ -112,7 +126,7 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let arguments = params.get("arguments").cloned().unwrap_or_default();
-            let text = call_tool(registry, permissions, name, arguments).await;
+            let text = forward_tool_call(registry, socket_path, name, arguments).await;
             id.map(|id| {
                 json!({
                     "jsonrpc": "2.0",
@@ -160,9 +174,12 @@ fn tool_list(registry: &ToolRegistry) -> Vec<Value> {
         .collect()
 }
 
-/// Look up, permission-gate, and (only on `Allow`) execute one tool call.
-/// Never panics on bad input or an unknown tool — every path returns a plain
-/// string the model can read, same as any other Finch tool failure.
+/// Look up and forward one tool call to the frontend over the bridge socket
+/// (issue #1341). Never panics on bad input, an unknown tool, or a socket
+/// failure — every path returns a plain string the model can read, same as
+/// any other Finch tool failure. Never executes anything itself: a missing or
+/// unreachable socket fails the call closed, it never falls back to local
+/// execution.
 ///
 /// `name` is expected to already be the plain Finch tool name: verified
 /// directly against the real `claude` CLI (issue #1309) that a JSON-RPC
@@ -173,62 +190,86 @@ fn tool_list(registry: &ToolRegistry) -> Vec<Value> {
 /// accepted as a fallback, in case a future CLI version or a different MCP
 /// client sends it, so this never regresses to failing closed on a name it
 /// could reasonably resolve.
-async fn call_tool(
+async fn forward_tool_call(
     registry: &ToolRegistry,
-    permissions: &PermissionManager,
+    socket_path: Option<&str>,
     name: &str,
     input: Value,
 ) -> String {
     let finch_name = if registry.get(name).is_some() {
         name
     } else {
-        match finch_providers::claude_cli_tool_name_from_wire(name) {
+        match claude_cli_tool_name_from_wire(name) {
             Some(stripped) => stripped,
             None => return format!("Finch MCP bridge: unrecognized tool name {name:?}"),
         }
     };
-    let Some(tool) = registry.get(finch_name) else {
+    if registry.get(finch_name).is_none() {
         return format!("Finch MCP bridge: tool {finch_name:?} is not registered");
-    };
-    match permissions.check_tool_use(finch_name, &input) {
-        PermissionCheck::Deny(reason) => {
-            format!("Finch denied this tool call: {reason}")
-        }
-        PermissionCheck::AskUser(reason) => format!(
-            "Finch requires interactive approval for this call ({reason}), which is not \
-             available through the automated Claude Code bridge. Ask the person running Finch \
-             to run this themselves, or approve it from within the Finch session."
-        ),
-        PermissionCheck::Allow => {
-            let context = ToolContext {
-                skip_interactive_review: true,
-                ..ToolContext::default()
-            };
-            match tool.execute(input, &context).await {
-                Ok(output) => output,
-                Err(error) => format!("Tool {finch_name} failed: {error}"),
-            }
-        }
     }
+    let Some(socket_path) = socket_path else {
+        return format!(
+            "Finch MCP bridge: no {CLAUDE_CLI_TOOL_SOCKET_ENV} was set on this process, so \
+             there is no frontend to execute {finch_name:?} for real (issue #1341); this is a \
+             configuration bug, not a permission decision."
+        );
+    };
+    match relay_over_socket(socket_path, finch_name, input).await {
+        Ok(response) => response.content,
+        Err(error) => format!(
+            "Finch MCP bridge: could not reach the frontend to execute {finch_name:?}: {error}"
+        ),
+    }
+}
+
+/// Connect fresh, send one request, read exactly one reply line. A fresh
+/// connection per call keeps this side of the protocol trivially correlated
+/// (the frontend answers whichever connection asked) without needing a
+/// request id of its own — the underlying MCP JSON-RPC id never needs to
+/// leave this process. No timeout on the read: real interactive approval on
+/// the other end can legitimately take arbitrarily long.
+async fn relay_over_socket(
+    socket_path: &str,
+    finch_name: &str,
+    input: Value,
+) -> Result<ClaudeCliBridgeToolResponse> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("connecting to the Finch bridge socket at {socket_path}"))?;
+    let mut payload = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+        name: finch_name.to_string(),
+        input,
+    })
+    .context("encoding the bridge tool-call request")?;
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .context("sending the tool-call request to the frontend")?;
+    stream
+        .flush()
+        .await
+        .context("flushing the tool-call request to the frontend")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .context("reading the tool-call response from the frontend")?;
+    if read == 0 {
+        anyhow::bail!("the frontend closed the connection before sending a response");
+    }
+    serde_json::from_str(line.trim()).context("parsing the frontend's tool-call response")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn permissions() -> PermissionManager {
-        let temp = std::env::temp_dir();
-        PermissionManager::for_peer().with_workspace_root(temp)
-    }
-
     fn registry() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ReadTool));
-        registry.register(Box::new(WriteTool));
-        registry.register(Box::new(EditTool));
-        registry.register(Box::new(GlobTool));
-        registry.register(Box::new(GrepTool));
-        registry.register(Box::new(BashTool));
+        register_tool_schemas(&mut registry);
         registry
     }
 
@@ -263,22 +304,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_wire_name_fails_closed_with_a_named_error_not_a_panic() {
-        let text = call_tool(
-            &registry(),
-            &permissions(),
-            "not_an_mcp_wire_name",
-            json!({}),
-        )
-        .await;
+        let text = forward_tool_call(&registry(), None, "not_an_mcp_wire_name", json!({})).await;
         assert!(
             text.contains("unrecognized tool name"),
-            "a wire name without the mcp__finch__ prefix must fail closed with an actionable message: {text}"
+            "a wire name without the mcp__finch__ prefix must fail closed with an actionable \
+             message: {text}"
         );
     }
 
     #[tokio::test]
     async fn an_unregistered_tool_name_fails_closed_with_a_named_error_not_a_panic() {
-        let text = call_tool(&registry(), &permissions(), "mcp__finch__nope", json!({})).await;
+        let text = forward_tool_call(&registry(), None, "mcp__finch__nope", json!({})).await;
         assert!(
             text.contains("is not registered"),
             "a well-formed wire name for a tool nothing registers must still fail closed: {text}"
@@ -286,72 +322,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_tool_actually_executes_through_finchs_own_registry() {
+    async fn a_missing_socket_env_fails_closed_and_never_executes_locally() {
+        // Issue #1341: there is no permission policy left in this process to
+        // fall back to. A misconfigured (missing) socket must fail the call
+        // closed with a message that names the real cause, never silently
+        // execute anything here.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("probe.txt");
-        std::fs::write(&file, "hello-from-the-real-tool\n").unwrap();
-        let permissions =
-            PermissionManager::for_peer().with_workspace_root(dir.path().to_path_buf());
-        // "read", the plain name: this is the real shape confirmed against
-        // the actual claude CLI (see call_tool's doc comment). The
-        // mcp__finch__-prefixed fallback is covered separately below.
-        let text = call_tool(
+        std::fs::write(&file, "must never be read by this process\n").unwrap();
+        let text = forward_tool_call(
             &registry(),
-            &permissions,
+            None,
             "read",
             json!({"file_path": file.to_string_lossy()}),
         )
         .await;
         assert!(
-            text.contains("hello-from-the-real-tool"),
-            "a read-tier call must execute for real and return the file's real content: {text}"
+            text.contains(CLAUDE_CLI_TOOL_SOCKET_ENV),
+            "the error must name the missing configuration, not a bare generic failure: {text}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_prefixed_tool_name_is_still_accepted_as_a_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("probe.txt");
-        std::fs::write(&file, "hello-from-the-prefixed-fallback\n").unwrap();
-        let permissions =
-            PermissionManager::for_peer().with_workspace_root(dir.path().to_path_buf());
-        let text = call_tool(
-            &registry(),
-            &permissions,
-            "mcp__finch__read",
-            json!({"file_path": file.to_string_lossy()}),
-        )
-        .await;
         assert!(
-            text.contains("hello-from-the-prefixed-fallback"),
-            "a fully mcp__finch__-prefixed name must still resolve, for a future CLI version or \
-             a different MCP client that does send it: {text}"
+            !text.contains("must never be read by this process"),
+            "a missing socket must never fall back to executing the tool in this process: {text}"
         );
     }
 
     #[tokio::test]
-    async fn a_mutating_call_is_never_auto_applied_without_interactive_approval() {
+    async fn a_real_tool_call_is_forwarded_over_the_socket_and_the_real_reply_is_returned() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("target.txt");
-        std::fs::write(&file, "original\n").unwrap();
-        let permissions =
-            PermissionManager::for_peer().with_workspace_root(dir.path().to_path_buf());
-        let text = call_tool(
+        let socket_path = dir.path().join("bridge.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: ClaudeCliBridgeToolRequest = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request.name, "read");
+            let mut stream = reader.into_inner();
+            let mut payload = serde_json::to_string(&ClaudeCliBridgeToolResponse {
+                is_error: false,
+                content: "real-content-from-the-real-frontend".to_string(),
+            })
+            .unwrap();
+            payload.push('\n');
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let text = forward_tool_call(
             &registry(),
-            &permissions,
-            "mcp__finch__write",
-            json!({"file_path": file.to_string_lossy(), "content": "overwritten"}),
+            Some(socket_path.to_str().unwrap()),
+            "read",
+            json!({"file_path": "/tmp/x"}),
         )
         .await;
+        server.await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "original\n",
-            "issue #1309: a write call reaching this bridge must never actually modify the \
-             file without interactive approval, no side channel around Finch's permission system"
+            text, "real-content-from-the-real-frontend",
+            "the bridge must relay exactly what the frontend answered, not fabricate a result"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dead_socket_fails_closed_with_a_named_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("nothing-listening.sock");
+        let text = forward_tool_call(
+            &registry(),
+            Some(socket_path.to_str().unwrap()),
+            "read",
+            json!({}),
+        )
+        .await;
         assert!(
-            text.contains("interactive approval"),
-            "the reply must say why nothing happened: {text}"
+            text.contains("could not reach the frontend"),
+            "an unreachable socket must fail closed with a named cause, not panic: {text}"
         );
     }
 }
