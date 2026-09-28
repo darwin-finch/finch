@@ -195,6 +195,28 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   did not match its completed content"). This is user-visible by design, not a side effect to hide:
   the finished transcript now includes any preamble narration the model produced before its tool
   call, matching exactly what streamed to the screen in real time.
+  **Accumulation is conditioned on an actual `tool_use` bridging the two text segments, not merely
+  on both arriving within one invocation (issue #1388, found via a real Claude CLI Subscription
+  session).** #1331 established that `assistant_text` accumulates rather than overwrites so a
+  preamble survives a mid-turn tool call. But the real CLI can also emit two independent, *complete*
+  `assistant` text events back to back with no `tool_use` anywhere between them — a confused first
+  reply reacting to bare context, immediately followed by a second, unrelated real answer (the
+  reproduction: asked to spawn a subagent for `47*89`, no `▶ Tools (N call)` indicator ever
+  appeared). Appending blindly fused the two into one string with no separator, mid-word
+  (`...help with?I don't have...`), fed straight into the wire parser as bogus "source" and shown to
+  the user as one garbled reply. `TurnRecord::tool_use_bridges_next_text` tracks whether a `tool_use`
+  block has been observed since text was last recorded; `absorb_line`'s `assistant` handling inserts
+  `INDEPENDENT_REPLY_SEPARATOR` before a new message's text only when that flag is false. The live
+  delta stream needs the identical decision made at the identical point — `stream_delta_text` carries
+  no per-message boundary of its own, so `TurnRecord::mid_delta_run` marks whether a
+  `content_block_delta` run already has an open, not-yet-finalized message, and the separator is
+  prefixed to the first delta of a new run under the same condition — or the streamed text and
+  `response_text()` desync and `query_processor.rs`'s streamed-vs-completed check fails the turn.
+  `two_text_only_assistant_events_with_no_tool_use_between_them_get_a_separator` (unit-level) and
+  `two_unrelated_assistant_replies_with_no_tool_use_get_a_separator_not_fused_mid_word`
+  (production-boundary, via a new `two-unrelated-replies` fixture) cover this; the existing #1331
+  fixtures (`tool-preamble`, `mcp-tool-call-with-preamble`) are unaffected since their `tool_use`
+  block keeps the flag true across the boundary.
   **That whole-turn accumulation must not leak into a *resumed* call's own `ContentBlockComplete`
   (found via a real Claude CLI Subscription session, not a synthetic fixture).** #1331's fix covers
   a preamble and final answer arriving within *one continuous `execute_turn` call* (the `claude`

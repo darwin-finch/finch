@@ -219,7 +219,37 @@ struct TurnRecord {
     /// [`TurnRecord::response_text`] there. See
     /// `resumed_round_reports_only_its_own_new_text_not_the_prior_rounds_preamble`.
     already_streamed_len: usize,
+    /// True from the moment a `tool_use` block is observed in an `assistant`
+    /// event until the next text is recorded (issue #1388). A `tool_use`
+    /// genuinely bridges two text segments into one continuous reply
+    /// (#1331's preamble-then-final-answer shape); its *absence* between two
+    /// text-bearing `assistant` events means the CLI produced two
+    /// independent, complete replies in the same continuous invocation (the
+    /// reproduction: a confused first reply reacting to bare context,
+    /// immediately followed by a second, real answer — no tool call ever
+    /// appeared). `absorb_line` consults this to decide whether the next
+    /// text segment continues the open reply (append) or starts a new one
+    /// (append after [`INDEPENDENT_REPLY_SEPARATOR`]).
+    tool_use_bridges_next_text: bool,
+    /// True while a live `content_block_delta` run is already open for the
+    /// current, not-yet-finalized `assistant` message (issue #1388).
+    /// `stream_delta_text` carries no per-message boundary of its own, so
+    /// this is what tells `absorb_line` "this is the first delta of a new
+    /// message's run" — the one delta that may need
+    /// [`INDEPENDENT_REPLY_SEPARATOR`] prefixed so the live `TextDelta`
+    /// stream reported to `query_processor.rs` inserts the separator at
+    /// exactly the same point [`TurnRecord::response_text`] does, keeping
+    /// the streamed-vs-completed invariant intact. Reset to `false` the
+    /// moment an `assistant` event finalizes that message.
+    mid_delta_run: bool,
 }
+
+/// Inserted between two `assistant` text segments in the same continuous CLI
+/// invocation when nothing (`tool_use`) bridges them, so two independent
+/// complete replies (issue #1388) never fuse into one string with no
+/// separator, mid-word. Never inserted for the #1331 preamble-then-final-
+/// answer shape, where a `tool_use` genuinely bridges the two segments.
+const INDEPENDENT_REPLY_SEPARATOR: &str = "\n\n";
 
 /// Best-effort removes the bridge socket file on drop, so a paused-then-
 /// abandoned turn never leaks a stale socket path on disk. A separate type
@@ -1321,18 +1351,36 @@ impl TurnRecord {
             Some("assistant") => {
                 let message = event.get("message").cloned().unwrap_or_default();
                 if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
+                    // This message's own delta run (if any) is now
+                    // consolidated by this event; any further deltas start a
+                    // new message's run (issue #1388).
+                    self.mid_delta_run = false;
                     // Append, never overwrite (issue #1331): a preamble
                     // message's text must survive into the completed
                     // content even though a later `assistant` event (the
                     // final answer, possibly after a mid-turn tool_use in
                     // this same message) arrives afterward. See the field
-                    // doc comment on `assistant_text`.
+                    // doc comment on `assistant_text`. But append *blindly*
+                    // only when a `tool_use` actually bridges this text to
+                    // whatever text came before it — two independent,
+                    // complete replies with nothing bridging them (issue
+                    // #1388) get `INDEPENDENT_REPLY_SEPARATOR` between them
+                    // instead of fusing mid-word.
                     let message_text = content
                         .iter()
                         .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
                         .join("");
-                    self.assistant_text.push_str(&message_text);
+                    let has_tool_use = content.iter().any(|block| {
+                        block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    });
+                    if !message_text.is_empty() {
+                        if !self.assistant_text.is_empty() && !self.tool_use_bridges_next_text {
+                            self.assistant_text.push_str(INDEPENDENT_REPLY_SEPARATOR);
+                        }
+                        self.assistant_text.push_str(&message_text);
+                        self.tool_use_bridges_next_text = false;
+                    }
                     // Re-derived for issue #1341 (previously: "observability
                     // only, because the bridge already executed this for
                     // real" — no longer true, the bridge never executes
@@ -1352,6 +1400,9 @@ impl TurnRecord {
                     // `AGENTS.md`) by handing the ToolLoop two different ids
                     // for what a human sees as one call. The counter below
                     // remains observability/debug-logging only.
+                    if has_tool_use {
+                        self.tool_use_bridges_next_text = true;
+                    }
                     for block in content {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             let wire_name = block.get("name").and_then(|n| n.as_str());
@@ -1374,7 +1425,27 @@ impl TurnRecord {
                     .map(str::to_string);
                 self.usage = message.get("usage").and_then(parse_usage);
             }
-            Some("stream_event") => return Ok(stream_delta_text(&event)),
+            Some("stream_event") => {
+                let Some(delta) = stream_delta_text(&event) else {
+                    return Ok(None);
+                };
+                // The first delta of a message's run needs
+                // `INDEPENDENT_REPLY_SEPARATOR` prefixed under the same
+                // condition `absorb_line`'s `assistant` handling uses (issue
+                // #1388), so the live `TextDelta` stream this returns stays
+                // byte-for-byte in sync with `TurnRecord::response_text` —
+                // both must apply the separator at the same point or
+                // `query_processor.rs`'s streamed-vs-completed check fails
+                // the turn. Every later delta in the same run is a plain
+                // continuation of text already prefixed (or not).
+                if !self.mid_delta_run {
+                    self.mid_delta_run = true;
+                    if !self.assistant_text.is_empty() && !self.tool_use_bridges_next_text {
+                        return Ok(Some(format!("{INDEPENDENT_REPLY_SEPARATOR}{delta}")));
+                    }
+                }
+                return Ok(Some(delta));
+            }
             Some("rate_limit_event") => self.allowance = parse_allowance(&event),
             Some("result") => {
                 if event.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
@@ -1869,6 +1940,24 @@ if [ "$MODE" = "mcp-two-tool-calls" ]; then
   done
   echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"both tools handled"}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"both tools handled","stop_reason":"end_turn"}}'
+  exit 0
+fi
+if [ "$MODE" = "two-unrelated-replies" ]; then
+  # Production-boundary reproduction of issue #1388: the real claude CLI
+  # 2.1.283, in one continuous --print invocation with no tool_use anywhere
+  # in the transcript, emitted two independent, complete `assistant` text
+  # events back to back -- a confused first reply reacting to bare context,
+  # then a second, real answer -- with nothing bridging them. Before the fix,
+  # `TurnRecord::assistant_text` fused both into one string with no
+  # separator, mid-word ("...help with?I don't have...").
+  printf '%s\n' \
+    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I do not see a specific request yet."}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_confused","role":"assistant","content":[{{"type":"text","text":"I do not see a specific request yet."}}]}}}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"47 "}}}}}}' \
+    '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"times 89 is 4183."}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_real_answer","role":"assistant","content":[{{"type":"text","text":"47 times 89 is 4183."}}]}}}}' \
+    '{{"type":"result","subtype":"success","is_error":false,"result":"47 times 89 is 4183.","stop_reason":"end_turn"}}'
   exit 0
 fi
 if [ "$MODE" = "tool-preamble" ]; then
@@ -2593,6 +2682,49 @@ printf '%s\n' \
         );
     }
 
+    #[test]
+    fn two_text_only_assistant_events_with_no_tool_use_between_them_get_a_separator() {
+        // Issue #1388, `TurnRecord::absorb_line` unit-level: unlike the
+        // fixture above, nothing (no `tool_use` block, in this event or an
+        // earlier one) bridges the two text segments, so they are two
+        // independent, complete replies -- appending them directly would
+        // reproduce the exact reported seam ("...help with?I don't have...").
+        let mut record = TurnRecord::default();
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"text","text":"I don't see a specific request yet."}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.assistant_text, "I don't see a specific request yet.",
+            "the first, unbridged text-only assistant event is recorded as-is"
+        );
+        assert_eq!(
+            record.tool_calls_observed, 0,
+            "this fixture never emits a tool_use block"
+        );
+        record
+            .absorb_line(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":"I'll compute it directly: 47 x 89 = 4183."}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            record.response_text(),
+            format!(
+                "I don't see a specific request yet.{INDEPENDENT_REPLY_SEPARATOR}I'll compute \
+                 it directly: 47 x 89 = 4183."
+            ),
+            "two independent complete replies with no tool_use bridging them must be joined \
+             by INDEPENDENT_REPLY_SEPARATOR, never fused with nothing between them"
+        );
+        assert!(
+            !record.response_text().contains("yet.I'll"),
+            "the exact pre-fix seam ('yet.I'll', analogous to the real transcript's \
+             'help with?I don't') must not reappear: {:?}",
+            record.response_text()
+        );
+    }
+
     #[tokio::test]
     async fn preamble_text_before_a_mid_turn_tool_use_does_not_desync_streamed_from_completed_text()
     {
@@ -2637,6 +2769,62 @@ printf '%s\n' \
             complete, streamed_text,
             "completed content must equal everything actually streamed, or \
              query_processor.rs's streamed-vs-completed check fails the turn (issue #1331); \
+             got completed={complete:?} streamed={streamed_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_unrelated_assistant_replies_with_no_tool_use_get_a_separator_not_fused_mid_word() {
+        // Production-boundary reproduction of issue #1388: real claude CLI
+        // 2.1.283, asked "Please spawn a subagent to compute 47*89 and tell
+        // me the result", emitted two independent, complete `assistant` text
+        // events in one continuous --print invocation with no `tool_use`
+        // anywhere in the transcript (no "Tools (N call)" indicator ever
+        // appeared) -- a confused first reply reacting to bare context,
+        // immediately followed by the real answer. Before the fix, both
+        // `TurnRecord::response_text()` and the live `TextDelta` stream fused
+        // the two into one string with no separator, mid-word
+        // ("...yet.47 times..." in this fixture; "...help with?I don't
+        // have..." in the real transcript) -- fed straight into the wire
+        // parser as bogus "source" and shown to the user as one garbled
+        // reply.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "two-unrelated-replies");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+
+        let mut rx = provider
+            .send_message_stream(&simple_request())
+            .await
+            .expect("streaming must be supported");
+        let mut streamed_text = String::new();
+        let mut complete = None;
+        while let Some(chunk) = rx.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::TextDelta(text) => streamed_text.push_str(&text),
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    complete = Some(text);
+                }
+                other => panic!("unexpected chunk {other:?}"),
+            }
+        }
+        let complete = complete.expect("a ContentBlockComplete chunk must terminate the stream");
+        let expected = format!(
+            "I do not see a specific request yet.{INDEPENDENT_REPLY_SEPARATOR}47 times 89 is 4183."
+        );
+        assert_eq!(
+            streamed_text, expected,
+            "two independent assistant replies with no tool_use bridging them must be \
+             separated, not fused mid-word ('yet.47' would be the pre-fix regression)"
+        );
+        assert!(
+            !streamed_text.contains("yet.47"),
+            "the exact pre-fix seam ('yet.47', analogous to the real transcript's \
+             'help with?I don't') must not reappear in the streamed text: {streamed_text:?}"
+        );
+        assert_eq!(
+            complete, streamed_text,
+            "completed content must equal everything actually streamed, or \
+             query_processor.rs's streamed-vs-completed check fails the turn; \
              got completed={complete:?} streamed={streamed_text:?}"
         );
     }
