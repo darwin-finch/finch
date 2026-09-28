@@ -15,10 +15,12 @@ Two callers show how those pieces meet:
    owns query cancellation, approval presentation, and output timing; this module owns local
    tool dispatch and the registered implementations.
 2. The [headless `finch agent` loop](../agent/mod.rs) builds a smaller registry of file, shell,
-   and web tools with its explicit agent-mode permission rule, then calls `ToolExecutor`
-   directly for each provider tool use and returns result blocks to the provider. This legacy
-   path does not currently use `ToolLoop`; do not infer the REPL's round-admission guarantees
-   for it from the shared executor alone.
+   and web tools with its explicit agent-mode permission rule, admits each provider turn's
+   `ToolUse` calls through its own per-turn `ToolLoop` (issue #1058, matching the pattern
+   `src/scheduler.rs` uses for its own agent turn loop), then calls `ToolExecutor` for each
+   admitted call and returns result blocks to the provider in call order. See this module's
+   [AGENTS.md](AGENTS.md) for the concrete audit of that boundary against REPL/scheduler's
+   guarantees, behavior by behavior.
 
 The code-retrieval implementations are adapters over `source_index`. `code_outline` supplies one
 path and returns its bounded structural envelope. `find_code` accepts a path, identifier, quoted

@@ -42,13 +42,68 @@ timing-dependent) and proves the retry recovers it; the concurrent-load counterp
 unlike every other test in this module) stresses genuinely overlapping forks across real OS
 threads and asserts every one of many concurrent spawns still resolves to a passing check.
 
-**ToolLoop owns REPL and scheduler rounds.** Those two callers admit a call through the
-`finch-tools-api` protocol before execution; malformed arguments, duplicate ids, unknown or
-unsupported tools fail closed with a typed result. Cancel, timeout, disconnect, retry, and
-late-result-after-terminal must not admit another execution or append another result. The
-legacy headless `finch agent` loop calls `ToolExecutor` directly and does not have that
-`ToolLoop` admission lifecycle; see the [README](README.md) before extending this path.
-Generators and provider adapters must not import or invoke `ToolExecutor` themselves.
+**ToolLoop owns REPL, scheduler, and headless `finch agent` rounds (issue #1058).** All three
+callers admit a call through the `finch-tools-api` protocol before execution; malformed
+arguments, duplicate ids, unknown or unsupported tools fail closed with a typed result. Cancel,
+timeout, disconnect, retry, and late-result-after-terminal must not admit another execution or
+append another result. Generators and provider adapters must not import or invoke `ToolExecutor`
+themselves.
+
+**Audit result for the legacy headless `finch agent` loop (issue #1058, `AgentLoop::run_task` in
+`src/agent/mod.rs`).** Before this issue, `run_task` called `ToolExecutor::execute_tool` directly
+for each provider `ToolUse`, with no round-admission lifecycle: nothing stopped two `ToolUse`
+blocks sharing one tool-call id from both executing. Traced against the same five hostile-provider
+behaviors the REPL/scheduler `ToolLoop` integration defends:
+- **Malformed arguments:** structurally cannot reach this loop as raw fragments — `run_task` uses
+  `ClaudeClient::send_message` (non-streaming; see `src/claude/client.rs`), so every adapter (see
+  `finch-providers/AGENTS.md`, "tool calls become semantic `ToolUse` only after adapter
+  validation") already parses/validates JSON tool arguments before constructing
+  `ContentBlock::ToolUse`, or the whole `send_message` call fails
+  (`openai.rs`'s `"OpenAI returned malformed JSON function arguments"` /
+  `"...were not a JSON object"` bails, `claude.rs`'s `response.json()` failing the same way). This
+  is coarser-grained than `ToolLoop`'s per-call reject (a malformed adapter payload fails the whole
+  turn, not just that call) but strictly more conservative: no call ever executes on malformed
+  input either way. `ToolLoop::observe_complete` itself performs no `is_object` check on an
+  already-complete call (only the delta-accumulation path does); this matches REPL/scheduler
+  exactly, since a non-streaming provider always calls `observe_complete` directly, never
+  `observe_delta`.
+- **Duplicate tool-call ids — the one real gap found, now fixed.** `run_task` now builds one
+  `ToolLoop` per turn (catalog = `tool_defs`, the exact registered set) and runs every `ToolUse`
+  through `observe_complete` → `finish_observation` → `admit_execution` → `append_result` before
+  calling `ToolExecutor::execute_tool`, identically to `src/scheduler.rs`'s own agent turn loop
+  (~line 984). Two `ToolUse` blocks sharing an id with conflicting inputs now fail *both* closed
+  (matching `test_tool_loop_duplicate_id_fails_closed_without_second_execution`) instead of
+  double-executing. `test_headless_agent_duplicate_tool_call_id_is_not_double_executed` in
+  `src/agent/mod.rs` reproduces the pre-fix defect through the real `run_task` and a real
+  `BashTool`/`ToolExecutor` (a side-effect marker file went from two writes to zero) and pins the
+  fix.
+- **Unknown/unsupported tool names:** already fail closed pre-fix (the registry lookup in
+  `ToolExecutor::execute_tool` returns a typed `Ok(ToolResult::error(...))`, never executing) and
+  continue to via `ToolLoop`'s catalog check (`RejectReason::UnsupportedTool`/`UnknownTool`).
+  `test_headless_agent_unknown_tool_name_never_executes_and_does_not_abort_the_turn` proves a
+  never-registered tool name produces no side effect while a second, real call in the same turn
+  still runs.
+- **Cancellation mid-call:** `finch agent` (`src/main.rs`'s `run_agent_command`) never installs a
+  `tokio::signal::ctrl_c()` handler or holds a cancellation token anywhere in this loop — unlike the
+  REPL/scheduler, there is no live signal that can arrive *during* an in-flight `execute_tool`
+  call. The only way to stop a running headless task is killing the process, which terminates
+  every in-flight state uniformly; there is no partial-admission state to leak. `ToolLoop`'s
+  `terminalize`/late-result guards exist for a concurrent cancel signal this loop structurally does
+  not have, so this behavior class does not apply here and is not simulated.
+- **Late/out-of-order results:** `run_task`'s tool dispatch is a plain sequential `for` loop —
+  each `ToolExecutor::execute_tool(...).await` is fully awaited before the next call is even
+  admitted, and results are appended to `result_blocks` in the same iteration. There is no
+  concurrent execution or channel through which a result could arrive after the round moved on;
+  the race class `ToolLoop`'s late-result-after-terminal guard defends against cannot occur here by
+  construction, independent of the `ToolLoop` integration.
+
+**Preserved through the fix:** the agent-mode permission rule
+(`PermissionManager::with_default_rule(PermissionRule::Allow)` in `build_tool_executor`) is
+untouched — `ToolLoop` only gates catalog/duplicate-id admission, never permission, and
+`ToolExecutor::execute_tool` is still the sole execution call. Provider-visible result order is
+preserved because `finish_observation()` returns calls in first-observed order (see
+`finch-tools-api`'s own ordering tests) and `run_task` pushes into `result_blocks` by plain
+iteration over that same order, with no reordering step.
 
 **The Claude Code MCP bridge is a translator, not a caller of this subtree's execution authority
 (issue #1309, corrected by issue #1341, `src/cli/claude_cli_bridge.rs`).** `finch_providers::ClaudeCliProvider`
