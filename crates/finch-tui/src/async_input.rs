@@ -154,15 +154,18 @@ impl KeyboardShortcut {
 const PASTE_MODIFIERS: KeyModifiers =
     KeyModifiers::from_bits_retain(KeyModifiers::CONTROL.bits() | KeyModifiers::SUPER.bits());
 
-/// Ctrl+C: clear the draft immediately; when it's already empty, press twice
-/// (within `CTRL_C_CANCEL_WINDOW`) to cancel the running query — the Claude
-/// Code / Codex CLI SIGINT convention, unlike Escape's immediate single-press
-/// cancel below.
+/// Ctrl+C: copy the active transcript selection to the clipboard; a no-op
+/// with nothing selected. Never clears the draft and never cancels a query
+/// — Escape owns both of those unchanged (single press, immediate; a
+/// confirming second idle press to exit, #1301/#1311). This supersedes an
+/// earlier, unimplemented proposal (#895, "Ctrl+C should always cancel,
+/// never clear") with what was actually requested live: matching other
+/// terminal coding agents' copy convention instead.
 const COMPOSER_CTRL_C: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::Char('c'),
     requires: KeyModifiers::CONTROL,
     label: "Ctrl+C",
-    description: "Clear the draft; press twice to cancel the query when empty",
+    description: "Copy the selected transcript text",
     submit: None,
     authority: ShortcutAuthority::ComposerShortcut,
 };
@@ -369,23 +372,11 @@ pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
 /// the entry's `submit` command for the input task to submit.
 fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Option<String>) {
     if COMPOSER_CTRL_C.owns(&key) {
-        // Ctrl+C: clear input if non-empty (immediate, like Escape); when
-        // the draft is already empty, this is the "nothing to clear" case
-        // where Ctrl+C follows the Claude Code / Codex CLI SIGINT convention
-        // instead of Escape's immediate single-press cancel — arm on the
-        // first press and only cancel on a confirming second press inside
-        // `CTRL_C_CANCEL_WINDOW`.
-        let content = tui.input_textarea.lines().join("");
-        if content.trim().is_empty() {
-            if crate::ctrl_c_should_cancel(&mut tui.ctrl_c_armed_at) {
-                tui.pending_cancellation = true;
-            }
-            (false, None)
-        } else {
-            tui.input_textarea = TuiRenderer::create_clean_textarea();
-            tui.ctrl_c_armed_at = None;
-            (true, None)
-        }
+        // Ctrl+C: copy the active transcript selection; never touches the
+        // draft or the running query (Escape owns both, immediately below).
+        // A no-op with nothing selected.
+        tui.copy_active_selection_to_clipboard();
+        (false, None)
     } else if COMPOSER_ESCAPE.owns(&key) {
         // Escape: clear input if non-empty (unchanged, single press,
         // immediate). When it's already empty, request a cancel — this
@@ -396,7 +387,6 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
         let content = tui.input_textarea.lines().join("");
         if content.trim().is_empty() {
             tui.pending_escape_cancel = true;
-            tui.ctrl_c_armed_at = None;
             (false, None)
         } else {
             tui.input_textarea = TuiRenderer::create_clean_textarea();
@@ -1116,80 +1106,58 @@ mod tests {
                         "{why}: Escape must request a cancel on an empty draft \
                          on a single press, unconditionally"
                     );
-                    assert!(
-                        !renderer.pending_cancellation,
-                        "{why}: Escape must never set Ctrl+C's own \
-                         pending_cancellation flag"
-                    );
                 }
                 ("Ctrl+C", ShortcutAuthority::ComposerShortcut) => {
                     covered += 1;
+                    // INVARIANT: Ctrl+C never touches the draft or the
+                    // running query — Escape owns both (#895 superseded by
+                    // what was actually requested live: Ctrl+C matches
+                    // other terminal coding agents' copy convention).
                     let mut renderer = headless_renderer();
                     renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
                     let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
                     assert!(
-                        modified && submitted.is_none(),
-                        "{why}: with a non-empty draft Ctrl+C must clear the \
-                         draft immediately, not cancel or submit"
+                        !modified && submitted.is_none(),
+                        "{why}: Ctrl+C must never modify or submit the draft, \
+                         with or without a selection"
                     );
                     assert_eq!(
                         renderer.input_textarea.lines(),
-                        [""],
-                        "{why}: the draft must be cleared"
-                    );
-                    assert!(
-                        !renderer.pending_cancellation,
-                        "{why}: a non-empty draft is cleared, never cancelled"
+                        ["hello"],
+                        "{why}: Ctrl+C must never clear the draft"
                     );
 
-                    // INVARIANT: with an empty draft, Ctrl+C must NOT cancel
-                    // on the first press (unlike Escape) — it only arms a
-                    // confirming second press within CTRL_C_CANCEL_WINDOW
-                    // (Claude Code / Codex CLI SIGINT convention).
+                    // With nothing selected, Ctrl+C is a no-op: no clipboard
+                    // attempt, no status-line message.
                     let mut renderer = headless_renderer();
-                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    let had_selection = renderer.copy_active_selection_to_clipboard();
                     assert!(
-                        !modified && submitted.is_none() && !renderer.pending_cancellation,
-                        "{why}: the first Ctrl+C on an empty draft must arm, \
-                         not cancel"
+                        !had_selection,
+                        "{why}: with no active selection, Ctrl+C must report \
+                         nothing was copied"
                     );
-                    assert!(
-                        renderer.ctrl_c_armed_at.is_some(),
-                        "{why}: the first Ctrl+C on an empty draft must record \
-                         an arm timestamp"
-                    );
-                    // #1301: this is the application's only signal that a
-                    // confirming second press is imminent — a silent arm here
-                    // is what let two idle Ctrl+C presses exit Finch with no
-                    // warning shown at any point.
-                    assert!(
-                        renderer.ctrl_c_exit_armed(),
-                        "{why}: after the first idle Ctrl+C, ctrl_c_exit_armed() \
-                         must report true so the event loop can surface the \
-                         'press again to exit' warning before a second press lands"
+                    assert_eq!(
+                        renderer.status_text_for_test(),
+                        "",
+                        "{why}: a no-op copy must not touch the status line"
                     );
 
-                    // A second Ctrl+C within the window performs the cancel
-                    // Escape gives immediately.
+                    // With an active selection, Ctrl+C copies it and reports
+                    // the attempt on the status line either way (success or
+                    // failure — a keyboard shortcut has no other feedback).
+                    let mut renderer = headless_renderer();
+                    renderer.install_test_selection("selected text");
                     let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
                     assert!(
                         !modified && submitted.is_none(),
-                        "{why}: the confirming Ctrl+C must not modify or \
-                         submit the draft"
+                        "{why}: copying a selection must not modify or submit \
+                         the (empty) draft"
                     );
+                    let status = renderer.status_text_for_test();
                     assert!(
-                        renderer.pending_cancellation,
-                        "{why}: a second Ctrl+C within the window must cancel"
-                    );
-                    assert!(
-                        renderer.ctrl_c_armed_at.is_none(),
-                        "{why}: cancelling must clear the arm so a later \
-                         Ctrl+C starts over"
-                    );
-                    assert!(
-                        !renderer.ctrl_c_exit_armed(),
-                        "{why}: once the confirming press has fired, the exit \
-                         warning must not remain latched"
+                        status.contains("Copied to clipboard") || status.contains("Copy failed"),
+                        "{why}: a selection copy attempt must always report on \
+                         the status line, success or failure; status={status:?}"
                     );
                 }
                 ("Ctrl+V", ShortcutAuthority::ComposerShortcut) => {
@@ -1263,8 +1231,8 @@ mod tests {
                         "{why}: the draft must be untouched"
                     );
                     assert!(
-                        renderer.pending_feedback.is_none() && !renderer.pending_cancellation,
-                        "{why}: a no-op must not set feedback or cancellation state"
+                        renderer.pending_feedback.is_none(),
+                        "{why}: a no-op must not set feedback state"
                     );
                 }
                 ("Ctrl+P", ShortcutAuthority::ComposerShortcut) => {
@@ -1458,48 +1426,6 @@ mod tests {
                 .iter()
                 .map(|b| b.label)
                 .collect::<Vec<_>>()
-        );
-    }
-
-    /// A Ctrl+C press after `CTRL_C_CANCEL_WINDOW` has elapsed must not count
-    /// as the confirming second press — it starts a fresh arm instead, so a
-    /// stray Ctrl+C long after the first one can never surprise-cancel a
-    /// query the user has since kept typing into (documented choice: only
-    /// Ctrl+C presses move the arm; unrelated keystrokes don't reset it).
-    #[test]
-    fn test_composer_ctrl_c_after_window_elapses_does_not_cancel_but_rearms() {
-        let mut renderer = headless_renderer();
-        let event = ctrl(KeyCode::Char('c'));
-
-        let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
-        assert!(!modified && submitted.is_none() && !renderer.pending_cancellation);
-        let armed_at = renderer
-            .ctrl_c_armed_at
-            .expect("the first press on an empty draft must arm");
-
-        // Back-date the arm past the window instead of sleeping in a test —
-        // deterministic, no wall-clock flake.
-        renderer.ctrl_c_armed_at =
-            Some(armed_at - crate::CTRL_C_CANCEL_WINDOW - Duration::from_millis(1));
-
-        let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
-        assert!(
-            !modified && submitted.is_none() && !renderer.pending_cancellation,
-            "a Ctrl+C press after the window elapsed must not cancel; \
-             pending_cancellation={}",
-            renderer.pending_cancellation
-        );
-        assert!(
-            renderer.ctrl_c_armed_at.is_some(),
-            "a lapsed press must start a fresh arm rather than leaving no arm \
-             at all (which would make the following in-window press look like \
-             an unconfirmed first press forever)"
-        );
-
-        let (_, _) = handle_composer_shortcuts(&mut renderer, event);
-        assert!(
-            renderer.pending_cancellation,
-            "the next Ctrl+C within the fresh window must cancel"
         );
     }
 
