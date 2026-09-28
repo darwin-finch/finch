@@ -195,6 +195,24 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   did not match its completed content"). This is user-visible by design, not a side effect to hide:
   the finished transcript now includes any preamble narration the model produced before its tool
   call, matching exactly what streamed to the screen in real time.
+  **That whole-turn accumulation must not leak into a *resumed* call's own `ContentBlockComplete`
+  (found via a real Claude CLI Subscription session, not a synthetic fixture).** #1331's fix covers
+  a preamble and final answer arriving within *one continuous `execute_turn` call* (the `claude`
+  process pauses only long enough to forward a `tools/call` over the bridge, then keeps streaming on
+  the same `deltas` channel). It does not cover the more common case: the pause returns all the way
+  to `query_processor.rs`, which executes the tool for real and opens a *second*, separate
+  `send_message_stream` call to resume — a fresh `deltas` channel that only ever carries this call's
+  own new text, even though `TurnRecord::response_text()` (the same record, correctly still
+  accumulating per #1331) now spans both calls. Reporting the whole accumulated text as *this* call's
+  `ContentBlockComplete` desynced `query_processor.rs`'s check again, on real live traffic, months
+  after #1331 landed. `TurnRecord::already_streamed_len` snapshots the prefix length right before
+  `execute_turn` resumes a parked turn's `pump_until_settled`, and
+  `TurnRecord::newly_streamed_text()` (used only by the streaming `ContentBlockComplete` site) reports
+  just the suffix beyond it — `response_text()` itself, and the non-streaming `response_from` path,
+  are untouched, since they correctly want the whole turn.
+  `resumed_round_reports_only_its_own_new_text_not_the_prior_rounds_preamble` reproduces this at the
+  production boundary via a new `mcp-tool-call-with-preamble` fixture (the existing `tool-preamble`
+  fixture never genuinely pauses, so it could not have caught this).
   **Since issue #1354, this transport can be driven by more than one caller connection over its
   own lifetime — the daemon now owns and constructs it (`src/server/claude_cli_session.rs` in the
   root crate), reused unchanged; this crate's own process-management logic did not move or
