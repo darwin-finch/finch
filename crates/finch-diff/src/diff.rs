@@ -10,12 +10,19 @@ pub const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
 /// from the much smaller transcript preview limit.
 pub const MAX_DIFF_LINES: usize = 1024;
 pub const MAX_DIFF_PREVIEW_LINES: usize = 16;
-pub const MAX_DIFF_FILES: usize = 64;
+/// #1033 audit (workspace-wide grep, not definition-scoped LSP): no caller
+/// outside this crate references this bound. Narrowed to `pub(crate)`;
+/// still enforced internally by [`FileDiff::parse_all`]/[`FileDiff::parse`].
+pub(crate) const MAX_DIFF_FILES: usize = 64;
 pub const MAX_DIFF_LINE_CHARS: usize = 512;
-pub const MAX_DIFF_COMPUTE_LINES: usize = 20_000;
+/// #1033 audit: no external caller found workspace-wide. Narrowed to
+/// `pub(crate)`; still enforced internally by [`FileDiff::from_texts`].
+pub(crate) const MAX_DIFF_COMPUTE_LINES: usize = 20_000;
 pub const MAX_DIFF_HUNKS: usize = 128;
 pub const MAX_DIFF_STRUCTURAL_LINES: usize = 1024;
-pub const MAX_RENDER_CHARS: usize = 131_072;
+/// #1033 audit: no external caller found workspace-wide. Narrowed to
+/// `pub(crate)`; still enforced internally by [`bound_rendered`].
+pub(crate) const MAX_RENDER_CHARS: usize = 131_072;
 
 /// Bounded structured diff for one file.
 ///
@@ -41,19 +48,31 @@ pub struct FileDiff {
     file_count_exact: bool,
 }
 
+// #1033 audit (workspace-wide grep, not definition-scoped LSP): no caller
+// outside this crate reads `old_start`/`old_count`/`new_start`/`new_count`/
+// `context`, so those five fields are narrowed to `pub(crate)`. `lines`
+// keeps a confirmed external reader (crates/finch-messages/src/work_unit.rs
+// flat-maps `FileDiff::hunks` into `DiffHunk::lines`), and `DiffHunk` itself
+// stays `pub` because it is the element type of `FileDiff::hunks: Vec<DiffHunk>`,
+// a `pub` field on a `pub` struct (Rust's private-in-public rule forces this
+// regardless of caller evidence).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffHunk {
-    pub old_start: usize,
-    pub old_count: usize,
-    pub new_start: usize,
-    pub new_count: usize,
-    pub context: String,
+    pub(crate) old_start: usize,
+    pub(crate) old_count: usize,
+    pub(crate) new_start: usize,
+    pub(crate) new_count: usize,
+    pub(crate) context: String,
     pub lines: Vec<DiffLine>,
 }
+// `DiffLine` stays `pub` for the same private-in-public reason as `DiffHunk`
+// (it is `DiffHunk::lines`'s element type). `kind` has a confirmed external
+// reader (the same work_unit.rs test checks `line.kind`); `text` has none
+// found anywhere in the workspace, so it is narrowed to `pub(crate)` (#1033).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
-    pub text: String,
+    pub(crate) text: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffLineKind {
@@ -405,7 +424,12 @@ impl FileDiff {
     }
     /// Whether the number of files in this payload is exact, or only a
     /// lower bound because later files were omitted at a parse limit.
-    pub fn file_count_is_exact(&self) -> bool {
+    ///
+    /// #1033 audit (workspace-wide grep): no caller outside this crate
+    /// references this method, so it is narrowed to `pub(crate)`, the same
+    /// finding and disposition PR #1093 gave `is_complete`. It remains used
+    /// internally by [`Self::is_complete`] and [`summarize_files`].
+    pub(crate) fn file_count_is_exact(&self) -> bool {
         self.file_count_exact
     }
     /// Honest answer to "is this complete?": exact line counts, exact file
