@@ -23,7 +23,10 @@ Two callers show how those pieces meet:
    guarantees, behavior by behavior.
 
 The code-retrieval implementations are adapters over `source_index`. `code_outline` supplies one
-path and returns its bounded structural envelope. `find_code` accepts a path, identifier, quoted
+path and returns its bounded structural envelope; with an optional `base_ref`, it instead returns
+a compact symbol-level delta (added/removed/signature_changed/body_changed) against that file's
+contents at a Git revision, letting a caller skip a full re-read when it only needs to know what
+changed. `find_code` accepts a path, identifier, quoted
 fixed string, or plain lexical terms, with optional path, structural-kind, and result-count
 constraints. It returns a compact list of exact line ranges for a later `read`, never source bodies
 or its internal traversal and cache diagnostics. Plain terms use deterministic string similarity;

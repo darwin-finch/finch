@@ -1,15 +1,20 @@
 use super::identity::ResolvedSource;
+use super::identity::MAX_SOURCE_BYTES;
 use super::{SourceIdentity, SourceResolver};
 use anyhow::{bail, Context, Result};
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 use tree_sitter::Language;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 pub(super) const MAX_OUTLINE_RECORDS: usize = 200;
 pub(super) const MAX_LABEL_BYTES: usize = 256;
 const FALLBACK_WINDOW_LINES: usize = 80;
+const MAX_BASE_REF_BYTES: usize = 256;
+const MAX_GIT_ERROR_BYTES: usize = 512;
 
 /// A source range using zero-based, half-open UTF-8 byte offsets and
 /// one-based, inclusive line numbers. Newline bytes belong to the line they
@@ -88,11 +93,117 @@ pub struct SourceExcerpt {
     pub text: String,
 }
 
+/// How one definition's text splits into its signature and body regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureSplit {
+    /// Everything before the first opening brace is signature text.
+    FirstBrace,
+    /// Signature text ends at the line that closes the header with ':'.
+    ColonLine,
+    /// No body region exists; the whole record text is signature text.
+    WholeText,
+}
+
+/// Change classification for one symbol between two structural outlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutlineChangeKind {
+    Added,
+    Removed,
+    SignatureChanged,
+    BodyChanged,
+}
+
+/// One bounded symbol-level delta entry. It carries no source body text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineDiffChange {
+    pub name: String,
+    pub kind: String,
+    pub change: OutlineChangeKind,
+    /// Span of the symbol in the working-tree version; absent for removals.
+    pub span: Option<SourceSpan>,
+}
+
+/// Compact structural delta between a file's working-tree outline and its
+/// outline at a Git revision. Bounded and body-free like every outline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineDiff {
+    pub path: String,
+    pub base_ref: String,
+    pub source: SourceIdentity,
+    pub provenance: RetrievalProvenance,
+    pub changes: Vec<OutlineDiffChange>,
+    pub base_parse_had_errors: bool,
+    pub parse_had_errors: bool,
+    pub truncated: bool,
+}
+
 impl SourceResolver {
     /// Produce a deterministic, bounded outline for one workspace file.
     pub fn outline(&self, requested: impl AsRef<Path>) -> Result<OutlineResult> {
         let source = self.read(requested)?;
         outline_source(source)
+    }
+
+    /// Produce a compact structural delta between one workspace file's
+    /// working-tree outline and its outline at a Git revision (`base_ref`).
+    /// Symbols are matched by name and kind; a symbol present in both with
+    /// identical source bytes is omitted. A symbol whose signature region
+    /// (everything before its first brace, or before a header-ending colon
+    /// for colon-bodied languages such as Python) changed is reported as
+    /// `SignatureChanged`; otherwise a byte-level change is `BodyChanged`.
+    /// No source body text is ever included in the result.
+    pub fn outline_diff(&self, requested: impl AsRef<Path>, base_ref: &str) -> Result<OutlineDiff> {
+        validate_base_ref(base_ref)?;
+        let requested = requested.as_ref();
+        let current = self.read(requested).with_context(|| {
+            format!(
+                "code_outline diff mode requires the current file to exist: {}",
+                requested.display()
+            )
+        })?;
+        let extension = current
+            .canonical
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let Some(language) = LanguageSpec::for_extension(&extension) else {
+            bail!(
+                "code_outline diff mode does not support the \"{}\" file type: {}",
+                extension,
+                current.identity.path
+            );
+        };
+
+        let base_text = fetch_git_blob(self.workspace_root(), base_ref, &current.identity.path)?;
+        let (base_records, base_truncated, base_parse_had_errors) = match &base_text {
+            Some(text) => tree_sitter_records(text, &language)?,
+            None => (Vec::new(), false, false),
+        };
+        let (current_records, current_truncated, parse_had_errors) =
+            tree_sitter_records(&current.text, &language)?;
+
+        let changes = diff_records(
+            base_text.as_deref().unwrap_or(""),
+            &base_records,
+            &current.text,
+            &current_records,
+        );
+
+        Ok(OutlineDiff {
+            path: current.identity.path.clone(),
+            base_ref: base_ref.to_string(),
+            source: current.identity,
+            provenance: RetrievalProvenance {
+                class: RetrievalProvenanceClass::StructuralParser,
+                method: RetrievalMethod::TreeSitter,
+            },
+            changes,
+            base_parse_had_errors,
+            parse_had_errors,
+            truncated: base_truncated || current_truncated,
+        })
     }
 
     /// Consume a recorded span only if the same source generation is still
@@ -212,11 +323,32 @@ impl LanguageSpec {
 }
 
 fn tree_sitter_outline(source: ResolvedSource, spec: LanguageSpec) -> Result<OutlineResult> {
-    let config = TagsConfiguration::new(spec.language, &spec.tags_query, &spec.locals_query)
-        .context("failed to configure source tag parser")?;
+    let (records, truncated, parse_had_errors) = tree_sitter_records(&source.text, &spec)?;
+    Ok(OutlineResult {
+        source: source.identity,
+        provenance: RetrievalProvenance {
+            class: RetrievalProvenanceClass::StructuralParser,
+            method: RetrievalMethod::TreeSitter,
+        },
+        records,
+        truncated,
+        parse_had_errors,
+    })
+}
+
+/// Extract bounded, sorted structural records from raw source text without
+/// tying them to a `SourceIdentity`, so both a working-tree read and a Git
+/// blob can share the same tag-extraction path for diffing.
+fn tree_sitter_records(
+    text: &str,
+    spec: &LanguageSpec,
+) -> Result<(Vec<OutlineRecord>, bool, bool)> {
+    let config =
+        TagsConfiguration::new(spec.language.clone(), &spec.tags_query, &spec.locals_query)
+            .context("failed to configure source tag parser")?;
     let mut context = TagsContext::new();
     let (tags, parse_had_errors) = context
-        .generate_tags(&config, source.text.as_bytes(), None)
+        .generate_tags(&config, text.as_bytes(), None)
         .context("failed to parse source tags")?;
     let mut records = Vec::new();
     let mut truncated = false;
@@ -229,14 +361,13 @@ fn tree_sitter_outline(source: ResolvedSource, spec: LanguageSpec) -> Result<Out
             truncated = true;
             break;
         }
-        let name = source.text[tag.name_range.clone()].trim();
+        let name = text[tag.name_range.clone()].trim();
         if name.is_empty() {
             continue;
         }
         let (name, label_truncated) = bounded_label(name);
         truncated |= label_truncated;
-        let (start_line, end_line) =
-            span_line_coordinates(&source.text, tag.range.start, tag.range.end);
+        let (start_line, end_line) = span_line_coordinates(text, tag.range.start, tag.range.end);
         records.push(OutlineRecord {
             name,
             kind: config.syntax_type_name(tag.syntax_type_id).to_string(),
@@ -256,16 +387,179 @@ fn tree_sitter_outline(source: ResolvedSource, spec: LanguageSpec) -> Result<Out
             .then_with(|| left.kind.cmp(&right.kind))
     });
     records.dedup();
-    Ok(OutlineResult {
-        source: source.identity,
-        provenance: RetrievalProvenance {
-            class: RetrievalProvenanceClass::StructuralParser,
-            method: RetrievalMethod::TreeSitter,
-        },
-        records,
-        truncated,
-        parse_had_errors,
-    })
+    Ok((records, truncated, parse_had_errors))
+}
+
+/// Reject a `base_ref` value before it reaches a `git` argument vector.
+fn validate_base_ref(base_ref: &str) -> Result<()> {
+    if base_ref.is_empty() {
+        bail!("base_ref must not be empty");
+    }
+    if base_ref.len() > MAX_BASE_REF_BYTES {
+        bail!("base_ref exceeds {MAX_BASE_REF_BYTES} bytes");
+    }
+    if base_ref.starts_with('-') {
+        bail!("base_ref must not begin with '-'");
+    }
+    if base_ref.bytes().any(|byte| byte == 0 || byte == b'\n') {
+        bail!("base_ref must not contain control characters");
+    }
+    Ok(())
+}
+
+/// Read one file's UTF-8 text as it existed at `base_ref`. Returns `Ok(None)`
+/// when `base_ref` resolves but the path did not exist there (a new file),
+/// and a hard error when `base_ref` itself does not resolve to a commit.
+fn fetch_git_blob(workspace_root: &Path, base_ref: &str, path: &str) -> Result<Option<String>> {
+    let verify = Command::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--end-of-options")
+        .arg(format!("{base_ref}^{{commit}}"))
+        .current_dir(workspace_root)
+        .output()
+        .context("failed to invoke git to verify base_ref")?;
+    if !verify.status.success() {
+        bail!(
+            "base_ref \"{base_ref}\" does not resolve to a commit: {}",
+            bounded_git_error(&verify.stderr)
+        );
+    }
+
+    let show = Command::new("git")
+        .arg("show")
+        .arg(format!("{base_ref}:{path}"))
+        .current_dir(workspace_root)
+        .output()
+        .context("failed to invoke git to read the base revision")?;
+    if !show.status.success() {
+        // The path most likely did not exist at base_ref; treat it as new.
+        return Ok(None);
+    }
+    if show.stdout.len() as u64 > MAX_SOURCE_BYTES {
+        bail!(
+            "base revision of {path} is {} bytes; code_outline diff limit is {MAX_SOURCE_BYTES} bytes",
+            show.stdout.len()
+        );
+    }
+    let text = String::from_utf8(show.stdout)
+        .map_err(|_| anyhow::anyhow!("base revision of {path} is not UTF-8"))?;
+    Ok(Some(text))
+}
+
+fn bounded_git_error(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.len() <= MAX_GIT_ERROR_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_GIT_ERROR_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Match base and current records by `(name, kind)` and classify each delta.
+/// Matched records with byte-identical spans are omitted entirely.
+fn diff_records(
+    base_text: &str,
+    base_records: &[OutlineRecord],
+    current_text: &str,
+    current_records: &[OutlineRecord],
+) -> Vec<OutlineDiffChange> {
+    let mut base_by_key: BTreeMap<(&str, &str), Vec<&OutlineRecord>> = BTreeMap::new();
+    for record in base_records {
+        base_by_key
+            .entry((record.name.as_str(), record.kind.as_str()))
+            .or_default()
+            .push(record);
+    }
+
+    let mut changes = Vec::new();
+    for record in current_records {
+        let key = (record.name.as_str(), record.kind.as_str());
+        let matched = base_by_key
+            .get_mut(&key)
+            .filter(|slots| !slots.is_empty())
+            .map(|slots| slots.remove(0));
+        let Some(base_record) = matched else {
+            changes.push(OutlineDiffChange {
+                name: record.name.clone(),
+                kind: record.kind.clone(),
+                change: OutlineChangeKind::Added,
+                span: Some(record.span.clone()),
+            });
+            continue;
+        };
+        let base_span_text = &base_text[base_record.span.start_byte..base_record.span.end_byte];
+        let current_span_text = &current_text[record.span.start_byte..record.span.end_byte];
+        if base_span_text == current_span_text {
+            continue;
+        }
+        let (_, base_signature, _) = split_signature_body(base_span_text);
+        let (_, current_signature, _) = split_signature_body(current_span_text);
+        let change = if base_signature.trim() != current_signature.trim() {
+            OutlineChangeKind::SignatureChanged
+        } else {
+            OutlineChangeKind::BodyChanged
+        };
+        changes.push(OutlineDiffChange {
+            name: record.name.clone(),
+            kind: record.kind.clone(),
+            change,
+            span: Some(record.span.clone()),
+        });
+    }
+
+    let mut removed: Vec<&OutlineRecord> = base_by_key.into_values().flatten().collect();
+    removed.sort_by_key(|record| record.span.start_byte);
+    for base_record in removed {
+        changes.push(OutlineDiffChange {
+            name: base_record.name.clone(),
+            kind: base_record.kind.clone(),
+            change: OutlineChangeKind::Removed,
+            span: None,
+        });
+    }
+    changes
+}
+
+/// Split one definition's source text into a signature region (compared to
+/// decide `SignatureChanged`) and a body region. Braces mark the boundary
+/// where a language has them; otherwise a header-ending colon (Python-style
+/// blocks) does; otherwise the whole text is signature with no body.
+fn split_signature_body(text: &str) -> (SignatureSplit, &str, &str) {
+    if let Some(brace_index) = text.find('{') {
+        return (
+            SignatureSplit::FirstBrace,
+            &text[..brace_index],
+            &text[brace_index..],
+        );
+    }
+    if let Some(split_at) = colon_line_end(text) {
+        return (
+            SignatureSplit::ColonLine,
+            &text[..split_at],
+            &text[split_at..],
+        );
+    }
+    (SignatureSplit::WholeText, text, "")
+}
+
+/// Byte offset just after the colon on the first line (scanning from the
+/// start of `text`) whose trailing whitespace-trimmed content ends with
+/// `:`. Returns `None` when no such line exists.
+fn colon_line_end(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let core = line.trim_end_matches(['\n', '\r']).trim_end();
+        if core.ends_with(':') {
+            return Some(offset + core.len());
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn markdown_outline(source: ResolvedSource) -> OutlineResult {
@@ -435,6 +729,48 @@ mod tests {
             .expect("source resolver")
             .outline(&file)
             .expect("source outline")
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A tempdir Git repo with one file committed at HEAD as the "base"
+    /// version. Callers then overwrite the file in place to produce the
+    /// "current" working-tree version `outline_diff` compares against it.
+    fn git_workspace_with_base_commit(
+        filename: &str,
+        base_source: &str,
+    ) -> (tempfile::TempDir, SourceResolver) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        run_git(workspace.path(), &["init", "-q"]);
+        fs::write(workspace.path().join(filename), base_source).expect("base source");
+        run_git(workspace.path(), &["add", filename]);
+        run_git(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Finch Test",
+                "-c",
+                "user.email=finch-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        let resolver = SourceResolver::new(workspace.path()).expect("resolver");
+        (workspace, resolver)
     }
 
     #[test]
@@ -649,6 +985,221 @@ mod tests {
                 "class": "structural/parser",
                 "method": "tree_sitter"
             })
+        );
+    }
+
+    #[test]
+    fn test_validate_base_ref_rejects_empty_oversized_and_dash_prefixed_values() {
+        assert!(
+            validate_base_ref("").is_err(),
+            "empty base_ref must be rejected"
+        );
+        assert!(
+            validate_base_ref(&"a".repeat(MAX_BASE_REF_BYTES + 1)).is_err(),
+            "an over-long base_ref must be rejected"
+        );
+        assert!(
+            validate_base_ref("-oops").is_err(),
+            "a base_ref starting with '-' must be rejected before it can be read as a git flag"
+        );
+        assert!(validate_base_ref("HEAD~1").is_ok());
+    }
+
+    #[test]
+    fn test_outline_diff_reports_added_symbol() {
+        let (workspace, resolver) = git_workspace_with_base_commit("sample.rs", "fn kept() {}\n");
+        fs::write(
+            workspace.path().join("sample.rs"),
+            "fn kept() {}\nfn added() {}\n",
+        )
+        .expect("current source");
+
+        let diff = resolver
+            .outline_diff("sample.rs", "HEAD")
+            .expect("outline diff");
+        assert_eq!(
+            diff.changes
+                .iter()
+                .map(|change| (change.name.as_str(), change.change))
+                .collect::<Vec<_>>(),
+            vec![("added", OutlineChangeKind::Added)],
+            "only the newly added symbol should appear in the delta: {diff:?}"
+        );
+        assert!(
+            diff.changes[0].span.is_some(),
+            "an added symbol must carry its current span"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_reports_removed_symbol() {
+        let (workspace, resolver) =
+            git_workspace_with_base_commit("sample.rs", "fn kept() {}\nfn gone() {}\n");
+        fs::write(workspace.path().join("sample.rs"), "fn kept() {}\n").expect("current source");
+
+        let diff = resolver
+            .outline_diff("sample.rs", "HEAD")
+            .expect("outline diff");
+        assert_eq!(
+            diff.changes
+                .iter()
+                .map(|change| (change.name.as_str(), change.change, change.span.is_none()))
+                .collect::<Vec<_>>(),
+            vec![("gone", OutlineChangeKind::Removed, true)],
+            "a removed symbol must be reported with no current span: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_reports_signature_changed() {
+        let (workspace, resolver) =
+            git_workspace_with_base_commit("sample.rs", "fn edited(a: usize) {}\n");
+        fs::write(workspace.path().join("sample.rs"), "fn edited(a: u64) {}\n")
+            .expect("current source");
+
+        let diff = resolver
+            .outline_diff("sample.rs", "HEAD")
+            .expect("outline diff");
+        assert_eq!(diff.changes.len(), 1, "{diff:?}");
+        assert_eq!(diff.changes[0].name, "edited");
+        assert_eq!(
+            diff.changes[0].change,
+            OutlineChangeKind::SignatureChanged,
+            "a parameter-type edit must be classified as a signature change: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_reports_body_changed_when_signature_unchanged() {
+        let (workspace, resolver) =
+            git_workspace_with_base_commit("sample.rs", "fn edited(a: usize) { a + 1; }\n");
+        fs::write(
+            workspace.path().join("sample.rs"),
+            "fn edited(a: usize) { a + 2; }\n",
+        )
+        .expect("current source");
+
+        let diff = resolver
+            .outline_diff("sample.rs", "HEAD")
+            .expect("outline diff");
+        assert_eq!(diff.changes.len(), 1, "{diff:?}");
+        assert_eq!(diff.changes[0].name, "edited");
+        assert_eq!(
+            diff.changes[0].change,
+            OutlineChangeKind::BodyChanged,
+            "an unchanged signature with a changed body must not be reported as a signature change: {diff:?}"
+        );
+        let json = serde_json::to_string(&diff).expect("diff JSON");
+        assert!(
+            !json.contains("a + 2"),
+            "diff mode must not leak body text: {json}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_omits_byte_identical_symbol() {
+        let source = "fn stable() { 1 }\n";
+        let (workspace, resolver) = git_workspace_with_base_commit("sample.rs", source);
+        fs::write(workspace.path().join("sample.rs"), source).expect("current source == base");
+
+        let diff = resolver
+            .outline_diff("sample.rs", "HEAD")
+            .expect("outline diff");
+        assert!(
+            diff.changes.is_empty(),
+            "a byte-identical symbol must not appear in the delta: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_detects_signature_and_body_changes_in_python() {
+        let base = "def greet(name):\n    return 'hi ' + name\n\ndef stable():\n    return 1\n";
+        let (workspace, resolver) = git_workspace_with_base_commit("sample.py", base);
+        let current =
+            "def greet(name, loud=False):\n    return 'hi ' + name\n\ndef stable():\n    return 2\n";
+        fs::write(workspace.path().join("sample.py"), current).expect("current source");
+
+        let diff = resolver
+            .outline_diff("sample.py", "HEAD")
+            .expect("outline diff");
+        let change_of = |name: &str| {
+            diff.changes
+                .iter()
+                .find(|change| change.name == name)
+                .map(|change| change.change)
+        };
+        assert_eq!(
+            change_of("greet"),
+            Some(OutlineChangeKind::SignatureChanged),
+            "an added parameter is a signature change for a colon-headed definition too: {diff:?}"
+        );
+        assert_eq!(
+            change_of("stable"),
+            Some(OutlineChangeKind::BodyChanged),
+            "{diff:?}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_treats_missing_base_path_as_a_new_file() {
+        let (workspace, resolver) =
+            git_workspace_with_base_commit("other.rs", "fn unrelated() {}\n");
+        fs::write(workspace.path().join("fresh.rs"), "fn brand_new() {}\n")
+            .expect("new file, never committed");
+
+        let diff = resolver
+            .outline_diff("fresh.rs", "HEAD")
+            .expect("a base_ref that predates the file must diff cleanly, not error");
+        assert_eq!(diff.changes.len(), 1, "{diff:?}");
+        assert_eq!(diff.changes[0].name, "brand_new");
+        assert_eq!(
+            diff.changes[0].change,
+            OutlineChangeKind::Added,
+            "every symbol in a file absent from base_ref must show as added: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_rejects_unresolvable_base_ref() {
+        let (workspace, resolver) = git_workspace_with_base_commit("sample.rs", "fn kept() {}\n");
+        let _keep_alive = &workspace;
+
+        let error = resolver
+            .outline_diff("sample.rs", "not-a-real-ref")
+            .expect_err(
+                "an unresolvable base_ref must fail closed, not silently diff against nothing",
+            );
+        assert!(
+            error.to_string().contains("not-a-real-ref"),
+            "error must name the offending base_ref: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_fails_closed_when_working_tree_file_is_missing() {
+        let (workspace, resolver) = git_workspace_with_base_commit("sample.rs", "fn kept() {}\n");
+        fs::remove_file(workspace.path().join("sample.rs")).expect("delete working-tree file");
+
+        let error = resolver.outline_diff("sample.rs", "HEAD").expect_err(
+            "diff mode must fail closed, not panic, when the current file no longer exists",
+        );
+        assert!(
+            error.to_string().contains("sample.rs"),
+            "error must name the missing file: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_outline_diff_rejects_unsupported_language() {
+        let (workspace, resolver) = git_workspace_with_base_commit("notes.txt", "first\n");
+        fs::write(workspace.path().join("notes.txt"), "second\n").expect("current source");
+
+        let error = resolver
+            .outline_diff("notes.txt", "HEAD")
+            .expect_err("fallback/plain-text outlines must not silently produce an empty diff");
+        assert!(
+            error.to_string().contains("txt"),
+            "error must name the unsupported file type: {error:#}"
         );
     }
 }

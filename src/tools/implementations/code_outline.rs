@@ -34,7 +34,7 @@ impl Tool for CodeOutlineTool {
     }
 
     fn description(&self) -> &str {
-        "Return a bounded structural outline of one workspace source file, with exact-byte identity, provenance, and source spans. The result omits source bodies."
+        "Return a bounded structural outline of one workspace source file, with exact-byte identity, provenance, and source spans. The result omits source bodies. With base_ref set, instead return a compact symbol-level delta (added/removed/signature_changed/body_changed) between the working-tree file and its contents at that Git revision."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -44,6 +44,10 @@ impl Tool for CodeOutlineTool {
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative or contained absolute source-file path"
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Optional Git revision (e.g. \"HEAD\", \"main\", a commit SHA) to diff the file against. When set, the tool returns a structural delta instead of a full outline."
                 }
             }),
             required: vec!["path".to_string()],
@@ -55,8 +59,19 @@ impl Tool for CodeOutlineTool {
             .get("path")
             .and_then(Value::as_str)
             .context("Missing path parameter")?;
-        let result = SourceResolver::new(&self.workspace_root)?.outline(path)?;
-        serde_json::to_string_pretty(&result).context("failed to serialize code outline")
+        let base_ref = input.get("base_ref").and_then(Value::as_str);
+        let resolver = SourceResolver::new(&self.workspace_root)?;
+        match base_ref {
+            Some(base_ref) => {
+                let result = resolver.outline_diff(path, base_ref)?;
+                serde_json::to_string_pretty(&result)
+                    .context("failed to serialize code outline diff")
+            }
+            None => {
+                let result = resolver.outline(path)?;
+                serde_json::to_string_pretty(&result).context("failed to serialize code outline")
+            }
+        }
     }
 
     fn workspace_root(&self) -> Option<&std::path::Path> {
@@ -69,6 +84,186 @@ mod tests {
     use super::*;
     use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry, ToolUse};
     use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn executor_for(workspace: &Path) -> ToolExecutor {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CodeOutlineTool::new(workspace)));
+        let permissions = PermissionManager::new()
+            .with_default_rule(PermissionRule::Allow)
+            .with_workspace_root(workspace.to_path_buf());
+        ToolExecutor::new(registry, permissions, workspace.join("patterns.json")).expect("executor")
+    }
+
+    #[tokio::test]
+    async fn test_code_outline_diff_mode_reports_structural_delta_through_executor() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        run_git(workspace.path(), &["init", "-q"]);
+        let sample = workspace.path().join("sample.rs");
+        fs::write(
+            &sample,
+            "fn removed() {}\nfn kept() {}\nfn body_only() { let a = 1; }\nfn signature_old(a: usize) {}\n",
+        )
+        .expect("base source");
+        run_git(workspace.path(), &["add", "sample.rs"]);
+        run_git(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Finch Test",
+                "-c",
+                "user.email=finch-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        fs::write(
+            &sample,
+            "fn kept() {}\nfn body_only() { let a = 2; }\nfn signature_old(a: u64) {}\nfn added() {}\n",
+        )
+        .expect("current source");
+
+        let executor = executor_for(workspace.path());
+        let result = executor
+            .execute_tool(
+                &ToolUse::new(
+                    "code_outline".to_string(),
+                    serde_json::json!({"path": "sample.rs", "base_ref": "HEAD"}),
+                ),
+                None::<fn() -> anyhow::Result<()>>,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("tool result");
+
+        assert!(
+            !result.is_error,
+            "diff mode must succeed through the executor: {}",
+            result.content
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content).expect("diff mode must return JSON");
+        let changes = parsed
+            .get("changes")
+            .and_then(serde_json::Value::as_array)
+            .expect("diff mode must return a changes list");
+        let change_of = |name: &str| {
+            changes
+                .iter()
+                .find(|change| change.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .and_then(|change| {
+                    change
+                        .get("change")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        };
+        assert_eq!(
+            change_of("added").as_deref(),
+            Some("added"),
+            "added symbol must be reported as added; diff: {}",
+            result.content
+        );
+        assert_eq!(
+            change_of("removed").as_deref(),
+            Some("removed"),
+            "removed symbol must be reported as removed; diff: {}",
+            result.content
+        );
+        assert_eq!(
+            change_of("body_only").as_deref(),
+            Some("body_changed"),
+            "body-only edit must not be reported as a signature change; diff: {}",
+            result.content
+        );
+        assert_eq!(
+            change_of("signature_old").as_deref(),
+            Some("signature_changed"),
+            "signature edit must be distinguished from a body-only edit; diff: {}",
+            result.content
+        );
+        assert!(
+            change_of("kept").is_none(),
+            "unchanged symbol must not appear in the delta; diff: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("let a = 2"),
+            "diff mode must not copy source bodies into its result: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_code_outline_diff_mode_names_unsupported_language_in_error() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        run_git(workspace.path(), &["init", "-q"]);
+        let notes = workspace.path().join("notes.txt");
+        fs::write(&notes, "first draft\n").expect("base source");
+        run_git(workspace.path(), &["add", "notes.txt"]);
+        run_git(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Finch Test",
+                "-c",
+                "user.email=finch-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        fs::write(&notes, "second draft\n").expect("current source");
+
+        let executor = executor_for(workspace.path());
+        let result = executor
+            .execute_tool(
+                &ToolUse::new(
+                    "code_outline".to_string(),
+                    serde_json::json!({"path": "notes.txt", "base_ref": "HEAD"}),
+                ),
+                None::<fn() -> anyhow::Result<()>>,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("tool result");
+
+        assert!(
+            result.is_error,
+            "unsupported-language diff must fail, not return windows: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("txt"),
+            "error must name the unsupported language: {}",
+            result.content
+        );
+    }
 
     #[tokio::test]
     async fn test_code_outline_runs_through_real_executor_without_source_body() {
