@@ -6,9 +6,8 @@
 pub use finch_messages::{
     random_spinner_verb, AgentActivityView, AgentToolView, BrainParticipantMessage,
     ComponentAction, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage, Message, MessageId,
-    MessageRef, MessageStatus, OperationMessage, OperationRow, OperationRowStatus, OutputVm,
-    ProgramSourceVm, ProgressMessage, SayTurnStatus, SayTurnView, StaticMessage, StaticMessageType,
-    StreamingResponseMessage, ToggleProgram, ToolExecutionMessage, UserQueryMessage, WorkRow,
+    MessageRef, MessageStatus, OperationMessage, OutputVm, ProgramSourceVm, ProgressMessage,
+    SayTurnStatus, SayTurnView, StaticMessage, StreamingResponseMessage, UserQueryMessage,
     WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitPresentation,
     WorkUnitView, WorkUnitViewModel,
 };

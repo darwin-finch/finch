@@ -50,6 +50,28 @@ need. Keep pure snapshot-to-widget conversion in `finch-ui-model`; do not put te
 provider dispatch here. Child modules stay private; add a flat re-export only when an actual
 caller needs it. Do not add whole-module exports or recreate a generated `INTERFACE.md`.
 
+**Public surface audit (#1063):** a cross-crate, alias-aware grep sweep (workspace-wide by bare
+identifier, following every re-export chain — `crates/finch-messages/src/lib.rs`,
+`src/cli/messages/mod.rs`, and `src/cli/mod.rs` — not a definition-scoped LSP reference search,
+which had produced confirmed false negatives on `WorkUnit::queue_agent_activity` and `MessageRef`)
+narrowed `OperationRow`, `OperationRowStatus`, `StaticMessageType`, `ToggleMemoryRow`,
+`ToolExecutionMessage`, `ToggleProgram`, `WorkRow`, `ComponentAction::{new,downcast_ref}`,
+`WorkUnit::{set_thinking,complete_row_with_diff}`, and `LiveToolMessage::{set_content,set_failed}`
+to `pub(crate)` after confirming zero external callers by any path. `ToolExecutionMessage`'s
+`append_stdout`/`append_stderr`/`set_exit_code`/`set_failed` and `StaticMessage`'s
+`success`/`warning` (plus the now-unreachable `StaticMessageType::{Success,Warning}` variants and
+their `format`/`component_view` match arms) were deleted outright: zero callers anywhere,
+including this crate's own tests. `MessageRef`, `WorkUnit::{is_assistant_prose,
+append_row_body_line}`, and the seven `WorkUnit` methods widened during extraction
+(`spawn_agent_row_indices`, `is_activity_presentation`, `queue_agent_activity`,
+`start_agent_activity`, `start_agent_tool`, `complete_agent_tool`, `finish_agent_activity`) all
+have confirmed real external callers and are unchanged. `StreamingResponseMessage::set_thinking`
+has zero callers anywhere (not even this crate's own tests) yet was left exactly as `pub` rather
+than deleted: it is the only writer of a `thinking` field that `format()` actively reads to render
+the "[thinking…]" streaming indicator, so an empty caller list here looks like an unwired product
+feature, not dead API surface — a maintainer decision, not one to make silently inside an API
+audit. Full findings: issue #1063.
+
 **Focused tests:**
 `./scripts/test_brains.sh cargo test -p finch-messages --lib` for lifecycle and snapshot
 assembly, `./scripts/test_brains.sh cargo test -p finch-ui-model` for pure projection, and

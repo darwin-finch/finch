@@ -89,20 +89,32 @@ const GRAY_DIM: GrayDim = GrayDim;
 /// carries actions opaquely (`ComponentAction`) — there is no central action
 /// enum; each component defines its own payloads beside the ViewModel they
 /// mutate.
+///
+/// Issue #1063 audit: zero callers outside this crate (constructed and
+/// downcast entirely within `WorkUnit::say_turn_action`/
+/// `handle_say_turn_action`); narrowed from `pub`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToggleProgram;
+pub(crate) struct ToggleProgram;
 
 /// Opaque component-defined action. The engine never inspects the payload;
 /// the owning component downcasts it in its handle.
+///
+/// The type itself stays `pub`: it is a parameter/return type of the public
+/// `Message::transcript_action`/`handle_transcript_action` trait methods,
+/// which real external callers do invoke (e.g. `crates/finch-tui/src/lib.rs`)
+/// while passing the action through opaquely, per the design. Its own
+/// constructor and downcast, however, had zero callers outside this crate
+/// (issue #1063 audit) — external code never constructs or downcasts one
+/// directly — so they are narrowed from `pub`.
 #[derive(Debug)]
 pub struct ComponentAction(Box<dyn std::any::Any + Send + Sync>);
 
 impl ComponentAction {
-    pub fn new<A: std::any::Any + Send + Sync>(action: A) -> Self {
+    pub(crate) fn new<A: std::any::Any + Send + Sync>(action: A) -> Self {
         Self(Box::new(action))
     }
 
-    pub fn downcast_ref<A: std::any::Any>(&self) -> Option<&A> {
+    pub(crate) fn downcast_ref<A: std::any::Any>(&self) -> Option<&A> {
         self.0.downcast_ref::<A>()
     }
 }
@@ -112,8 +124,13 @@ impl ComponentAction {
 // ============================================================================
 
 /// A single tool-call sub-item rendered below the WorkUnit header
+///
+/// Issue #1063 audit: zero callers outside this crate. No public `WorkUnit`
+/// method returns a `WorkRow`/`Vec<WorkRow>` — the externally-visible row
+/// projection is the separate `finch-ui-model` type `WorkRowView`, built
+/// internally from `WorkRow` in `domain_view`; narrowed from `pub`.
 #[derive(Clone, Debug)]
-pub struct WorkRow {
+pub(crate) struct WorkRow {
     /// Pre-formatted label, e.g. "bash(git status)"
     pub label: String,
     pub status: WorkRowStatus,
@@ -262,7 +279,13 @@ impl WorkUnit {
     }
 
     /// Set the "thinking" flag shown in the animated status line.
-    pub fn set_thinking(&self, thinking: bool) {
+    ///
+    /// Issue #1063 audit: zero callers outside this crate's own
+    /// `test_set_thinking`; narrowed from `pub`. Note for the record: the
+    /// in-progress header's own "· thinking" text is actually driven by
+    /// `token_count == 0` (see `format`), not by this `thinking` field, so
+    /// this setter currently has no live production reader either way.
+    pub(crate) fn set_thinking(&self, thinking: bool) {
         self.inner
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -581,7 +604,13 @@ impl WorkUnit {
     }
 
     /// Complete a tool row with a structured, theme-independent file diff.
-    pub fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
+    ///
+    /// Issue #1063 audit: zero callers outside this crate's own tests.
+    /// Production exclusively uses `complete_row_with_body`, which already
+    /// parses `FileDiff`s from string content itself; narrowed from `pub`
+    /// rather than deleted, since this crate's own tests still exercise it
+    /// directly against a typed `FileDiff`.
+    pub(crate) fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());

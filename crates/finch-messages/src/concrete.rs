@@ -357,7 +357,15 @@ impl Default for StreamingResponseMessage {
 // ============================================================================
 
 /// Tool execution message with separate stdout/stderr
-pub struct ToolExecutionMessage {
+///
+/// Issue #1063 audit: zero external callers by any alias path (root
+/// compatibility facades re-exported this but nothing consumed the
+/// re-export); narrowed from `pub`. Its only remaining caller is this
+/// crate's own `test_tool_message_handles_poisoned_lock`. `append_stdout`,
+/// `append_stderr`, `set_exit_code`, and `set_failed` had zero callers
+/// anywhere, including that test, and were deleted outright rather than
+/// narrowed.
+pub(crate) struct ToolExecutionMessage {
     id: MessageId,
     tool_name: String,
     stdout: Arc<RwLock<String>>,
@@ -367,7 +375,7 @@ pub struct ToolExecutionMessage {
 }
 
 impl ToolExecutionMessage {
-    pub fn new(tool_name: impl Into<String>) -> Self {
+    pub(crate) fn new(tool_name: impl Into<String>) -> Self {
         Self {
             id: MessageId::new(),
             tool_name: tool_name.into(),
@@ -375,69 +383,6 @@ impl ToolExecutionMessage {
             stderr: Arc::new(RwLock::new(String::new())),
             exit_code: Arc::new(RwLock::new(None)),
             status: Arc::new(RwLock::new(MessageStatus::InProgress)),
-        }
-    }
-
-    /// Append to stdout
-    pub fn append_stdout(&self, text: &str) {
-        match self.stdout.write() {
-            Ok(mut stdout) => stdout.push_str(text),
-            Err(poisoned) => {
-                tracing::warn!(
-                    "ToolExecutionMessage stdout lock poisoned in append_stdout, recovering"
-                );
-                let mut stdout = poisoned.into_inner();
-                stdout.push_str(text);
-            }
-        }
-    }
-
-    /// Append to stderr
-    pub fn append_stderr(&self, text: &str) {
-        match self.stderr.write() {
-            Ok(mut stderr) => stderr.push_str(text),
-            Err(poisoned) => {
-                tracing::warn!(
-                    "ToolExecutionMessage stderr lock poisoned in append_stderr, recovering"
-                );
-                let mut stderr = poisoned.into_inner();
-                stderr.push_str(text);
-            }
-        }
-    }
-
-    /// Set exit code (marks as complete)
-    pub fn set_exit_code(&self, code: i32) {
-        match self.exit_code.write() {
-            Ok(mut e) => *e = Some(code),
-            Err(poisoned) => {
-                tracing::warn!(
-                    "ToolExecutionMessage exit_code lock poisoned in set_exit_code, recovering"
-                );
-                *poisoned.into_inner() = Some(code);
-            }
-        }
-        match self.status.write() {
-            Ok(mut s) => *s = MessageStatus::Complete,
-            Err(poisoned) => {
-                tracing::warn!(
-                    "ToolExecutionMessage status lock poisoned in set_exit_code, recovering"
-                );
-                *poisoned.into_inner() = MessageStatus::Complete;
-            }
-        }
-    }
-
-    /// Mark as failed
-    pub fn set_failed(&self) {
-        match self.status.write() {
-            Ok(mut s) => *s = MessageStatus::Failed,
-            Err(poisoned) => {
-                tracing::warn!(
-                    "ToolExecutionMessage status lock poisoned in set_failed, recovering"
-                );
-                *poisoned.into_inner() = MessageStatus::Failed;
-            }
         }
     }
 }
@@ -596,7 +541,10 @@ impl LiveToolMessage {
     }
 
     /// Replace the full content (for immediate complete display)
-    pub fn set_content(&self, content: impl Into<String>) {
+    ///
+    /// Issue #1063 audit: zero callers outside this crate's own tests
+    /// (`test_live_tool_message_complete_with_output`); narrowed from `pub`.
+    pub(crate) fn set_content(&self, content: impl Into<String>) {
         if let Ok(mut c) = self.content.write() {
             *c = content.into();
         }
@@ -610,7 +558,10 @@ impl LiveToolMessage {
     }
 
     /// Mark as failed
-    pub fn set_failed(&self) {
+    ///
+    /// Issue #1063 audit: zero callers outside this crate's own tests
+    /// (`test_live_tool_message_failed_state`); narrowed from `pub`.
+    pub(crate) fn set_failed(&self) {
         if let Ok(mut s) = self.status.write() {
             *s = MessageStatus::Failed;
         }
@@ -712,15 +663,22 @@ impl Message for LiveToolMessage {
 // ============================================================================
 
 /// Status of an individual row within an OperationMessage
+///
+/// Issue #1063 audit: zero callers outside this crate (`OperationMessage`'s
+/// `rows` field is private with no accessor exposing individual rows);
+/// narrowed from `pub`.
 #[derive(Clone)]
-pub enum OperationRowStatus {
+pub(crate) enum OperationRowStatus {
     Running,
     Complete(String), // compact one-line summary, may be empty
     Error(String),
 }
 
 /// A single sub-row representing one tool call
-pub struct OperationRow {
+///
+/// Issue #1063 audit: zero callers outside this crate, same as
+/// [`OperationRowStatus`]; narrowed from `pub`.
+pub(crate) struct OperationRow {
     pub label: String, // pre-formatted label, e.g. "bash(git push)"
     pub status: OperationRowStatus,
 }
@@ -900,8 +858,13 @@ pub struct MemoryRecallRow {
 /// `ToggleProgram`'s opaque-action pattern in `work_unit.rs` -- each
 /// component defines its own payload beside the ViewModel it mutates, and the
 /// engine's hit-rect routing never inspects it.
+///
+/// Issue #1063 audit: zero callers outside this crate (constructed and
+/// downcast entirely within [`MemoryRecalledMessage`]'s own
+/// `transcript_action`/`handle_transcript_action`, the same pattern as
+/// `ToggleProgram`); narrowed from `pub`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToggleMemoryRow(pub usize);
+pub(crate) struct ToggleMemoryRow(pub(crate) usize);
 
 /// A recalled/committed memory set shown for one turn. The identity and
 /// content (`header`, `rows`) are immutable once constructed -- unlike a
@@ -1212,12 +1175,18 @@ pub struct StaticMessage {
     message_type: StaticMessageType,
 }
 
+/// Issue #1063 audit: nothing outside this crate ever spells
+/// `StaticMessageType` (external callers only ever go through
+/// [`StaticMessage`]'s constructors); narrowed from `pub`. `Success` and
+/// `Warning` had zero callers anywhere, including this crate's own tests —
+/// only `info`/`error`/`plain` are ever constructed — so both variants and
+/// their two `format`/`component_view` match arms were deleted rather than
+/// merely narrowed. `finch_ui_model::StaticTextKind::{Success,Warning}` are
+/// a separate, independently-used type and are unaffected.
 #[derive(Debug, Clone, Copy)]
-pub enum StaticMessageType {
+pub(crate) enum StaticMessageType {
     Info,
     Error,
-    Success,
-    Warning,
     Plain, // For messages that already have their own formatting
 }
 
@@ -1235,22 +1204,6 @@ impl StaticMessage {
             id: MessageId::new(),
             content: content.into(),
             message_type: StaticMessageType::Error,
-        }
-    }
-
-    pub fn success(content: impl Into<String>) -> Self {
-        Self {
-            id: MessageId::new(),
-            content: content.into(),
-            message_type: StaticMessageType::Success,
-        }
-    }
-
-    pub fn warning(content: impl Into<String>) -> Self {
-        Self {
-            id: MessageId::new(),
-            content: content.into(),
-            message_type: StaticMessageType::Warning,
         }
     }
 
@@ -1276,8 +1229,6 @@ impl Message for StaticMessage {
             kind: match self.message_type {
                 StaticMessageType::Info => StaticTextKind::Info,
                 StaticMessageType::Error => StaticTextKind::Error,
-                StaticMessageType::Success => StaticTextKind::Success,
-                StaticMessageType::Warning => StaticTextKind::Warning,
                 StaticMessageType::Plain => StaticTextKind::Plain,
             },
             content_lines: self.content.lines().map(str::to_owned).collect(),
@@ -1298,22 +1249,6 @@ impl Message for StaticMessage {
                 format!(
                     "{}❌ {}{}",
                     color_to_ansi(&colors.messages.error),
-                    self.content,
-                    RESET
-                )
-            }
-            StaticMessageType::Success => {
-                format!(
-                    "{}✓ {}{}",
-                    color_to_ansi(&colors.messages.system),
-                    self.content,
-                    RESET
-                )
-            }
-            StaticMessageType::Warning => {
-                format!(
-                    "{}⚠️  {}{}",
-                    color_to_ansi(&colors.status.operation),
                     self.content,
                     RESET
                 )
