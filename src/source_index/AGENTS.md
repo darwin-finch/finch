@@ -4,16 +4,19 @@ Supplements the root [`AGENTS.md`](../../AGENTS.md), which applies in full.
 
 **Owns** workspace-namespaced exact-byte source identity, workspace-relative paths,
 revision/content generations, bounded source spans, retrieval provenance, deterministic structural
-outlines, Git-defined repository manifests, direct-child directory menus, and an atomic versioned
-cache. It does not own tool registration, hop selection, provider prompting, embeddings, model
-calls, MemTree, application state-path selection, or document/media discovery.
+outlines, symbol-level structural diffs against a Git revision, Git-defined repository manifests,
+direct-child directory menus, and an atomic versioned cache. It does not own tool registration, hop
+selection, provider prompting, embeddings, model calls, MemTree, application state-path selection,
+or document/media discovery.
 
 **Interface:** [`mod.rs`](mod.rs) is the facade. `identity` and `outline` stay private; callers use
 only the facade exports. Parser-library values never cross this boundary.
 
-**Dependencies:** this capsule may use Git as a path-set authority plus deterministic parsing,
-Markdown, hashing, capability-filesystem, locking, and serialization libraries. It must not
-depend on `cli`, `tools`, providers, models, memory, runtime, server, or application configuration.
+**Dependencies:** this capsule may use Git as a path-set authority, as a read-only blob source for
+one file at one revision (`outline_diff`, via `git show <base_ref>:<path>`, bounded and validated —
+see Invariants), plus deterministic parsing, Markdown, hashing, capability-filesystem, locking, and
+serialization libraries. It must not depend on `cli`, `tools`, providers, models, memory, runtime,
+server, or application configuration.
 The application layer injects one canonical workspace root and one existing owner-only state
 directory. Source and cache leaves are opened relative to capability directories; repository source
 opens do not follow leaf symlinks, and `..` cannot redirect a read.

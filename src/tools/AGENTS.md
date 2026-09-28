@@ -61,6 +61,11 @@ means “any path under the workspace root”, not “any string”. Bash has no
 `code_outline.path` is a discrete path slot and receives the same containment decision as
 `read.file_path`; `ToolExecutor::new` rejects any path-bound tool whose declared execution root
 differs from the permission root, and the implementation capability-opens beneath that same root.
+`code_outline`'s optional `base_ref` (diff mode) is not a path slot — it is a bounded Git revision
+string validated in `source_index::outline` (length, no leading `-`, no control bytes) before it
+reaches a `git` argument vector — and it only ever reads blob content already reachable inside the
+same workspace's repository via `git show <base_ref>:<path>`, scoped to the already
+containment-checked `path`; it grants no filesystem authority beyond plain `code_outline`.
 `find_code.path`, when supplied, is a workspace-contained permission slot and an in-memory scope on
 the already capability-bounded index; omitting it searches only the workspace injected at
 construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived

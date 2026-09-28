@@ -10,8 +10,8 @@ mod repository;
 
 pub use identity::{SourceIdentity, SourceResolver};
 pub use outline::{
-    OutlineRecord, OutlineResult, RetrievalMethod, RetrievalProvenance, RetrievalProvenanceClass,
-    SourceExcerpt, SourceSpan,
+    OutlineChangeKind, OutlineDiff, OutlineDiffChange, OutlineRecord, OutlineResult,
+    RetrievalMethod, RetrievalProvenance, RetrievalProvenanceClass, SourceExcerpt, SourceSpan,
 };
 pub use repository::{
     AgentLead, DirectoryChild, DirectoryChildKind, DirectoryRecord, IndexedOutline,
