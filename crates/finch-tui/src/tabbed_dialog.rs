@@ -40,8 +40,12 @@ pub enum TabbedDialogResult {
 }
 
 /// State for a single question tab
+///
+/// Crate-internal (#1078 facade audit): never re-exported at the crate root;
+/// `TabbedDialog::{current_tab,tabs}` (also narrowed below) are its only
+/// accessors and neither has an external caller.
 #[derive(Debug, Clone)]
-pub struct TabState {
+pub(crate) struct TabState {
     /// The question being asked
     pub question: QuestionView,
     /// Current selection (for single-select) or cursor position (for multi-select)
@@ -154,7 +158,7 @@ impl TabbedDialog {
     }
 
     /// Get the current tab state
-    pub fn current_tab(&self) -> &TabState {
+    pub(crate) fn current_tab(&self) -> &TabState {
         &self.tabs[self.current_tab]
     }
 
@@ -164,7 +168,7 @@ impl TabbedDialog {
     }
 
     /// Get all tabs (for rendering)
-    pub fn tabs(&self) -> &[TabState] {
+    pub(crate) fn tabs(&self) -> &[TabState] {
         &self.tabs
     }
 

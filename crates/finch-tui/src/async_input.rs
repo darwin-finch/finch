@@ -464,7 +464,10 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
 ///
 /// Used to send a quit signal through the out-of-band quit channel.
 /// The quit watcher task decodes and acts on it independently of the event loop.
-pub fn encode_quit_message() -> Vec<u8> {
+///
+/// Crate-internal (#1078 facade audit): never re-exported at the crate root;
+/// only this module's own quit-signal sender and its own test call it.
+fn encode_quit_message() -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut ctrl = message.init_root::<finch_ipc::finch_ipc_capnp::control_message::Builder>();

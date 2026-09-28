@@ -91,10 +91,6 @@ use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace
 use command_autocomplete::{CommandRegistry, CommandSpec};
 pub use diagnostic_console::{DiagnosticConsolePort, DiagnosticConsoleSnapshot};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
-pub use dialog_widget::DialogWidget;
-pub use shadow_buffer::{
-    extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
-};
 pub use tabbed_dialog::{QuestionOptionView, QuestionView};
 
 /// Application-owned status state read and updated by the terminal renderer.
@@ -210,7 +206,7 @@ pub fn emergency_restore_terminal() {
     let _ = disable_raw_mode();
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
-pub use tabbed_dialog_widget::TabbedDialogWidget;
+use tabbed_dialog_widget::TabbedDialogWidget;
 // The DOM manifest (#1141 part 2): the versioned wire contract the Tauri
 // client will consume over the daemon IPC (#808). The lowerings are engine
 // render modes; components never write HTML.
@@ -223,9 +219,9 @@ pub use dom_manifest::{
 // module private so the crate facade remains the only external path.
 pub use wizard_host::{
     lower_wizard_line, lower_wizard_span, plan_wizard_frame, wizard_bold, wizard_boxed,
-    wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_physical_rows,
-    wizard_plain, wizard_selected, wizard_visible_length, wizard_wrap, WizardCard, WizardColor,
-    WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
+    wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_plain,
+    wizard_selected, wizard_visible_length, wizard_wrap, WizardCard, WizardColor, WizardFrame,
+    WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
@@ -1483,7 +1479,10 @@ pub struct TuiRenderer {
 
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
-    pub active_tabbed_dialog: Option<TabbedDialog>,
+    // Crate-internal (#1078 facade audit): no external caller reads or
+    // writes this field; unlike `active_dialog`, `show_tabbed_dialog` runs
+    // its own alternate-screen loop with a local `dialog` binding.
+    pub(crate) active_tabbed_dialog: Option<TabbedDialog>,
     /// True while `active_dialog` occupies the live surface. A rising edge
     /// writes one terminal bell (`\x07`); later draws of the same overlay do not.
     attention_dialog_live: bool,
@@ -1567,7 +1566,10 @@ pub struct TuiRenderer {
 
     /// Words currently being typed (updated on each keystroke via set_typing_words).
     /// When non-empty, the panel switches to Typing mode to show live arrows.
-    pub typing_words: Vec<String>,
+    ///
+    /// Crate-internal (#1078 facade audit): external callers use the pub
+    /// `set_typing_words` method; none reads or writes this field directly.
+    pub(crate) typing_words: Vec<String>,
     /// Panel mode to restore after typing is done (before Typing mode was set).
     pre_typing_mode: PosetPanelMode,
 
@@ -1861,7 +1863,10 @@ impl TuiRenderer {
     }
 
     /// Mark the live area as needing a redraw on the next flush.
-    pub fn mark_dirty(&mut self) {
+    ///
+    /// Crate-internal (#1078 facade audit): only this crate's own
+    /// `async_input` event loop calls it; no external caller does.
+    pub(crate) fn mark_dirty(&mut self) {
         self.live_area_dirty = true;
     }
 
@@ -1895,8 +1900,11 @@ impl TuiRenderer {
     }
 
     // ── TextArea factories (also called from async_input) ─────────────────────
+    //
+    // Crate-internal (#1078 facade audit): both factories are called only
+    // from this file and `async_input`; no external caller names either.
 
-    pub fn create_clean_textarea() -> TextArea<'static> {
+    pub(crate) fn create_clean_textarea() -> TextArea<'static> {
         use ratatui::style::{Modifier, Style};
         let mut ta = TextArea::default();
         ta.set_placeholder_text("Type your message…");
@@ -1909,7 +1917,7 @@ impl TuiRenderer {
         ta
     }
 
-    pub fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
+    pub(crate) fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
         let mut ta = Self::create_clean_textarea();
         for (i, line) in text.split('\n').enumerate() {
             if i > 0 {
@@ -2935,7 +2943,10 @@ impl TuiRenderer {
     /// Uses cursor::SavePosition / RestorePosition so the overlay has **zero
     /// effect** on the live area's cursor tracking.  No rows are added to
     /// `active_rows`; the panel never triggers the "Reflecting…" scrollback spam.
-    pub fn draw_poset_overlay(&mut self) -> Result<()> {
+    ///
+    /// Crate-internal (#1078 facade audit): only this file's own render path
+    /// calls it; no external caller does.
+    pub(crate) fn draw_poset_overlay(&mut self) -> Result<()> {
         // Show the output of the user-defined `check` word, if any.
         let text = self.corner.lock().ok().and_then(|g| g.clone());
         let Some(text) = text else {
@@ -2968,10 +2979,6 @@ impl TuiRenderer {
             self.draw_live_area()?;
         }
         Ok(())
-    }
-
-    pub fn trigger_refresh(&mut self) {
-        self.needs_full_refresh = true;
     }
 
     /// Retain a render failure for the next frame and request a full refresh.
@@ -3058,10 +3065,6 @@ impl TuiRenderer {
         Self::save_history(&self.command_history);
         self.output_manager.enable_stdout();
         Ok(())
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.is_active
     }
 
     /// Temporarily release the terminal so another full-screen TUI (e.g. the
@@ -4058,7 +4061,10 @@ impl TuiRenderer {
         id
     }
 
-    pub fn handle_resize(&mut self, w: u16, h: u16) -> Result<()> {
+    /// Crate-internal (#1078 facade audit): only this crate's own
+    /// `async_input` event loop drives terminal resize; the application
+    /// never calls this directly.
+    pub(crate) fn handle_resize(&mut self, w: u16, h: u16) -> Result<()> {
         // Reflow can move previously owned rows above viewport row zero, where
         // relative MoveUp/Clear operations can never reach them. Do not touch
         // the reflowed bytes here. The next render replaces the complete visible
@@ -4239,7 +4245,9 @@ impl TuiRenderer {
         );
     }
 
-    pub fn update_ghost_text(&mut self) {
+    /// Crate-internal (#1078 facade audit): only this crate's own composer
+    /// key handling calls it; no external caller does.
+    pub(crate) fn update_ghost_text(&mut self) {
         // Recalled history lines are already complete. Showing the slash
         // dropdown would steal the next Up/Down from history navigation.
         if self.history_index.is_some() {
@@ -5032,7 +5040,9 @@ impl TuiRenderer {
     /// The settled record rides the standard canonical-commit pipeline — the
     /// question, the options with the picked marker, and the answer become
     /// speakable, copyable transcript rows exactly once.
-    pub fn complete_dialog(&mut self, result: DialogResult) {
+    /// Crate-internal (#1078 facade audit): only this crate's own
+    /// `async_input` dialog-key handling calls it; no external caller does.
+    pub(crate) fn complete_dialog(&mut self, result: DialogResult) {
         if let Some(dialog) = self.active_dialog.take() {
             self.settle_dialog(&dialog, &result);
         }
@@ -5041,7 +5051,9 @@ impl TuiRenderer {
     }
 
     /// Write the answered dialog's settled record into the transcript (#807).
-    pub fn settle_dialog(&mut self, dialog: &Dialog, result: &DialogResult) {
+    /// Crate-internal (#1078 facade audit): only `complete_dialog` and
+    /// `show_dialog` (both same-crate) call it; no external caller does.
+    pub(crate) fn settle_dialog(&mut self, dialog: &Dialog, result: &DialogResult) {
         let record = dialog::settled_dialog_record(dialog, result);
         self.output_manager.write_tool_raw(record);
         self.live_area_dirty = true;
@@ -5188,15 +5200,6 @@ impl TuiRenderer {
         execute!(io::stdout(), LeaveAlternateScreen)?;
         self.active_rows = 0;
         Ok(result)
-    }
-
-    /// Convenience wrapper for the tool-approval flow.
-    pub fn render_ask_user_dialog(
-        &mut self,
-        title: &str,
-        options: Vec<DialogOption>,
-    ) -> Result<DialogResult> {
-        self.show_dialog(Dialog::select(title, options))
     }
 }
 

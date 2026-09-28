@@ -507,3 +507,36 @@ under this facade instead of reaching through `crate::cli`.
 `test_scanner_would_fail_if_runtime_returned_to_draw_live_area` and
 `test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no longer
 see those production functions; the removed file viewer is no longer a scan target.
+
+**Public surface audit (#1078).** A workspace-wide grep by bare identifier through every
+re-export/alias path (crate name, the root `use finch_tui as tui` facade in `src/cli/mod.rs`, and
+same-named-method false matches like the one below) — not the definition-scoped LSP reference
+search that produced this issue's own confirmed false negatives (`TuiRenderer`, `MentionAttachment`,
+`PosetPanelMode`, `WizardHost`, `WizardRects`, `finch_ui_model::extract_visible_chars` all showed
+zero LSP hits despite real root callers). Narrowed to `pub(crate)` (confirmed zero external
+callers by any path, still used internally): `DialogWidget`, `TabbedDialogWidget`, `ShadowBuffer`,
+`Cell` (the shadow-buffer cell, unrelated to any other `Cell` type), `diff_buffers`,
+`TabState`/`TabbedDialog::{current_tab,tabs}`, `encode_quit_message`,
+`TuiRenderer::{active_tabbed_dialog,typing_words,mark_dirty,create_clean_textarea,
+create_clean_textarea_with_text,draw_poset_overlay,handle_resize,update_ghost_text,
+complete_dialog,settle_dialog}`, and the crate-root re-exports of `finch_ui_model`'s four line
+helpers (`extract_visible_chars`, `physical_rows`, `truncate_to_columns`, `visible_length` — every
+in-crate call site already reaches them through the qualified `shadow_buffer::` path; nothing
+external ever named the old crate-root re-export despite the LSP false negative on the same
+symbols). `wizard_keys` was already unreachable outside the crate (a `pub mod` nested inside an
+already-private module) and is now plainly `mod`. Deleted outright (zero callers anywhere,
+including this crate's own tests): `TuiRenderer::{is_active,render_ask_user_dialog,
+trigger_refresh}` — the first two were simple dead convenience methods; `trigger_refresh` looked
+internally-used at first grep (it flips the same `needs_full_refresh` flag `record_render_failure`
+also sets) but had zero actual callers of its own anywhere, confirmed by a second, targeted grep
+before deleting it outright rather than leaving it `pub(crate)` with an inaccurate "still used
+internally" claim — `needs_full_refresh` itself is not dead, it just has other live writers.
+One issue-text correction found along the way: the issue's own list of confirmed root callers
+named `wizard_physical_rows` (this crate's raw `&str` helper) as called from
+`src/cli/setup_wizard/render.rs`; that call is actually `WizardLine::physical_rows`, an unrelated
+same-named inherent method on a different type — verified independently, the free function has
+zero external callers and is narrowed to `pub(crate)` too.
+Everything else in the flat facade — `TuiRenderer`, `TuiStatusPort`, `TuiOutputPort`,
+`MentionPort`, `MentionAttachment`, `PosetPanelMode`, `ActivityUsageState`, `WizardView`,
+`WizardHost`, `plan_wizard_frame`, `WizardFrame`/`WizardRects`, and the remaining wizard styling
+helpers — has a confirmed real external caller and is unchanged. Full findings: issue #1078.

@@ -14,7 +14,11 @@ use super::tabbed_dialog::TabbedDialog;
 use finch_theme::ColorScheme;
 
 /// Widget for rendering tabbed dialogs
-pub struct TabbedDialogWidget<'a> {
+///
+/// Crate-internal (#1078 facade audit): constructed only by
+/// `TuiRenderer::show_tabbed_dialog`'s own alternate-screen paint loop; no
+/// external caller ever names this type.
+pub(crate) struct TabbedDialogWidget<'a> {
     pub dialog: &'a TabbedDialog,
     colors: &'a ColorScheme,
 }

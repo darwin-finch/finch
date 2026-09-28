@@ -19,13 +19,19 @@ use ratatui::style::Style;
 // (`finch_ui_model`) so components can measure text without this
 // buffer; engine call sites keep their stable paths here.
 use finch_ui_model::char_display_width;
-pub use finch_ui_model::{
+// Crate-internal (#1078 facade audit): every call site in this crate reaches
+// these through the qualified `shadow_buffer::` path, and no external caller
+// ever named them through the old crate-root re-export.
+pub(crate) use finch_ui_model::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
 
 /// A single cell in the shadow buffer (character + style)
+///
+/// Crate-internal (#1078 facade audit): never re-exported at the crate root
+/// and no external caller reaches it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Cell {
+pub(crate) struct Cell {
     pub ch: char,
     pub style: Style,
 }
@@ -49,7 +55,10 @@ impl Cell {
 }
 
 /// 2D shadow buffer for terminal rendering
-pub struct ShadowBuffer {
+///
+/// Crate-internal (#1078 facade audit): never re-exported at the crate root
+/// and no external caller reaches it.
+pub(crate) struct ShadowBuffer {
     /// 2D array of cells [y][x]
     cells: Vec<Vec<Cell>>,
     /// Terminal width
@@ -236,7 +245,13 @@ impl ShadowBuffer {
 
 /// Diff two shadow buffers and return changed cells
 /// Returns Vec<(x, y, cell)> for cells that changed
-pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usize, usize, Cell)> {
+///
+/// Crate-internal (#1078 facade audit): never re-exported at the crate root
+/// and no external caller reaches it.
+pub(crate) fn diff_buffers(
+    current: &ShadowBuffer,
+    previous: &ShadowBuffer,
+) -> Vec<(usize, usize, Cell)> {
     let mut changes = Vec::new();
 
     // If dimensions changed, return all cells
