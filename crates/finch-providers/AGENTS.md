@@ -249,6 +249,41 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   mid-human-approval `claude` child. `parked_call_match_reports_mismatch_and_leaves_the_parked_turn_alive`
   and `parked_call_match_is_a_non_destructive_peek_that_never_abandons_a_correct_resume` (both in
   `claude_cli.rs`) prove the peek never disturbs the parked state either way.
+- **The inner `claude` subprocess must never act as an independent agent with its own persistent
+  state, skills, or interactive prompts — it is a scoped model-generation backend, full stop
+  (issue #1389, found via a real Claude CLI Subscription session).** `--tools ""` only turns off
+  the CLI's own *built-in* Read/Write/Edit/Bash/etc; it does nothing about a *real, legitimately
+  advertised* Finch tool served over the MCP bridge (`mcp_bridge_args`). A completely ordinary
+  chat message ("remember that") made the model call Finch's own MCP-bridged `write` tool to
+  persist a file shaped exactly like Claude Code's own auto-memory feature (`name`/`description`/
+  `metadata.type` frontmatter) under `~/.claude/projects/<hashed-cwd>/memory/` — real files, on
+  the host filesystem, entirely outside Finch's own Brain/memory store, surfaced to the user as an
+  ordinary Finch write-approval dialog with no indication it targeted a different tool's storage.
+  `invocation_args()` now always includes `--restricted --permission-prompts none`, verified live
+  against the real `claude` CLI 2.1.284 on 2026-09-28 (a fake MCP server standing in for the real
+  bridge, advertising just a `write` tool exactly as `mcp_bridge_args` does): four consecutive
+  live runs with these flags produced no memory write and no `write` `tool_use` at all, and a
+  separate live run confirmed a real, explicitly requested MCP tool call still round-trips
+  correctly (`system/init` reports the `finch` server `connected`, a proper `tool_use` is emitted,
+  the fake bridge receives it) under the machine's real OAuth subscription login (no
+  `ANTHROPIC_API_KEY` in the environment). Two flags were tried first and rejected — do not re-add
+  either without new live evidence: **`--bare`** forces `ANTHROPIC_API_KEY`/`apiKeyHelper` auth and
+  never reads OAuth or the keychain per its own help text, which breaks this provider's entire
+  reason for existing (driving the user's Claude subscription login, `claude_oauth.rs`).
+  **`--safe-mode`** did suppress the memory write in the same live repro, but a second live run —
+  asking the model to use the MCP-bridged `write` tool for a real, explicit task — showed
+  `system/init`'s `mcp_servers` come back `[]`: it drops even an *explicitly passed* `--mcp-config`
+  server, not just ambient/settings-discovered ones, and the model fell back to emitting a
+  hallucinated `<invoke name="Write">...` text block that nothing here can execute — silently
+  breaking every real Finch tool call through this provider. `--permission-prompts none`
+  additionally closes the "Edit in $EDITOR"-style terminal-hijack risk from the issue's report:
+  anything that would still try to prompt a human outside Finch's own approval flow is denied
+  automatically instead of ever reaching an interactive dialog, regardless of what triggers it.
+  `invocation_args_always_scope_the_subprocess_against_its_own_persistent_state_and_prompts` pins
+  both flags present (with and without tools requested) and the two rejected flags absent;
+  `real_tool_call_still_round_trips_with_the_new_subprocess_scoping_flags_present` is the
+  production-boundary proof that a real MCP tool call still completes end to end through the
+  spawned process with the new argv (both in `claude_cli.rs`).
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
