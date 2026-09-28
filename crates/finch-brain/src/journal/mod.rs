@@ -413,7 +413,7 @@ pub struct BrainProviderSelection {
 }
 
 impl BrainProviderSelection {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.provider.is_none() && self.model.is_none() && self.reasoning_effort.is_none()
     }
 }

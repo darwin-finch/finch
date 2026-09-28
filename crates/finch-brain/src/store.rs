@@ -664,7 +664,7 @@ impl BrainStore {
         Self::with_environment(machine, workspace, root)
     }
 
-    pub fn with_environment(
+    pub(crate) fn with_environment(
         machine: impl Into<String>,
         workspace: impl Into<PathBuf>,
         root: Option<PathBuf>,
@@ -4674,7 +4674,7 @@ impl BrainStore {
         self.push_locked_for_run(name, state, sender, Some(run_id), kind)
     }
 
-    pub fn pop_program(&self, name: &str, sender: &str) -> Result<Option<BrainEvent>> {
+    pub(crate) fn pop_program(&self, name: &str, sender: &str) -> Result<Option<BrainEvent>> {
         let snapshot = self.snapshot(name)?;
         let Some(program) = snapshot.program_stack.last() else {
             return Ok(None);
@@ -4773,7 +4773,7 @@ impl BrainStore {
     }
 
     /// Open or reuse the Brain-bound portable effect delivery log.
-    pub fn effect_delivery_log(
+    pub(crate) fn effect_delivery_log(
         &self,
         name: &str,
     ) -> Result<Option<Arc<std::sync::Mutex<finch_runtime::VmEffectDeliveryLog>>>> {
@@ -4922,7 +4922,7 @@ impl BrainStore {
     /// Journal the latest checkpoint only after a ProgramRuntime commit. The
     /// source event remains the audit record; restart restores state rather
     /// than replaying effects from that source.
-    pub fn commit_runtime(
+    pub(crate) fn commit_runtime(
         &self,
         name: &str,
         request_seq: u64,
@@ -4965,7 +4965,7 @@ impl BrainStore {
     /// Commit reducible state returned by the frontend that owns this Brain's
     /// environment. The daemon validates and journals the checkpoint but does
     /// not execute the source or inherit the frontend's host authority.
-    pub fn commit_runner_runtime(
+    pub(crate) fn commit_runner_runtime(
         &self,
         name: &str,
         request_seq: u64,

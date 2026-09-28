@@ -34,16 +34,16 @@ use uuid::Uuid;
 
 /// Default bound on concurrently running background tasks. Starting beyond
 /// this bound fails closed; a running process is never evicted to make room.
-pub const DEFAULT_MAX_RUNNING_TASKS: usize = 16;
+pub(crate) const DEFAULT_MAX_RUNNING_TASKS: usize = 16;
 
 /// Default bound on total retained task entries (running + finished). Finished
 /// entries are reaped oldest-first to make room; a start is rejected only when
 /// every slot is held by a running task.
-pub const DEFAULT_MAX_TOTAL_TASKS: usize = 64;
+pub(crate) const DEFAULT_MAX_TOTAL_TASKS: usize = 64;
 
 /// Default per-stream ring-buffer retention budget in bytes. Output beyond the
 /// budget evicts the oldest lines; the count of discarded lines is reported.
-pub const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
+pub(crate) const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
 
 /// Watcher poll interval while a task is running. Coarse liveness only; no
 /// correctness assertion depends on this granularity.
@@ -68,7 +68,7 @@ impl BackgroundTaskId {
     }
 
     /// The identifier as presented in tool results.
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -117,7 +117,7 @@ impl std::fmt::Display for ExitOutcome {
 
 impl BackgroundTaskState {
     /// True while the task still holds a slot a new task cannot take.
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         matches!(self, Self::Running)
     }
 }
@@ -308,7 +308,7 @@ impl BackgroundTaskManager {
     }
 
     /// Manager with explicit bounds (used by tests to make bounds reachable).
-    pub fn with_limits(max_running: usize, max_total: usize, ring_bytes: usize) -> Self {
+    pub(crate) fn with_limits(max_running: usize, max_total: usize, ring_bytes: usize) -> Self {
         Self {
             state: Mutex::new(ManagerState {
                 tasks: HashMap::new(),
@@ -320,24 +320,8 @@ impl BackgroundTaskManager {
         }
     }
 
-    /// Number of tasks currently in `Running` state.
-    pub async fn running_count(&self) -> usize {
-        let state = self.state.lock().expect("background manager state lock");
-        state
-            .tasks
-            .values()
-            .filter(|entry| {
-                entry
-                    .lock()
-                    .expect("background task entry lock")
-                    .state
-                    .is_running()
-            })
-            .count()
-    }
-
     /// Total retained entries, running and finished.
-    pub async fn total_count(&self) -> usize {
+    pub(crate) async fn total_count(&self) -> usize {
         self.state
             .lock()
             .expect("background manager state lock")
@@ -514,7 +498,7 @@ impl BackgroundTaskManager {
 
     /// Kill and reap every running task. This is the daemon-death path: the
     /// owning process is going away, so nothing may survive it.
-    pub async fn shutdown_all(&self) {
+    pub(crate) async fn shutdown_all(&self) {
         let ids: Vec<BackgroundTaskId> = {
             let state = self.state.lock().expect("background manager state lock");
             state.tasks.keys().cloned().collect()

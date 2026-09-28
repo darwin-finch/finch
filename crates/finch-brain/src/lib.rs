@@ -27,7 +27,7 @@ pub use attachment::{
 };
 pub use background::{
     BackgroundTaskId, BackgroundTaskManager, BackgroundTaskSnapshot, BackgroundTaskState,
-    ExitOutcome, DEFAULT_MAX_RUNNING_TASKS, DEFAULT_MAX_TOTAL_TASKS, DEFAULT_RING_BYTES_PER_STREAM,
+    ExitOutcome,
 };
 pub use credential::{
     default_participant_scopes, permitted_participant_scopes, BrainCredentialAuthority,
@@ -53,8 +53,8 @@ pub use journal::{
 pub use names::generate;
 pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};
 pub use remote::{
-    AttachedBrainClient, LocalBrainTransport, RemoteBrainCapabilities, RemoteBrainClient,
-    RemoteBrainTarget, DEFAULT_BRAIN_PORT,
+    AttachedBrainClient, BrainMutationHandle, LocalBrainTransport, RemoteBrainCapabilities,
+    RemoteBrainClient, RemoteBrainTarget, DEFAULT_BRAIN_PORT,
 };
 pub use run::{
     BrainRun, BrainRunCancellationReservation, BrainRunKind, BrainRunStatus, BrainRunnerHandoff,
