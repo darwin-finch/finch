@@ -140,11 +140,40 @@ fn markdown_wrapping_repair_hint(
     )
 }
 
+/// One-line correction appended to a repair request when the rejected
+/// submission was classified as unwrapped natural language
+/// (`WireFailureClass::RawProse`) rather than any other compile/link
+/// failure — the sibling gap to `markdown_wrapping_repair_hint` (issue
+/// #1230/#1231 fixed the Markdown-fence case; this covers the other half of
+/// BOOT.md's "Raw `Hello`... are invalid submissions" rule, which the raw
+/// diagnostic alone does not restate).
+///
+/// Without this, a model that replies in plain prose (e.g. "Hi — what do
+/// you need?", rejected as `unknown Co-Forth word 'Hi'`) gets no better
+/// information on its repair attempt than on its first: the bare
+/// unknown-word diagnostic does not say *why* — that Finch always executes
+/// the full text response as a program, and prose must be wrapped in an
+/// output effect like `say`. This reproduces a live failure: Claude Sonnet
+/// 5, a strong instruction-following model, still replied in bare prose on
+/// a fresh boot with no corrective hint available on this class.
+fn raw_prose_repair_hint(rejected_source: &str, diagnostic: &str, language: &str) -> String {
+    if classify_wire_failure(rejected_source, diagnostic) != WireFailureClass::RawProse {
+        return String::new();
+    }
+    format!(
+        "\n\nNote: this was rejected as plain natural-language text, not {language} source. \
+         Finch never renders assistant prose directly — every text response is executed as a \
+         program. Wrap any words you want the human to see in an output effect, for example \
+         `say`: `s\"...\" say` in Co-Forth or `(say \"...\")` in Lisp."
+    )
+}
+
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     let language = ProgramLanguage::infer_source(rejected_source).as_str();
     let tool_call_hint = provider_native_tool_repair_hint(diagnostic, language);
     let markdown_hint = markdown_wrapping_repair_hint(rejected_source, diagnostic, language);
+    let raw_prose_hint = raw_prose_repair_hint(rejected_source, diagnostic, language);
     format!(
         "E-WIRE-001. You do not communicate with the human directly; every byte of your text output is Finch VM input. \
          The preceding Finch VM wire program was rejected before execution. \
@@ -153,7 +182,7 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
          Re-emit exactly one complete raw Finch {language} ProgramSubmission; do not use Markdown, prose, labels, or tools. \
          User-visible text must be produced by an output effect inside that program.\n\n\
          Rejected source:\n---\n{rejected_source}\n---\n\
-         Diagnostic:\n{diagnostic}{tool_call_hint}{markdown_hint}"
+         Diagnostic:\n{diagnostic}{tool_call_hint}{markdown_hint}{raw_prose_hint}"
     )
 }
 
@@ -1677,6 +1706,65 @@ mod tests {
         assert!(
             !prose_request.contains("Markdown code fences"),
             "raw prose with no fence must not get the markdown-wrapping hint: {prose_request}"
+        );
+    }
+
+    #[test]
+    fn test_wire_repair_tells_a_raw_prose_reply_to_wrap_output_in_say() {
+        // Live-session reproduction: Claude Sonnet 5 (a strong
+        // instruction-following model) replied to "Hi claude?" with bare
+        // prose ("Hi — what do you need?"), rejected as `unknown Co-Forth
+        // word 'Hi'` since Finch executes the full text response as a
+        // program (BOOT.md). Sibling gap to the Markdown-fence hint above
+        // (#1230/#1231): the raw diagnostic alone does not say *why* prose
+        // is rejected or how to fix it.
+        let diagnostic = "error[E-LINK-002]: unknown Co-Forth word 'Hi'\n\
+             1 | Hi — what do you need?\n  = phase: name resolution";
+        let request = wire_repair_request("Hi — what do you need?", diagnostic);
+        assert!(
+            request.contains("Finch never renders assistant prose directly")
+                && request.contains("say"),
+            "repair prompt must explicitly tell a raw-prose reply to wrap output in an effect \
+             like say: {request}"
+        );
+
+        // The other live example from the same session: longer, multi-clause prose.
+        let longer_diagnostic = "error[E-LINK-002]: unknown Co-Forth word 'Yes'\n\
+             1 | Yes, I'm Claude (Sonnet 5), running as your Claude Code agent in this repo.\n\
+             = phase: name resolution";
+        let longer_request = wire_repair_request(
+            "Yes, I'm Claude (Sonnet 5), running as your Claude Code agent in this repo.",
+            longer_diagnostic,
+        );
+        assert!(
+            longer_request.contains("Finch never renders assistant prose directly"),
+            "multi-clause raw prose must also get the correction: {longer_request}"
+        );
+    }
+
+    #[test]
+    fn test_wire_repair_omits_raw_prose_hint_for_a_non_prose_rejection() {
+        // Negative case: an ordinary invented-word failure (a single lowercase
+        // token, not prose) must not get the raw-prose correction -- it stays
+        // targeted to `WireFailureClass::RawProse`, not appended to every
+        // repair prompt.
+        let diagnostic =
+            "error[E-LINK-002]: unknown Co-Forth word 'dupp'\n  = hint: did you mean `dup`?";
+        let request = wire_repair_request("dupp", diagnostic);
+        assert!(
+            !request.contains("Finch never renders assistant prose directly"),
+            "an ordinary unlinked-word rejection must not get the raw-prose hint: {request}"
+        );
+
+        // A Markdown-fenced submission is a different, already-hinted class; it
+        // must not also collect the raw-prose hint.
+        let fenced_diagnostic = "E-WIRE-002: Finch wire response must be raw Lisp/Co-Forth, not a \
+            Markdown code fence; emit s\"...\" say for user prose";
+        let fenced_request = wire_repair_request("```lisp\n(say \"hi\")\n```", fenced_diagnostic);
+        assert!(
+            !fenced_request.contains("Finch never renders assistant prose directly"),
+            "a Markdown-fenced rejection must get only the fence hint, not also the raw-prose \
+             hint: {fenced_request}"
         );
     }
 
