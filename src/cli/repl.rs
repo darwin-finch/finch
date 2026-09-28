@@ -1204,17 +1204,10 @@ impl Repl {
         tool_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
             background_tasks,
         )));
-        // Delegate a coding task to the official Claude Code CLI as a
-        // distinct sub-agent, running as itself (issue: delegate to
-        // Claude Code). Hard-denied to peers alongside restart/spawn_task.
-        tool_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
-            tool_workspace_root.clone(),
-        )));
         // Delegate a subtask to an isolated subagent loop with its own
         // conversation history, optionally against a named configured
         // provider (see `/providers`) instead of the one driving this
-        // conversation. Hard-denied to peers alongside restart and
-        // delegate_to_claude_code.
+        // conversation. Hard-denied to peers alongside restart.
         tool_registry.register(Box::new(crate::tools::TaskTool::new(
             claude_client.shared_provider(),
             Arc::new(config.clone()),
@@ -1386,9 +1379,6 @@ impl Repl {
                 )));
                 fallback_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
                     background_tasks,
-                )));
-                fallback_registry.register(Box::new(crate::tools::ClaudeCodeDelegateTool::new(
-                    tool_workspace_root.clone(),
                 )));
                 fallback_registry.register(Box::new(crate::tools::TaskTool::new(
                     claude_client.shared_provider(),
