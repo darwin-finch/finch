@@ -17,5 +17,9 @@ Two callers show why this is a shared leaf:
 
 The application-facing `cli::diff` path remains a compatibility re-export for existing event-loop
 callers. Read the [agent contract](AGENTS.md) for bounds and dependency rules. [`src/lib.rs`](src/lib.rs)
-is the flat callable facade; rustdoc shows methods on its exported model types. Rendering callers
-name `ColorScheme` through `finch-theme` directly; `finch-diff` does not re-export theme types.
+is the flat callable facade; rustdoc shows methods on its exported model types. `render_files` and
+`FileDiff::render` take `&ColorScheme`, and the facade re-exports `ColorScheme` from `finch-theme`
+so a caller can spell that argument's type without adding its own direct `finch-theme` dependency
+(revised by the #1033 audit; matches the convention already set by `src/theme.rs`, the root
+package's own compatibility facade for the extracted `finch-theme` crate, and by `finch-tui`'s
+crate root, both of which re-export `ColorScheme` the same way).
