@@ -105,7 +105,7 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   Filed: #1387 (exit message contradicts `finch brain ls`, reads as data loss to a first-timer),
   #1388 (two distinct provider responses concatenated with no separator on Claude CLI
   Subscription — the concrete reproduction of an anomaly flagged-but-unconfirmed earlier that
-  night; root-cause investigation and fix dispatched separately), #1389 (Claude CLI Subscription's
+  night; fixed same night, PR #1390 — `TurnRecord::tool_use_bridges_next_text`), #1389 (Claude CLI Subscription's
   inner `claude` subprocess runs unrestricted with its own auto-memory skill, writing real files
   outside Finch's data model, and can hijack terminal input via an approval dialog — serious,
   needs a design decision on subprocess scoping, not just a quick patch). Strong corroborating
