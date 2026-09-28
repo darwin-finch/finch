@@ -513,10 +513,22 @@ re-export/alias path (crate name, the root `use finch_tui as tui` facade in `src
 same-named-method false matches like the one below) — not the definition-scoped LSP reference
 search that produced this issue's own confirmed false negatives (`TuiRenderer`, `MentionAttachment`,
 `PosetPanelMode`, `WizardHost`, `WizardRects`, `finch_ui_model::extract_visible_chars` all showed
-zero LSP hits despite real root callers). Narrowed to `pub(crate)` (confirmed zero external
-callers by any path, still used internally): `DialogWidget`, `TabbedDialogWidget`, `ShadowBuffer`,
-`Cell` (the shadow-buffer cell, unrelated to any other `Cell` type), `diff_buffers`,
-`TabState`/`TabbedDialog::{current_tab,tabs}`, `encode_quit_message`,
+zero LSP hits despite real root callers). Even the bare-identifier grep approach has its own blind
+spot, caught by CI on the first pass (and a second pass after the first fix, since `cargo build
+--workspace` alone does not compile `tests/` integration binaries or `#[cfg(test)]` code — the
+follow-up verification used `cargo build --workspace --all-targets` specifically to catch this
+class of miss): a caller that reaches a type purely through method-chained type inference, never
+spelling the type's name anywhere in the caller file, is invisible to any grep for that literal
+name. Two real instances found this way, both reverted to `pub`:
+- `ShadowBuffer`/`Cell` — `src/cli/setup_wizard/tests.rs` calls
+  `frame.to_shadow_buffer(w, h).rows_as_text()`; `Cell` is separately required because
+  `ShadowBuffer`'s own `get`/`set`/`get_cells` (all `pub`) name it in their signatures.
+- `TabState`/`TabbedDialog::{current_tab,tabs}` — `tests/tabbed_dialog_test.rs` (root package
+  integration tests) calls `dialog.current_tab().custom_mode_active` and `dialog.tabs().len()`.
+
+`diff_buffers` (a free function, not a type obtainable this way) has no such exposure and is
+confirmed `pub(crate)`. Narrowed to `pub(crate)` (confirmed zero external callers by any path,
+still used internally): `DialogWidget`, `TabbedDialogWidget`, `diff_buffers`, `encode_quit_message`,
 `TuiRenderer::{active_tabbed_dialog,typing_words,mark_dirty,create_clean_textarea,
 create_clean_textarea_with_text,draw_poset_overlay,handle_resize,update_ghost_text,
 complete_dialog,settle_dialog}`, and the crate-root re-exports of `finch_ui_model`'s four line

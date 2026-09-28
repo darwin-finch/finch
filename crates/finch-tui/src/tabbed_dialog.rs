@@ -41,11 +41,15 @@ pub enum TabbedDialogResult {
 
 /// State for a single question tab
 ///
-/// Crate-internal (#1078 facade audit): never re-exported at the crate root;
-/// `TabbedDialog::{current_tab,tabs}` (also narrowed below) are its only
-/// accessors and neither has an external caller.
+/// #1078 facade audit: not re-exported at the crate root by name, but
+/// `TabbedDialog::{current_tab,tabs}` (both `pub`) return it, and
+/// `tests/tabbed_dialog_test.rs` (root package integration tests) is a real
+/// external caller of both accessors, reached purely through method-chained
+/// type inference (e.g. `dialog.current_tab().custom_mode_active`) without
+/// ever spelling `TabState` by name — the same blind spot a bare-identifier
+/// grep missed for `ShadowBuffer` in this same audit. Stays `pub`.
 #[derive(Debug, Clone)]
-pub(crate) struct TabState {
+pub struct TabState {
     /// The question being asked
     pub question: QuestionView,
     /// Current selection (for single-select) or cursor position (for multi-select)
@@ -158,7 +162,11 @@ impl TabbedDialog {
     }
 
     /// Get the current tab state
-    pub(crate) fn current_tab(&self) -> &TabState {
+    ///
+    /// #1078 facade audit: real external caller in
+    /// `tests/tabbed_dialog_test.rs`, reached without ever spelling
+    /// `TabState` by name. Stays `pub`; see `TabState`'s own note.
+    pub fn current_tab(&self) -> &TabState {
         &self.tabs[self.current_tab]
     }
 
@@ -168,7 +176,10 @@ impl TabbedDialog {
     }
 
     /// Get all tabs (for rendering)
-    pub(crate) fn tabs(&self) -> &[TabState] {
+    ///
+    /// #1078 facade audit: real external caller in
+    /// `tests/tabbed_dialog_test.rs` (`dialog.tabs().len()`). Stays `pub`.
+    pub fn tabs(&self) -> &[TabState] {
         &self.tabs
     }
 

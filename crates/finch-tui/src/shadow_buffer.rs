@@ -28,10 +28,12 @@ pub(crate) use finch_ui_model::{
 
 /// A single cell in the shadow buffer (character + style)
 ///
-/// Crate-internal (#1078 facade audit): never re-exported at the crate root
-/// and no external caller reaches it.
+/// #1078 facade audit: no external caller spells this type by name, but it
+/// stays `pub` because `ShadowBuffer::{get,set,get_cells}` (all `pub`) name
+/// it in their own signatures — narrowing it would make those methods
+/// expose a private type. See `ShadowBuffer`'s own note.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Cell {
+pub struct Cell {
     pub ch: char,
     pub style: Style,
 }
@@ -56,9 +58,16 @@ impl Cell {
 
 /// 2D shadow buffer for terminal rendering
 ///
-/// Crate-internal (#1078 facade audit): never re-exported at the crate root
-/// and no external caller reaches it.
-pub(crate) struct ShadowBuffer {
+/// #1078 facade audit: not re-exported at the crate root, but the
+/// `shadow_buffer` module itself is `pub`, and `WizardFrame::to_shadow_buffer`
+/// (`wizard_host.rs`) returns this type by its fully-qualified module path
+/// (`finch_tui::shadow_buffer::ShadowBuffer`) — `src/cli/setup_wizard/tests.rs`
+/// is a real external caller of that method chain
+/// (`frame.to_shadow_buffer(w, h).rows_as_text()`), reached entirely through
+/// type inference without ever spelling `ShadowBuffer` by name anywhere in
+/// that file. A bare-identifier grep for the type name cannot see this kind
+/// of caller; narrowing it here was wrong and is reverted. Stays `pub`.
+pub struct ShadowBuffer {
     /// 2D array of cells [y][x]
     cells: Vec<Vec<Cell>>,
     /// Terminal width
