@@ -287,8 +287,17 @@ impl McpConnection {
             .await
     }
 
-    /// Get the list of available tools
-    pub fn list_tools(&self) -> &[McpTool] {
+    /// Get the list of available tools.
+    ///
+    /// `pub(super)`, not `pub`: only `McpClient` (a sibling module inside
+    /// `tools::mcp`) calls this. No caller outside this capsule has ever named
+    /// `McpConnection::list_tools` or the `McpTool` type it returns — both
+    /// documented production workflows (tool-executor composition and the
+    /// `/mcp` event-loop refresh) go through `McpClient::list_tools`, which
+    /// returns the already-exported `ToolDefinition` shape instead (issue
+    /// #1047's audit). Widen this back to `pub` only alongside a real external
+    /// caller and a flat export of `McpTool`.
+    pub(super) fn list_tools(&self) -> &[McpTool] {
         &self.tools
     }
 
@@ -502,11 +511,6 @@ impl McpConnection {
     /// Get the server name
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Get server info
-    pub fn server_info(&self) -> Option<&McpServerInfo> {
-        self.server_info.as_ref()
     }
 
     /// Check if connected

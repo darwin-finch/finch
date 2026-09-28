@@ -18,5 +18,11 @@ Two callers show the boundary:
    user sees and when bindings change; this module supplies current server/tool data.
 
 Read [AGENTS.md](AGENTS.md) for trust and dependency rules, and [`mod.rs`](mod.rs) for the flat
-callable facade. Two lower-level `McpConnection` methods currently return types not exported by
-that facade; they are tracked separately and are not needed for either workflow above.
+callable facade. `McpConnection::list_tools` and `McpConnection::server_info` used to return
+`McpTool`/`McpServerInfo`, two child-defined types the facade never exported — a real gap only if
+something outside this capsule could reach them (issue #1047). A workspace-wide reference audit
+found neither: `list_tools` is called only from `McpClient` (a sibling module inside this
+capsule), and `server_info` had no caller anywhere, including inside this capsule. Both documented
+workflows above go through `McpClient::list_tools`, which returns the already-exported
+`ToolDefinition` shape. `list_tools` is now `pub(super)` and `server_info` is removed; `McpTool`
+and `McpServerInfo` stay unexported because nothing outside this capsule needs to name them.
