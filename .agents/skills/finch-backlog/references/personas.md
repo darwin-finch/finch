@@ -100,4 +100,20 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   the single highest-impact finding, affects every fresh session), #1382 (GUI-automation
   accessibility invariant violations), #1383 (raw internal errors leaking into transcript on a
   local-model repair round), #1384 (startup panic in `finch-routing-tree` on a fresh/near-empty
-  workspace). Marcus, Priya, Ollie, Chen not yet run.
+  workspace).
+- **2026-09-28**: second wave (Marcus, Priya, Ollie, Chen) run against the same build plus #1380.
+  Filed: #1387 (exit message contradicts `finch brain ls`, reads as data loss to a first-timer),
+  #1388 (two distinct provider responses concatenated with no separator on Claude CLI
+  Subscription — the concrete reproduction of an anomaly flagged-but-unconfirmed earlier that
+  night; root-cause investigation and fix dispatched separately), #1389 (Claude CLI Subscription's
+  inner `claude` subprocess runs unrestricted with its own auto-memory skill, writing real files
+  outside Finch's data model, and can hijack terminal input via an approval dialog — serious,
+  needs a design decision on subprocess scoping, not just a quick patch). Strong corroborating
+  evidence added to #1381 (deliberate `finch attach <new-name>` still mismatches, ruling out
+  "accidental old-brain reuse"; a fresh session actually searched/read the wrong directory because
+  of it — real correctness risk, not just a confusing banner), #1228 (two independent testers hit
+  the identical 500 error; local-model tool-use follow-up now hard-fails rather than degrading),
+  #1383 (two more independent triggers, including one on the (non-local) Claude CLI Subscription
+  provider). Copy/paste and approval-prompt flow (Marcus) and TUI rendering robustness (Rin, wave
+  one) both held up well under real stress-testing — worth noting as much as the failures.
+  All 8 planned personas have now run at least once.
