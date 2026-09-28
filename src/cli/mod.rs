@@ -67,10 +67,7 @@ pub use llm_dialogs::{
 };
 pub use memtree_console::{ConsoleNode, ConsoleNodeType, MemTreeConsole};
 pub use messages::{Message, MessageId, MessageRef, MessageStatus, WorkUnit};
-pub use messages::{
-    ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage,
-    UserQueryMessage,
-};
+pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage};
 pub(crate) use output_layer::MessageVisitor;
 pub use output_layer::OutputManagerLayer;
 pub use output_manager::{OutputManager, VmOutputProjection};
