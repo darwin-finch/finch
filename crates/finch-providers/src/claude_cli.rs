@@ -200,6 +200,25 @@ struct TurnRecord {
     /// Count of `tool_use` blocks seen across every `assistant` event in this
     /// turn — observability only, see [`TurnRecord::absorb_line`].
     tool_calls_observed: usize,
+    /// Byte length of `assistant_text` already reported as a *prior*
+    /// `execute_turn` call's own `ContentBlockComplete` (issue #1372's
+    /// investigation). `assistant_text` accumulates across the *whole*
+    /// Finch-level turn on purpose (issue #1331) — including a preamble
+    /// that streamed through an earlier, now-closed `deltas` channel from a
+    /// prior `send_message_stream` call, once a parked turn resumes in a
+    /// new one. But each individual `execute_turn` call's own streaming
+    /// consumer only ever sees `TextDelta`s that arrived *through that same
+    /// call*, so reporting the whole-turn `assistant_text` as *this* call's
+    /// completed content — rather than just the suffix generated during
+    /// this call — desyncs `query_processor.rs`'s streamed-vs-completed
+    /// check (which is scoped per call, not per Finch-level turn) even
+    /// though nothing was actually lost or duplicated. Set once, right
+    /// before resuming a parked turn's `pump_until_settled`, to the prefix
+    /// length that call did *not* itself stream; `0` for a turn that never
+    /// paused, so [`TurnRecord::newly_streamed_text`] equals
+    /// [`TurnRecord::response_text`] there. See
+    /// `resumed_round_reports_only_its_own_new_text_not_the_prior_rounds_preamble`.
+    already_streamed_len: usize,
 }
 
 /// Best-effort removes the bridge socket file on drop, so a paused-then-
@@ -661,8 +680,16 @@ impl ClaudeCliProvider {
                     .await
                     .push_back((extract_system_prompt(request), extra_text.join("\n")));
             }
-            self.pump_until_settled(parked.running, deltas.clone())
-                .await?
+            // This call's own `deltas` channel is brand new — it never
+            // carried whatever text already streamed through the *prior*
+            // `execute_turn` call that parked this turn in the first place.
+            // Snapshot that prefix now, before `pump_until_settled` mutates
+            // `record` further, so the eventual `ContentBlockComplete` this
+            // call reports can be scoped to only what it itself streamed
+            // (see `TurnRecord::newly_streamed_text`, issue #1372).
+            let mut running = parked.running;
+            running.record.already_streamed_len = running.record.response_text().len();
+            self.pump_until_settled(running, deltas.clone()).await?
         } else {
             let (system, input_lines) = self.split_request(request)?;
             let tool_names = self.supported_tool_names(request);
@@ -1401,6 +1428,26 @@ impl TurnRecord {
         }
         self.result_text.clone().unwrap_or_default()
     }
+
+    /// What *this specific* `execute_turn` call actually streamed as
+    /// `TextDelta` chunks through its own `deltas` channel — the suffix of
+    /// [`TurnRecord::response_text`] beyond `already_streamed_len` (issue
+    /// #1372's investigation). A turn that never paused has
+    /// `already_streamed_len == 0`, so this equals `response_text()`
+    /// exactly. Use this, not `response_text()`, when building a streaming
+    /// call's own `ContentBlockComplete` — `query_processor.rs`'s
+    /// streamed-vs-completed check is scoped to one call, not one
+    /// Finch-level turn.
+    fn newly_streamed_text(&self) -> String {
+        let text = self.response_text();
+        // `already_streamed_len` is always a byte length previously read
+        // off this exact string (a strict, append-only prefix — see the
+        // field's own doc comment) via `.len()`, so it always lands on a
+        // valid UTF-8 boundary here; `.min()` is defensive only, in case a
+        // future change to this invariant is ever introduced by mistake.
+        let boundary = self.already_streamed_len.min(text.len());
+        text[boundary..].to_string()
+    }
 }
 
 fn user_input_line(text: &str) -> Result<String> {
@@ -1531,9 +1578,16 @@ impl ProviderBackend for ClaudeCliProvider {
             let result = worker.execute_turn(&request, Some(tx.clone())).await;
             match result {
                 Ok(TurnOutcome::Complete(record)) => {
+                    // `newly_streamed_text`, not `response_text` — this
+                    // call's own `deltas`/`tx` only ever carried what
+                    // streamed through *this* `execute_turn` invocation;
+                    // `response_text()` can include an earlier call's
+                    // preamble on a resumed parked turn, which would desync
+                    // `query_processor.rs`'s streamed-vs-completed check
+                    // (issue #1372's investigation).
                     let _ = tx
                         .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::text(
-                            record.response_text(),
+                            record.newly_streamed_text(),
                         ))))
                         .await;
                 }
@@ -1760,6 +1814,32 @@ if [ "$MODE" = "mcp-tool-call" ]; then
   done
   echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"tool call handled"}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"tool call handled","stop_reason":"end_turn"}}'
+  exit 0
+fi
+if [ "$MODE" = "mcp-tool-call-with-preamble" ]; then
+  # Combines "tool-preamble"'s text-before-tool_use shape with
+  # "mcp-tool-call"'s real bridge pause/resume (unlike "tool-preamble",
+  # which never pauses at all and so never spans two separate Finch-level
+  # `send_message_stream` calls). Production-boundary reproduction of a bug
+  # found via a real Claude CLI Subscription session (issue #1372's
+  # investigation): a preamble text block streamed before the tool_use, in
+  # a turn that genuinely pauses for a real tool result rather than
+  # completing in one uninterrupted process invocation.
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
+  printf '%s' "$SOCK" > "$SPOOL/socket_path"
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I will check "}}}}}}'
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"the file."}}}}}}'
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
+  tries=0
+  while [ ! -f "$SPOOL/proceed" ] && [ "$tries" -lt 500 ]; do
+    sleep 0.02
+    tries=$((tries + 1))
+  done
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"The first "}}}}}}'
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"line is Finch."}}}}}}'
+  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}]}}}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"The first line is Finch.","stop_reason":"end_turn"}}'
   exit 0
 fi
 if [ "$MODE" = "mcp-two-tool-calls" ]; then
@@ -2722,6 +2802,132 @@ printf '%s\n' \
             complete.as_deref(),
             Some("tool call handled"),
             "the resumed claude process must run to completion after the real tool result lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_round_reports_only_its_own_new_text_not_the_prior_rounds_preamble() {
+        // Production-boundary reproduction of a bug found via a real Claude
+        // CLI Subscription session (query: "What is the exact line count
+        // of Cargo.toml in this repo?"): a preamble ("I'll check that
+        // file.") streamed in the round before the tool call, the tool
+        // executed for real, and the *second*, separate
+        // `send_message_stream` call that resumes the paused process
+        // failed with "Provider streaming text did not match its completed
+        // content" — `query_processor.rs`'s consistency check compares what
+        // streamed as `TextDelta` chunks *during this one call* against the
+        // terminal `ContentBlockComplete`'s text. Before this fix,
+        // `ContentBlockComplete` reported `TurnRecord::response_text()`
+        // unconditionally — the *whole* turn's accumulated text spanning
+        // both the paused-and-resumed process's rounds — even though this
+        // call's own `deltas` channel only ever carried the second round's
+        // new text; the first round's preamble streamed through a
+        // different, already-closed channel from an earlier
+        // `send_message_stream` call. Every other provider's streams are
+        // each genuinely self-contained, so this mismatch is specific to
+        // this transport's cross-call parked-turn resume.
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call-with-preamble");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+
+        let mut rx = provider
+            .send_message_stream(&request)
+            .await
+            .expect("streaming must be supported");
+
+        // Play the bridge's role directly, matching
+        // `parked_turn_pauses_then_resumes_with_a_real_tool_result`: connect
+        // to the socket this transport bound and told the fake `claude`
+        // process about, then send exactly the shape a real bridge forwards
+        // for one `tools/call`. This must happen *before* draining `rx` for
+        // `ToolCallComplete` — that chunk is only sent once `drive`'s
+        // `listener.accept()` branch actually wins its race against
+        // continued stdout reads, which requires a real connection to
+        // arrive and deliver a well-formed request.
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        let mut first_round_text = String::new();
+        let (call_id, call_name, call_input) = loop {
+            match rx
+                .recv()
+                .await
+                .expect("stream must yield the preamble then the tool call")
+                .unwrap()
+            {
+                StreamChunk::TextDelta(text) => first_round_text.push_str(&text),
+                StreamChunk::ToolCallComplete {
+                    id, name, input, ..
+                } => break (id, name, input),
+                other => panic!("unexpected chunk before the tool call: {other:?}"),
+            }
+        };
+        assert_eq!(
+            first_round_text, "I will check the file.",
+            "the preamble must still stream live before the tool call, exactly as issue \
+             #1331 established"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "the stream must end right after the tool call, like every other provider's \
+             stream after a native tool_use stop reason"
+        );
+
+        let followup = with_tool_result(
+            request.clone(),
+            &call_id,
+            &call_name,
+            call_input,
+            "real tool output",
+            false,
+        );
+        let mut rx2 = provider
+            .send_message_stream(&followup)
+            .await
+            .expect("resuming a parked turn must still return a stream");
+
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+
+        let mut second_round_streamed = String::new();
+        let mut second_round_complete = None;
+        while let Some(chunk) = rx2.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::TextDelta(text) => second_round_streamed.push_str(&text),
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    second_round_complete = Some(text);
+                }
+                other => panic!("unexpected chunk on the resumed stream: {other:?}"),
+            }
+        }
+        assert_eq!(
+            second_round_streamed, "The first line is Finch.",
+            "the resumed round's own TextDelta chunks must be only its own new text, not \
+             the first round's preamble (that already streamed through a different, closed \
+             channel)"
+        );
+        assert_eq!(
+            second_round_complete.as_deref(),
+            Some("The first line is Finch."),
+            "the resumed round's ContentBlockComplete must equal exactly what this specific \
+             call streamed, matching query_processor.rs's streamed-vs-completed invariant — \
+             not TurnRecord::response_text()'s whole-turn total, which also includes the \
+             first round's preamble; second_round_streamed={second_round_streamed:?}"
         );
     }
 
