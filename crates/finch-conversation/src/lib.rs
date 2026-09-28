@@ -452,7 +452,12 @@ impl ConversationHistory {
     }
 
     /// Check if conversation has any messages
-    pub fn is_empty(&self) -> bool {
+    ///
+    /// No caller outside this crate's own tests uses this predicate as of
+    /// the #1084 facade audit; narrowed to `pub(crate)` rather than deleted
+    /// because it is a cheap, idiomatic container accessor a future
+    /// same-crate caller (or a widened facade) may reasonably want.
+    pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
 
