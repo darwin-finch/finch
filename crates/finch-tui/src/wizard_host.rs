@@ -258,7 +258,16 @@ pub fn wizard_visible_length(text: &str) -> usize {
 }
 
 /// Physical terminal rows `text` occupies at `width` as a terminal renders it.
-pub fn wizard_physical_rows(text: &str, width: usize) -> usize {
+///
+/// Crate-internal (#1078 facade audit): only `wizard_paint`'s own line
+/// splitting below calls this. External callers measure a `WizardLine`
+/// through its own `physical_rows` method or the free function
+/// `wizard_wrap`/`wizard_visible_length`, never this raw-`&str` helper (the
+/// issue's own text named this as a confirmed root caller from
+/// `src/cli/setup_wizard/render.rs`, but that call is actually
+/// `WizardLine::physical_rows`, an unrelated same-named inherent method —
+/// verified independently, this free function has zero external callers).
+pub(crate) fn wizard_physical_rows(text: &str, width: usize) -> usize {
     wizard_visible_length(text).max(1).div_ceil(width.max(1))
 }
 
@@ -725,7 +734,12 @@ impl WizardCard {
 
 /// Keys the wizard tree's claimable regions. Distinct from the conversation
 /// `frame_key` values so a debugging layout dump never confuses the two roots.
-pub mod wizard_keys {
+///
+/// Crate-internal (#1078 facade audit): was `pub mod` inside this private
+/// module, so it was already unreachable outside the crate — never
+/// re-exported at the crate root, and no external caller could have named
+/// it regardless of this keyword.
+mod wizard_keys {
     pub const TAB_ROW: u16 = 20;
     pub const SECTION: u16 = 21;
     pub const CARD: u16 = 22;

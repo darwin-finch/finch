@@ -14,7 +14,12 @@ use super::dialog::{Dialog, DialogOption, DialogType};
 use finch_theme::ColorScheme;
 
 /// Widget for rendering dialogs
-pub struct DialogWidget<'a> {
+///
+/// Crate-internal (#1078 facade audit): superseded in production by the
+/// line-based ViewModel pipeline (`show_dialog` renders through
+/// `draw_live_area`); this ratatui `Widget` remains only for its own unit
+/// tests below. No external caller ever constructed it directly.
+pub(crate) struct DialogWidget<'a> {
     pub dialog: &'a Dialog,
     colors: &'a ColorScheme,
 }
