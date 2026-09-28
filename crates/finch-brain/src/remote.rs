@@ -596,7 +596,7 @@ impl RemoteBrainClient {
         self.attachment.as_ref()
     }
 
-    pub fn invited_node_public_key(&self) -> Option<[u8; 32]> {
+    pub(crate) fn invited_node_public_key(&self) -> Option<[u8; 32]> {
         match &self.bootstrap {
             RemoteBrainBootstrap::Invitation {
                 node_public_key, ..
@@ -1033,7 +1033,7 @@ impl RemoteBrainClient {
     /// frontend restarts. The local file stores only an opaque ID; the daemon
     /// remains authoritative for role, cursor, connection state, and whether
     /// the ID may be rebound.
-    pub async fn attach_persistent(
+    pub(crate) async fn attach_persistent(
         &mut self,
         subject: &str,
         role: AttachmentRole,
@@ -1076,7 +1076,7 @@ impl RemoteBrainClient {
 
     /// Retrieve live node/model availability after authenticating to the exact
     /// Brain audience named by this client's scoped credential.
-    pub async fn capabilities(&self) -> Result<RemoteBrainCapabilities> {
+    pub(crate) async fn capabilities(&self) -> Result<RemoteBrainCapabilities> {
         let credential = self
             .credential
             .lock()
@@ -1309,7 +1309,10 @@ impl RemoteBrainClient {
         }
     }
 
-    pub async fn cancel_run(&self, run_id: super::store::RunId) -> Result<super::store::BrainRun> {
+    pub(crate) async fn cancel_run(
+        &self,
+        run_id: super::store::RunId,
+    ) -> Result<super::store::BrainRun> {
         use crate::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
@@ -1348,7 +1351,7 @@ impl RemoteBrainClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_schedule(
+    pub(crate) async fn create_schedule(
         &self,
         language: super::store::ProgramLanguage,
         source: String,
@@ -1427,7 +1430,10 @@ impl RemoteBrainClient {
         }
     }
 
-    pub async fn cancel_schedule(&self, schedule_id: super::store::ScheduleId) -> Result<bool> {
+    pub(crate) async fn cancel_schedule(
+        &self,
+        schedule_id: super::store::ScheduleId,
+    ) -> Result<bool> {
         use crate::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
@@ -2194,81 +2200,6 @@ impl AttachedBrainClient {
                     .await
             }
             AttachedBrainTransport::Remote(client) => client.cancel_run(run_id).await,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_schedule(
-        &self,
-        language: super::store::ProgramLanguage,
-        source: String,
-        grant_ceiling: finch_vm::EffectSet,
-        next_due_ms: u64,
-        interval_ms: Option<u64>,
-        delivery_policy: super::store::BrainScheduleDeliveryPolicy,
-    ) -> Result<super::store::BrainSchedule> {
-        let attachment = self
-            .attachment
-            .as_ref()
-            .context("client is not attached to a Brain")?;
-        match &self.transport {
-            AttachedBrainTransport::Local(ipc) => {
-                ipc.brain_create_schedule(
-                    &self.target.brain,
-                    attachment,
-                    language,
-                    &source,
-                    &grant_ceiling,
-                    next_due_ms,
-                    interval_ms,
-                    &delivery_policy,
-                )
-                .await
-            }
-            AttachedBrainTransport::Remote(client) => {
-                client
-                    .create_schedule(
-                        language,
-                        source,
-                        grant_ceiling,
-                        next_due_ms,
-                        interval_ms,
-                        delivery_policy,
-                    )
-                    .await
-            }
-        }
-    }
-
-    pub async fn inspect_schedule(
-        &self,
-        schedule_id: super::store::ScheduleId,
-    ) -> Result<Option<super::store::BrainSchedule>> {
-        match &self.transport {
-            AttachedBrainTransport::Local(ipc) => {
-                ipc.brain_inspect_schedule(&self.target.brain, schedule_id)
-                    .await
-            }
-            AttachedBrainTransport::Remote(client) => Ok(client
-                .snapshot()
-                .await?
-                .schedules
-                .into_iter()
-                .find(|schedule| schedule.schedule_id == schedule_id)),
-        }
-    }
-
-    pub async fn cancel_schedule(&self, schedule_id: super::store::ScheduleId) -> Result<bool> {
-        let attachment = self
-            .attachment
-            .as_ref()
-            .context("client is not attached to a Brain")?;
-        match &self.transport {
-            AttachedBrainTransport::Local(ipc) => {
-                ipc.brain_cancel_schedule(&self.target.brain, attachment, schedule_id)
-                    .await
-            }
-            AttachedBrainTransport::Remote(client) => client.cancel_schedule(schedule_id).await,
         }
     }
 

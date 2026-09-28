@@ -18,6 +18,16 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
 - Export a new external capability deliberately as a flat `pub use` in `src/lib.rs`; child modules
   stay private. Keep the feature-gated `test_support` surface for application integration tests,
   not production shortcuts. Do not regenerate or hand-maintain an API catalog.
+- **A type that appears in a `pub` method signature on an exported type must itself be re-exported
+  from `src/lib.rs`, or the signature leaks an unnameable type to callers.** `BrainMutationHandle`
+  (`src/remote.rs`) is the caller-persisted idempotency handle `RemoteBrainClient`'s
+  `prepare_*_mutation`/`*_with_handle` retry pairs (`prepare_push_mutation`, `push_with_handle`,
+  and the runner-handoff/cancel-run/schedule equivalents) return and accept; those methods are real
+  production surface (`src/brain_application_tests.rs` in the root crate calls them across the
+  `crate::brain` alias), but until #992's audit the type was only `pub` inside the private `remote`
+  module, so an external caller could receive and hold a value of it (via type inference) but never
+  spell its name in a field, signature, or generic bound. Fixed by adding `BrainMutationHandle` to
+  the `pub use remote::{...}` list rather than changing the mutation-handle methods' signatures.
 
 ## Invariants and lifetimes
 
