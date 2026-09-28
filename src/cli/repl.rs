@@ -550,8 +550,8 @@ pub enum ReplMode {
     /// The REPL AskUser / VM dialog is skipped. `PermissionManager` Deny and
     /// constitutional constraints still apply at execute time. Planning
     /// restrictions do not apply. This is a working mode like `Normal`, not a
-    /// temporary overlay: Ctrl+C cancels a query without leaving it, and idle
-    /// Ctrl+C exits Finch.
+    /// temporary overlay: Esc cancels a query without leaving it, and idle
+    /// Esc exits Finch.
     AutoAccept,
     /// Planning mode - only inspection tools allowed (read, glob, grep, web_fetch)
     Planning {
@@ -573,7 +573,7 @@ impl ReplMode {
         matches!(self, Self::AutoAccept)
     }
 
-    /// Plan and executing-plan overlays. Ctrl+C exits these without leaving Finch.
+    /// Plan and executing-plan overlays. Esc exits these without leaving Finch.
     /// `AutoAccept` is a working mode like `Normal`, not an overlay.
     pub fn is_plan_overlay(&self) -> bool {
         matches!(self, Self::Planning { .. } | Self::Executing { .. })

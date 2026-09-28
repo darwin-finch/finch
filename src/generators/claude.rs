@@ -87,8 +87,8 @@ Collaboration: /say <text>  /who  /whois <subject>  @finch <prompt>
 Other: /plan [task]  /graph  /setup  /license  /license activate <key>  /accept  /reject
   /ask <query>  /self-fix
 
-Keyboard: Ctrl+C cancel  Ctrl+D forward-delete  Ctrl+G good  Ctrl+B bad  Ctrl+Z undefine
-  Ctrl+P pop  Tab complete  Shift+Tab plan mode  Shift+Enter newline";
+Keyboard: Esc cancel  Ctrl+C copy selection  Ctrl+D forward-delete  Ctrl+G good  Ctrl+B bad
+  Ctrl+Z undefine  Ctrl+P pop  Tab complete  Shift+Tab plan mode  Shift+Enter newline";
 
 /// Build the full system prompt including working directory and project context.
 pub fn build_system_prompt(cwd: Option<&str>, claude_md: Option<&str>) -> String {

@@ -788,7 +788,7 @@ pub(crate) fn compute_effective_status(
             return desc;
         }
     }
-    "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel".to_string()
+    "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Esc cancel".to_string()
 }
 
 fn write_live_area_erase(
@@ -1492,18 +1492,16 @@ pub struct TuiRenderer {
     needs_full_refresh: bool,
     last_render_error: Option<String>,
     pub pending_feedback: Option<activity::Verdict>,
-    pub pending_cancellation: bool,
     pub pending_dialog_result: Option<DialogResult>,
-    /// When Ctrl+C has nothing left to clear (empty composer draft, or a
-    /// dialog not in custom-input mode), the first press arms this instead
-    /// of cancelling; a second Ctrl+C within [`CTRL_C_CANCEL_WINDOW`] clears
-    /// it and performs the cancel. Escape's own key handling stays
-    /// single-press everywhere in this crate (see `pending_escape_cancel`
-    /// below for how the application-level idle-exit decision is kept out
-    /// of that single press, #1311). Shared by the async composer dispatch
-    /// (`async_input::handle_composer_shortcuts`), `read_line`, and
-    /// `show_dialog` — they run in disjoint input modes, so one field is
-    /// enough.
+    /// When Ctrl+C has nothing left to clear (a dialog not in custom-input
+    /// mode), the first press arms this instead of cancelling; a second
+    /// Ctrl+C within [`CTRL_C_CANCEL_WINDOW`] clears it and performs the
+    /// cancel — the SIGINT convention `read_line` and `show_dialog` both
+    /// still use (they run in disjoint input modes, so one field is
+    /// enough). The top-level composer no longer participates: Ctrl+C
+    /// there copies the active transcript selection instead (issue found
+    /// live, superseding #895's "always cancel" proposal), so it never
+    /// arms or reads this field.
     pub(crate) ctrl_c_armed_at: Option<Instant>,
     /// Set by an idle (empty-composer) Escape press in
     /// `async_input::handle_composer_shortcuts`; a non-empty composer clears
@@ -1515,11 +1513,8 @@ pub struct TuiRenderer {
     /// plan/executing overlay) is cancelled immediately, matching Escape's
     /// established single-press character; the case that would actually
     /// exit Finch instead requires a confirming second idle Escape within
-    /// its own window, warned on the status line first — the same
-    /// warn-before-exit shape Ctrl+C already has (#1301), reached through
-    /// its own state because Ctrl+C's arm-then-confirm is unconditional
-    /// (it also gates cancelling an active query) while Escape's must not
-    /// be (#1311).
+    /// its own window, warned on the status line first (#1301/#1311). This
+    /// is now the composer's only idle-exit path — Ctrl+C no longer has one.
     pub pending_escape_cancel: bool,
 
     // Autocomplete
@@ -1664,7 +1659,6 @@ impl TuiRenderer {
             needs_full_refresh: false,
             last_render_error: None,
             pending_feedback: None,
-            pending_cancellation: false,
             pending_dialog_result: None,
             ctrl_c_armed_at: None,
             pending_escape_cancel: false,
@@ -1758,7 +1752,6 @@ impl TuiRenderer {
             needs_full_refresh: false,
             last_render_error: None,
             pending_feedback: None,
-            pending_cancellation: false,
             pending_dialog_result: None,
             ctrl_c_armed_at: None,
             pending_escape_cancel: false,
@@ -3812,7 +3805,7 @@ impl TuiRenderer {
                 return true;
             }
             let text = selection::selected_text(&self.selection_index, active);
-            self.copy_selection_to_clipboard(&text);
+            let _ = self.copy_selection_to_clipboard(&text);
             self.live_area_dirty = true;
             return true;
         }
@@ -3829,21 +3822,21 @@ impl TuiRenderer {
         self.handle_accordion_mouse(press)
     }
 
-    /// Best-effort system clipboard copy (#221): the same `arboard` crate
-    /// already used for the OAuth device-code copy (`grok_auth.rs`,
-    /// `chatgpt_auth.rs`). A clipboard failure (no clipboard provider, a
-    /// headless/sandboxed session) never breaks the selection itself — it
-    /// stays highlighted either way, so the text is still readable and
-    /// selectable again on the next drag.
-    fn copy_selection_to_clipboard(&self, text: &str) {
+    /// System clipboard copy (#221): the same `arboard` crate already used
+    /// for the OAuth device-code copy (`grok_auth.rs`, `chatgpt_auth.rs`).
+    /// A no-op for empty text. On a mouse-release copy, the caller (below)
+    /// discards the result deliberately: a clipboard failure (no clipboard
+    /// provider, a headless/sandboxed session) never breaks the selection
+    /// itself — it stays highlighted either way, so the text is still
+    /// readable and selectable again on the next drag, with no status-line
+    /// noise for a gesture that has no explicit confirmation step anyway.
+    /// [`Self::copy_active_selection_to_clipboard`] (Ctrl+C) does use the
+    /// result, since a keyboard shortcut has no other feedback at all.
+    fn copy_selection_to_clipboard(&self, text: &str) -> Result<(), arboard::Error> {
         if text.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Err(error) =
-            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
-        {
-            tracing::debug!(%error, "transcript selection: clipboard copy failed");
-        }
+        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
     }
 
     /// Page keys scroll the conversation ScrollView when nothing more
@@ -4218,19 +4211,72 @@ impl TuiRenderer {
         self.status_port.clear_operation();
     }
 
-    /// True while a first "nothing to clear" Ctrl+C press is still armed for
-    /// a confirming second press inside [`CTRL_C_CANCEL_WINDOW`] (#1301).
+    /// Ctrl+C in the composer: copy the active transcript selection, if one
+    /// exists, to the system clipboard. A no-op with nothing selected
+    /// (never clears the draft, never cancels a query — Escape owns both,
+    /// unchanged). Superseding a stale "always cancel" proposal (#895) with
+    /// what was actually requested live: Ctrl+C matches other terminal
+    /// coding agents' copy convention instead.
     ///
-    /// The renderer owns `ctrl_c_armed_at`; whether a confirming press would
-    /// actually exit Finch also depends on application state (an active
-    /// query, a plan/executing overlay) this crate does not hold, so the
-    /// application reads this snapshot and decides whether to surface an
-    /// exit warning via [`Self::set_operation_status`] — mirroring how it
-    /// already reads other renderer-reported snapshots through
-    /// [`TuiStatusPort`].
-    pub fn ctrl_c_exit_armed(&self) -> bool {
-        self.ctrl_c_armed_at
-            .is_some_and(|armed| armed.elapsed() <= CTRL_C_CANCEL_WINDOW)
+    /// Unlike the silent [`Self::copy_selection_to_clipboard`] a mouse
+    /// release already used (#221) — where the highlighted selection
+    /// staying on screen is itself the confirmation — a keyboard-triggered
+    /// copy has no such visual feedback, so this also reports success or
+    /// failure on the status line via [`Self::set_operation_status`].
+    ///
+    /// Returns whether there was a selection to copy, for tests.
+    pub(crate) fn copy_active_selection_to_clipboard(&mut self) -> bool {
+        let Some(active) = self.selection.as_ref() else {
+            return false;
+        };
+        let text = selection::selected_text(&self.selection_index, active);
+        if text.is_empty() {
+            return false;
+        }
+        match self.copy_selection_to_clipboard(&text) {
+            Ok(()) => self.set_operation_status("Copied to clipboard"),
+            Err(error) => {
+                tracing::debug!(%error, "Ctrl+C selection copy failed");
+                self.set_operation_status(format!("Copy failed: {error}"));
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+impl TuiRenderer {
+    /// Test-only fixture for [`Self::copy_active_selection_to_clipboard`]:
+    /// installs a finalized (non-dragging), single-row selection covering
+    /// all of `text` at row 0, without needing a real paint pass to build
+    /// `selection_index`. `pub(crate)` so other modules' own `#[cfg(test)]`
+    /// code (`async_input.rs`) can reach it — `selection`/`selection_index`
+    /// stay private otherwise.
+    pub(crate) fn install_test_selection(&mut self, text: &str) {
+        self.selection_index = selection::SelectionIndex::build(
+            &[finch_ui_model::RenderedTranscriptLine {
+                text: text.to_string(),
+                ..finch_ui_model::RenderedTranscriptLine::default()
+            }],
+            0,
+            text.chars().count() as u16 + 1,
+        );
+        self.selection = Some(selection::TranscriptSelection {
+            anchor: selection::SelectionPoint { row: 0, col: 0 },
+            head: selection::SelectionPoint {
+                row: 0,
+                col: text.chars().count().saturating_sub(1) as u16,
+            },
+            dragging: false,
+        });
+    }
+
+    /// Test-only accessor for the status line's current combined text
+    /// (`status_port` is private): lets another module's `#[cfg(test)]`
+    /// code (`async_input.rs`) assert on what `set_operation_status`/
+    /// `clear_operation_status` actually did without exposing the field.
+    pub(crate) fn status_text_for_test(&self) -> String {
+        self.status_port.status_without_session()
     }
 }
 
@@ -8852,7 +8898,7 @@ mod tests {
     fn status_idle_when_no_ghost_and_no_raw() {
         let reg = CommandRegistry::new();
         let s = compute_effective_status(None, "", "hello", &reg);
-        assert!(s.contains("Ctrl+C"), "should show idle hint: {}", s);
+        assert!(s.contains("Esc"), "should show idle hint: {}", s);
         assert!(s.contains("/help"), "should mention /help: {}", s);
     }
 
@@ -12266,7 +12312,7 @@ mod tests {
         assert!(s.contains("Tab"), "should mention Tab: {}", s);
         assert!(s.contains("history"), "should mention history: {}", s);
         assert!(s.contains("/help"), "should mention /help: {}", s);
-        assert!(s.contains("Ctrl+C"), "should mention Ctrl+C: {}", s);
+        assert!(s.contains("Esc"), "should mention Esc: {}", s);
     }
 
     // ── Physical row regression tests ─────────────────────────────────────────
@@ -13687,7 +13733,7 @@ mod selection_tests {
         });
         assert_eq!(
             term.row(status_row),
-            "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel",
+            "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Esc cancel",
             "the idle status line must read its real content with no stale \
              selected-text prefix bleeding in from the row the selection used \
              to occupy before the completion pane opened and closed;\n{}",

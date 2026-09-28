@@ -922,7 +922,7 @@ pub fn format_help() -> String {
          {gray}  • Can you read my Cargo.toml and explain the dependencies?{reset}\n\
          {gray}  • Find all TODO comments in my code{reset}\n\n\
          {cyan_bold}─────────────────────────────────────────────────────────────────────────{reset}\n\
-         {gray}Tip: Use Ctrl+C to cancel long-running queries{reset}")
+         {gray}Tip: Press Esc to cancel long-running queries{reset}")
 }
 
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
