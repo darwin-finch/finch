@@ -485,6 +485,64 @@ impl ClaudeCliProvider {
     /// intersected with [`CLAUDE_CLI_TOOL_NAMES`] by the caller); empty means
     /// no tools at all. `--tools` itself is always `""`: the CLI's own
     /// built-ins never run (see the module doc comment).
+    ///
+    /// `--restricted --permission-prompts none` (issue #1389, verified live
+    /// against the real `claude` CLI 2.1.284 on 2026-09-28, not guessed from
+    /// `--help` text alone): the repo owner's stated intent is that this
+    /// subprocess is a scoped model-generation backend, never an independent
+    /// agent with its own persistent state, skills, or interactive prompts.
+    /// Without this, a completely ordinary chat message ("remember that")
+    /// made the model call Finch's own MCP-bridged `write` tool — a real,
+    /// legitimately-available tool, since `--tools ""` only turns off the
+    /// CLI's *built-in* Read/Write/Edit — to persist a file shaped exactly
+    /// like Claude Code's own auto-memory feature
+    /// (`name`/`description`/`metadata.type` frontmatter) under
+    /// `~/.claude/projects/<hashed-cwd>/memory/`, entirely outside Finch's
+    /// own Brain/memory store, surfaced to the user as an ordinary Finch
+    /// write-approval dialog with no indication it targets a different
+    /// tool's storage. Reproduced directly: a fake MCP server standing in
+    /// for the real bridge, advertising just a `write` tool exactly as
+    /// `mcp_bridge_args` does, received two `tools/call` writes
+    /// (`<memory-name>.md` then `MEMORY.md`) for "My favorite test constant
+    /// is the number 8675309. Remember that." under the pre-#1389 flag set.
+    ///
+    /// Two flags considered and rejected — do not re-add either without new
+    /// evidence:
+    /// - `--bare`: its own help text says "Anthropic auth is strictly
+    ///   ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
+    ///   are never read)". This provider exists specifically to drive the
+    ///   user's OAuth-based subscription login (`claude_oauth.rs`) — the
+    ///   entire reason Finch shells out to the real `claude` binary instead
+    ///   of calling the Anthropic API directly with a key. `--bare` breaks
+    ///   this provider's reason for existing.
+    /// - `--safe-mode`: looked like the right fit (disables CLAUDE.md,
+    ///   skills, plugins, hooks, MCP servers, etc. while leaving "auth, model
+    ///   selection, built-in tools and plugins, and permissions" alone per
+    ///   its own help text) and *did* suppress the memory write in the same
+    ///   live repro above. But it also disqualifies itself: the same live
+    ///   repro, re-run with a real task for the MCP-bridged `write` tool
+    ///   ("create a file at /tmp/... containing ..."), showed
+    ///   `system/init`'s `mcp_servers` as `[]` — `--safe-mode` drops even an
+    ///   *explicitly passed* `--mcp-config` server, not just ambient/settings
+    ///   -discovered ones — and the model emitted a hallucinated
+    ///   `<invoke name="Write">...` text block instead of a real MCP
+    ///   `tool_use`, which nothing here can execute. That silently breaks
+    ///   every real Finch tool call through this provider. Reproduced twice.
+    ///
+    /// `--restricted --permission-prompts none` is what survived: verified
+    /// live, four consecutive runs, that the memory write never happens
+    /// (`system/init`'s `mcp_servers` list stays healthy and no `write`
+    /// `tool_use` appears), and separately verified live that a real,
+    /// explicitly requested MCP tool call still round-trips correctly
+    /// (`system/init` shows the `finch` server `connected`, the model emits
+    /// a proper `tool_use`, and the fake bridge receives it) — under the
+    /// literal OAuth subscription login already active on the verifying
+    /// machine (no `ANTHROPIC_API_KEY` in the environment), so `--restricted`
+    /// does not touch auth the way `--bare` does. `--permission-prompts
+    /// none` additionally closes the "Edit in $EDITOR"-style terminal-hijack
+    /// risk from the issue: anything that would still try to prompt a human
+    /// outside Finch's own approval flow is denied automatically instead of
+    /// ever reaching an interactive dialog, regardless of what triggers it.
     fn invocation_args(
         &self,
         resumable: bool,
@@ -502,6 +560,9 @@ impl ClaudeCliProvider {
             "stream-json".to_string(),
             "--tools".to_string(),
             String::new(),
+            "--restricted".to_string(),
+            "--permission-prompts".to_string(),
+            "none".to_string(),
         ];
         args.extend(self.mcp_bridge_args(tool_names, tool_socket_path)?);
         if let Some(system) = system {
@@ -2469,6 +2530,58 @@ printf '%s\n' \
         );
     }
 
+    /// Issue #1389: the inner `claude` subprocess must never act as an
+    /// independent agent with its own persistent state or its own
+    /// interactive prompts, regardless of whether this turn requests Finch
+    /// tools. `--restricted` and `--permission-prompts none` are verified
+    /// live (this file's `invocation_args` doc comment records the exact
+    /// repro and the two flags rejected first) to close the auto-memory
+    /// write and the terminal-hijack risk without disturbing the real MCP
+    /// tool bridge or OAuth subscription auth — unlike `--safe-mode`
+    /// (drops even an explicit `--mcp-config` server) or `--bare` (forces
+    /// API-key auth, breaking this provider's own subscription login).
+    #[test]
+    fn invocation_args_always_scope_the_subprocess_against_its_own_persistent_state_and_prompts() {
+        let provider = ClaudeCliProvider::new(None);
+        let no_tools_args = provider
+            .invocation_args(false, Some("SYSTEM"), &[], None)
+            .unwrap();
+        let socket_path = std::path::Path::new("/tmp/finch-test-claude-cli-bridge.sock");
+        let with_tools_args = provider
+            .invocation_args(false, None, &["read".to_string()], Some(socket_path))
+            .unwrap();
+        for (label, args) in [
+            ("no tools", &no_tools_args),
+            ("with tools", &with_tools_args),
+        ] {
+            assert!(
+                args.contains(&"--restricted".to_string()),
+                "{label}: --restricted must always be present so the CLI never falls back to \
+                 an independent agent's own persistent state or ambient customization; args: {args:?}"
+            );
+            assert!(
+                args.iter().zip(args.iter().skip(1)).any(|(flag, value)| flag
+                    == "--permission-prompts"
+                    && value == "none"),
+                "{label}: --permission-prompts none must always be present so anything that would \
+                 prompt a human outside Finch's own approval flow is denied automatically instead \
+                 of hijacking the terminal (issue #1389's \"Edit in $EDITOR\" repro); args: {args:?}"
+            );
+            assert!(
+                !args.contains(&"--bare".to_string()),
+                "{label}: --bare forces ANTHROPIC_API_KEY/apiKeyHelper auth and never reads OAuth \
+                 or the keychain, which would break this provider's whole reason for existing \
+                 (driving the user's Claude subscription login); args: {args:?}"
+            );
+            assert!(
+                !args.contains(&"--safe-mode".to_string()),
+                "{label}: --safe-mode was verified live to drop even an explicitly passed \
+                 --mcp-config server (system/init's mcp_servers came back empty) and broke real \
+                 tool calls through the bridge; args: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn supported_tool_names_intersects_with_the_safe_allowlist_and_ignores_unknown_tools() {
         let provider = ClaudeCliProvider::new(None);
@@ -2990,6 +3103,71 @@ printf '%s\n' \
             complete.as_deref(),
             Some("tool call handled"),
             "the resumed claude process must run to completion after the real tool result lands"
+        );
+    }
+
+    /// Issue #1389: `--restricted --permission-prompts none` are always in
+    /// `invocation_args()`'s output now, but the flags that suppressed the
+    /// auto-memory write were chosen specifically *because* they were
+    /// verified live not to disturb the real MCP tool bridge (unlike
+    /// `--safe-mode`, which dropped the explicit `--mcp-config` server
+    /// entirely). This production-boundary test is the automated half of
+    /// that claim: a real tool call must still round-trip end to end through
+    /// the spawned process with the new flags present on its argv, not just
+    /// that the flags are present in isolation (covered by
+    /// `invocation_args_always_scope_the_subprocess_against_its_own_persistent_state_and_prompts`).
+    #[tokio::test]
+    async fn real_tool_call_still_round_trips_with_the_new_subprocess_scoping_flags_present() {
+        let temp = TempDir::new().unwrap();
+        let binary = install_fake_claude(&temp, "mcp-tool-call");
+        let provider = ClaudeCliProvider::with_binary(binary, None);
+        let spool_dir = PathBuf::from(spool(&temp));
+
+        let mut request = simple_request();
+        request.tools = Some(vec![tool_definition("read")]);
+
+        let mut rx = provider
+            .send_message_stream(&request)
+            .await
+            .expect("streaming must be supported");
+
+        let socket_path_text = wait_for_text_file(&spool_dir.join("socket_path")).await;
+        let mut bridge_stream = UnixStream::connect(socket_path_text.trim())
+            .await
+            .expect("connect to the live bridge socket the paused turn is listening on");
+        let request_line = serde_json::to_string(&ClaudeCliBridgeToolRequest {
+            name: "probe_tool".to_string(),
+            input: json!({"key": "value"}),
+        })
+        .unwrap()
+            + "\n";
+        bridge_stream
+            .write_all(request_line.as_bytes())
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            StreamChunk::ToolCallComplete { name, input, .. } => {
+                assert_eq!(name, "probe_tool");
+                assert_eq!(input, json!({"key": "value"}));
+            }
+            other => panic!("expected a real ToolCallComplete, got {other:?}"),
+        }
+
+        // Let the fake claude process finish; the tool-call round trip above
+        // already proves the process spawned, accepted a real MCP tools/call
+        // over the bridge, and paused correctly with these flags on argv.
+        std::fs::write(spool_dir.join("proceed"), b"go").unwrap();
+        while rx.recv().await.is_some() {}
+
+        let log = calls_log(&temp);
+        assert!(
+            log.contains("--restricted"),
+            "the real spawned process must have been invoked with --restricted: {log}"
+        );
+        assert!(
+            log.contains("--permission-prompts none"),
+            "the real spawned process must have been invoked with --permission-prompts none: {log}"
         );
     }
 
