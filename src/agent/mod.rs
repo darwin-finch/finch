@@ -16,12 +16,15 @@ use crate::claude::ClaudeClient;
 use crate::claude::MessageRequest;
 use crate::config::{Config, Persona};
 use crate::generators::CODING_SYSTEM_PROMPT;
-use crate::providers::{ContentBlock, Message};
+use crate::providers::{ContentBlock, EventProvenance, Message};
 use crate::tools::ToolDefinition;
 use crate::tools::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
 };
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+use crate::tools::{
+    PreparedCall, ToolCatalog, ToolLoop, ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal,
+};
 
 use activity_log::{ActivityLogger, AgentEvent};
 use backlog::{AgentTask, TaskBacklog};
@@ -285,55 +288,117 @@ impl AgentLoop {
                 return Ok(());
             }
 
-            // Execute tool calls
+            // Execute tool calls. Admitted through the same `ToolLoop` round
+            // protocol the REPL and scheduler use (finch-tools-api), so a
+            // provider response that repeats a tool-call id fails that id
+            // closed instead of running it twice; see issue #1058 and
+            // `src/tools/README.md`. This changes only admission bookkeeping,
+            // not the agent-mode permission rule (still auto-approve, via the
+            // same `executor` built in `build_tool_executor`) or the
+            // provider-visible result order (still one result per call,
+            // pushed in the order the provider returned them).
             messages.push(response.to_message());
             let tool_uses = response.tool_uses();
             let mut result_blocks = Vec::new();
 
-            for tu in &tool_uses {
-                // Log tool use
-                let cmd_preview = tu
-                    .input
-                    .get("command")
-                    .or_else(|| tu.input.get("pattern"))
-                    .or_else(|| tu.input.get("path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let _ = logger.log(AgentEvent::ToolUse {
-                    tool: tu.name.clone(),
-                    cmd: cmd_preview,
-                });
-
-                let tool_use = crate::tools::ToolUse {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    input: tu.input.clone(),
-                };
-
-                let exec_result = {
-                    let guard = executor.lock().await;
-                    guard
-                        .execute_tool::<fn() -> anyhow::Result<()>>(
-                            &tool_use, None, // save_models_fn
-                            None, // repl_mode
-                            None, // plan_content
-                            None, // live_output
-                            None, // effect_audit
-                        )
-                        .await
-                };
-
-                let (content, is_error) = match exec_result {
-                    Ok(result) => (result.content, result.is_error),
-                    Err(e) => (format!("Error: {e}"), true),
-                };
-                result_blocks.push(ContentBlock::tool_result(
+            let catalog = ToolCatalog::offered(tool_defs.iter().map(|def| def.name.clone()));
+            let mut tool_loop = ToolLoop::new(
+                ToolLoopIdentity {
+                    provider: client.provider_name().to_string(),
+                    model: model.clone(),
+                    brain: None,
+                    run_id: Some(task.id.clone()),
+                },
+                catalog,
+            );
+            for (index, tu) in tool_uses.iter().enumerate() {
+                tool_loop.observe_complete(
                     tu.id.clone(),
-                    content,
-                    if is_error { Some(true) } else { None },
-                ));
+                    tu.name.clone(),
+                    tu.input.clone(),
+                    EventProvenance {
+                        provider: client.provider_name().to_string(),
+                        model: model.clone(),
+                        event: "tool_call".to_string(),
+                        sequence: index as u64 + 1,
+                        opaque_replay: None,
+                    },
+                );
             }
+
+            for call in tool_loop.finish_observation() {
+                match call {
+                    PreparedCall::Rejected(rejected) => {
+                        let _ = logger.log(AgentEvent::ToolUse {
+                            tool: rejected.name.clone(),
+                            cmd: format!("rejected: {:?}", rejected.reason),
+                        });
+                        let result = ToolLoopResult::from_reject(&rejected);
+                        result_blocks.push(ContentBlock::tool_result(
+                            rejected.id,
+                            result.content,
+                            Some(true),
+                        ));
+                    }
+                    PreparedCall::Ready(validated) => {
+                        let Ok(validated) = tool_loop.admit_execution(&validated.id) else {
+                            continue;
+                        };
+
+                        // Log tool use
+                        let cmd_preview = validated
+                            .input
+                            .get("command")
+                            .or_else(|| validated.input.get("pattern"))
+                            .or_else(|| validated.input.get("path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = logger.log(AgentEvent::ToolUse {
+                            tool: validated.name.clone(),
+                            cmd: cmd_preview,
+                        });
+
+                        let tool_use = crate::tools::ToolUse {
+                            id: validated.id.clone(),
+                            name: validated.name.clone(),
+                            input: validated.input.clone(),
+                        };
+
+                        let exec_result = {
+                            let guard = executor.lock().await;
+                            guard
+                                .execute_tool::<fn() -> anyhow::Result<()>>(
+                                    &tool_use, None, // save_models_fn
+                                    None, // repl_mode
+                                    None, // plan_content
+                                    None, // live_output
+                                    None, // effect_audit
+                                )
+                                .await
+                        };
+
+                        let (content, is_error) = match exec_result {
+                            Ok(result) => (result.content, result.is_error),
+                            Err(e) => (format!("Error: {e}"), true),
+                        };
+                        let appended = if is_error {
+                            ToolLoopResult::error(&validated.id, content)
+                        } else {
+                            ToolLoopResult::success(&validated.id, content)
+                        };
+                        let Some(appended) = tool_loop.append_result(appended) else {
+                            continue;
+                        };
+                        result_blocks.push(ContentBlock::tool_result(
+                            appended.id,
+                            appended.content,
+                            appended.is_error.then_some(true),
+                        ));
+                    }
+                }
+            }
+            tool_loop.terminalize(ToolLoopTerminal::Completed);
 
             messages.push(Message::with_content("user", result_blocks));
         }
@@ -536,5 +601,352 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Legacy chatgpt_subscription profiles are unsupported"));
+    }
+
+    // ── ToolLoop admission on the headless agent path (issue #1058) ──────────
+    //
+    // `run_task` used to call `ToolExecutor::execute_tool` directly for every
+    // provider `ToolUse`, with no round-admission lifecycle at all: nothing
+    // stopped two tool_use blocks in the same provider response from sharing
+    // one tool-call id. The interactive REPL and scheduler both fail closed
+    // on that case via `finch-tools-api::ToolLoop`
+    // (`test_tool_loop_duplicate_id_fails_closed_without_second_execution`,
+    // `test_scheduler_duplicate_tool_id_fails_closed_without_execution`); this
+    // production-boundary test proves the same guarantee now holds on the
+    // headless `finch agent` loop, through the real `run_task` and the real
+    // `ToolExecutor`/`BashTool`, not a helper-only unit test.
+
+    use crate::providers::{
+        CapabilitySupport, ContentBlock, ModelCapabilities, ProviderBackend, ProviderResponse,
+        ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
+    };
+    use crate::tools::{BashTool, PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc::Receiver;
+
+    /// Fake provider whose first turn offers two `ToolUse` blocks under the
+    /// *same* tool-call id (a hostile-or-buggy-provider shape ToolLoop must
+    /// reject), then finishes on the second turn. Never touches the network.
+    struct DuplicateIdProvider {
+        calls: AtomicUsize,
+        marker_path: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBackend for DuplicateIdProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let marker = self.marker_path.display();
+                Ok(ProviderResponse {
+                    id: "resp-1".into(),
+                    model: "dup-model".into(),
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": format!("echo hit >> {marker}")}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": format!("echo hit >> {marker} # second")}),
+                        },
+                    ],
+                    stop_reason: Some("tool_use".into()),
+                    role: "assistant".into(),
+                    provider: "dup".into(),
+                    usage: None,
+                    allowance: None,
+                })
+            } else {
+                Ok(ProviderResponse {
+                    id: "resp-2".into(),
+                    model: "dup-model".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    stop_reason: Some("end_turn".into()),
+                    role: "assistant".into(),
+                    provider: "dup".into(),
+                    usage: None,
+                    allowance: None,
+                })
+            }
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<Receiver<Result<StreamChunk>>> {
+            unreachable!("test never streams")
+        }
+
+        fn name(&self) -> &str {
+            "dup"
+        }
+
+        fn default_model(&self) -> &str {
+            "dup-model"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                "dup",
+                model,
+                "2026-01-01",
+                "test fixture",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-01-01", "test fixture"),
+                Some(1_000_000),
+                Some(64_000),
+                None,
+            )
+            .with_wire_protocol(
+                WireProtocol::AnthropicMessages,
+                "2026-01-01",
+                "test fixture",
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_headless_agent_duplicate_tool_call_id_is_not_double_executed() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker_path = marker_dir.path().join("marker.txt");
+
+        let provider = std::sync::Arc::new(DuplicateIdProvider {
+            calls: AtomicUsize::new(0),
+            marker_path: marker_path.clone(),
+        });
+        let client = ClaudeClient::with_shared_provider(provider);
+
+        // Build a headless executor the same way `build_tool_executor` does,
+        // with a disposable patterns path instead of the real home directory.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BashTool));
+        let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
+        let patterns_dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(
+            registry,
+            permissions,
+            patterns_dir.path().join("tool_patterns.json"),
+        )
+        .expect("test executor must construct");
+        let executor = Arc::new(tokio::sync::Mutex::new(executor));
+        let tool_defs = executor.lock().await.list_all_tools().await;
+
+        let config = Config::with_providers(Vec::new());
+        let agent_config = AgentConfig {
+            persona_spec: "default".to_string(),
+            tasks_path: PathBuf::from(".finch/tasks.toml"),
+            reflect_every: 1,
+            once: true,
+        };
+        let agent = AgentLoop::new(config, agent_config);
+
+        let task = AgentTask {
+            id: "t1".to_string(),
+            description: "duplicate id regression".to_string(),
+            repo: None,
+            status: backlog::TaskStatus::Running,
+            priority: backlog::TaskPriority::Normal,
+            notes: None,
+            failure_reason: None,
+        };
+        let persona = Persona::default();
+        let log_dir = tempfile::tempdir().unwrap();
+        let logger = ActivityLogger::with_dir(log_dir.path().to_path_buf());
+
+        agent
+            .run_task(
+                &task,
+                &persona,
+                &client,
+                "dup-model".to_string(),
+                executor,
+                tool_defs,
+                &logger,
+            )
+            .await
+            .expect("run_task must complete despite the duplicate id");
+
+        let contents = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        let hits = contents.lines().filter(|line| line.contains("hit")).count();
+        assert_eq!(
+            hits, 0,
+            "a tool-call id repeated with conflicting inputs in one provider turn \
+             must never execute (ToolLoop fails the whole id closed, matching \
+             test_tool_loop_duplicate_id_fails_closed_without_second_execution: \
+             prepared.len()==1 and admit_execution returns NotReady for it); \
+             marker file contents={contents:?}"
+        );
+    }
+
+    /// Fake provider whose first turn asks for a tool name that was never
+    /// registered/advertised (`build_tool_executor` only registers a fixed
+    /// set), alongside a real `bash` call, then finishes on the second turn.
+    struct UnknownToolProvider {
+        calls: AtomicUsize,
+        marker_path: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBackend for UnknownToolProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let marker = self.marker_path.display();
+                Ok(ProviderResponse {
+                    id: "resp-1".into(),
+                    model: "dup-model".into(),
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call-unknown".into(),
+                            name: "definitely_not_a_registered_tool".into(),
+                            input: serde_json::json!({}),
+                        },
+                        // A second, real call in the same turn proves the
+                        // unknown one is rejected on its own and does not
+                        // abort the rest of the turn.
+                        ContentBlock::ToolUse {
+                            id: "call-real".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": format!("echo real >> {marker}")}),
+                        },
+                    ],
+                    stop_reason: Some("tool_use".into()),
+                    role: "assistant".into(),
+                    provider: "dup".into(),
+                    usage: None,
+                    allowance: None,
+                })
+            } else {
+                Ok(ProviderResponse {
+                    id: "resp-2".into(),
+                    model: "dup-model".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    stop_reason: Some("end_turn".into()),
+                    role: "assistant".into(),
+                    provider: "dup".into(),
+                    usage: None,
+                    allowance: None,
+                })
+            }
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<Receiver<Result<StreamChunk>>> {
+            unreachable!("test never streams")
+        }
+
+        fn name(&self) -> &str {
+            "dup"
+        }
+
+        fn default_model(&self) -> &str {
+            "dup-model"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                "dup",
+                model,
+                "2026-01-01",
+                "test fixture",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-01-01", "test fixture"),
+                Some(1_000_000),
+                Some(64_000),
+                None,
+            )
+            .with_wire_protocol(
+                WireProtocol::AnthropicMessages,
+                "2026-01-01",
+                "test fixture",
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_headless_agent_unknown_tool_name_never_executes_and_does_not_abort_the_turn() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker_path = marker_dir.path().join("marker.txt");
+
+        let provider = std::sync::Arc::new(UnknownToolProvider {
+            calls: AtomicUsize::new(0),
+            marker_path: marker_path.clone(),
+        });
+        let client = ClaudeClient::with_shared_provider(provider);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BashTool));
+        let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
+        let patterns_dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(
+            registry,
+            permissions,
+            patterns_dir.path().join("tool_patterns.json"),
+        )
+        .expect("test executor must construct");
+        let executor = Arc::new(tokio::sync::Mutex::new(executor));
+        let tool_defs = executor.lock().await.list_all_tools().await;
+
+        let config = Config::with_providers(Vec::new());
+        let agent_config = AgentConfig {
+            persona_spec: "default".to_string(),
+            tasks_path: PathBuf::from(".finch/tasks.toml"),
+            reflect_every: 1,
+            once: true,
+        };
+        let agent = AgentLoop::new(config, agent_config);
+
+        let task = AgentTask {
+            id: "t2".to_string(),
+            description: "unknown tool regression".to_string(),
+            repo: None,
+            status: backlog::TaskStatus::Running,
+            priority: backlog::TaskPriority::Normal,
+            notes: None,
+            failure_reason: None,
+        };
+        let persona = Persona::default();
+        let log_dir = tempfile::tempdir().unwrap();
+        let logger = ActivityLogger::with_dir(log_dir.path().to_path_buf());
+
+        agent
+            .run_task(
+                &task,
+                &persona,
+                &client,
+                "dup-model".to_string(),
+                executor,
+                tool_defs,
+                &logger,
+            )
+            .await
+            .expect("run_task must complete: the unknown tool must not abort the turn");
+
+        let contents = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(
+            contents, "real\n",
+            "the never-registered tool name must never execute (no side effect of its \
+             own), while the other real call in the same turn still runs; marker file \
+             contents={contents:?}"
+        );
     }
 }
