@@ -24,6 +24,15 @@ crate exists and traces two callers. [`src/lib.rs`](src/lib.rs) is its flat faca
 - A rejected program may get one source-only repair at the compile/link boundary. Runtime
   limits, approvals, cancellation, and host-effect failures must never become implicit retries
   of a program that may already have caused effects.
+- `wire_repair_request`'s repair prompt carries a targeted correction hint per
+  `WireFailureClass`, not just the raw compiler diagnostic — the diagnostic alone does not say
+  *why* a rejection happened, so a model that made a specific misconception gets no better
+  information on its repair attempt than on its first without one. `WireFailureClass::MarkdownFence`
+  (issue #1230/#1231) and `WireFailureClass::RawProse` (found live: Claude Sonnet 5 replying in
+  bare prose, e.g. "Hi — what do you need?", with no corrective hint available on this class)
+  both have their own hint function; a new failure class that similarly represents a recurring,
+  correctable model misconception should get the same treatment rather than relying on the
+  generic fallback prompt text.
 - Provider-stream tokenization is for safe preview, not incremental execution. Full source is
   compiled and verified before the VM runs it.
 
