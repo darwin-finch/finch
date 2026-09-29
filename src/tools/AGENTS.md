@@ -201,6 +201,40 @@ own dialogs must not demand a second host-effect confirmation.
 schemas as data. MCP names are namespaced before they reach the registry; do not invent a second
 permission path around that.
 
+**GUI automation and Excel accessibility tools register unconditionally on macOS, never gated on
+a runtime state (issue #421).** `GuiClickTool`, `GuiTypeTool`, `GuiInspectTool` (`implementations/gui.rs`)
+and `ExcelReadTool`/`ExcelWriteTool`/`ExcelRangeTool`/`ExcelFormulaTool`/`ExcelSheetsTool`/
+`ExcelActivateTool` (`implementations/excel.rs`) previously registered only when
+`config.features.gui_automation` was on (Gui* tools) or not at all (Excel tools, never wired into
+`src/cli/repl.rs`'s registry despite being exported), so a model with the flag off, or without
+Accessibility permission, could not discover the capability existed, attempt it, and learn why it
+failed — CLAUDE.md's GUI Accessibility invariant ("Accessibility permission errors must explain
+how to fix them") was unreachable by construction. `src/cli/repl.rs` now registers all nine tools
+inside a single `#[cfg(target_os = "macos")]` block with no feature-flag or permission gate; only
+non-macOS platforms omit them (the one state — "not installed/not supported" — that legitimately
+justifies absence, since neither AppleScript nor `AXIsProcessTrusted` exist there).
+`GuiClickTool::new(enabled)`/`GuiTypeTool::new(enabled)`/`GuiInspectTool::new(enabled)` now carry
+`config.features.gui_automation` as a constructor argument instead of hardcoding
+`AutomationBroker::new(true)`, so `execute()` reports `AutomationState::Disabled` (flag off) or
+`AutomationState::PermissionRequired` (flag on, Accessibility not granted) through
+`AutomationAvailability::unavailable_message()` (`crates/finch-runtime/src/automation.rs`,
+issue #1382) rather than the tool being absent or silently assuming enabled. The Excel tools have
+no feature flag of their own; each shells out via `osascript` and already translates macOS's own
+Automation/Accessibility denial into an actionable message inline (`osascript()` helper in
+excel.rs) — registering them was the only fix needed. `owner_repl_catalog()` in
+`src/cli/repl/always_allow_tests.rs` mirrors this real registration (macOS-only,
+`GuiClickTool::new(true)` etc.) so `test_declared_effects_match_pre_refactor_classification` and
+the allowlist conformance tests actually cover all nine names; they previously were not imported
+into that catalog at all. `test_gui_click_reports_disabled_setting_not_absence_when_flag_is_off`
+and `test_gui_inspect_availability_reports_disabled_state_even_when_flag_is_off` in
+`implementations/gui.rs` pin the flag-off behavior at the tool-execution boundary. There is no
+persona-based tool-list filtering mechanism in this codebase today — `config/persona.rs`'s
+`Persona` only shapes system-prompt tone, never tool registration or advertisement — so the
+separate CLAUDE.md bullet about `gui_click` not appearing "in the default tool list for
+non-developer personas" names a mechanism that does not exist to regress; peers still get the
+generic per-tool `PermissionCheck::AskUser` fallback (`check_peer_tool_use`'s "Everything else:
+ask" arm) for both `gui_click` and the Excel write tools, unchanged by this issue.
+
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- tools::` for the
 composition-root side, and `./scripts/test_brains.sh cargo test --lib -p finch-tools-api` for the
 API surface (the pure permission-policy tests moved there with the policy). The
