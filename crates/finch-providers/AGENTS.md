@@ -134,22 +134,51 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   — matching the same "observe the whole stream, batch-execute, re-invoke with the result appended"
   round-trip every other provider already goes through, with no changes needed to `ToolLoop`,
   `ToolExecutionCoordinator`, or `query_processor.rs`.
-  **Disclosed limitation: multiple tools requested in one turn are handled sequentially, one
-  Finch-level round per tool, and this is not verified against the real CLI (issue #1351).**
-  `pump_until_settled`/`drive` accept and pause on exactly one bridge connection at a time. The
-  bridge's own JSON-RPC loop is already single-threaded and sequential (`claude_cli_bridge.rs`'s
-  `run()` fully awaits one `tools/call`'s round trip, including the real interactive approval wait,
-  before reading its next stdin line — true before and after #1341), so this transport never
-  deadlocks or cross-talks between two tool calls in the same turn:
-  `mcp-two-tool-calls`'s test fixture (`claude_cli.rs`) proves the *sequential* case — a second
-  tool requested only after the first one's real result returns — completes correctly across two
-  pause/resume cycles. What is not reproduced or verified is whether the real `claude` CLI's own
-  MCP client ever pipelines two `tools/call` requests before reading the first reply (true
-  concurrent dispatch for a "parallel" tool-calling turn); if it does, this transport still answers
-  each sequentially but records them as separate `[assistant: ToolUse]`/`[user: ToolResult]` round
-  pairs in Finch's own `ConversationHistory`, rather than one combined round the way a native
-  HTTP-based provider produces for the same case. No real-CLI login was available to verify this
-  directly; issue #1351 tracks confirming the real behavior and revisiting this note.
+  **Accepted trade-off, verified live: multiple tools requested in one turn are handled
+  sequentially, one Finch-level round per tool — and the real CLI itself never pipelines a second
+  `tools/call` before the first is answered (issue #1351, measured against the real, logged-in
+  `claude` CLI 2.1.284 on 2026-09-29).** `pump_until_settled`/`drive` accept and pause on exactly
+  one bridge connection at a time. The bridge's own JSON-RPC loop is already single-threaded and
+  sequential (`claude_cli_bridge.rs`'s `run()` fully awaits one `tools/call`'s round trip, including
+  the real interactive approval wait, before reading its next stdin line — true before and after
+  #1341), so this transport never deadlocks or cross-talks between two tool calls in the same turn:
+  `mcp-two-tool-calls`'s test fixture (`claude_cli.rs`) proves the *sequential* case — a second tool
+  requested only after the first one's real result returns — completes correctly across two
+  pause/resume cycles.
+  Three live turns against the real CLI (driving `ClaudeCliProvider` directly, real binary, real
+  OAuth subscription login, real bridge subprocess, no fixture) tested whether the CLI's own MCP
+  client ever sends a second `tools/call` before reading the first one's reply: (1) "read these
+  three unrelated files and report their line counts", (2) the same request but explicitly told to
+  read "simultaneously, in parallel ... do not wait for one to finish before starting the next",
+  (3) three independent `bash` echo commands with the same explicit parallel instruction. All three
+  turns produced a model reply that *narrated* parallel intent ("I'll read all three files in
+  parallel." / "Running the three commands in parallel.") but the wire traffic was strictly
+  sequential every time: a temporary instrumentation patch on `claude_cli_bridge.rs`'s `run()` (an
+  env-gated probe, reverted after the investigation) logged, for every `tools/call` line received,
+  whether a second complete stdin line arrived within 500ms *before this bridge had sent any reply*
+  — since no reply had gone out yet, any such line could only be an unprompted, unpaired pipelined
+  request. It never fired: across all three turns, the very next `tools/call` (observed as little as
+  ~3ms after the previous reply was written) always arrived *after*, never before, the prior reply.
+  The real CLI's MCP client dispatches one `tools/call` at a time and waits for its JSON-RPC
+  response before sending the next, regardless of how the model narrates its own intent. Multiple
+  tools requested "in parallel" therefore still surface to Finch as separate
+  `[assistant: ToolUse]`/`[user: ToolResult]` round pairs in `ConversationHistory`, never one
+  combined round the way a native HTTP-based provider produces for a parallel-tool-call turn — but
+  this is the CLI's own real, observed behavior, not a Finch approximation of a hazard that turned
+  out not to exist. Given this, the pre-existing design decision — one Finch-level round per tool
+  call — is retained as an accepted trade-off (issue #1351's own framing), not revisited: it also
+  avoids surfacing two simultaneous interactive approval prompts competing for a human's attention.
+  Separately, even if a future CLI version *did* pipeline, the bridge's architecture makes it
+  provably safe regardless: `relay_over_socket` has no read timeout, `tools/call` payloads are tiny
+  relative to the kernel pipe buffer, and `run()`'s single-threaded loop never has more than one
+  socket relay in flight, so a pipelined second line simply waits, buffered, until the first
+  completes — no deadlock, no dropped call, and replies stay correctly paired with their own
+  requests by strict FIFO order. `two_pipelined_tools_call_requests_on_stdin_are_still_answered_correctly_one_at_a_time`
+  (`tests/claude_cli_bridge_subprocess.rs`) pins this deterministically at the real subprocess
+  boundary: both `tools/call` requests are written to the real, compiled bridge binary's stdin back
+  to back, with no reply read in between (genuine pipelining pressure, not just fast sequential
+  dispatch, with an artificial slow-approval delay on the first call to remove any doubt), and the
+  test asserts no deadlock and correct, non-cross-talking request/reply pairing.
   This is why `ClaudeGenerator::needs_prompt_injection`
   (`src/generators/claude.rs`) now bypasses its #1303 prompt-injection fold for this provider —
   `supports_tools()` derives straight from `capabilities().tools`, so the two decisions cannot drift
