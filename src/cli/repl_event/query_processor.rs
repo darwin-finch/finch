@@ -2166,9 +2166,20 @@ pub(crate) async fn process_query_with_tools(
                 // then route its `say`/UI events to a distinct output unit.
                 // This keeps agent activity inspectable without making source
                 // and user-visible output compete for the same mutable row.
+                //
+                // This text-only round is always this query_id's terminal
+                // round -- no tool calls means `dispatch_prepared_calls`
+                // never runs, so no further round will reuse an inherited
+                // tool work unit for this query_id. Clear it whenever it was
+                // inherited, regardless of turn kind, or `query_states`
+                // leaks one entry per query that ever used a tool (#1379).
+                // Named-brain turns still keep reusing `work_unit` itself as
+                // `source_unit` below -- only the map entry clears.
+                if reusing_tool_unit {
+                    query_states.set_tool_work_unit(query_id, None).await;
+                }
                 let source_unit = if reusing_tool_unit && !named_brain_turn {
                     work_unit.set_complete();
-                    query_states.set_tool_work_unit(query_id, None).await;
                     output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
                 } else {
                     Arc::clone(&work_unit)
@@ -2417,9 +2428,16 @@ pub(crate) async fn process_query_with_tools(
 
             // Non-streaming providers receive the same two-unit projection:
             // source first, then the independently reactive program output.
+            //
+            // As in the streaming path above, this text-only round is always
+            // this query_id's terminal round, so the inherited tool work
+            // unit entry clears here whenever it was inherited, regardless
+            // of turn kind (#1379).
+            if reusing_tool_unit {
+                query_states.set_tool_work_unit(query_id, None).await;
+            }
             let source_unit = if reusing_tool_unit && !named_brain_turn {
                 work_unit.set_complete();
-                query_states.set_tool_work_unit(query_id, None).await;
                 output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
             } else {
                 Arc::clone(&work_unit)
@@ -3623,6 +3641,46 @@ mod tests {
             "completed named-Brain program emitted no output completion"
         );
         assert_eq!(completed_response.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_named_brain_text_only_round_after_tool_reuse_clears_tool_work_unit() {
+        // The harness pre-seeds `tool_work_unit(query_id)` with the
+        // canonical WorkUnit before the round starts and binds brain-turn
+        // provenance, simulating a named-Brain turn continuing after an
+        // earlier round used a tool -- exactly `reusing_tool_unit &&
+        // named_brain_turn` (#1379). The round below completes text-only
+        // (no tool calls), which is this query_id's terminal round: no
+        // further continuation will ever consult this entry again, so it
+        // must not be left behind in `query_states`.
+        let mut harness = StreamingQueryHarness::spawn("say hello").await;
+        assert!(
+            harness
+                .query_states
+                .tool_work_unit(harness.query_id)
+                .await
+                .is_some(),
+            "harness setup invariant: tool_work_unit must start seeded for this case"
+        );
+
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"hello\")".to_string())))
+            .await;
+        harness.wait_for_content("(say \"hello\")").await;
+        harness.close_stream();
+        harness.task.await.expect("named-Brain query task panicked");
+
+        assert!(
+            harness
+                .query_states
+                .tool_work_unit(harness.query_id)
+                .await
+                .is_none(),
+            "settled named-Brain text-only round left a stale tool_work_unit entry \
+             for query_id {:?} -- query_states leaks one map entry per query that \
+             ever used a tool (#1379)",
+            harness.query_id
+        );
     }
 
     #[tokio::test]
