@@ -3393,6 +3393,239 @@ fn replayed_brain_snapshot(events: Vec<crate::brain::BrainEvent>) -> crate::brai
     }
 }
 
+/// A minimal `LocalBrainTransport` fake whose only meaningful behavior is
+/// `brain_attach`: it hands back a `BrainAttachment` with a caller-chosen,
+/// nonzero `acknowledged_seq`, simulating the persisted per-`client_slot`
+/// attachment cursor (`AttachmentIdentityStore`, `attach_persistent` in
+/// `crates/finch-brain/src/remote.rs`) that a brand-new client process
+/// inherits on reattach because `client_slot` is the stable Brain name, not a
+/// per-process identity (issue #909). Every other method is unreachable: the
+/// fixture below drives `render_remote_brain_message` directly and never
+/// calls them.
+struct StaleCursorTransport {
+    acknowledged_seq: u64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::brain::LocalBrainTransport for StaleCursorTransport {
+    async fn brain_attach(
+        &self,
+        _brain: &str,
+        subject: &str,
+        role: crate::brain::AttachmentRole,
+        _attachment_id: Option<crate::brain::AttachmentId>,
+    ) -> anyhow::Result<crate::brain::BrainAttachment> {
+        Ok(crate::brain::BrainAttachment {
+            attachment_id: crate::brain::AttachmentId(uuid::Uuid::new_v4()),
+            subject: subject.to_string(),
+            role,
+            acknowledged_seq: self.acknowledged_seq,
+            connected: false,
+            connection_id: None,
+        })
+    }
+    async fn brain_snapshot(&self, _brain: &str) -> anyhow::Result<crate::brain::BrainSnapshot> {
+        unreachable!("fixture drives render_remote_brain_message directly")
+    }
+    async fn brain_submit(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _kind: crate::brain::BrainEventKind,
+    ) -> anyhow::Result<()> {
+        unreachable!()
+    }
+    async fn brain_start_speculative(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _prompt: String,
+    ) -> anyhow::Result<crate::brain::BrainRun> {
+        unreachable!()
+    }
+    async fn brain_cancel_run(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _run_id: crate::brain::RunId,
+    ) -> anyhow::Result<crate::brain::BrainRun> {
+        unreachable!()
+    }
+    async fn brain_create_schedule(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _language: crate::brain::ProgramLanguage,
+        _source: &str,
+        _grant_ceiling: &finch_vm::EffectSet,
+        _next_due_ms: u64,
+        _interval_ms: Option<u64>,
+        _delivery_policy: &crate::brain::BrainScheduleDeliveryPolicy,
+    ) -> anyhow::Result<crate::brain::BrainSchedule> {
+        unreachable!()
+    }
+    async fn brain_inspect_schedule(
+        &self,
+        _brain: &str,
+        _schedule_id: crate::brain::ScheduleId,
+    ) -> anyhow::Result<Option<crate::brain::BrainSchedule>> {
+        unreachable!()
+    }
+    async fn brain_cancel_schedule(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _schedule_id: crate::brain::ScheduleId,
+    ) -> anyhow::Result<bool> {
+        unreachable!()
+    }
+    async fn brain_schedule_initialization(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+        _next_due_ms: u64,
+    ) -> anyhow::Result<crate::brain::BrainSchedule> {
+        unreachable!()
+    }
+    async fn brain_acknowledge(
+        &self,
+        _brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        _seq: u64,
+    ) -> anyhow::Result<crate::brain::BrainAttachment> {
+        Ok(attachment.clone())
+    }
+    async fn brain_detach(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn brain_watch(
+        &self,
+        _brain: &str,
+        _attachment: &crate::brain::BrainAttachment,
+    ) -> anyhow::Result<
+        tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<crate::brain::BrainWireMessage>>,
+    > {
+        unreachable!()
+    }
+}
+
+/// Issue #909's hypothesis: a fresh client process that reattaches to an
+/// existing Brain and inherits a stale, fully-caught-up `acknowledged_seq`
+/// (via the persisted `client_slot` attachment cursor, simulated here by
+/// `StaleCursorTransport`) might silently skip rendering prior conversation
+/// turns it has never actually displayed. It does not: every interactive
+/// turn is a `BrainRun` and `project_remote_brain_snapshot_runs` rebuilds run
+/// groups from the full snapshot unconditionally — `acknowledged_seq` only
+/// gates the separate, run-unaffiliated replay loop in
+/// `render_remote_brain_message` (queue/administrative events and
+/// off-run `say`s). This production-boundary test drives a real
+/// `AttachedBrainClient` (backed by the fake transport, not a stub of
+/// `render_remote_brain_message`'s internals) through the exact attach and
+/// render path `attach_home_brain` uses, with `acknowledged_seq` set to the
+/// snapshot's own revision -- the most hostile stale-cursor case, matching
+/// what `attach_home_brain`'s own eager `client.acknowledge(snapshot.revision)`
+/// produces before this function ever runs.
+#[tokio::test]
+async fn reattach_with_stale_fully_acknowledged_cursor_still_renders_every_prior_turn() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::BrainRunStatus;
+
+            let run_one = crate::brain::RunId(uuid::Uuid::new_v4());
+            let run_two = crate::brain::RunId(uuid::Uuid::new_v4());
+            let mut events = replayed_say_run_events(
+                run_one,
+                "(say \"turn one\")",
+                Some("turn one"),
+                None,
+                Some(BrainRunStatus::Completed),
+            );
+            let mut second = replayed_say_run_events(
+                run_two,
+                "(say \"turn two\")",
+                Some("turn two"),
+                None,
+                Some(BrainRunStatus::Completed),
+            );
+            events.append(&mut second);
+            for (index, event) in events.iter_mut().enumerate() {
+                event.seq = index as u64 + 1;
+            }
+            let snapshot = replayed_brain_snapshot(events);
+            let stale_seq = snapshot.revision;
+
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("stale cursor fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("stale cursor fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            let target =
+                crate::brain::RemoteBrainTarget::local("shared", "http://127.0.0.1:0").unwrap();
+            let mut client = crate::brain::AttachedBrainClient::local(
+                target,
+                StaleCursorTransport {
+                    acknowledged_seq: stale_seq,
+                },
+            );
+            client
+                .attach("shammah", crate::brain::AttachmentRole::Driver, None)
+                .await
+                .expect("fake attach must hand back the stale-cursor attachment");
+            assert_eq!(
+                client
+                    .attachment()
+                    .map(|attachment| attachment.acknowledged_seq),
+                Some(stale_seq),
+                "fixture: the attachment must actually carry the stale cursor being tested"
+            );
+            event_loop.home_brain = Some(client);
+
+            event_loop
+                .render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
+                    brain: snapshot,
+                })
+                .await
+                .expect("snapshot replay must dispatch");
+
+            let messages = event_loop.output_manager.get_messages();
+            let rendered = messages
+                .iter()
+                .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            assert_eq!(
+                messages.len(),
+                2,
+                "INVARIANT (#909): a fresh reattach with a stale, fully-caught-up \
+                 acknowledged_seq must still render every prior interactive turn -- \
+                 run-group reconstruction does not consult the acknowledgement cursor; \
+                 rendered={rendered}"
+            );
+            assert!(
+                rendered.contains("turn one") && rendered.contains("turn two"),
+                "INVARIANT (#909): both historical turns' content must actually be present, \
+                 not just two empty placeholders; rendered={rendered}"
+            );
+        })
+        .await;
+}
+
 /// Production-boundary regression for #970's guest-replay duplication: when a
 /// replayed run's say card already carries the turn's program, the separate
 /// run-unaffiliated Program source unit must not render beside it — the same
