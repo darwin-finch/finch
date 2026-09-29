@@ -600,13 +600,34 @@ impl DaemonClient {
         name: &str,
         selection: &crate::brain::BrainProviderSelection,
     ) -> Result<crate::brain::BrainProviderSelection> {
-        self.client
+        self.set_brain_provider_selection_for_client(name, selection, None)
+            .await
+    }
+
+    /// Same as [`Self::set_brain_provider_selection`], but `requesting_workspace`
+    /// (when supplied) is sent so a Brain first created through this route
+    /// records its creating client's own cwd instead of the daemon's own
+    /// launch-time default (issue #1381, second creation path — see the
+    /// server-side `X_FINCH_WORKSPACE_HEADER` doc comment,
+    /// `src/server/handlers/lifecycle.rs`).
+    pub async fn set_brain_provider_selection_for_client(
+        &self,
+        name: &str,
+        selection: &crate::brain::BrainProviderSelection,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<crate::brain::BrainProviderSelection> {
+        let mut request = self
+            .client
             .put(format!(
                 "{}/v1/brains/named/{name}/selection",
                 self.base_url
             ))
             .json(selection)
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10));
+        if let Some(workspace) = requesting_workspace {
+            request = request.header("x-finch-workspace", workspace.to_string_lossy().as_ref());
+        }
+        request
             .send()
             .await
             .context("Failed to persist Brain provider selection")?

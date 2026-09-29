@@ -6152,6 +6152,133 @@ fn environment_binds_machine_and_workspace_as_one_revision() {
     assert_eq!(snapshot.events[0].environment_generation, 1);
 }
 
+/// Issue #1381, second creation path: `set_provider_selection_for_client` is
+/// a SEPARATE first-touch creation path from `snapshot_for_client`
+/// (`EventLoop::hydrate_brain_selection` can persist an inherited default
+/// provider selection for a brand-new Brain over the HTTP route before
+/// `register_home_brain`'s own Cap'n Proto `snapshot` call ever runs). A
+/// Brain first created through THIS path must record the requesting
+/// client's own cwd too, not the daemon's own launch-time default, or a
+/// fresh Brain whose *first* write happens to be a provider-selection
+/// persist (not a snapshot fetch) is workspace-mismatched against itself
+/// exactly like the original bug.
+#[test]
+fn set_provider_selection_for_client_records_the_requesting_workspace_on_first_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon_default_workspace = tempfile::tempdir().unwrap();
+    let client_workspace = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root_and_workspace_for_test(
+        "box.local",
+        Some(root.path().join("brains")),
+        daemon_default_workspace.path().to_path_buf(),
+    );
+
+    let selection = BrainProviderSelection {
+        provider: Some("local-gemma-2-9b".to_string()),
+        ..Default::default()
+    };
+    store
+        .set_provider_selection_for_client("fresh-brain", selection, Some(client_workspace.path()))
+        .unwrap();
+
+    let snapshot = store.snapshot("fresh-brain").unwrap();
+    assert_eq!(
+        snapshot.environment.workspace,
+        client_workspace.path().canonicalize().unwrap(),
+        "a Brain whose first-ever write is a provider-selection persist must record the \
+         requesting client's own cwd, not the daemon's own default: {:?}",
+        snapshot.environment
+    );
+}
+
+/// Companion to the above: once a Brain already exists (created via either
+/// path), a later `set_provider_selection_for_client` call must NEVER
+/// overwrite its already-recorded workspace with a different requesting
+/// client's cwd — a Brain's canonical workspace is fixed at creation.
+#[test]
+fn set_provider_selection_for_client_never_overwrites_an_existing_brains_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon_default_workspace = tempfile::tempdir().unwrap();
+    let original_client_workspace = tempfile::tempdir().unwrap();
+    let different_later_workspace = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root_and_workspace_for_test(
+        "box.local",
+        Some(root.path().join("brains")),
+        daemon_default_workspace.path().to_path_buf(),
+    );
+
+    store
+        .set_provider_selection_for_client(
+            "existing-brain",
+            BrainProviderSelection::default(),
+            Some(original_client_workspace.path()),
+        )
+        .unwrap();
+    store
+        .set_provider_selection_for_client(
+            "existing-brain",
+            BrainProviderSelection {
+                provider: Some("chatgpt".to_string()),
+                ..Default::default()
+            },
+            Some(different_later_workspace.path()),
+        )
+        .unwrap();
+
+    let snapshot = store.snapshot("existing-brain").unwrap();
+    assert_eq!(
+        snapshot.environment.workspace,
+        original_client_workspace.path().canonicalize().unwrap(),
+        "a second call from a DIFFERENT client cwd must not overwrite the workspace \
+         recorded at creation: {:?}",
+        snapshot.environment
+    );
+}
+
+/// The exact production bug shape: whichever of the two independent
+/// creation paths (`snapshot_for_client` or
+/// `set_provider_selection_for_client`) happens to run FIRST for a given
+/// Brain name is the one that determines its workspace forever — both must
+/// therefore be workspace-aware, or the one left unfixed silently wins the
+/// race depending on call order (exactly what shipped as an incomplete fix
+/// for #1381: `snapshot_for_client` alone, with `EventLoop::run`'s real
+/// startup sequence calling `hydrate_brain_selection`, and therefore this
+/// path, before `register_home_brain`).
+#[test]
+fn either_creation_path_running_first_records_the_requesting_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon_default_workspace = tempfile::tempdir().unwrap();
+    let client_workspace = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root_and_workspace_for_test(
+        "box.local",
+        Some(root.path().join("brains")),
+        daemon_default_workspace.path().to_path_buf(),
+    );
+
+    // Reproduces the real startup order: the provider-selection persist path
+    // (hydrate_brain_selection, pre-register_home_brain) touches the Brain
+    // FIRST, before anything ever calls snapshot_for_client for it.
+    store
+        .set_provider_selection_for_client(
+            "startup-order-brain",
+            BrainProviderSelection::default(),
+            Some(client_workspace.path()),
+        )
+        .unwrap();
+    let snapshot = store
+        .snapshot_for_client("startup-order-brain", Some(client_workspace.path()))
+        .unwrap();
+
+    assert_eq!(
+        snapshot.environment.workspace,
+        client_workspace.path().canonicalize().unwrap(),
+        "the FIRST creation path to touch a new Brain name must record the requesting \
+         client's workspace, regardless of which of the two independent creation paths \
+         that happens to be: {:?}",
+        snapshot.environment
+    );
+}
+
 #[test]
 fn old_events_default_to_the_initial_environment_generation() {
     let event: BrainEvent = serde_json::from_str(

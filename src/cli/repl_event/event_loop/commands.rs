@@ -83,8 +83,19 @@ impl EventLoop {
             &self.selection_request(),
         );
         if let Some(client) = self.daemon_client.as_ref() {
+            // This may be the very first write for a brand-new Brain (an
+            // inherited default provider persisted before `register_home_brain`
+            // ever runs) — send this console's own cwd so that, if so, it
+            // becomes the Brain's canonical workspace instead of the
+            // daemon's own launch-time default (#1381, second creation
+            // path). Has no effect when the Brain already exists.
+            let own_workspace = std::env::current_dir().ok();
             let stored = client
-                .set_brain_provider_selection(&self.session_label, &persistable)
+                .set_brain_provider_selection_for_client(
+                    &self.session_label,
+                    &persistable,
+                    own_workspace.as_deref(),
+                )
                 .await?;
             self.brain_selection = stored;
         } else {
