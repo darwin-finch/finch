@@ -201,4 +201,70 @@ mod tests {
         assert_eq!(snap.avg_latency_ms(), 0.0);
         assert_eq!(snap.local_pct(), 0.0);
     }
+
+    // #986's audit narrowed `started_at`/`last_query_at` from `pub` to
+    // `pub(crate)`. Field visibility is a Rust-only concept; serde's derive
+    // reads struct field names regardless of it, so the wire format cannot
+    // change from that alone — but the issue asked for an explicit check
+    // rather than an assumption, and none existed. This pins both the wire
+    // shape (field names and value encoding) and that a `work_stats.json`
+    // written by a pre-narrowing build (fields still `pub`) still parses.
+    #[test]
+    fn test_work_stats_serde_wire_format_is_stable_across_the_visibility_narrowing() {
+        let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let last_query_at = "2026-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        let stats = WorkStats {
+            queries_processed: 7,
+            local_queries: 4,
+            forwarded_queries: 3,
+            total_latency_ms: 1234,
+            started_at: Some(started_at),
+            last_query_at: Some(last_query_at),
+        };
+
+        let json = serde_json::to_value(&stats).expect("WorkStats must serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "queries_processed": 7,
+                "local_queries": 4,
+                "forwarded_queries": 3,
+                "total_latency_ms": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "last_query_at": "2026-01-02T03:04:05Z",
+            }),
+            "narrowing started_at/last_query_at to pub(crate) must not change \
+             the wire field names or their encoding; actual={json}"
+        );
+
+        let round_tripped: WorkStats =
+            serde_json::from_value(json).expect("WorkStats must deserialize its own wire format");
+        assert_eq!(
+            round_tripped.started_at, stats.started_at,
+            "started_at must round-trip through JSON unchanged"
+        );
+        assert_eq!(
+            round_tripped.last_query_at, stats.last_query_at,
+            "last_query_at must round-trip through JSON unchanged"
+        );
+
+        // A stats file written before the narrowing (started_at/last_query_at
+        // still `pub`) has the identical on-disk shape; load_persisted_from_path
+        // must still accept it.
+        let pre_narrowing_wire = serde_json::json!({
+            "queries_processed": 1,
+            "local_queries": 1,
+            "forwarded_queries": 0,
+            "total_latency_ms": 10,
+            "started_at": "2025-01-01T00:00:00Z",
+            "last_query_at": null,
+        });
+        let legacy: WorkStats = serde_json::from_value(pre_narrowing_wire)
+            .expect("a pre-narrowing work_stats.json must still deserialize");
+        assert_eq!(legacy.queries_processed, 1, "legacy={legacy:?}");
+        assert!(
+            legacy.last_query_at.is_none(),
+            "legacy null last_query_at must deserialize to None; legacy={legacy:?}"
+        );
+    }
 }
