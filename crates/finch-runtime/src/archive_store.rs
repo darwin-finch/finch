@@ -103,7 +103,7 @@ impl ProgramRuntimeArchiveStore {
         Ok(())
     }
 
-    pub fn load_archive(&self) -> Result<Option<ProgramRuntimeArchive>> {
+    pub(crate) fn load_archive(&self) -> Result<Option<ProgramRuntimeArchive>> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -179,7 +179,7 @@ impl ProgramRuntimeAuthorityStore {
         atomic_write_json(&self.path, &stored, "runtime authority")
     }
 
-    pub fn load_state(&self) -> Result<Option<ProgramRuntimeAuthorityState>> {
+    pub(crate) fn load_state(&self) -> Result<Option<ProgramRuntimeAuthorityState>> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

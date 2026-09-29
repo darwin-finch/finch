@@ -20,6 +20,32 @@ contracts without opening those implementations. Root callers may use the
 - Add an externally needed item as a flat re-export from `src/lib.rs`; do not make child modules
   public. Confirm a real caller needs it and keep the associated type beside the invariant it
   represents. Do not duplicate the facade as a generated signature catalog.
+- **Narrowed/removed dead public surface (#981 bounded pass, 2026-09-29).** A prior LSP audit
+  (2026-09-20) listed `ProgramRun::with_identity`, `ProgramRuntime::capability_project_id`,
+  `ProgramRuntime::has_mcp_client`, `EffectAuditReducer::active_for_run`, and
+  `VmEffectDeliveryLog::cursor_for` as confirmed-dead (zero references, including this crate's own
+  tests). A whole-workspace re-grep found this stale: all five had real internal callers predating
+  the audit date (`ipc_codec.rs`'s `ProgramRun::new(..).with_identity(..)`, `effect_log.rs`'s own
+  admission-quota check calling `active_for_run`, and round-trip assertions in `tests.rs` /
+  `archive_store.rs`'s test module for the other three) — an LSP false negative even within the
+  crate boundary the audit's compensating whole-workspace grep was meant to catch. These five were
+  narrowed to `pub(crate)` instead of deleted. Confirmed actually dead and removed:
+  `ProgramRuntime::{submit_as_with_typed_effect_sink, clear_task_output_root,
+  deny_typed_execution_for_effect}`, `DeliveryConsumerIdentity::parse_wire_key`,
+  `ProgramRun::effect_handle`, the `EffectAuditReducer::replay_fence_count` getter (the backing
+  field stays, still written by the transition machinery), and the constant
+  `MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN` (referenced only by its own facade re-export, never
+  an enforced bound unlike its sibling `MAX_ACTIVE_EFFECT_AUDIT*` limits). Narrowed to
+  `pub(crate)` (real internal-only use confirmed): `ProgramRuntime::{cancel_typed_execution_for_effect,
+  resume_typed_execution_for_effect, submit_as, submit_as_typed_only,
+  submit_as_typed_only_with_typed_effect_sink, submit_with_deferred_host_effects,
+  submit_with_typed_effect_sink, attach_memory, authority_state, bind_host_machine_root,
+  bind_project_root, bind_whole_machine_root, cancel_typed_execution, clear_host_machine_root,
+  clear_project_root, from_archive, from_archive_with_authority, pending_typed_execution_count,
+  restore_authority_state, restore_capability_ledger, with_automation}`,
+  `ProgramRuntimeArchiveStore::load_archive`, `ProgramRuntimeAuthorityStore::load_state`, and
+  `RuntimeApplicationMessage::abi_version`. No behavior change; verified with a full workspace
+  `cargo check --workspace --all-targets` and the crate's `--lib` test suite.
 
 ## Invariants and lifetimes
 
