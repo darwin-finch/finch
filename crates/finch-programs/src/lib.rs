@@ -259,11 +259,20 @@ pub fn wrap_prose_as_say(text: &str, language: ProgramLanguage) -> String {
 /// still streaming. The runtime must not execute these incrementally: callers
 /// use them only for safe progress/display projection before the complete
 /// source is compiled and verified at the program boundary.
+///
+/// Narrowed to crate-private (#949): whole-workspace grep found no caller of
+/// this type, [`ForthWireBuffer`], or its methods outside this crate's own
+/// tests. Kept compiled in every profile (not `#[cfg(test)]`-gated) as the
+/// more conservative choice, given #949's own warning that a prior audit of
+/// this crate produced confirmed false negatives; `#[allow(dead_code)]`
+/// below only silences the lint, it does not remove the code from the
+/// binary. See `crates/finch-programs/AGENTS.md` for the audit record.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForthWireToken {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub source: String,
+struct ForthWireToken {
+    start_byte: usize,
+    end_byte: usize,
+    source: String,
 }
 
 /// Incremental lexical receiver for the compact Co-Forth wire form.
@@ -274,23 +283,33 @@ pub struct ForthWireToken {
 /// clear wire error and releases a final unterminated word. This deliberately
 /// does not type-check or execute a prefix; full typed verification remains an
 /// all-program operation.
+///
+/// Narrowed to crate-private (#949): no caller outside this crate's own tests
+/// was found across the whole-workspace grep audit. See the note on
+/// [`ForthWireToken`] on why this stays `#[allow(dead_code)]` rather than
+/// `#[cfg(test)]` or deleted.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
-pub struct ForthWireBuffer {
+struct ForthWireBuffer {
     source: String,
     emitted_tokens: usize,
 }
 
+#[allow(dead_code)]
 impl ForthWireBuffer {
-    pub fn push(&mut self, fragment: &str) -> Result<Vec<ForthWireToken>> {
+    fn push(&mut self, fragment: &str) -> Result<Vec<ForthWireToken>> {
         self.source.push_str(fragment);
         self.collect_complete(false)
     }
 
-    pub fn finish(&mut self) -> Result<Vec<ForthWireToken>> {
+    fn finish(&mut self) -> Result<Vec<ForthWireToken>> {
         self.collect_complete(true)
     }
 
-    pub fn source(&self) -> &str {
+    // Unlike `push`/`finish` above (both exercised by this crate's own
+    // tests), nothing anywhere — including tests — calls `source()`: the
+    // single strongest deletion candidate this audit found.
+    fn source(&self) -> &str {
         &self.source
     }
 
@@ -312,6 +331,10 @@ impl ForthWireBuffer {
     }
 }
 
+// This and the two helpers below are reachable only from `ForthWireBuffer`
+// above (see its note); already private before #949, they only became
+// dead-code-lint-eligible as a downstream effect of narrowing `push`/`finish`.
+#[allow(dead_code)]
 fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<(usize, usize)>> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
@@ -420,6 +443,7 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
     Ok(tokens)
 }
 
+#[allow(dead_code)]
 fn looks_like_streamed_json_object(source: &str, start: usize) -> bool {
     matches!(
         source[start + 1..].trim_start().as_bytes().first(),
@@ -430,6 +454,7 @@ fn looks_like_streamed_json_object(source: &str, start: usize) -> bool {
 /// Return the byte after a structurally complete JSON object. This is only
 /// incremental framing; the typed frontend performs the real JSON parse once
 /// the complete program arrives.
+#[allow(dead_code)]
 fn streamed_json_object_end(source: &str, start: usize) -> Option<usize> {
     let mut cursor = start;
     let mut depth = 0_u32;
