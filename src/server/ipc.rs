@@ -879,11 +879,21 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::SnapshotParams,
         mut results: brain_service::SnapshotResults,
     ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
-        let brain = pry!(pry!(params.get()).get_brain())
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let requesting_workspace = pry!(params.get_requesting_workspace())
             .to_str()
             .unwrap_or("")
             .to_string();
-        let snapshot = match self.lifecycle.snapshot(&brain) {
+        let requesting_workspace = if requesting_workspace.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(requesting_workspace))
+        };
+        let snapshot = match self
+            .lifecycle
+            .snapshot_for_client(&brain, requesting_workspace.as_deref())
+        {
             Ok(snapshot) => snapshot,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };

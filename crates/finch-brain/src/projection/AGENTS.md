@@ -20,6 +20,10 @@ locks or schedule indexing. Do not hydrate, create files, or truncate journals.
 second authority for runner leases. An unhydrated list may read existing metadata and journal
 files but must not create, repair, or truncate them. Observer effect-audit events must not
 disclose fields withheld from observers. Keep handoff detection tied to the exact lease id.
+`BrainEnvironment::same_host_identity` (machine + generation) is the only comparison a caller may
+use to gate runner-lease acquisition/handoff/submission readiness (#1381) — `workspace` is a
+per-Brain value (the parent `store` capsule owns setting it), not part of "same daemon process and
+restart epoch."
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib projection::`.
 Parent `store::` tests cover unhydrated health counts and snapshot

@@ -34,6 +34,43 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
 - `BrainStore` is the durable authority for a named Brain. A daemon restart reconstructs its
   snapshot, active runs, schedules, and attachments from the Brain journal; a console's
   `AttachedBrainClient` is a projection and transport connection, not another source of truth.
+- **A Brain's canonical `environment.workspace` is per-Brain, recorded once at creation, not a
+  single daemon-wide default (#1381).** `BrainStore.environment` (set once from
+  `std::env::current_dir()` at store construction, i.e. the daemon's own launch-time cwd) is only
+  the *fallback* for a Brain whose own metadata carries no `workspace` — legacy Brains created
+  before this field existed, and any caller that never supplies one. `BrainStore::snapshot_for_client`
+  is the entry point that can set it: when a not-yet-existing Brain's metadata is first created
+  (`ensure_loaded_with_workspace` -> `load_or_create_metadata`), the caller's `requesting_workspace`
+  becomes that Brain's own, permanently recorded `BrainMetadata.workspace` (canonicalized, same as
+  the store default). `BrainStore::snapshot` is a thin `snapshot_for_client(name, None)` wrapper for
+  every caller that has no client-specific workspace to offer. Once set, a Brain's workspace is
+  never overwritten by a later caller's cwd — canonical workspace is fixed at creation so
+  workspace-mismatch detection (`verify_frontend_environment`,
+  `src/cli/repl_event/brain_handler.rs` in the root crate) stays meaningful. The local Cap'n Proto
+  `BrainService.snapshot` RPC (`crates/finch-ipc/schema/finch_ipc.capnp`) carries the requesting
+  client's own cwd as `requestingWorkspace` for exactly this reason — a brand-new Brain created for
+  one client invocation must never record a *different* daemon-wide default and then immediately
+  read back as workspace-mismatched against the very client that just created it. Covered by
+  `test_brain_created_through_real_ipc_records_creating_clients_cwd_not_daemon_launch_cwd` in
+  `src/server/ipc/tests.rs` (root crate), which drives a real `IpcClient` against a real
+  `BrainRpcService` over an actual Cap'n Proto `UnixStream` pair.
+- **A caller comparing `BrainEnvironment`s to gate runner-lease acquisition, handoff acceptance,
+  or submission readiness must use `BrainEnvironment::same_host_identity` (machine + generation),
+  never `==` (whole-struct, includes `workspace`).** Before the #1381 per-Brain-workspace fix
+  above, every Brain's `workspace` was always identical to `BrainStore`'s own daemon-wide default,
+  so `BrainLifecycleService::acquire_runner`/`accept_runner_handoff`
+  (`src/server/brain_service.rs` in the root crate) and `ensure_named_brain_store_environment`
+  (`src/server/handlers.rs`, the gate `named_brain_runner_is_ready` runs before *every* executable
+  submission) could compare the full struct and it was harmless — the comparison was dead code that
+  always passed. Once `workspace` genuinely varies per Brain, that same whole-struct comparison
+  would reject the ordinary case (a runner supplying its own Brain's real, client-derived
+  environment, which legitimately differs from the daemon's unrelated default workspace) and break
+  runner registration and prompt submission for exactly the sessions #1381 was reported from.
+  Covered by `acquire_runner_succeeds_when_the_brains_own_workspace_differs_from_the_daemon_default`
+  in `src/server/brain_service.rs` and
+  `prompt_submission_reaches_running_when_the_brains_own_workspace_differs_from_the_daemon_default`
+  in `src/server/handlers/handler_tests.rs` (root crate); both fail if either call site regresses
+  to `==`.
 - A run, runner lease, attachment, and connection have distinct identities and lifetimes.
   Detaching a connection must not silently grant runner authority. The server explicitly rejects
   attaching with `AttachmentRole::Runner`; runner authority goes through a lease.

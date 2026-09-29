@@ -22,6 +22,9 @@ payloads; do not copy delivery.
 torn append. A receipt belongs to the first canonical event for one authorized mutation;
 retry resolution must not append a second transition. Read-only scans must not hydrate,
 create files, or repair the log. The store controls writer lifetime and authorization.
+`BrainMetadata.workspace` (#1381) is `#[serde(default)]` so legacy `metadata.json` files without
+it still parse; the store, not this module, decides what a missing value falls back to and is the
+only writer of a non-`None` value, set once at first creation and never rewritten afterward.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib journal::`.
 Parent `store::` tests cover hydration replay, effect-audit sequence

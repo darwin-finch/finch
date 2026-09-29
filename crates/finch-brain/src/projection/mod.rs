@@ -26,6 +26,24 @@ pub struct BrainEnvironment {
     pub generation: u64,
 }
 
+impl BrainEnvironment {
+    /// Same daemon process and restart epoch as `other`, ignoring `workspace`.
+    ///
+    /// `machine` and `generation` are always this store's own live values on
+    /// every `BrainSnapshot`; `workspace` is the only field that is genuinely
+    /// per-Brain, recorded once at that Brain's own creation from its
+    /// creating client's cwd (#1381). A caller that means "is this the same
+    /// daemon process/epoch I expect to be talking to" (runner-lease
+    /// acquisition and handoff, submission readiness) should use this
+    /// instead of `==`, which would incorrectly reject a Brain whose own
+    /// recorded workspace differs from this store's daemon-wide default —
+    /// the normal case once a Brain's workspace reflects its creating
+    /// client's own cwd rather than the daemon's launch-time cwd.
+    pub fn same_host_identity(&self, other: &Self) -> bool {
+        self.machine == other.machine && self.generation == other.generation
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSnapshot {
     pub brain_id: BrainId,

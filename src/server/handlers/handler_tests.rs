@@ -1698,6 +1698,103 @@ async fn task_submission_rejects_huge_or_ambiguous_lists_before_persistence() {
     );
 }
 
+/// #1381 regression, discovered while fixing the reported bug: a Brain's own
+/// `environment.workspace` is now recorded from its *creating client's* cwd
+/// rather than always equal to the daemon-wide default `BrainStore` carries.
+/// A Prompt submitted for such a Brain must still reach `Running` (not be
+/// spuriously stuck `QueuedForEnvironment` or rejected outright) once a
+/// matching runner is registered for it —
+/// `ensure_named_brain_store_environment` (the gate `named_brain_runner_is_ready`
+/// calls before every executable submission) must not reject a Brain merely
+/// because its own workspace differs from this store's unrelated daemon-wide
+/// default workspace.
+#[tokio::test]
+async fn prompt_submission_reaches_running_when_the_brains_own_workspace_differs_from_the_daemon_default(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let client_workspace = tempfile::tempdir().unwrap();
+    // `with_root` (like real production `BrainStore::new`/`AgentServer::new`)
+    // derives the daemon-wide default workspace from this test process's own
+    // real `std::env::current_dir()`, so the unrelated "has the daemon
+    // process's own cwd drifted from its own configured default" check
+    // inside `ensure_named_brain_store_environment` stays satisfied and does
+    // not confound this test's actual assertion.
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+    let daemon_default_workspace = store.environment().workspace.clone();
+    let snapshot = store
+        .snapshot_for_client("shared", Some(client_workspace.path()))
+        .unwrap();
+    assert_ne!(
+        snapshot.environment.workspace, daemon_default_workspace,
+        "test fixture bug, not a #1381 assertion: client and daemon \
+         workspaces must actually differ for this test to be meaningful"
+    );
+
+    let pending = store
+        .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    let driver = store
+        .activate_connection(
+            "shared",
+            pending.attachment_id,
+            pending.connection_id.unwrap(),
+        )
+        .unwrap();
+    let runners = crate::server::BrainRunnerBroker::default();
+    let approvals = crate::server::BrainApprovalBroker::default();
+    let lease = crate::server::BrainLifecycleService::new(
+        store.clone(),
+        runners.clone(),
+        approvals.clone(),
+    )
+    .acquire_runner(
+        "shared",
+        "runner@box.local",
+        &snapshot.environment,
+        None,
+        60_000,
+    )
+    .unwrap_or_else(|error| {
+        panic!("#1381 regression: acquire_runner must accept a runner supplying this Brain's own environment even though it differs from the daemon's unrelated default workspace; got: {error}")
+    });
+    let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+    runners.register("shared", lease.lease_id, runner_tx);
+    // `submit_named_brain_event` awaits the full turn dispatch before
+    // returning, so a stub runner must actually reply — the assertion below
+    // only cares that the run reached `Running` (captured before dispatch),
+    // not how the stubbed turn itself resolves.
+    tokio::spawn(async move {
+        if let crate::server::RunnerRequest::Turn(request) = runner_rx.recv().await.unwrap() {
+            let _ = request
+                .response_tx
+                .send(Err("#1381 test stub: no real runner".to_string().into()));
+        }
+    });
+
+    let outcome = submit_named_brain_event(
+        &store,
+        &runners,
+        &approvals,
+        "shared",
+        &driver,
+        BrainEventKind::Prompt {
+            text: "hello".into(),
+            attached_mentions: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let run = outcome.run.expect("a Prompt submission starts a run");
+    assert_eq!(
+        run.status,
+        crate::brain::BrainRunStatus::Running,
+        "a live, correctly-registered runner must be usable even though \
+         this Brain's own workspace differs from the daemon's unrelated \
+         default (#1381); got {:?}",
+        run.status
+    );
+}
+
 #[tokio::test]
 async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_sequence() {
     let temp = tempfile::tempdir().unwrap();

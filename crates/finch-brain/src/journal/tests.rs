@@ -257,6 +257,7 @@ fn test_metadata_selection_round_trip_is_secret_free() {
             reasoning_effort: Some("high".into()),
             provider_inherited: false,
         },
+        workspace: None,
     };
     let json = serde_json::to_string(&metadata).unwrap();
     assert!(
