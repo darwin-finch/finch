@@ -434,12 +434,23 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
     )
 }
 
-/// Bottom status rule with provider · model identity on the left.
-fn status_rule_line(width: usize, identity: &str) -> String {
+/// Bottom status rule with provider · model identity on the left and,
+/// only while the transcript is scrolled away from the live edge, a
+/// scroll-position hint on the right (#1252): "↑ N more above" and/or
+/// "↓ N more below" (see [`scroll_view::scroll_position_hint`]). Identity
+/// keeps the priority it always had — it is sized exactly as the pre-#1252
+/// rule sized it, from the full available width — and the hint only claims
+/// whatever room is left over, shrinking and then dropping entirely below a
+/// usable minimum on a narrow terminal. `scroll_hint: None` reproduces the
+/// pre-#1252 rule exactly, including its bare-dash fallback when there is
+/// no identity either.
+fn status_rule_line(width: usize, identity: &str, scroll_hint: Option<&str>) -> String {
     if width == 0 {
         return String::new();
     }
-    if identity.trim().is_empty() {
+    let identity = identity.trim();
+    let scroll_hint = scroll_hint.map(str::trim).filter(|hint| !hint.is_empty());
+    if identity.is_empty() && scroll_hint.is_none() {
         return "─".repeat(width);
     }
     let prefix = ellipsize("── ", width);
@@ -447,17 +458,33 @@ fn status_rule_line(width: usize, identity: &str) -> String {
     if remaining <= 2 {
         return format!("{prefix}{}", "─".repeat(remaining));
     }
-    let label = format!(" {} ", identity.trim());
-    let label = if label.chars().count() + 2 > remaining {
-        format!(
-            " {} ",
-            ellipsize(identity.trim(), remaining.saturating_sub(2))
-        )
+
+    // `ellipsize` is a no-op whenever the text already fits, so sizing the
+    // label unconditionally from the full `remaining` budget reproduces the
+    // pre-#1252 rule's own conditional-ellipsize result exactly.
+    let label = if identity.is_empty() {
+        String::new()
     } else {
-        label
+        format!(" {} ", ellipsize(identity, remaining.saturating_sub(2)))
     };
-    let used = prefix.chars().count() + label.chars().count();
-    format!("{prefix}{label}{}", "─".repeat(width.saturating_sub(used)))
+
+    // Minimum leftover width to show anything legible: " ", at least two
+    // hint characters (one real character plus an ellipsis, or two real
+    // characters), a trailing space, and the closing "──".
+    const MIN_HINT_WIDTH: usize = 6;
+    let leftover = remaining.saturating_sub(label.chars().count());
+    let right = match scroll_hint {
+        Some(hint) if leftover >= MIN_HINT_WIDTH => {
+            format!(" {} ──", ellipsize(hint, leftover - 4))
+        }
+        _ => String::new(),
+    };
+
+    let used = prefix.chars().count() + label.chars().count() + right.chars().count();
+    format!(
+        "{prefix}{label}{}{right}",
+        "─".repeat(width.saturating_sub(used))
+    )
 }
 
 /// Return a plain visible suffix small enough to fit in `columns`. This is
@@ -1266,7 +1293,7 @@ pub(crate) fn plan_live_frame(
     // ── 6. Status separator and status line(s) ───────────────────────────────
     // Provider/model identity sits on the left of this rule. Brain identity
     // remains on the upper separator so the two identities are not stacked.
-    let rule = status_rule_line(width, vm.model_identity);
+    let rule = status_rule_line(width, vm.model_identity, vm.scroll_hint);
     if claimed_rects.status_rule.height > 0 {
         frame.push(format!("{DIM_GRAY}{rule}{RESET}"));
     }
@@ -2296,13 +2323,20 @@ impl TuiRenderer {
         // live area renders only the suffix's lines above the hidden tail and
         // the reader sees one contiguous window over the projected union.
         // Follow mode (offset 0) clips nothing and stays byte-identical.
-        let live_rendered = if self.transcript_scroll.offset() == 0 {
-            live_rendered
+        //
+        // The scroll-position hint (#1252) is derived here rather than at
+        // paint time: `derive_window` (which refreshes `content_rows`, the
+        // hint's other input besides the offset) only runs in this same
+        // scrolled branch, so the hint and the window it describes are
+        // always computed from the same union.
+        let (live_rendered, scroll_hint) = if self.transcript_scroll.offset() == 0 {
+            (live_rendered, None)
         } else {
             let (union, live_start) = self.projected_scroll_union(term_width);
             let (split, _skipped) = self.transcript_scroll.derive_window(&union, term_width);
             let visible_end = split.max(live_start).min(union.len());
-            union[live_start..visible_end].to_vec()
+            let hint = scroll_view::scroll_position_hint(self.transcript_scroll.hidden_rows());
+            (union[live_start..visible_end].to_vec(), hint)
         };
         LiveFrameSources {
             input_cursor: self.input_textarea.cursor(),
@@ -2312,6 +2346,7 @@ impl TuiRenderer {
             cwd_label,
             session_label,
             model_identity: self.model_identity.clone(),
+            scroll_hint,
             task_rows,
             tracked_rows,
             live_rendered,
@@ -2744,6 +2779,9 @@ struct LiveFrameSources {
     cwd_label: String,
     session_label: String,
     model_identity: String,
+    /// The transcript's scroll-position hint (#1252); `None` at the live
+    /// edge. See [`view_model::LiveViewModel::scroll_hint`].
+    scroll_hint: Option<String>,
     task_rows: Vec<activity::ActivityRow>,
     tracked_rows: Vec<activity::ActivityRow>,
     live_rendered: Vec<RenderedTranscriptLine>,
@@ -2769,6 +2807,7 @@ fn live_view_model<'a>(
         cwd_label: &sources.cwd_label,
         session_label: &sources.session_label,
         model_identity: &sources.model_identity,
+        scroll_hint: sources.scroll_hint.as_deref(),
         dialog,
         expanded_lines,
         render_error: sources.render_error,
@@ -5979,6 +6018,7 @@ mod tests {
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
             model_identity: "",
+            scroll_hint: None,
             dialog: None,
             expanded_lines: None,
             render_error: false,
@@ -7409,7 +7449,7 @@ mod tests {
     fn status_rule_never_wraps_and_keeps_identity_on_the_left() {
         let identity = "ChatGPT · gpt-5.6-sol · override";
         for width in 1..160 {
-            let line = status_rule_line(width, identity);
+            let line = status_rule_line(width, identity, None);
             assert_eq!(line.chars().count(), width, "width {width}: {line:?}");
             assert_eq!(
                 shadow_buffer::physical_rows(&line, width),
@@ -7417,11 +7457,62 @@ mod tests {
                 "width {width}: {line:?}"
             );
         }
-        let wide = status_rule_line(80, identity);
+        let wide = status_rule_line(80, identity, None);
         assert!(
             wide.contains("ChatGPT · gpt-5.6-sol"),
             "bottom rule must keep provider/model on the left: {wide:?}"
         );
+    }
+
+    #[test]
+    fn status_rule_never_wraps_with_a_scroll_hint_and_keeps_identity_priority() {
+        // INVARIANT (#1252): adding the scroll-position hint must never
+        // break the rule's fixed-width, single-row guarantee, and the
+        // identity keeps priority over the hint on a narrow terminal.
+        let identity = "ChatGPT · gpt-5.6-sol · override";
+        let hint = "↑ 128 more above · ↓ 4 more below";
+        for width in 1..160 {
+            let line = status_rule_line(width, identity, Some(hint));
+            assert_eq!(line.chars().count(), width, "width {width}: {line:?}");
+            assert_eq!(
+                shadow_buffer::physical_rows(&line, width),
+                1,
+                "width {width}: {line:?}"
+            );
+        }
+        let wide = status_rule_line(90, identity, Some(hint));
+        assert!(
+            wide.contains("ChatGPT · gpt-5.6-sol") && wide.contains("128 more above"),
+            "a wide rule must show both identity and the scroll hint: {wide:?}"
+        );
+        let narrow = status_rule_line(20, identity, Some(hint));
+        assert!(
+            narrow.contains("ChatGPT"),
+            "a narrow rule must drop the hint before it drops identity: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn status_rule_shows_only_the_scroll_hint_when_identity_is_empty() {
+        let hint = "↓ 9 more below";
+        let line = status_rule_line(80, "", Some(hint));
+        assert!(
+            line.contains(hint),
+            "an empty identity must not suppress the scroll hint: {line:?}"
+        );
+        assert_eq!(
+            line.chars().count(),
+            80,
+            "the rule must still fill the width: {line:?}"
+        );
+    }
+
+    #[test]
+    fn status_rule_line_with_no_identity_and_no_hint_is_a_bare_dash_rule() {
+        // Pre-#1252 fallback, preserved exactly: no scroll_hint argument
+        // reproduces the plain, unbroken dash rule.
+        assert_eq!(status_rule_line(40, "", None), "─".repeat(40));
+        assert_eq!(status_rule_line(40, "   ", None), "─".repeat(40));
     }
 
     #[test]
@@ -10555,6 +10646,7 @@ mod tests {
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
             model_identity: "",
+            scroll_hint: None,
             dialog: None,
             expanded_lines: None,
             render_error: false,
@@ -10633,6 +10725,7 @@ mod tests {
                 cwd_label: "~/repos/finch",
                 session_label: "jade-river",
                 model_identity: "",
+                scroll_hint: None,
                 dialog: None,
                 expanded_lines: None,
                 render_error: false,
@@ -10807,6 +10900,7 @@ mod tests {
                 cwd_label: "~/repos/finch",
                 session_label: "jade-river",
                 model_identity: "",
+                scroll_hint: None,
                 dialog: None,
                 expanded_lines: None,
                 render_error: false,
@@ -10897,6 +10991,7 @@ mod tests {
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
             model_identity: "",
+            scroll_hint: None,
             dialog: None,
             expanded_lines: None,
             render_error: false,
@@ -14150,6 +14245,115 @@ mod selection_tests {
             revealed,
             "drag-autoscroll must extend the selection to cover content that was \
              off-screen before the drag within 60 ticks; final scroll offset {last_offset}"
+        );
+    }
+
+    /// #1252: the transcript's scroll-position hint (the "↑ N more above ·
+    /// ↓ N more below" text [`scroll_view::scroll_position_hint`] produces)
+    /// must appear on the bottom status rule while scrolled away from the
+    /// live edge, and must fully clear — no leftover fragment — on
+    /// returning to follow mode. A changing digit count shrinking the hint
+    /// between frames is exactly the "row-diff blit strands a stale row"
+    /// bug class the wizard fixes (#1297, #1305) had to repair; the live
+    /// area's own repaint is instead a full erase-then-redraw
+    /// (`write_live_area_erase` + `draw_live_area_to`, never an incremental
+    /// row diff), so this test pins that guarantee at the production
+    /// boundary — the real `TuiRenderer` methods and byte stream, replayed
+    /// through `VtOracle`, a real VT100 parser — rather than assume it from
+    /// the architecture alone.
+    #[test]
+    fn test_scroll_position_hint_appears_while_scrolled_and_clears_at_follow_mode() {
+        let mut renderer = renderer_with_numbered_lines(60);
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            0,
+            "sanity: a freshly drawn transcript starts in follow mode"
+        );
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        let mut follow_frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut follow_frame)
+            .expect("follow-mode draw must succeed");
+        term.feed(&follow_frame);
+        assert!(
+            term.find_row("more above").is_none() && term.find_row("more below").is_none(),
+            "follow mode (at the live edge) must show no scroll-position hint; screen:\n{}",
+            term.diagnostic()
+        );
+
+        // Scroll into history far enough that both edges are non-trivial:
+        // some content remains above the visible window and some (the
+        // newest lines) is hidden below it.
+        renderer.transcript_scroll.scroll(-40);
+        let mut erase = Vec::new();
+        write_live_area_erase(
+            &mut erase,
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+        )
+        .expect("erase before the scrolled draw must succeed");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        term.feed(&erase);
+        let mut scrolled_frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut scrolled_frame)
+            .expect("scrolled draw must succeed");
+        term.feed(&scrolled_frame);
+
+        let offset = renderer.transcript_scroll.offset();
+        assert!(
+            offset > 0,
+            "sanity: scrolling up must move the offset off follow mode"
+        );
+        let hint_row = term
+            .find_row("more above")
+            .or_else(|| term.find_row("more below"));
+        assert!(
+            hint_row.is_some(),
+            "scrolled {offset} rows into history, the status rule must show a \
+             scroll-position hint; screen:\n{}",
+            term.diagnostic()
+        );
+        let row_text = term.row(hint_row.expect("checked above"));
+        assert!(
+            row_text.contains("more above") && row_text.contains("more below"),
+            "scrolled into the middle of 60 numbered messages, both edges must be \
+             non-trivial, so the hint must report both counts: {row_text:?}\n{}",
+            term.diagnostic()
+        );
+
+        // Scroll back to the live edge and repaint: the hint must fully
+        // clear, with no stale fragment surviving from the wider scrolled
+        // frame's rule.
+        renderer.transcript_scroll.scroll(offset as isize);
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            0,
+            "sanity: scrolling all the way back down returns to follow mode"
+        );
+        let mut erase = Vec::new();
+        write_live_area_erase(
+            &mut erase,
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+        )
+        .expect("erase before the return-to-follow draw must succeed");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        term.feed(&erase);
+        let mut restored_frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut restored_frame)
+            .expect("return-to-follow draw must succeed");
+        term.feed(&restored_frame);
+        assert!(
+            term.find_row("more above").is_none() && term.find_row("more below").is_none(),
+            "returning to follow mode must clear the hint with no stale fragment; screen:\n{}",
+            term.diagnostic()
         );
     }
 

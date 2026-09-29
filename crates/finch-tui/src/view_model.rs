@@ -114,6 +114,11 @@ pub(crate) struct LiveViewModel<'a> {
     pub cwd_label: &'a str,
     pub session_label: &'a str,
     pub model_identity: &'a str,
+    /// The transcript's scroll-position hint (#1252), painted on the bottom
+    /// status rule: `Some` only while scrolled away from the live edge (see
+    /// [`super::scroll_view::TranscriptScrollView::hidden_rows`] and
+    /// [`super::scroll_view::scroll_position_hint`]).
+    pub scroll_hint: Option<&'a str>,
     pub dialog: Option<&'a super::Dialog>,
     /// Lines of the focused expanded tool-result surface (#656), pre-rendered
     /// by the caller so the planner stays a pure function of its inputs.
