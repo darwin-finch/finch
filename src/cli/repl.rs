@@ -38,7 +38,10 @@ use crate::tools::{
     RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
-use crate::tools::{GuiClickTool, GuiInspectTool, GuiTypeTool};
+use crate::tools::{
+    ExcelActivateTool, ExcelFormulaTool, ExcelRangeTool, ExcelReadTool, ExcelSheetsTool,
+    ExcelWriteTool, GuiClickTool, GuiInspectTool, GuiTypeTool,
+};
 use crate::tools::{ToolDefinition, ToolUse};
 use crate::training::batch_trainer::BatchTrainer;
 
@@ -1284,15 +1287,37 @@ impl Repl {
             }
         }
 
-        // GUI automation tools (macOS only)
+        // GUI automation and Excel accessibility tools (macOS only).
+        //
+        // #421: these register unconditionally on macOS regardless of the
+        // `gui_automation` feature flag or Accessibility permission state,
+        // so a model can discover the capability and get an actionable
+        // reason instead of the tool silently not existing. `GuiClickTool`,
+        // `GuiTypeTool`, and `GuiInspectTool` carry the flag's value and
+        // consult it (and, when enabled, real Accessibility trust) at
+        // execution time via `AutomationBroker::availability()` /
+        // `unavailable_message()` (`crates/finch-runtime/src/automation.rs`).
+        // The Excel tools have no feature flag of their own — they shell out
+        // via `osascript` and translate macOS's own Automation/Accessibility
+        // denial into an actionable message directly (`osascript()` in
+        // `src/tools/implementations/excel.rs`) — so they always register.
         #[cfg(target_os = "macos")]
         {
-            if config.features.gui_automation {
-                tracing::info!("Registering GUI automation tools (macOS)");
-                tool_registry.register(Box::new(GuiClickTool));
-                tool_registry.register(Box::new(GuiTypeTool));
-                tool_registry.register(Box::new(GuiInspectTool));
-            }
+            tracing::info!(
+                gui_automation_enabled = config.features.gui_automation,
+                "Registering GUI automation and Excel accessibility tools (macOS)"
+            );
+            tool_registry.register(Box::new(GuiClickTool::new(config.features.gui_automation)));
+            tool_registry.register(Box::new(GuiTypeTool::new(config.features.gui_automation)));
+            tool_registry.register(Box::new(GuiInspectTool::new(
+                config.features.gui_automation,
+            )));
+            tool_registry.register(Box::new(ExcelReadTool));
+            tool_registry.register(Box::new(ExcelWriteTool));
+            tool_registry.register(Box::new(ExcelRangeTool));
+            tool_registry.register(Box::new(ExcelFormulaTool));
+            tool_registry.register(Box::new(ExcelSheetsTool));
+            tool_registry.register(Box::new(ExcelActivateTool));
         }
 
         // Phase 4: Register memory tools if memory system is enabled

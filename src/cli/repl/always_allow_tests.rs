@@ -13,6 +13,11 @@ use crate::tools::{
     RemoveMemoryTool, RestartTool, SearchMemoryTool, SearchWordTool, SubmitProgramTool, TaskTool,
     TodoReadTool, TodoWriteTool, Tool, ToolRegistry, WebFetchTool, WriteTool,
 };
+#[cfg(target_os = "macos")]
+use crate::tools::{
+    ExcelActivateTool, ExcelFormulaTool, ExcelRangeTool, ExcelReadTool, ExcelSheetsTool,
+    ExcelWriteTool, GuiClickTool, GuiInspectTool, GuiTypeTool,
+};
 use finch_programs::ExecutionEffect;
 use serde_json::json;
 use std::path::PathBuf;
@@ -168,6 +173,25 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         Box::new(AgentAwaitTool::new(Arc::clone(&scheduler))),
         Box::new(AgentPollTool::new(Arc::clone(&scheduler))),
         Box::new(AgentCancelTool::new(scheduler)),
+    ] {
+        registry.register(tool);
+    }
+    // #421: GUI automation and Excel accessibility tools now register
+    // unconditionally on macOS (no longer gated on the `gui_automation`
+    // feature flag), mirroring the real REPL registration in
+    // `src/cli/repl.rs` so the effect/allowlist conformance tests below
+    // actually cover them.
+    #[cfg(target_os = "macos")]
+    for tool in [
+        Box::new(GuiClickTool::new(true)) as Box<dyn Tool>,
+        Box::new(GuiTypeTool::new(true)),
+        Box::new(GuiInspectTool::new(true)),
+        Box::new(ExcelReadTool),
+        Box::new(ExcelWriteTool),
+        Box::new(ExcelRangeTool),
+        Box::new(ExcelFormulaTool),
+        Box::new(ExcelSheetsTool),
+        Box::new(ExcelActivateTool),
     ] {
         registry.register(tool);
     }
