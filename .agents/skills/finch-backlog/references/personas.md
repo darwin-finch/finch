@@ -117,3 +117,25 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   provider). Copy/paste and approval-prompt flow (Marcus) and TUI rendering robustness (Rin, wave
   one) both held up well under real stress-testing — worth noting as much as the failures.
   All 8 planned personas have now run at least once.
+- **2026-09-29**: full re-test, all 8 personas, against a build with every issue above fixed and
+  merged (#1181, #1380, #1382 partial/#1395, #1383/#1396, #1384/#1398, #1387/#1397, #1388/#1390,
+  #1389/#1392). Wave 1 (Dana, Sam, Rin, Jordan) immediately found **#1381 was not actually fixed
+  live** despite being merged and closed — three independent testers reproduced the exact original
+  symptom on the fixed build. Root cause: the merged fix (#1393) only closed one of two independent
+  Brain-creation paths; `EventLoop::hydrate_brain_selection` (which runs *before*
+  `register_home_brain` in real startup) can create a Brain first via a wholly separate HTTP route
+  the original fix never touched, and Brain-metadata creation is first-write-wins. This also
+  explained why #1387 regressed at the same time (the workspace-verification step then fails,
+  short-circuiting the code path that sets `home_brain_registered`). Fixed for real in #1400
+  (`set_provider_selection_for_client` + `x-finch-workspace` header), verified live directly (not
+  just via test suite) before closing #1381/#1387 a second time. Wave 2 (Marcus, Priya, Ollie,
+  Chen), run after the #1400 fix, unanimously confirmed #1381/#1383/#1387/#1388/#1389 all hold up
+  live now, with fresh corroborating evidence for each. Zero new bugs found in this final
+  full-coverage pass — every remaining observation (wizard Ctrl+C footer wording, `background_bash`
+  not exposed to the Claude CLI Subscription provider) was checked and confirmed either
+  intentional/documented or too low-confidence to file. **Lesson for future passes, now in
+  `crates/finch-brain/AGENTS.md`**: a fix's own test suite passing is not sufficient evidence a
+  live regression is actually closed when the bug crossed a real end-to-end sequence (startup
+  order, in this case) that the tests exercised only in isolated pieces — re-verify live before
+  trusting a "fixed" issue closed again, especially for anything touching multi-step
+  client/daemon sequencing.
