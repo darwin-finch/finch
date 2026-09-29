@@ -3960,6 +3960,180 @@ fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
     );
 }
 
+/// Issue #439 (approvals render as a separate block instead of inline with
+/// the tool call they gate): a maintainer transcript capture showed every
+/// tool call's approval collected into a second "Tools (N calls)" section,
+/// correlated back to its gated call only by matching an opaque provider
+/// call id — the denial ("failed: deny") in particular appeared detached
+/// from the edit it actually blocked. `handle_tool_approval_request` always
+/// sets a tool approval's `approval_id` to the gated call's own `tool_id`
+/// (tools.rs), so `project_remote_brain_run_event` can and must fold the
+/// decision onto that same row instead of a separately correlated one.
+#[test]
+fn tool_approval_decision_renders_on_the_gated_tool_row_not_a_separate_section() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "shammah".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    // One approved edit and one denied edit, each identified the way
+    // production code actually identifies them: `approval_id` equal to the
+    // gated call's own `tool_id` (never a separate id space).
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "call_approved_edit".into(),
+            name: "edit".into(),
+            input: serde_json::json!({"file_path": "index.html"}),
+        },
+        BrainEventKind::ApprovalRequested {
+            request_seq: 1,
+            approval_id: "call_approved_edit".into(),
+            approval_kind: "tool".into(),
+            subject: "edit".into(),
+            audience: None,
+            detail: serde_json::json!({"input": {"file_path": "index.html"}}),
+        },
+        BrainEventKind::ApprovalDecided {
+            request_seq: 1,
+            approval_id: "call_approved_edit".into(),
+            decision: serde_json::json!({"choice": "approve_pattern_session"}),
+        },
+        BrainEventKind::ToolResult {
+            request_seq: 1,
+            tool_id: "call_approved_edit".into(),
+            output: "Edited index.html".into(),
+            is_error: false,
+        },
+        BrainEventKind::ToolCall {
+            request_seq: 2,
+            tool_id: "call_denied_edit".into(),
+            name: "edit".into(),
+            input: serde_json::json!({"file_path": "secrets.env"}),
+        },
+        BrainEventKind::ApprovalRequested {
+            request_seq: 2,
+            approval_id: "call_denied_edit".into(),
+            approval_kind: "tool".into(),
+            subject: "edit".into(),
+            audience: None,
+            detail: serde_json::json!({"input": {"file_path": "secrets.env"}}),
+        },
+        BrainEventKind::ApprovalDecided {
+            request_seq: 2,
+            approval_id: "call_denied_edit".into(),
+            decision: serde_json::json!({"choice": "deny"}),
+        },
+        BrainEventKind::ToolResult {
+            request_seq: 2,
+            tool_id: "call_denied_edit".into(),
+            output: "Tool execution denied by user".into(),
+            is_error: true,
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 1, "shammah", kind);
+        event.run_id = Some(run_id);
+        assert!(
+            super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+                &super::LocallyRenderedRuns::default(),
+                None,
+            ),
+            "every projected run event must be acknowledged: seq={}",
+            index + 1
+        );
+    }
+
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let projected = crate::cli::test_projection::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
+    let dump = format!("{projected:#?}");
+
+    // No row is reachable only by matching a provider call id: every
+    // approval-only row (the pre-#439 shape) must be gone.
+    assert!(
+        !projected
+            .children
+            .iter()
+            .any(|row| row.label.starts_with("approval")),
+        "an approval must not render as its own row, separately correlated \
+         by id to the tool call it gates: {dump}"
+    );
+
+    let tool_rows: Vec<_> = projected
+        .children
+        .iter()
+        .filter(|row| row.role == crate::cli::test_projection::NodeRole::ToolCall)
+        .collect();
+    assert_eq!(
+        tool_rows.len(),
+        2,
+        "exactly the two edit calls must project as tool rows, no extras: {dump}"
+    );
+
+    // The approved call's row carries who approved it and how, in its own
+    // body -- not in a same-named row four screens away.
+    let approved = tool_rows
+        .iter()
+        .find(|row| row.label.contains("edit") && !row.label.contains("failed"))
+        .unwrap_or_else(|| panic!("the approved edit must project as a tool row: {dump}"));
+    let approved_body: String = approved
+        .children
+        .iter()
+        .flat_map(|child| child.body.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        approved_body.contains("approve_pattern_session by shammah"),
+        "the approved call's own row must show who approved it and how: {dump}"
+    );
+
+    // The denial -- "the single most important fact" per #439 -- must read
+    // as a denied call in place, on the row for the edit it actually
+    // blocked, not on an unrelated row matched only by a call id.
+    let denied = tool_rows
+        .iter()
+        .find(|row| row.label.contains("failed"))
+        .unwrap_or_else(|| panic!("the denied edit must project as a failed tool row: {dump}"));
+    assert!(
+        denied.label.contains("edit"),
+        "the denial must be on the edit row it blocked, not a separate row: {dump}"
+    );
+    assert!(
+        denied.label.contains("deny by shammah"),
+        "the denial's row must say who denied it, on the row itself: {dump}"
+    );
+}
+
 #[test]
 fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
     use crate::brain::{
