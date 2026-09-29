@@ -100,9 +100,14 @@ initiate or execute, keeps its legacy rows (the control regressions pin this).
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.
 
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
-after the home Brain was attached, or a visible persistence failure. It does not mint or
-checkpoint a client-owned UUID session file. `ConversationHistory` stays an in-memory
-projection; named Brains are the durable store.
+whenever `register_home_brain` reached the daemon this session and the home Brain's entry was
+created or loaded in the durable store (`EventLoop::home_brain_registered`), or a visible
+persistence failure otherwise. This is *not* the same as the live `home_brain` watch attachment
+being connected at the moment of exit — that can be `None` mid-reconnect while the Brain still
+exists on disk, and the exit line must still agree with `finch brain ls` in that case (#1387: it
+used to key off `home_brain.is_some()` and claimed "not saved" for a Brain `brain ls` listed).
+It does not mint or checkpoint a client-owned UUID session file. `ConversationHistory` stays an
+in-memory projection; named Brains are the durable store.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::repl_event::`. Tests for the
 loop are in `event_loop/tests.rs` and reach private items through `use super::*` exactly as they

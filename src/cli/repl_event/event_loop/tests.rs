@@ -8865,6 +8865,79 @@ fn test_resume_instruction_rejects_hostile_brain_names() {
     }
 }
 
+/// #1387: the exit message used to key off `home_brain.is_some()`, the live
+/// watch attachment, instead of whether the Brain was ever durably
+/// registered with the daemon this session. Those two go out of sync
+/// whenever `register_home_brain` succeeds (creating/loading the Brain's
+/// entry in `BrainStore`, exactly what `finch brain ls` later reads) but
+/// `attach_home_brain`'s own watch either has not completed yet or dropped
+/// afterward — the reported repro's likely path, since the banner and
+/// status bar both print `session_label` independently of `home_brain`.
+///
+/// Before the fix this asserted false: `exit_resume_line()` still read
+/// `self.home_brain.is_some()` (`None` here) and printed "This run was not
+/// saved as a named Brain and cannot be resumed" for a Brain that
+/// `register_home_brain` had already created on disk. After the fix it
+/// reads the latched `home_brain_registered` flag instead, so the message
+/// agrees with what `finch brain ls` would show.
+#[tokio::test]
+async fn test_exit_resume_line_reports_saved_when_brain_registered_but_watch_detached() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut event_loop = runner_recovery_test_event_loop();
+            assert!(
+                event_loop.home_brain.is_none(),
+                "fixture precondition: no live watch attachment"
+            );
+
+            // Simulate what the real startup path does on a successful
+            // `register_home_brain` (event_loop.rs's `Ok(state) => { self
+            // .home_brain_registered = state.is_some(); ... }`) without ever
+            // reaching a successful `attach_home_brain`, e.g. because the
+            // watch attempt is still retrying when `/quit` runs.
+            event_loop.home_brain_registered = true;
+
+            let line = event_loop.exit_resume_line();
+            assert!(
+                !line.contains("not saved") && !line.contains("cannot be resumed"),
+                "a Brain the daemon already durably registered must not be reported as unsaved \
+                 (home_brain={:?}, home_brain_registered={}), got {line:?}",
+                event_loop.home_brain.is_some(),
+                event_loop.home_brain_registered,
+            );
+            assert_eq!(
+                line, "To resume, run: finch attach audit-test",
+                "a registered Brain must print the real copyable resume command, got {line:?}"
+            );
+        })
+        .await;
+}
+
+/// Companion to the above: a session that never reached the daemon at all
+/// (`register_home_brain` returned `Ok(None)`, so `home_brain_registered`
+/// stays at its default `false`) has genuinely created nothing durable, and
+/// the exit line must still say so honestly.
+#[tokio::test]
+async fn test_exit_resume_line_reports_not_saved_when_registration_never_happened() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let event_loop = runner_recovery_test_event_loop();
+            assert!(!event_loop.home_brain_registered, "fixture precondition");
+            assert!(event_loop.home_brain.is_none(), "fixture precondition");
+
+            let line = event_loop.exit_resume_line();
+            assert!(
+                line.contains("not saved") && line.contains("cannot be resumed"),
+                "an unregistered session has nothing on disk to resume, got {line:?}"
+            );
+            assert!(
+                !line.contains("finch attach"),
+                "an unregistered session must not print a copyable attach command, got {line:?}"
+            );
+        })
+        .await;
+}
+
 fn provider_switch_local_entry(
     family: crate::models::ModelFamily,
     size: crate::models::ModelSize,
