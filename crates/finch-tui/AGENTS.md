@@ -342,6 +342,35 @@ across an open-then-close completion-pane cycle and replays every emitted byte t
 (a real VT100 parser), asserting the selection is cleared, the selected line appears in exactly one
 place, and the status row reads its own real content with no stale prefix.
 
+**The erase-redraw a new press triggers on an old finalized selection must never outrun that same
+press (#1378).** `handle_left_press` clears any previously-finalized `self.selection` immediately,
+and — because that selection's highlighted rows may already be scrolled-back terminal history,
+outside anything `paint_selection_overlay`'s live-area-only diff can reach — must erase them with a
+full-viewport repaint, the same `redraw_full_viewport_inner` the rules above route through. That
+function's own "any full repaint clears it" rule (#221, above) also unconditionally clears
+`self.selection_press_candidate` — correct when a repaint is erasing content that moved out from
+under a still-pending press, but not here: this repaint exists only to erase the *old* highlight,
+and the press it would delete is the fresh one from the same gesture that triggered it. Reported
+live as the sharper, common-case form of the #1293 family: "select some text, then try to select
+text again — it just unselects the existing selection and doesn't select the new stuff." The
+previous code deferred this erase via `viewport_invalidated = true`, relying on some later render
+call to perform it — but `async_input.rs`'s event loop only drains events already buffered within a
+zero-duration poll before calling `TuiRenderer::render()` once per outer-loop iteration, and a real
+mouse press followed by physical pointer movement essentially never already has its first `Drag`
+tick queued at that exact instant. So the deferred repaint ran on the very next `render()` call —
+before the press was ever promoted into a selection — and silently discarded its own
+`selection_press_candidate`; the following real `Drag` tick then had nothing left to promote, and no
+new selection was ever created. The fix runs the erase redraw synchronously inside
+`handle_left_press` and restashes the press afterward — the same stash-then-restore shape
+`autoscroll_transcript_drag` (#1237, above) already uses around its own mid-drag
+`redraw_full_viewport` call — so the erase can never finish after the gesture that asked for it.
+`test_press_after_finalized_selection_survives_the_erase_redraw_and_starts_a_new_selection` in
+`src/lib.rs`'s `selection_tests` module drives the exact production dispatch/render sequence
+(`handle_mouse(Down)`, then `TuiRenderer::render()` — the same call the event loop makes once no
+further input is immediately available — then `handle_mouse(Drag)`, then `Up`) and confirms through
+`VtOracle` that the new selection's highlight, styled exactly like
+`span_render::selection_highlight_style()`, actually reaches the screen.
+
 `write_live_frame` also unconditionally clears every physical row a logical line occupies before
 printing it, not just the row the cursor starts on. A single `Clear(ClearType::CurrentLine)` per
 logical line (matching `continue_full_viewport_paint`) is enough for the common single-row case,
