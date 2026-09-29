@@ -1303,7 +1303,16 @@ pub(super) async fn dispatch_tool_uses(
         .get_metadata(query_id)
         .await
         .and_then(|metadata| metadata.effect_audit);
-    let current_mode = mode.read().await;
+    // Snapshot the mode instead of holding the `RwLockReadGuard` across this
+    // loop (#26): `handle_present_plan`, called below for an approved
+    // `present_plan` in the same batch, does `mode.write().await` on this
+    // same lock. A guard held here across that await would deadlock the
+    // approving task against itself — the write can never observe the read
+    // guard drop because the task holding it is the one parked on the write.
+    // `ReplMode` is `Clone`, and every use of `current_mode` in this
+    // function is a read-only mode check against one consistent snapshot for
+    // the whole batch, so cloning it up front changes no behavior.
+    let current_mode = mode.read().await.clone();
     let mut spawn_queue: Vec<(crate::tools::ToolUse, usize)> = Vec::new();
     for tool_use in tool_uses {
         let declared_effect = {
@@ -1416,7 +1425,6 @@ pub(super) async fn dispatch_tool_uses(
             spawn_queue.push((tool_use, row_idx));
         }
     }
-    drop(current_mode);
 
     for group in
         super::changeset::group_consecutive_changeset(spawn_queue, |item| item.0.name.as_str())
@@ -6281,6 +6289,181 @@ mod tests {
                  dispatch_tool_uses path; got Ok({text:?})"
             ),
         }
+    }
+
+    /// Production-boundary regression for #26's remaining deadlock: `dispatch_tool_uses`
+    /// takes `let current_mode = mode.read().await;` for the whole function body, and
+    /// `handle_present_plan` (called from inside that same scope, on approval) does
+    /// `mode.write().await` on the *same* `Arc<RwLock<ReplMode>>`. Both the outer read
+    /// guard and the inner write attempt live on one task, so the write can never
+    /// observe the read guard drop and the task hangs forever approving its own plan.
+    ///
+    /// Drives the real dialog exchange (`ShowDialog` -> `DialogResult::Selected(0)`,
+    /// the "Approve and execute" option) so the run actually reaches
+    /// `handle_present_plan`'s `mode.write().await`, then asserts the whole dispatch
+    /// completes and lands `mode` in `Executing` within a bounded deadline. Before the
+    /// fix this times out; the timeout failure is the reproduction.
+    #[tokio::test]
+    async fn test_present_plan_dispatch_does_not_deadlock_on_its_own_mode_read_guard() {
+        use crate::tools::{PermissionManager, ToolExecutor, ToolRegistry};
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        let plan_path =
+            std::env::temp_dir().join(format!("present_plan_deadlock_{}.md", uuid::Uuid::new_v4()));
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "Manual exploration".to_string(),
+            plan_path: plan_path.clone(),
+            created_at: chrono::Utc::now(),
+        }));
+
+        let registry = ToolRegistry::new();
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for plan dispatch");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for present_plan dispatch");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+
+        let present_plan_id = "toolu_present_plan_deadlock".to_string();
+        let present_plan_use = crate::tools::ToolUse {
+            id: present_plan_id.clone(),
+            name: "present_plan".to_string(),
+            input: serde_json::json!({"plan": "1. Do the thing\n2. Verify the thing"}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::providers::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: present_plan_id.clone(),
+                        name: "present_plan".to_string(),
+                        input: present_plan_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage the provider tool round that dispatch_tool_uses consumes");
+
+        let work_unit = output.start_work_unit("present-plan dispatch");
+        let active_tool_uses: ActiveToolUsesMap = Arc::new(RwLock::new(HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(HashMap::new()));
+
+        let dispatch = dispatch_tool_uses(
+            vec![present_plan_use],
+            query_id,
+            round_token,
+            &work_unit,
+            &mode,
+            &tool_call_history,
+            &event_tx,
+            &active_tool_uses,
+            &tui_renderer,
+            &output,
+            &query_states,
+            &tool_coordinator,
+            &None,
+            finch_memory::Recall::none(),
+            "test-session",
+            "/test/workspace",
+            &status,
+            4,
+        );
+        tokio::pin!(dispatch);
+
+        let mut dispatch_done = false;
+        let mut present_plan_result = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // `dispatch` sends present_plan's `ToolResult` on the channel and then
+        // returns in the same poll; keep draining the channel after
+        // `dispatch_done` flips so that already-queued message is not
+        // dropped by exiting the moment the future itself resolves.
+        while !(dispatch_done && present_plan_result.is_some()) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::select! {
+                _ = &mut dispatch, if !dispatch_done => {
+                    dispatch_done = true;
+                }
+                event = tokio::time::timeout(remaining, events.recv()) => {
+                    let event = event.unwrap_or_else(|_| {
+                        panic!(
+                            "invariant: dispatch_tool_uses must complete a present_plan \
+                             batch within {remaining:?} instead of hanging forever — \
+                             dispatch_done={dispatch_done} present_plan_result={present_plan_result:?}. \
+                             A hang here means the outer `mode.read()` guard in \
+                             dispatch_tool_uses is still held while handle_present_plan \
+                             awaits `mode.write()` on the same lock (#26)."
+                        )
+                    });
+                    match event {
+                        Some(ReplEvent::ShowDialog { response_tx, .. }) => {
+                            response_tx
+                                .send(crate::cli::tui::DialogResult::Selected(0))
+                                .expect("present_plan dialog receiver must still be waiting");
+                        }
+                        Some(ReplEvent::ToolResult { tool_id, result, .. })
+                            if tool_id == present_plan_id =>
+                        {
+                            present_plan_result = Some(match result {
+                                Ok(text) => Ok(text),
+                                Err(error) => Err(error.to_string()),
+                            });
+                        }
+                        Some(_) => {}
+                        None => panic!(
+                            "event channel closed before dispatch_tool_uses finished \
+                             approving present_plan; dispatch_done={dispatch_done} \
+                             present_plan_result={present_plan_result:?}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let present_plan_result = present_plan_result
+            .expect("dispatch_tool_uses completed without ever emitting present_plan's ToolResult");
+        assert!(
+            present_plan_result
+                .as_ref()
+                .map(|text| text.contains("Plan approved"))
+                .unwrap_or(false),
+            "invariant: approving present_plan must report approval, not an error; \
+             got {present_plan_result:?}"
+        );
+
+        let final_mode = mode.read().await;
+        assert!(
+            matches!(&*final_mode, ReplMode::Executing { .. }),
+            "invariant: approving present_plan inside dispatch_tool_uses must land \
+             `mode` in Executing once the batch completes; got {final_mode:?}"
+        );
+        drop(final_mode);
+
+        let _ = std::fs::remove_file(&plan_path);
     }
 
     #[test]
