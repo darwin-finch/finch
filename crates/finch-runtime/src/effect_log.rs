@@ -37,10 +37,6 @@ pub const EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// Capacity derived from the fixed event bound and replay-index budget.
 pub const MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN: usize =
     EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES / MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES;
-/// Upper bound for the audit share of the canonical Brain journal. Finite
-/// storage cannot retain infinite exact membership: at replay-index
-/// exhaustion admission fails closed and the operator must archive the Brain.
-pub const MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN: usize = 64 * 1024 * 1024;
 
 /// Complete immutable identity of one named-Brain host effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -319,7 +315,7 @@ impl EffectAuditReducer {
         self.entries.get(identity)
     }
 
-    pub fn active_for_run(&self, run_id: Uuid) -> usize {
+    pub(crate) fn active_for_run(&self, run_id: Uuid) -> usize {
         self.active_by_run.get(&run_id).copied().unwrap_or(0)
     }
 
@@ -333,10 +329,6 @@ impl EffectAuditReducer {
 
     pub fn total_count(&self) -> usize {
         self.total_count
-    }
-
-    pub fn replay_fence_count(&self) -> usize {
-        self.replay_fence_count
     }
 
     /// Oldest detailed terminal identities beyond the retained observer tail.
@@ -985,7 +977,7 @@ impl VmEffectDeliveryLog {
     }
 
     /// Current cursor for a Brain/client identity on one ProgramRun, if any.
-    pub fn cursor_for(
+    pub(crate) fn cursor_for(
         &self,
         consumer: &DeliveryConsumerIdentity,
         execution_id: Uuid,

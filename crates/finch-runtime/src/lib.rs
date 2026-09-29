@@ -60,9 +60,9 @@ pub use effect_log::{
     EffectAuditTransition, HostEffectPermit, VmEffectDeliveryLog,
     EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES, MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN,
     MAX_ACTIVE_EFFECT_AUDITS_PER_RUN, MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN,
-    MAX_EFFECT_AUDIT_INTENT_BYTES, MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN,
-    MAX_EFFECT_AUDIT_OUTCOME_BYTES, MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
-    MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES, MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
+    MAX_EFFECT_AUDIT_INTENT_BYTES, MAX_EFFECT_AUDIT_OUTCOME_BYTES,
+    MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN, MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES,
+    MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
 };
 pub use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 pub use workbook::{bounded_worksheet_range, MAX_WORKBOOK_CELLS};
@@ -675,7 +675,7 @@ impl ProgramRuntime {
     /// carry a checkpoint; historical entries may retain only metadata when
     /// their application-owned handles were not serializable. Older revisions
     /// may live in the application event/checkpoint store before `base_revision`.
-    pub fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self> {
+    pub(crate) fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self> {
         if archive.format_version != PROGRAM_RUNTIME_ARCHIVE_VERSION {
             bail!(
                 "unsupported ProgramRuntime archive version {}; expected {}",
@@ -736,7 +736,7 @@ impl ProgramRuntime {
     /// Restore reducible VM state and host authority as two independently
     /// validated records. The application chooses whether to supply the
     /// authority record; loading a VM archive alone remains authority-free.
-    pub fn from_archive_with_authority(
+    pub(crate) fn from_archive_with_authority(
         archive: ProgramRuntimeArchive,
         authority: ProgramRuntimeAuthorityState,
     ) -> Result<Self> {
@@ -745,7 +745,7 @@ impl ProgramRuntime {
         Ok(runtime)
     }
 
-    pub fn with_automation(enabled: bool) -> Self {
+    pub(crate) fn with_automation(enabled: bool) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self::with_automation_in_workspace(enabled, workspace_root)
     }
@@ -1005,7 +1005,7 @@ impl ProgramRuntime {
     /// Whether this runtime already has an application-owned MCP transport.
     /// This exposes availability only; it does not reveal transport state or
     /// imply that any MCP capability has been granted.
-    pub fn has_mcp_client(&self) -> bool {
+    pub(crate) fn has_mcp_client(&self) -> bool {
         self.mcp_client
             .read()
             .map(|client| client.is_some())
@@ -1029,7 +1029,7 @@ impl ProgramRuntime {
     /// callers must still grant a matching `file.read` or `file.write`
     /// selector before a typed program can use it. Whole-machine scope uses
     /// the deliberately named `bind_whole_machine_root` API.
-    pub fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()> {
+    pub(crate) fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()> {
         self.bind_resource_root(
             finch_vm::ResourceRoot::HostMachine,
             root,
@@ -1041,7 +1041,7 @@ impl ProgramRuntime {
     /// Deliberately expose the filesystem root as `root<host-machine>`. The
     /// distinct API makes whole-machine availability visible in durable audit
     /// instead of inferring it from an ordinary path binding.
-    pub fn bind_whole_machine_root(&self) -> Result<()> {
+    pub(crate) fn bind_whole_machine_root(&self) -> Result<()> {
         self.bind_resource_root(
             finch_vm::ResourceRoot::HostMachine,
             PathBuf::from("/"),
@@ -1053,7 +1053,7 @@ impl ProgramRuntime {
     /// Install an application-selected project root. This is distinct from
     /// the current workspace so a host can expose a narrower or broader
     /// project tree without changing process current-directory semantics.
-    pub fn bind_project_root(&self, root: impl Into<PathBuf>) -> Result<()> {
+    pub(crate) fn bind_project_root(&self, root: impl Into<PathBuf>) -> Result<()> {
         self.bind_resource_root(finch_vm::ResourceRoot::Project, root, false, "local-user")
     }
 
@@ -1160,16 +1160,12 @@ impl ProgramRuntime {
 
     /// Remove the host binding. Pending executions recheck this at their next
     /// host call, so revocation takes effect without widening workspace paths.
-    pub fn clear_host_machine_root(&self) -> Result<()> {
+    pub(crate) fn clear_host_machine_root(&self) -> Result<()> {
         self.clear_resource_root(&finch_vm::ResourceRoot::HostMachine)
     }
 
-    pub fn clear_project_root(&self) -> Result<()> {
+    pub(crate) fn clear_project_root(&self) -> Result<()> {
         self.clear_resource_root(&finch_vm::ResourceRoot::Project)
-    }
-
-    pub fn clear_task_output_root(&self) -> Result<()> {
-        self.clear_resource_root(&finch_vm::ResourceRoot::TaskOutput)
     }
 
     fn clear_resource_root(&self, kind: &finch_vm::ResourceRoot) -> Result<()> {
@@ -1227,7 +1223,7 @@ impl ProgramRuntime {
     /// Attach the host's MemTree service to the typed capability boundary.
     /// Keeping this explicit prevents a VM from accidentally acquiring a
     /// second memory database or an ambient memory authority.
-    pub fn attach_memory(&self, memory: Arc<finch_memory::MemorySystem>) {
+    pub(crate) fn attach_memory(&self, memory: Arc<finch_memory::MemorySystem>) {
         *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
     }
 
@@ -1274,7 +1270,7 @@ impl ProgramRuntime {
         self.session_id
     }
 
-    pub fn capability_project_id(&self) -> &str {
+    pub(crate) fn capability_project_id(&self) -> &str {
         &self.project_id
     }
 
@@ -1292,7 +1288,7 @@ impl ProgramRuntime {
             .clone())
     }
 
-    pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState> {
+    pub(crate) fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState> {
         let policy = self
             .capability_policy
             .read()
@@ -1482,7 +1478,10 @@ impl ProgramRuntime {
     /// Restore authority only before this runtime is shared with concurrent
     /// callers. Active grants from another policy version are rejected rather
     /// than silently becoming ambient or unexpectedly inactive.
-    pub fn restore_authority_state(&mut self, state: ProgramRuntimeAuthorityState) -> Result<()> {
+    pub(crate) fn restore_authority_state(
+        &mut self,
+        state: ProgramRuntimeAuthorityState,
+    ) -> Result<()> {
         if state.format_version != PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION {
             bail!(
                 "unsupported ProgramRuntime authority state version {}; expected {}",
@@ -1525,7 +1524,7 @@ impl ProgramRuntime {
     }
 
     /// Restore host-owned authority records independently of a VM checkpoint.
-    pub fn restore_capability_ledger(&self, ledger: CapabilityLedger) -> Result<()> {
+    pub(crate) fn restore_capability_ledger(&self, ledger: CapabilityLedger) -> Result<()> {
         let policy = self.capability_policy()?;
         validate_restored_process_authority(&ledger)?;
         let now = unix_time_ms();
@@ -1801,7 +1800,7 @@ impl ProgramRuntime {
     /// Number of private continuations retained by this runtime. This is
     /// exposed for application diagnostics and long-running lifecycle tests;
     /// source programs cannot use it to enumerate another run's frames.
-    pub fn pending_typed_execution_count(&self) -> Result<usize> {
+    pub(crate) fn pending_typed_execution_count(&self) -> Result<usize> {
         Ok(self
             .pending_typed
             .lock()
@@ -1921,7 +1920,7 @@ impl ProgramRuntime {
     }
 
     /// Compatibility boolean form of [`Self::cancel_typed_execution_with_outcome`].
-    pub fn cancel_typed_execution(&self, execution_id: uuid::Uuid) -> Result<bool> {
+    pub(crate) fn cancel_typed_execution(&self, execution_id: uuid::Uuid) -> Result<bool> {
         Ok(self
             .cancel_typed_execution_with_outcome(execution_id)?
             .is_some())
@@ -1930,7 +1929,7 @@ impl ProgramRuntime {
     /// Cancel an awaited portable effect only when it still owns the supplied
     /// `(execution_id, sequence)` boundary. A stale external cancellation
     /// cannot discard a newer suspension for the same ProgramRun.
-    pub async fn cancel_typed_execution_for_effect(
+    pub(crate) async fn cancel_typed_execution_for_effect(
         &self,
         execution_id: uuid::Uuid,
         effect_sequence: u64,
@@ -1967,48 +1966,6 @@ impl ProgramRuntime {
                 .expect("execution was checked while its pending lock was held")
         };
         self.cancel_pending_typed_execution(execution_id, pending, reason)
-    }
-
-    /// Record a deliberate denial for the exact awaited portable effect and
-    /// discard its uncommitted continuation. Unlike cancellation, the audit
-    /// journal preserves that the host rejected a capability request rather
-    /// than losing its audience or being interrupted.
-    pub fn deny_typed_execution_for_effect(
-        &self,
-        execution_id: uuid::Uuid,
-        effect_sequence: u64,
-        reason: impl Into<String>,
-    ) -> Result<ExecutionOutcome> {
-        let reason = reason.into();
-        let mut pending_runs = self
-            .pending_typed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
-        let pending = pending_runs
-            .get(&execution_id)
-            .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?;
-        let actual = pending
-            .suspension
-            .pending_host_call
-            .as_ref()
-            .and_then(|_| {
-                pending
-                    .suspension
-                    .event_journal
-                    .last()
-                    .map(|effect| effect.sequence)
-            })
-            .ok_or_else(|| anyhow::anyhow!("typed execution is not awaiting a host effect"))?;
-        if actual != effect_sequence {
-            bail!(
-                "stale typed effect denial: supplied sequence {effect_sequence}, pending sequence is {actual}"
-            );
-        }
-        let pending = pending_runs
-            .remove(&execution_id)
-            .expect("execution was checked while its pending lock was held");
-        drop(pending_runs);
-        self.deny_pending_typed_execution(execution_id, pending, reason)
     }
 
     fn deny_pending_typed_execution(
@@ -2264,7 +2221,7 @@ impl ProgramRuntime {
     /// Resume an awaited host effect only if it is still the same portable
     /// `(execution_id, sequence)` boundary. A stale approval/result is
     /// rejected without consuming the saved continuation.
-    pub async fn resume_typed_execution_for_effect(
+    pub(crate) async fn resume_typed_execution_for_effect(
         &self,
         execution_id: uuid::Uuid,
         effect_sequence: u64,
@@ -3012,7 +2969,7 @@ impl ProgramRuntime {
     /// Typed-only variant for a child/agent caller. Provider-facing protocol
     /// submissions use this entry point so a source form unsupported by the
     /// shared VM is reported as such instead of reaching a legacy evaluator.
-    pub async fn submit_as_typed_only(
+    pub(crate) async fn submit_as_typed_only(
         &self,
         submission: ProgramSubmission,
         caller: Option<agents::AgentIdentity>,
@@ -3030,7 +2987,7 @@ impl ProgramRuntime {
 
     /// Typed-only variant retaining the per-ProgramRun presentation binding.
     /// This is the provider wire-protocol entry point.
-    pub async fn submit_as_typed_only_with_typed_effect_sink(
+    pub(crate) async fn submit_as_typed_only_with_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
         caller: Option<agents::AgentIdentity>,
@@ -3051,7 +3008,7 @@ impl ProgramRuntime {
     /// The sink receives portable events for this run only; if the run yields,
     /// the binding travels with its saved continuation rather than becoming a
     /// mutable global "current WorkUnit".
-    pub async fn submit_with_typed_effect_sink(
+    pub(crate) async fn submit_with_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
@@ -3112,7 +3069,7 @@ impl ProgramRuntime {
     /// exact `(execution_id, sequence)` later with [`VmResume`]. This is for
     /// embedders which own filesystem, process, network, or UI operations;
     /// ordinary Finch submissions should use the compatibility host bindings.
-    pub async fn submit_with_deferred_host_effects(
+    pub(crate) async fn submit_with_deferred_host_effects(
         &self,
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
@@ -3128,19 +3085,7 @@ impl ProgramRuntime {
         .await
     }
 
-    /// Equivalent to [`Self::submit_with_typed_effect_sink`] for a child agent
-    /// whose ancestry must be preserved by host capability bindings.
-    pub async fn submit_as_with_typed_effect_sink(
-        &self,
-        submission: ProgramSubmission,
-        caller: Option<agents::AgentIdentity>,
-        effect_sink: TypedEffectSink,
-    ) -> Result<ExecutionOutcome> {
-        self.submit_as_typed_only_with_typed_effect_sink(submission, caller, effect_sink)
-            .await
-    }
-
-    pub async fn submit_as(
+    pub(crate) async fn submit_as(
         &self,
         submission: ProgramSubmission,
         caller: Option<agents::AgentIdentity>,

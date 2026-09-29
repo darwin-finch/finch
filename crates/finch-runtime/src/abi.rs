@@ -50,18 +50,10 @@ impl ProgramRun {
     }
 
     /// Bind embedder-neutral Brain/client ports onto this run identity.
-    pub fn with_identity(mut self, identity: DeliveryConsumerIdentity) -> Self {
+    pub(crate) fn with_identity(mut self, identity: DeliveryConsumerIdentity) -> Self {
         self.brain_id = Some(identity.brain_id);
         self.client_id = Some(identity.client_id);
         self
-    }
-
-    /// Named handle for one journaled effect on this run.
-    pub fn effect_handle(self, sequence: u64) -> VmEffectHandle {
-        VmEffectHandle {
-            execution_id: self.execution_id,
-            sequence,
-        }
     }
 }
 
@@ -85,15 +77,6 @@ impl DeliveryConsumerIdentity {
     /// Canonical durable-log key for this identity.
     pub fn wire_key(self) -> String {
         format!("{}/{}", self.brain_id, self.client_id)
-    }
-
-    /// Parse a canonical Brain/client wire key.
-    pub fn parse_wire_key(key: &str) -> Option<Self> {
-        let (brain, client) = key.split_once('/')?;
-        Some(Self {
-            brain_id: brain.parse().ok()?,
-            client_id: client.parse().ok()?,
-        })
     }
 }
 
@@ -168,7 +151,7 @@ impl RuntimeApplicationMessage {
     /// ABI version to stamp on a packed frame. Non-`ProgramRun` records use
     /// the process constant; packed decode fail-closes unless the frame
     /// version equals [`finch_vm::RUNTIME_APPLICATION_ABI_VERSION`].
-    pub fn abi_version(&self) -> u32 {
+    pub(crate) fn abi_version(&self) -> u32 {
         match self {
             Self::ProgramRun { run } => run.abi_version,
             _ => abi_version(),
