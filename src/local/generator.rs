@@ -41,6 +41,23 @@ const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 100;
 /// cannot see, since it only assembles the `query` half of the prompt.
 const LOCAL_PROMPT_OVERHEAD_RESERVE: usize = 64;
 
+/// Shown when `prompt_parts` finds a last "user"-role message but it carries
+/// no `ContentBlock::Text` -- concretely, a tool result posted back after a
+/// tool call (`Message::with_content("user", vec![ContentBlock::ToolResult
+/// { .. }])` in `src/server/handlers.rs`). Local generation here has no path
+/// that reads a tool result at all (`generate_messages`/`generate_streaming`
+/// both bottom out in this function), so surfacing the previous generic "No
+/// user message found" text for this case was actively misleading: it reads
+/// as if the message array were simply empty, not that a real message was
+/// found and the local model fundamentally cannot process it. This is the
+/// known, tracked gap in real local-model tool-use support (#1228 -- the
+/// streaming/tool-use daemon path is a dead stub), not a bug this function
+/// can silently paper over by hallucinating an answer to tool output it
+/// never saw.
+const LOCAL_TOOL_RESULT_FOLLOWUP_UNSUPPORTED_MESSAGE: &str =
+    "Local models don't yet support continuing a conversation after a tool call (#1228); \
+     try a cloud provider for tool-using turns.";
+
 /// Response template for a pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResponseTemplate {
@@ -356,14 +373,32 @@ impl TemplateGenerator {
             .iter()
             .rposition(|message| message.role == "user")
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
-        let current_question = messages[last_user_idx]
-            .content
-            .iter()
-            .find_map(|block| match block {
-                crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
+        let last_user_message = &messages[last_user_idx];
+        let current_question =
+            last_user_message
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    // A "user"-role message was found (the check above already
+                    // ruled out "no user message at all"), but it has no text
+                    // block. The one real-world way this happens is a tool
+                    // result posted back as `role: "user"` with only a
+                    // `ContentBlock::ToolResult` (#1228's crash symptom); name
+                    // that case specifically so the end user sees an actionable
+                    // explanation instead of a message that reads like the
+                    // conversation had no user turn at all.
+                    if last_user_message.content.iter().any(|block| {
+                        matches!(block, crate::providers::ContentBlock::ToolResult { .. })
+                    }) {
+                        anyhow::anyhow!(LOCAL_TOOL_RESULT_FOLLOWUP_UNSUPPORTED_MESSAGE)
+                    } else {
+                        anyhow::anyhow!("No user message found")
+                    }
+                })?;
 
         // Fresh recall is injected as a synthetic [user(memory), assistant(ack)]
         // pair, wrapped in a `<retrieved_memory>` tag, immediately before the
@@ -981,6 +1016,82 @@ mod tests {
         assert!(
             query.contains("what's the fib of 7?"),
             "the current question must still be present in the composed query: {query:?}"
+        );
+    }
+
+    /// Reproduces the crash in #1228's report: after a local-model turn
+    /// makes a tool call and the tool executes, the follow-up round posts
+    /// the tool result back as `role: "user"` with only a
+    /// `ContentBlock::ToolResult` (the exact shape `Message::with_content`
+    /// builds in `src/server/handlers.rs`'s `BrainEventKind::ToolResult`
+    /// arm) -- no `ContentBlock::Text` at all. Before the fix, `prompt_parts`
+    /// found that "user"-role message via `rposition`, then failed the
+    /// `find_map` for a `Text` block and returned the same generic "No user
+    /// message found" text used for "there is no user message anywhere in
+    /// this array," which reached the end user as an opaque
+    /// `{"error":{"message":"No user message found",...}}` 500 with no
+    /// indication local models simply can't read a tool result here. This
+    /// asserts the specific, actionable message instead, and that it names
+    /// #1228 rather than pretending the tool result was understood.
+    #[test]
+    fn prompt_parts_reports_the_local_tool_result_followup_gap_not_the_generic_no_user_message_text(
+    ) {
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message::user("Read math_utils.py and tell me what it does"),
+            crate::providers::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::providers::ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "math_utils.py"}),
+                }],
+            },
+            crate::providers::Message::with_content(
+                "user",
+                vec![crate::providers::ContentBlock::ToolResult {
+                    tool_use_id: "tool_1".to_string(),
+                    content: "def add(a, b):\n    return a + b\n".to_string(),
+                    is_error: None,
+                }],
+            ),
+        ];
+
+        let err = generator
+            .prompt_parts(&messages)
+            .expect_err("a tool-result-only last user message must not silently produce a query");
+
+        let message = err.to_string();
+        assert_eq!(
+            message, LOCAL_TOOL_RESULT_FOLLOWUP_UNSUPPORTED_MESSAGE,
+            "must surface the specific, actionable tool-result-followup message, not the \
+             generic \"No user message found\" text (which reads as if the array had no \
+             user turn at all): {message:?}"
+        );
+        assert!(
+            message.contains("#1228"),
+            "must point at the tracked feature gap so the message is actionable rather \
+             than an opaque failure: {message:?}"
+        );
+    }
+
+    /// The truly-empty case (no "user"-role message anywhere in the array)
+    /// must keep the original generic text -- only the tool-result-only case
+    /// above gets the more specific message.
+    #[test]
+    fn prompt_parts_keeps_the_generic_message_when_there_is_no_user_message_at_all() {
+        let mut generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![crate::providers::Message::assistant("no user turn here")];
+
+        let err = generator
+            .prompt_parts(&messages)
+            .expect_err("an array with no user-role message must still fail");
+
+        assert_eq!(
+            err.to_string(),
+            "No user message found",
+            "an array with genuinely no user-role message must keep the original generic \
+             text, not the tool-result-specific message: {err}"
         );
     }
 
