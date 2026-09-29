@@ -205,6 +205,32 @@ fn isolated_live_password() -> String {
         .expect("FINCH_TEST_BRAIN_PASSWORD must match the isolated daemon fixture")
 }
 
+/// Regression for issue #410: the `codex-conformance-{local,remote}-<uuid>` Brains
+/// `live_local_and_remote_transports_produce_equivalent_lifecycle` (below) creates leaked into a
+/// developer's real `~/.finch/brains` store when that `#[ignore]`d test was run outside
+/// `scripts/test_brains.sh`. Every live fixture in this file is gated by
+/// `ensure_supervisor_live_fixture`, whose very first act is to require a genuine
+/// supervisor-issued proof; this test pins that it fails *before* binding any listener or
+/// touching any Brain store, and is deliberately not `#[ignore]`d so ordinary unsupervised
+/// `cargo test --lib` runs (as CI runs by default) exercise it. If this process happens to carry
+/// real supervisor authority (e.g. `scripts/test_brains.sh cargo test --lib` with no filter),
+/// that authority is genuine and there is nothing unsafe to assert, so the test is a no-op.
+#[test]
+fn ensure_supervisor_live_fixture_refuses_without_supervisor_proof() {
+    if crate::brain::isolated_test_proof_if_present()
+        .expect("proof presence probe must not itself error")
+        .is_some()
+    {
+        return;
+    }
+    let outcome = std::panic::catch_unwind(ensure_supervisor_live_fixture);
+    assert!(
+        outcome.is_err(),
+        "ensure_supervisor_live_fixture must panic without supervisor authority, \
+         not silently bind a listener or touch a Brain store"
+    );
+}
+
 async fn connect_isolated_live_ipc() -> crate::client::IpcClient {
     let proof = crate::brain::isolated_test_proof().unwrap();
     let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
