@@ -87,6 +87,12 @@ fn pending_user_texts(pending: &[(String, bool, bool)]) -> Vec<String> {
 
 /// One labeled resume instruction, or a visible persistence failure.
 ///
+/// `durable` means the Brain was registered in the daemon's durable store
+/// this session (`EventLoop::home_brain_registered`), not that a live watch
+/// attachment happens to be connected right now (#1387) — those can
+/// disagree, and when they do, `finch brain ls` agrees with the durable
+/// flag, so this message must too.
+///
 /// The Brain argument is the store's validated charset (`1-64` ASCII
 /// letters, numbers, `-`, `_`), so the copyable command cannot inject a
 /// second shell command or a terminal control sequence.
@@ -552,6 +558,19 @@ pub struct EventLoop {
     /// this attachment whenever no foreign Brain is selected, so the runner
     /// console and remote drivers project the same canonical event log.
     home_brain: Option<crate::brain::AttachedBrainClient>,
+
+    /// Whether `register_home_brain` ever got far enough this session to
+    /// create or load the home Brain's entry in the daemon's durable store
+    /// (`BrainStore::snapshot_for_client`, which writes through on a
+    /// brand-new name). Set once at startup and never cleared afterward, so
+    /// it stays true across a later `home_brain` disconnect/reconnect flap
+    /// (#1387). `home_brain.is_some()` alone under-reports durability: it
+    /// tracks only the live watch attachment, which can be `None` — for
+    /// example while `attach_home_brain` is mid-retry after a transient
+    /// failure — even though the Brain already exists on disk and `finch
+    /// brain ls` lists it. The exit resume line must agree with `brain ls`,
+    /// not with the watch socket's momentary state.
+    home_brain_registered: bool,
 
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
@@ -2300,6 +2319,7 @@ impl EventLoop {
             review_rx,
             active_remote_brain: None,
             home_brain: None,
+            home_brain_registered: false,
             home_runner_lease_active: false,
             home_runner_lease_id: None,
             runner_reconnect_target: None,
@@ -2368,6 +2388,13 @@ impl EventLoop {
         self.effect_audit_test_wrapper = Some(wrapper);
     }
 
+    /// The resume instruction printed on a clean interactive exit. Driven by
+    /// `home_brain_registered`, not the live `home_brain` watch attachment
+    /// (#1387) — see the field doc comment for why those two differ.
+    fn exit_resume_line(&self) -> String {
+        interactive_resume_instruction(&self.session_label, self.home_brain_registered)
+    }
+
     #[cfg(test)]
     pub(crate) fn conversation_for_test(&self) -> Arc<RwLock<ConversationHistory>> {
         Arc::clone(&self.conversation)
@@ -2419,6 +2446,16 @@ impl EventLoop {
                 Ok(state) => {
                     // Brains actually registered, so the offline path reports
                     // zero rather than claiming one (#364).
+                    //
+                    // `state.is_some()` means `register_home_brain` reached
+                    // its daemon snapshot call and the home Brain now exists
+                    // (or already existed) in the durable store, independent
+                    // of whether the runner lease or the live watch
+                    // attachment below succeeds. Latch that fact for the
+                    // exit message (#1387) — a later attach retry or
+                    // disconnect must not make this session's Brain look
+                    // unsaved again.
+                    self.home_brain_registered = state.is_some();
                     phase.detail(if state.is_some() {
                         crate::startup::PhaseDetail::count(1).with_category("registered")
                     } else {
@@ -2823,11 +2860,13 @@ impl EventLoop {
             }
         }
 
-        // Capture durability before detaching: the resume line must not claim
-        // a Brain that was never attached, and must not use identity after
-        // presence has been released.
-        let resume_line =
-            interactive_resume_instruction(&self.session_label, self.home_brain.is_some());
+        // The resume line reflects whether this session's Brain was ever
+        // durably registered with the daemon (#1387), not the live watch
+        // attachment's momentary state — `home_brain` can be `None` here
+        // (mid-reconnect, or attach never completed) while the Brain still
+        // exists on disk and `finch brain ls` lists it. Read before
+        // detaching so identity is still available for the copyable command.
+        let resume_line = self.exit_resume_line();
 
         // Release durable Brain presence before the TUI shuts down. `/quit`
         // reaches this path rather than bypassing cleanup with process::exit.
