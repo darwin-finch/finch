@@ -1888,7 +1888,14 @@ impl MemorySystem {
     /// pass over the predicate. Running it twice must report a second count of
     /// zero and change nothing — that is the exactly-once property, and a flag
     /// short-circuit would hide a violation of it rather than prevent one.
-    pub async fn recover_pending_projections(&self) -> Result<usize> {
+    ///
+    /// `pub(crate)` rather than a dead public entry point (#943): production
+    /// self-healing already runs unconditionally through
+    /// `sweep_pending_projections`/`sweep_pending_projections_if_owed` at the
+    /// real insert and hydration call sites, so nothing outside this crate's
+    /// own test module currently needs the unconditional variant. Exercised
+    /// only by `mod tests` below as of 2026-09-29.
+    pub(crate) async fn recover_pending_projections(&self) -> Result<usize> {
         let ctx = self.projection();
         let _guard = ctx.insert_lock.lock().await;
         Self::sweep_pending_projections_locked(&ctx, None).await
@@ -2602,7 +2609,13 @@ impl MemorySystem {
     /// composition adapter. This reader remains temporarily available so older
     /// databases can be migrated without making their obsolete evaluator state
     /// authoritative again.
-    pub async fn load_lisp_defines(&self) -> Result<Vec<String>> {
+    ///
+    /// `pub(crate)` (#943): the "explicit migration tooling" this doc comment
+    /// describes does not exist anywhere in the codebase or `scripts/` as of
+    /// 2026-09-29 — only `program_registry.rs`'s own test module calls this.
+    /// Narrow rather than delete, since real migration tooling built later
+    /// would live in-crate or re-widen this deliberately.
+    pub(crate) async fn load_lisp_defines(&self) -> Result<Vec<String>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare("SELECT expr FROM lisp_env ORDER BY seq ASC")?;
         let exprs: Vec<String> = stmt

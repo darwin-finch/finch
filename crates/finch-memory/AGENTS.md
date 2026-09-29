@@ -71,6 +71,20 @@ modules, including `memory_status`, are private.
 - Keep external capabilities as deliberate flat exports from `src/lib.rs`. Do not expose child
   module paths or add a generated signature catalog. The four memory-status capabilities used by
   runtime, tools, and CLI are flat exports; `status_line` is crate-only.
+- **Narrowed dead public surface (#943 bounded pass, 2026-09-29).** `conversation_summary`
+  (non-session variant), `latest_program_indexes` (`program_registry.rs`), and
+  `RoutingMemTree::insert_with_effect` (`routing_memory.rs`) were already narrowed to `pub(crate)`
+  by an earlier pass (#1095); this pass additionally narrowed `recover_pending_projections` and
+  `load_lisp_defines` (`lib.rs`) to `pub(crate)` — both had zero callers outside this crate's own
+  test modules, confirmed by a whole-repo grep including `src/daemon`, CLI subcommands, and
+  `scripts/`. `recover_pending_projections`'s job is already covered in production by the
+  unconditional-vs-flag-gated automatic sweep (`sweep_pending_projections`/
+  `sweep_pending_projections_if_owed`, wired at real insert/hydration call sites), so this is
+  dead-but-tested administrative infrastructure, not a missing periodic/startup wiring gap.
+  `load_lisp_defines`'s doc comment claims "for explicit migration tooling"; no such tooling exists
+  anywhere in the tree. `index_shape` (`lib.rs`) stays `pub`: unlike the issue's original audit, it
+  now has a real caller in `tests/memory_integration_test.rs`, a workspace-root integration test
+  that links this crate as an external dependency and cannot see `pub(crate)` items.
 - `RoutingTree` (candidate-selected PCA axes via successive Hotelling deflation, dual-insert,
   stability-gated splitting, incrementally maintained real centroids, adaptive/beam/backtrack
   search, a verified removal primitive) and its save/load codec live in
