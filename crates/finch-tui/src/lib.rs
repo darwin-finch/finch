@@ -3623,6 +3623,27 @@ impl TuiRenderer {
     /// Any previously finalized selection is cleared here regardless: a new
     /// press elsewhere is exactly "the user is done reading that
     /// selection."
+    ///
+    /// Erasing that old highlight can require a full-viewport repaint: its
+    /// rows may already be in scrolled-back terminal history, outside what
+    /// `paint_selection_overlay`'s live-area-only diff can ever reach. But
+    /// `redraw_full_viewport_inner` unconditionally clears
+    /// `selection_press_candidate` too — the #221 "any full repaint clears
+    /// it" rule, meant to drop a press whose coordinates content moved out
+    /// from under while a repaint was merely *deferred*. `async_input.rs`'s
+    /// event loop drains only events already buffered within a zero-duration
+    /// poll before calling `TuiRenderer::render()` once per outer-loop
+    /// iteration; a real mouse press essentially never already has its first
+    /// `Drag` tick queued at that exact instant, so a *deferred*
+    /// (`viewport_invalidated = true`) erase used to run on the very next
+    /// `render()` call — before the press was ever promoted into a
+    /// selection — and silently ate its own candidate (#1378: starting a new
+    /// selection over an old one cleared the old highlight and then selected
+    /// nothing at all). Running the erase synchronously here and restashing
+    /// the press afterward — the same stash-then-restore shape
+    /// `autoscroll_transcript_drag` already uses around its own mid-drag
+    /// `redraw_full_viewport` call — keeps the erase but means it can never
+    /// outrun the very gesture that triggered it.
     fn handle_left_press(&mut self, mouse: MouseEvent) -> bool {
         if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
             // A dialog owns the live area (#807); selection stays inert
@@ -3632,11 +3653,19 @@ impl TuiRenderer {
             return self.handle_accordion_mouse(mouse);
         }
         let had_selection = self.selection.take().is_some();
-        self.selection_press_candidate = Some(mouse);
         if had_selection {
-            self.viewport_invalidated = true;
+            if let Err(error) = self.redraw_full_viewport() {
+                tracing::debug!(
+                    %error,
+                    "clearing a finalized selection on press: full-viewport redraw failed"
+                );
+            }
             self.live_area_dirty = true;
         }
+        // Stashed after the erase redraw above (which itself clears any
+        // candidate as part of its own unconditional invalidation) so this
+        // press — the one that just triggered that redraw — survives it.
+        self.selection_press_candidate = Some(mouse);
         had_selection
     }
 
@@ -14083,5 +14112,172 @@ mod selection_tests {
              {sel_top}..={sel_bottom}, offset went from {offset_after_setup} to \
              {last_offset}"
         );
+    }
+
+    /// Live-session regression (#1378): "If you select some text, and then
+    /// try to select text again, it just unselects the existing selection
+    /// and doesn't select the new stuff."
+    ///
+    /// Root cause: `handle_left_press` stashes the fresh press as
+    /// `selection_press_candidate` and, because a finalized selection
+    /// existed, used to set `viewport_invalidated = true` so a *later*
+    /// redraw would erase the old highlight even where it lives outside the
+    /// live area. `async_input.rs`'s event loop only drains events already
+    /// buffered within a zero-duration poll before calling
+    /// `TuiRenderer::render()` once per outer-loop iteration; a real mouse
+    /// press followed by physical pointer movement essentially never already
+    /// has its first `Drag` tick queued at that exact instant, so
+    /// `render()` — and therefore `redraw_full_viewport_inner`, which
+    /// unconditionally clears `selection_press_candidate` (the #221 "any
+    /// full repaint clears it" rule) — ran between the `Down` and the first
+    /// `Drag`. By the time the real `Drag` tick arrived,
+    /// `handle_left_drag`'s `let Some(press) = self.selection_press_candidate
+    /// else { return false }` had nothing left to promote, so no new
+    /// selection was ever created.
+    ///
+    /// This drives the exact real dispatch/render sequence `async_input.rs`
+    /// uses — `handle_mouse(Down)`, then `TuiRenderer::render()` (the same
+    /// call the event loop makes once no further input is immediately
+    /// available), then `handle_mouse(Drag)` — and confirms via a real VT100
+    /// parser (`VtOracle`, the same production-boundary technique
+    /// `test_selection_does_not_bleed_into_status_after_completion_pane_closes`
+    /// already uses) that the new selection's highlight actually reaches the
+    /// screen, not just that `self.selection` is logically populated.
+    #[test]
+    fn test_press_after_finalized_selection_survives_the_erase_redraw_and_starts_a_new_selection() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors);
+        output.add_trait_message(Arc::new(StaticMessage::plain("first line")) as MessageRef);
+        output.add_trait_message(Arc::new(StaticMessage::plain("second line")) as MessageRef);
+        let messages = output.get_messages();
+        renderer.poll_message_changes(&messages);
+        let mut initial = Vec::new();
+        renderer
+            .draw_live_area_to(&mut initial)
+            .expect("initial live draw must succeed");
+
+        let top_row = row_of(&renderer, "first line");
+        let bottom_row = row_of(&renderer, "second line");
+
+        // Select and finalize "first line".
+        renderer.handle_mouse(left_down(top_row, 0));
+        renderer.handle_mouse(left_drag(top_row, 5));
+        renderer.handle_mouse(left_up(top_row, 5));
+        assert!(
+            renderer
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !selection.dragging),
+            "sanity precondition: a finalized (non-dragging) selection must \
+             exist before the new press; selection={:?}",
+            renderer.selection
+        );
+
+        // Press elsewhere: clears the old selection, stashes the fresh
+        // press, and — because a finalized selection existed — needs the old
+        // highlight erased even outside the live area.
+        let pressed_at = left_down(bottom_row, 0);
+        let handled = renderer.handle_mouse(pressed_at);
+        assert!(
+            handled,
+            "a press that clears an existing finalized selection must report \
+             itself as handled"
+        );
+        assert!(
+            renderer.selection.is_none(),
+            "the old selection must be cleared immediately on press; \
+             selection={:?}",
+            renderer.selection
+        );
+        assert_eq!(
+            renderer.selection_press_candidate,
+            Some(pressed_at),
+            "the fresh press must be stashed as the candidate right away; \
+             candidate={:?}",
+            renderer.selection_press_candidate
+        );
+
+        // The production event loop (`async_input.rs`) calls exactly this —
+        // `TuiRenderer::render()` — once per outer-loop iteration whenever a
+        // just-handled event requested a redraw and no further input is
+        // already buffered. A real Down-then-move mouse gesture reliably
+        // hits this gap: the terminal has not yet delivered the first Drag
+        // tick by the time this runs.
+        renderer
+            .render()
+            .expect("render between Down and Drag must succeed");
+
+        assert!(
+            renderer.selection_press_candidate.is_some(),
+            "the erase-triggered full-viewport redraw must not discard the \
+             press that caused it, or the next Drag tick has nothing to \
+             promote into a selection (#1378: pressing to start a new \
+             selection silently produces no selection at all); \
+             candidate={:?}",
+            renderer.selection_press_candidate
+        );
+
+        // The real next event: the mouse actually moves. Column 5 (like the
+        // core happy-path test's column 4 selecting "hello" as (0, 5)) gives
+        // a half-open highlighted range of (0, 6) — exactly "second".
+        let dragged = renderer.handle_mouse(left_drag(bottom_row, 5));
+        assert!(
+            dragged,
+            "the first Drag tick after the press must start a new selection; \
+             selection_press_candidate={:?} selection={:?}",
+            renderer.selection_press_candidate, renderer.selection
+        );
+        let dragging = renderer
+            .selection
+            .as_ref()
+            .expect("a new selection must exist mid-drag after the press survived the redraw");
+        assert_eq!(
+            selection::highlighted_rows(&renderer.selection_index, dragging),
+            vec![(bottom_row, "second line".to_string(), (0, 6))],
+            "the new drag must highlight 'second' on the newly pressed row, \
+             not leave the old row's range behind; highlighted={:?}",
+            selection::highlighted_rows(&renderer.selection_index, dragging)
+        );
+
+        renderer.handle_mouse(left_up(bottom_row, 5));
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("the new selection must survive release");
+        assert_eq!(
+            selection::selected_text(&renderer.selection_index, released),
+            "second",
+            "the finalized new selection's text must be exactly the newly \
+             dragged range, not empty and not the old selection's text"
+        );
+
+        // Byte-level confirmation through a real VT100 parser (the same
+        // technique #1293's test above uses): the new selection's highlight
+        // must actually reach the screen, styled exactly like
+        // `span_render::selection_highlight_style()` (bold white-on-dark-blue).
+        let mut frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut frame)
+            .expect("final live draw must succeed");
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        term.feed(&frame);
+        let expected_style = vt_oracle::VtStyle {
+            foreground: vt_oracle::VtColor::Indexed(15),
+            background: vt_oracle::VtColor::Indexed(4),
+            bold: true,
+            reverse: false,
+        };
+        for col in 0..6 {
+            assert_eq!(
+                term.cell(bottom_row as usize, col).style,
+                expected_style,
+                "column {col} of {bottom_row}'s row ('second') must carry the \
+                 selection highlight style once the new selection is painted; \
+                 screen:\n{}",
+                term.diagnostic()
+            );
+        }
     }
 }
