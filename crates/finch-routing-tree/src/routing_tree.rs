@@ -636,6 +636,21 @@ impl RoutingTree {
     /// reused/renumbered) -- callers doing update/removal need it to track their own external key
     /// (e.g. a memory's own row id) to current point id across an update
     /// (`remove_point(old_id)` then `insert(new_embedding)`).
+    ///
+    /// `point.len()` must equal this tree's own fixed `dim` (the value given to
+    /// [`RoutingTree::new`]/[`load_routing_tree`](crate::routing_tree::persistence::load_routing_tree)
+    /// and never revisited afterward) for the entire life of the tree. This is NOT validated here
+    /// -- `insert` is documented and relied upon as infallible (see `RoutingMemTree`'s own doc in
+    /// the caller crate), and every current production embedding engine has a fixed dimension, so
+    /// a genuine per-call mismatch has never been a real caller-input case to design around. The
+    /// real, reachable way to violate this is at the TREE level, not per-insert: reloading an
+    /// existing store with a caller `dim` that no longer matches what it was built and split under
+    /// (its embedding engine changed between restarts) leaves `self.dim` permanently out of sync
+    /// with the tree's own persisted `anchor`/`direction` geometry, and the next insert that
+    /// reaches an old decision node indexes a shorter persisted axis with a longer new point and
+    /// panics in `projection` (issue #1384). `load_routing_tree` is the fix: it refuses to load a
+    /// store whose persisted embedding length disagrees with the caller's `dim`, so an inconsistent
+    /// tree -- and therefore this mismatch -- can no longer be constructed in the first place.
     pub fn insert(&mut self, point: Vec<f32>) -> usize {
         let point_id = self.points.len();
         let mut x = to_double(&point);

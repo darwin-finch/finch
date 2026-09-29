@@ -7353,4 +7353,70 @@ mod tests {
         );
         Ok(())
     }
+
+    /// #1384 production-boundary regression: the real async hydration path -- spawned on a
+    /// background tokio worker, matching the report's "thread 'tokio-rt-worker' panicked" -- must
+    /// settle to a clean, named failure and never hang or panic the process when a store built
+    /// under one embedding dimension is reopened under a different one. This is exactly what
+    /// happens across an ordinary restart in production: `select_memory_embedding_engine` picks
+    /// the hashed-n-gram fallback (2048-dim) until the neural embedding model is cached, and
+    /// `src/cli/repl.rs` deliberately downloads that model in the background "for the *next*
+    /// restart" against the SAME `~/.finch/memory.db` the current session already built and
+    /// split under the fallback's dimension -- the next restart then reopens that same store
+    /// under the neural engine's different dimension (384 vs. 2048), the shape this test
+    /// reproduces with two small synthetic dimensions instead.
+    ///
+    /// Before the fix, `RoutingMemTree::load` (via `load_routing_tree`) accepted any caller-
+    /// supplied `dim` unconditionally, so the reloaded tree's `self.dim` field silently stopped
+    /// matching its own persisted `anchor`/`direction` geometry. Hydration itself does not touch
+    /// `self.dim` (the replay-descent it does only ever compares a node's own persisted data
+    /// against itself), so hydration used to complete "successfully" -- the actual panic waited
+    /// for the next real insert to route through an old decision node, which is why #1384 was hard
+    /// to pin to hydration alone. This test still asserts hydration's own outcome, since the fix
+    /// moves the failure earlier (into `load_routing_tree` itself, before any insert is possible).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hydrating_a_store_built_at_a_different_embedding_dimension_settles_failed_not_stuck(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+        let config = MemoryConfig {
+            db_path: db_path.clone(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+
+        // Schema first (the same pattern every other `seed_routing_points` caller in this module
+        // uses): `seed_routing_points` writes raw rows straight against the SQLite file and does
+        // not create `routing_points`/`routing_nodes` itself.
+        drop(MemorySystem::new(config.clone())?);
+
+        // Session 1: build a real, split tree directly against the store, under an 8-dim
+        // embedding space -- the same seeding helper other hydration tests in this module use.
+        seed_routing_points(&db_path, SEEDED_STORE_SIZE, 8)?;
+
+        // Session 2: reopen the SAME db_path with a DIFFERENT-dimension engine, exactly the
+        // cross-restart embedding-engine change described above.
+        let memory = MemorySystem::new_with_engine(
+            config,
+            Arc::new(FixedDimensionEngine { dimension: 16 }),
+        )?;
+
+        let hydrated =
+            tokio::time::timeout(std::time::Duration::from_secs(30), memory.ensure_hydrated())
+                .await;
+        let result = hydrated.expect(
+            "hydration must settle to a terminal state within 30s -- a store built at one \
+             embedding dimension and reopened at another must never leave the status line stuck \
+             at \"index did not finish loading\" forever (#1384); a liveness failure here, not \
+             slowness, is itself a regression",
+        );
+        assert!(
+            result.is_err(),
+            "reopening a store whose persisted embeddings are 8-dimensional with a 16-dimensional \
+             engine must be refused (matching how any other unreadable store is already handled), \
+             not silently accepted with a tree whose self.dim no longer matches its own persisted \
+             node geometry: {result:?}"
+        );
+        Ok(())
+    }
 }
