@@ -1863,6 +1863,84 @@ mod tests {
         }));
     }
 
+    /// #1258: `dispatch_named_brain_run`'s `BrainEventKind::Program` arm must
+    /// never hand a runner dispatch an unbounded (`None`) grant ceiling. Its
+    /// sibling `ScheduleDue` arm already threads an explicit, narrow
+    /// `Some(due.grant_ceiling)` captured at schedule-creation time; ordinary
+    /// program events dispatched from a driver/peer attachment's own turn
+    /// carry no such captured ceiling and must not fall back to silently
+    /// reusing every active session/project/global VM capability grant ever
+    /// approved for this Brain (`ProgramRuntime::effective_grants_for(None)`
+    /// unions in every such grant when the runtime is not handed an explicit
+    /// ceiling). A `None` ceiling here is exactly the gap #1258 flags: a
+    /// non-owner attachment's program can silently reuse a write-capable
+    /// grant (e.g. `FileWrite`) the human already approved once for their
+    /// own turn, with no fresh confirmation — a guarantee the Tool pipeline
+    /// never breaks for a peer write (`PEER_REVIEWED_CHANGESET_TOOLS` always
+    /// asks, regardless of any owner-side "always allow").
+    #[tokio::test]
+    async fn test_named_brain_program_event_never_dispatches_with_unbounded_grant_ceiling() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+        let driver_id = driver.attachment_id;
+        let submitting = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .submit(
+                        "shared",
+                        driver_id,
+                        connection_id,
+                        BrainEventKind::Program {
+                            language: ProgramLanguage::Lisp,
+                            source: "(say \"write attempt\")".into(),
+                        },
+                    )
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Program(program) = rx.recv().await.unwrap() else {
+            panic!("expected program request")
+        };
+        assert!(
+            program.grant_ceiling.is_some(),
+            "an ordinary BrainEventKind::Program dispatch carried grant_ceiling=None, which \
+             makes the runtime fall back to effective_grants_for(None) — unrestricted reuse \
+             of every active session/project/global VM capability grant already approved for \
+             this Brain, with no per-dispatch confirmation; observed request: {program:?}"
+        );
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        program
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "write attempt".into(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }))
+            .unwrap();
+        submitting.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn lifecycle_service_owns_attachment_watch_and_cleanup() {
         let service = service();

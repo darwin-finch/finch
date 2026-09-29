@@ -116,7 +116,26 @@ pub(super) async fn dispatch_named_brain_run(
                 language,
                 &source,
                 crate::server::RunnerProgramInteraction::Interactive,
-                None,
+                // #1258: never hand the runner an unbounded (`None`) ceiling
+                // here. `None` makes `ProgramRuntime` fall back to
+                // `effective_grants_for(None)`, which unions in every active
+                // session/project/global VM capability grant this Brain has
+                // ever been approved for — silently reusable by whichever
+                // attachment (owner or a less-trusted peer) happens to push
+                // this program event, with no fresh confirmation. The sibling
+                // `ScheduleDue` arm below already threads its own explicit,
+                // narrow `Some(due.grant_ceiling)` captured at schedule
+                // creation; an ordinary program event has no such captured
+                // ceiling, so it gets only the always-safe intrinsic
+                // capabilities (VM read state, `say`/output) here. Any
+                // write-capable effect the program actually needs must still
+                // clear the real per-run approval flow
+                // (`ExecutionStatus::AuthorizationRequired` /
+                // `approval_prompts`), matching the Tool pipeline's own
+                // unconditional peer-write confirmation
+                // (`PEER_REVIEWED_CHANGESET_TOOLS`) instead of silently
+                // inheriting a grant approved for someone else's turn.
+                Some(crate::vm::TypedRuntime::intrinsic_grants()),
             )
             .await
             {
