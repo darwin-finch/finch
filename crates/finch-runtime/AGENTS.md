@@ -33,6 +33,18 @@ contracts without opening those implementations. Root callers may use the
   Bump finch-vm's `RUNTIME_APPLICATION_ABI_VERSION` and fail closed on incompatible frames; do
   not create a second journal or alternate encoding. Host effects remain subject to typed grants
   and the effect-audit fence.
+- `AutomationBroker::execute` (`src/automation.rs`) must fail with a readable sentence, not a
+  serialized `AutomationAvailability` blob, whenever `state != Available` — CLAUDE.md's GUI
+  Accessibility invariant requires an actionable message, and for `PermissionRequired`
+  specifically the sentence must literally contain "System Settings → Privacy & Security →
+  Accessibility". `AutomationAvailability::unavailable_message()` is the single place that text
+  is built; the structured `state`/`backend`/`operations` fields stay available separately for
+  programmatic callers (e.g. the `availability` query) — only the *error text* changed from JSON
+  to prose. `test_permission_required_message_names_the_system_settings_path`,
+  `test_unavailable_message_is_prose_not_a_serialized_struct`,
+  `test_disabled_broker_execute_error_is_prose_not_json` in `src/automation.rs` (issue #1382,
+  partial — the semantic-targeting and `gui_inspect` element/label read gaps that issue also
+  describes remain open).
 
 ## Focused proof
 
