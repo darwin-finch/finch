@@ -43,6 +43,23 @@ pub(crate) fn transcript_wheel_delta(kind: MouseEventKind) -> Option<isize> {
     }
 }
 
+/// Format the scroll-position hint painted on the bottom status rule
+/// (#1252) from [`TranscriptScrollView::hidden_rows`]: "↑ N more above"
+/// and/or "↓ N more below" — the issue's own suggested phrasing, and the
+/// same "N more" convention `command_autocomplete`'s own position indicator
+/// ("Commands 1-8 of 64 (56 more)") already uses for "how much more is
+/// there beyond what's visible." `None` when there is nothing to report (at
+/// the live edge, or, degenerately, both counts are zero).
+pub(crate) fn scroll_position_hint(hidden: Option<(usize, usize)>) -> Option<String> {
+    let (above, below) = hidden?;
+    match (above > 0, below > 0) {
+        (true, true) => Some(format!("↑ {above} more above · ↓ {below} more below")),
+        (true, false) => Some(format!("↑ {above} more above")),
+        (false, true) => Some(format!("↓ {below} more below")),
+        (false, false) => None,
+    }
+}
+
 /// Scroll state for the conversation transcript.
 ///
 /// `offset_from_bottom` is how many physical rows of the newest projected
@@ -135,6 +152,28 @@ impl TranscriptScrollView {
     /// How far the view is scrolled up from the newest projected row.
     pub(crate) fn offset(&self) -> usize {
         self.offset_from_bottom
+    }
+
+    /// Rows of the projected union still hidden above and below the visible
+    /// window — `(above, below)` — for the transcript's scroll-position hint
+    /// (#1252). `None` at follow mode (offset 0, the live edge: nothing to
+    /// report) or with no claimed viewport (dialog, tiny frame owns
+    /// nothing). `below` is exactly the honest offset [`Self::derive_window`]
+    /// already quantises and stores; `above` is the remainder of
+    /// `content_rows` once the visible window (bounded by the claimed pane
+    /// height) and the hidden tail are both accounted for. Callers must have
+    /// derived a window this frame for `content_rows` to be current — every
+    /// caller that can observe `offset() > 0` already has, since deriving
+    /// the window while scrolled is exactly what keeps the offset anchored
+    /// (#897).
+    pub(crate) fn hidden_rows(&self) -> Option<(usize, usize)> {
+        if self.offset_from_bottom == 0 || self.claim.is_empty() {
+            return None;
+        }
+        let above_and_visible = self.content_rows.saturating_sub(self.offset_from_bottom);
+        let visible = self.claim.height.min(above_and_visible);
+        let above = above_and_visible.saturating_sub(visible);
+        Some((above, self.offset_from_bottom))
     }
 
     /// Rows one PageUp/PageDown moves (#897): a page of the conversation
@@ -524,6 +563,121 @@ mod tests {
             view.visible_row_bounds(),
             Some((5, 8)),
             "a 4-row claim starting at row 5 spans rows 5..=8"
+        );
+    }
+
+    #[test]
+    fn test_hidden_rows_is_none_at_follow_mode_and_with_no_claim() {
+        // INVARIANT (#1252): the scroll-position hint has nothing to report
+        // at the live edge, and no claimed viewport has nothing to measure.
+        let mut view = TranscriptScrollView::new();
+        view.set_claim(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 5,
+        });
+        assert_eq!(
+            view.hidden_rows(),
+            None,
+            "follow mode (offset 0) must report no hidden rows; state: {view:?}"
+        );
+        view.set_offset(3);
+        view.set_claim(Rect::default());
+        assert_eq!(
+            view.hidden_rows(),
+            None,
+            "an empty claim (dialog, tiny frame) has no visible window to measure against; \
+             state: {view:?}"
+        );
+    }
+
+    #[test]
+    fn test_hidden_rows_reports_above_and_below_the_visible_window() {
+        // INVARIANT (#1252): scrolled into history with more content on both
+        // sides, both counts must reflect the union minus the hidden tail
+        // and the claimed pane's own height.
+        let mut view = TranscriptScrollView::new();
+        view.set_claim(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 5,
+        });
+        // 30 rows of union content; scrolled up so 10 rows are hidden below
+        // the viewport (newer content). Of the remaining 20 rows above the
+        // hidden tail, 5 are the visible pane, leaving 15 still above it.
+        let all = lines(&["row"; 30]);
+        view.scroll(-10);
+        let (split, skipped) = view.derive_window(&all, 80);
+        assert_eq!(
+            (split, skipped),
+            (20, 10),
+            "sanity: 10 rows hidden below, 20 rows remain in the prefix"
+        );
+        assert_eq!(
+            view.hidden_rows(),
+            Some((15, 10)),
+            "20 rows above the hidden tail minus the 5-row visible pane leaves 15 above; \
+             10 rows stay hidden below; state: {view:?}"
+        );
+    }
+
+    #[test]
+    fn test_hidden_rows_above_is_zero_at_the_top_of_history() {
+        // INVARIANT (#1252): scrolled all the way to the oldest content, the
+        // pane shows everything remaining above the hidden tail, so "above"
+        // must read zero even though "below" (still hidden, newer content)
+        // is nonzero.
+        let mut view = TranscriptScrollView::new();
+        view.set_claim(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 5,
+        });
+        let all = lines(&["row"; 12]);
+        view.scroll(-9); // hide the newest 9 of 12 rows below the viewport
+        let (split, skipped) = view.derive_window(&all, 80);
+        assert_eq!(
+            (split, skipped),
+            (3, 9),
+            "sanity: only the oldest 3 rows remain in the prefix"
+        );
+        assert_eq!(
+            view.hidden_rows(),
+            Some((0, 9)),
+            "the 3 remaining rows fit entirely inside the 5-row pane, so nothing is \
+             hidden above; state: {view:?}"
+        );
+    }
+
+    #[test]
+    fn test_scroll_position_hint_formats_above_below_or_neither() {
+        assert_eq!(
+            scroll_position_hint(None),
+            None,
+            "no hidden-row data means no hint"
+        );
+        assert_eq!(
+            scroll_position_hint(Some((0, 0))),
+            None,
+            "degenerately nothing hidden on either side means no hint"
+        );
+        assert_eq!(
+            scroll_position_hint(Some((15, 10))),
+            Some("↑ 15 more above · ↓ 10 more below".to_string()),
+            "both sides hidden must report both counts"
+        );
+        assert_eq!(
+            scroll_position_hint(Some((0, 9))),
+            Some("↓ 9 more below".to_string()),
+            "nothing above (top of history) must report only the below count"
+        );
+        assert_eq!(
+            scroll_position_hint(Some((5, 0))),
+            Some("↑ 5 more above".to_string()),
+            "nothing below must report only the above count"
         );
     }
 }

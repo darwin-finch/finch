@@ -240,6 +240,25 @@ canonical-commit and scroll-union rendering, and found the ordering correct at e
 If it resurfaces, the remaining unaudited surface is genuine terminal/OS-scheduler timing
 against a real daemon SSE connection, not reproducible by any in-process fake generator.
 
+**The scroll-position hint only exists while scrolled, and reads `TranscriptScrollView`
+directly rather than tracking its own state (#1252).** `TranscriptScrollView::hidden_rows`
+returns `(rows above, rows below)` the visible window from `content_rows` (refreshed by
+`derive_window`, so only current in the same scrolled branch that already calls it) and the
+claimed pane height; it is `None` at follow mode (offset 0 — the live edge has nothing to
+report) or with an empty claim. `scroll_view::scroll_position_hint` formats that into the
+"↑ N more above" / "↓ N more below" text painted on the bottom status rule
+(`status_rule_line`'s `scroll_hint` parameter), matching `command_autocomplete`'s own "N
+more" convention. Identity keeps priority in the rule's left/right budget split — it is
+sized exactly as before #1252, from the full available width — and the hint only claims
+whatever is left over, shrinking and then dropping below a usable minimum on a narrow
+terminal; `scroll_hint: None` reproduces the pre-#1252 rule byte-for-byte, including its
+bare-dash fallback with no identity either. The live area's own repaint is a full
+erase-then-redraw (`write_live_area_erase` + `draw_live_area_to`), never an incremental row
+diff, so a changing digit count between frames cannot strand a stale row the way the wizard's
+row-diff blit could (#1297, #1305) — `test_scroll_position_hint_appears_while_scrolled_and_clears_at_follow_mode`
+(`src/lib.rs`) pins that at the production boundary anyway, replaying real
+`TuiRenderer`/`VtOracle` bytes rather than assuming it from the architecture.
+
 ## Click-drag transcript text selection (#221)
 
 Mouse capture is held by default (#806, above), so the terminal never gets a native click-drag
