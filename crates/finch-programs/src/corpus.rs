@@ -19,8 +19,17 @@ use std::path::{Path, PathBuf};
 use finch_language::compile_with_functions;
 use finch_vm::Function;
 
-pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
-pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
+// Neither of these, nor `WireCorpusEntry`/`WireCorpusLogger` below, is named
+// in `lib.rs`'s `pub use corpus::{..}` list, and `mod corpus` itself is
+// private, so all four were already unreachable from outside this crate.
+// Narrowed to crate-private (#949) to say so plainly rather than leave a
+// `pub` that nothing outside this file could ever reach; whole-workspace
+// grep confirmed zero external references. `WireCorpusAudit::format_version`
+// (which IS re-exported) is still populated from `WIRE_CORPUS_FORMAT_VERSION`,
+// so that value stays externally observable even though the constant's own
+// name is not.
+const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
+const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
 
 /// Reducible language context needed to compile a captured provider program
 /// without retaining a live operand stack or host authority.
@@ -43,24 +52,27 @@ pub enum WireCorpusAttempt {
 /// This record is intentionally source-bearing and therefore separate from
 /// normal metrics. It contains no user prompt, tool result, credential, or VM
 /// output. Users still control whether and where it is written.
+// Narrowed to crate-private (#949): not in `lib.rs`'s `pub use corpus::{..}`
+// list and `mod corpus` is private, so this was already unreachable outside
+// the crate; whole-workspace grep found no external reference either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WireCorpusEntry {
-    pub format_version: u32,
-    pub manifest_protocol_version: u32,
-    pub vm_type_system_version: u32,
-    pub captured_at: DateTime<Utc>,
-    pub provider: String,
-    pub model: String,
-    pub surface: String,
-    pub attempt: WireCorpusAttempt,
-    pub source_sha256: String,
-    pub source: String,
+struct WireCorpusEntry {
+    format_version: u32,
+    manifest_protocol_version: u32,
+    vm_type_system_version: u32,
+    captured_at: DateTime<Utc>,
+    provider: String,
+    model: String,
+    surface: String,
+    attempt: WireCorpusAttempt,
+    source_sha256: String,
+    source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compiler_context: Option<ProgramCompilerContext>,
+    compiler_context: Option<ProgramCompilerContext>,
 }
 
 impl WireCorpusEntry {
-    pub fn new(
+    fn new(
         provider: impl Into<String>,
         model: impl Into<String>,
         surface: impl Into<String>,
@@ -83,30 +95,31 @@ impl WireCorpusEntry {
         }
     }
 
-    pub fn with_compiler_context(mut self, compiler_context: ProgramCompilerContext) -> Self {
+    fn with_compiler_context(mut self, compiler_context: ProgramCompilerContext) -> Self {
         self.compiler_context = Some(compiler_context);
         self
     }
 }
 
+// Same narrowing reasoning as `WireCorpusEntry` above.
 #[derive(Debug, Clone)]
-pub struct WireCorpusLogger {
+struct WireCorpusLogger {
     path: PathBuf,
 }
 
 impl WireCorpusLogger {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    pub fn from_env() -> Option<Self> {
+    fn from_env() -> Option<Self> {
         std::env::var_os(WIRE_CORPUS_PATH_ENV)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
             .map(Self::new)
     }
 
-    pub fn append(&self, entry: &WireCorpusEntry) -> Result<()> {
+    fn append(&self, entry: &WireCorpusEntry) -> Result<()> {
         if let Some(parent) = self
             .path
             .parent()

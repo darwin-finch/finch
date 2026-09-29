@@ -18,7 +18,15 @@ SOURCES = {
     "src/tools/AGENTS.md": "# tools capsule\n",
     "src/model/AGENTS.md": "# model capsule\n",
     "src/app/AGENTS.md": "# app capsule\n",
-    "src/programs/AGENTS.md": "# programs capsule\n",
+    # A generic root-package module that reaches a workspace crate through the root facade's
+    # `pub use ... as` alias (`crate::vm::Value`) *and* a direct crate-qualified path
+    # (`finch_vm::Value`) from the same file — covers both spellings a caller might use. This is
+    # deliberately not named after any real subsystem: FP-PROOF-003 (issue #949) found this fixture
+    # had drifted onto `src/programs/`, which stopped existing the moment #869 extracted that
+    # subsystem to `crates/finch-programs/`, so the alias/direct-path coverage below is kept but
+    # renamed to something with no real-world referent, and the extracted-crate boundary itself is
+    # asserted separately below against `crates/finch-programs/`, matching the real layout.
+    "src/widgets/AGENTS.md": "# widgets capsule\n",
     "src/lib.rs": "pub use finch_vm as vm;\n",
     # A clean candidate: one outgoing reference, several incoming.
     "src/tools/mcp/mod.rs": "pub use client::Client;\nmod client;\n",
@@ -34,13 +42,22 @@ SOURCES = {
     "src/model/mod.rs": "pub struct Value;\nuse crate::tools::mcp::Client;\n",
     # The root facade aliases the workspace crate exactly as Finch does. Cover both that alias and
     # a direct crate-qualified path from the same cross-package caller.
-    "src/programs/mod.rs": "use crate::vm::Value;\npub fn direct() -> finch_vm::Value { todo!() }\n",
+    "src/widgets/mod.rs": "use crate::vm::Value;\npub fn direct() -> finch_vm::Value { todo!() }\n",
     # Workspace-crate `crate::` paths are relative to that package, even when a root module has
     # the same name.
     "crates/finch-vm/AGENTS.md": "# finch-vm capsule\n",
     "crates/finch-vm/src/lib.rs": "mod codec;\nmod vm;\n",
     "crates/finch-vm/src/codec.rs": "use crate::vm::Value;\n",
     "crates/finch-vm/src/vm.rs": "pub struct Value;\n",
+    # FP-PROOF-003 (issue #949): the real seam this tool must measure correctly today is an
+    # *already-extracted* workspace crate, not an in-tree `src/` module — `crates/finch-programs/`
+    # is exactly that (extracted from `src/programs/` in #869). Its own facade reaches another
+    # workspace crate directly (`finch_vm::Value`, no `crate::` alias available to it, matching the
+    # real crate's `use finch_vm::...` imports), and a root-package caller reaches back in via
+    # `finch_programs::` (matching real callers such as `src/program_registry.rs`).
+    "crates/finch-programs/AGENTS.md": "# finch-programs capsule\n",
+    "crates/finch-programs/src/lib.rs": "use finch_vm::Value;\npub struct ProgramDefinition;\n",
+    "src/registry/caller.rs": "use finch_programs::ProgramDefinition;\n",
 }
 
 
@@ -103,11 +120,24 @@ class SeamCostTests(unittest.TestCase):
 
     def test_workspace_alias_and_direct_paths_count_cross_package_edges(self) -> None:
         crate_report = self.report("crates/finch-vm/")
-        self.assertIn("incoming: 2 reference(s) from 1 subsystem(s)", crate_report, crate_report)
-        self.assertIn("programs", crate_report, crate_report)
-        programs_report = self.report("src/programs/")
-        self.assertIn("outgoing: 1 subsystem(s)", programs_report, programs_report)
-        self.assertRegex(programs_report, r"finch-vm\s+2 reference\(s\)", programs_report)
+        self.assertIn("incoming: 3 reference(s) from 2 subsystem(s)", crate_report, crate_report)
+        self.assertIn("widgets", crate_report, crate_report)
+        widgets_report = self.report("src/widgets/")
+        self.assertIn("outgoing: 1 subsystem(s)", widgets_report, widgets_report)
+        self.assertRegex(widgets_report, r"finch-vm\s+2 reference\(s\)", widgets_report)
+
+    def test_extracted_workspace_crate_boundary_matches_its_real_facade(self) -> None:
+        # FP-PROOF-003 (issue #949): repairs a fixture that modelled the pre-#869 in-tree
+        # `src/programs/` layout instead of the real extracted `crates/finch-programs/` boundary.
+        # A workspace crate reaches another workspace crate only through a direct crate-qualified
+        # path (it has no root-facade `crate::` alias to use), and root-package callers reach back
+        # in the same way real callers like `src/program_registry.rs` do: `finch_programs::Name`.
+        report = self.report("crates/finch-programs/")
+        self.assertIn("outgoing: 1 subsystem(s)", report, report)
+        self.assertRegex(report, r"finch-vm\s+1 reference\(s\)", report)
+        self.assertIn("incoming: 1 reference(s) from 1 subsystem(s)", report, report)
+        self.assertIn("registry", report, report)
+        self.assertIn("src/registry/caller.rs", report, report)
 
 
 if __name__ == "__main__":
