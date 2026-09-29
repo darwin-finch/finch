@@ -75,6 +75,33 @@ reproduces the reported scenario at the `LocalGenerator::try_generate_from_patte
 production boundary (confirmed to fail against the pre-#1310 format and pass against the current
 one).
 
+**A tool-result-only follow-up message gets a named, actionable error, not a generic "No user
+message found" (crash-only fix for #1228; the real feature -- local models actually reading tool
+output -- stays open).** `TemplateGenerator::prompt_parts` (`generator.rs`) requires its last
+"user"-role message to carry a `ContentBlock::Text`. After a local-model tool call executes, the
+follow-up round posts the tool result back as `role: "user"` with only a `ContentBlock::ToolResult`
+(`Message::with_content("user", vec![ContentBlock::ToolResult { .. }])` in `src/server/handlers.rs`)
+-- a real user-role message with no text block. Before this fix, that case fell through to the same
+`ok_or_else(|| anyhow!("No user message found"))` used for "there is no user message in the array
+at all," which reached the end user as an opaque `{"error":{"message":"No user message found",
+"type":"generation_failed"}}` 500 (reported live twice: a fresh-session `find_code` follow-up and a
+one-file `read` follow-up). `prompt_parts` now distinguishes the two: a missing user message keeps
+the original generic text, while a present-but-textless user message whose content is a
+`ContentBlock::ToolResult` returns `LOCAL_TOOL_RESULT_FOLLOWUP_UNSUPPORTED_MESSAGE` ("Local models
+don't yet support continuing a conversation after a tool call (#1228); try a cloud provider for
+tool-using turns."), so the failure names the real, already-tracked gap instead of reading as a
+malformed request. This does not synthesize or guess at an answer to the tool output -- it still
+fails the turn, honestly, since local generation genuinely cannot read a tool result here yet.
+Covered by `prompt_parts_reports_the_local_tool_result_followup_gap_not_the_generic_no_user_message_text`
+(fails before the fix with the generic text, passes after with the specific one) and
+`prompt_parts_keeps_the_generic_message_when_there_is_no_user_message_at_all` (`generator.rs`).
+`src/generators/qwen.rs`'s `generate_single_turn` has the identical `ok_or_else(|| anyhow!("No user
+message found"))?` pattern but is not reachable via this scenario: every real caller (`query_processor.rs`'s
+`generator.generate(messages, Some(tool_definitions))` call, "for Qwen or fallback") always passes
+the full registered tool set, so a tool-result follow-up routes through `generate_proposing_tools`
+instead, which already formats a `ContentBlock::ToolResult` into `"[Tool Result: ...]"` text without
+crashing -- left unchanged.
+
 **Extension rule:** keep family-specific request adaptation in `src/generators` and model loading
 in `src/models`. Add a flat facade entry only for a demonstrated caller need; do not expose
 `generator` or `patterns` as public modules. Keep persistence and learning changes covered by
