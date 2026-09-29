@@ -20,6 +20,37 @@ pub struct AutomationAvailability {
     pub operations: Vec<&'static str>,
 }
 
+impl AutomationAvailability {
+    /// A human-readable sentence explaining why automation is unavailable in
+    /// this state, meant to be surfaced directly as tool/error output to a
+    /// human or model (see CLAUDE.md's GUI Accessibility invariants: "Every
+    /// GUI read must return plain text" and "Accessibility permission errors
+    /// must explain how to fix them"). The structured `state`/`backend`/
+    /// `operations` fields above remain available separately for anything
+    /// that consumes `AutomationAvailability` programmatically.
+    pub fn unavailable_message(&self) -> String {
+        match self.state {
+            AutomationState::PermissionRequired => format!(
+                "automation unavailable: Finch does not have Accessibility permission on this \
+                 Mac. Grant it in System Settings \u{2192} Privacy & Security \u{2192} \
+                 Accessibility, then retry (backend: {}).",
+                self.backend
+            ),
+            AutomationState::Disabled => format!(
+                "automation unavailable: GUI automation is disabled in Finch's configuration \
+                 (backend: {}).",
+                self.backend
+            ),
+            AutomationState::Unsupported => format!(
+                "automation unavailable: native desktop automation is not supported on this \
+                 platform (backend: {}).",
+                self.backend
+            ),
+            AutomationState::Available => "automation is available".to_string(),
+        }
+    }
+}
+
 /// Whether a native permission request was made for this process.
 ///
 /// This is deliberately separate from [`AutomationState`]. Apple's prompt is
@@ -188,10 +219,7 @@ impl AutomationBroker {
         }
         let availability = self.availability();
         if availability.state != AutomationState::Available {
-            bail!(
-                "automation unavailable: {}",
-                serde_json::to_string(&availability)?
-            );
+            bail!("{}", availability.unavailable_message());
         }
         platform::execute(request)
     }
@@ -603,6 +631,63 @@ mod tests {
                 remote_session: false,
             }
         ));
+    }
+
+    #[test]
+    fn test_permission_required_message_names_the_system_settings_path() {
+        let message = availability(AutomationState::PermissionRequired).unavailable_message();
+        assert!(
+            message.contains("System Settings \u{2192} Privacy & Security \u{2192} Accessibility"),
+            "permission-required error text must literally name the fix path a human/blind \
+             user can follow (CLAUDE.md's GUI Accessibility invariant), got: {message:?}"
+        );
+        // CLAUDE.md's invariant wording is checked piecewise too, so a future
+        // rewrite that keeps the words but breaks the arrow chain still fails.
+        assert!(message.contains("System Settings"), "got: {message:?}");
+        assert!(message.contains("Privacy & Security"), "got: {message:?}");
+        assert!(message.contains("Accessibility"), "got: {message:?}");
+    }
+
+    #[test]
+    fn test_unavailable_message_is_prose_not_a_serialized_struct() {
+        for state in [
+            AutomationState::Disabled,
+            AutomationState::Unsupported,
+            AutomationState::PermissionRequired,
+        ] {
+            let message = availability(state).unavailable_message();
+            assert!(
+                !message.contains('{') && !message.contains("\"state\""),
+                "unavailable_message() for {state:?} must be a readable sentence, not a \
+                 serialized AutomationAvailability, got: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disabled_broker_execute_error_is_prose_not_json() {
+        // AutomationBroker::new(false) deterministically yields
+        // AutomationState::Disabled without touching the real Accessibility
+        // trust state, so this exercises the real execute() -> bail! path
+        // (not just the message helper in isolation) on every platform/CI
+        // machine regardless of whether Accessibility happens to be trusted.
+        let broker = AutomationBroker::new(false);
+        let error = broker
+            .execute(AutomationRequest::Click {
+                x: 1.0,
+                y: 2.0,
+                button: "left".to_string(),
+                count: 1,
+            })
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            !text.contains('{'),
+            "AutomationBroker::execute's error text must be a sentence, not a serialized \
+             AutomationAvailability blob (issue #1382), got: {text:?}"
+        );
+        assert!(text.contains("automation unavailable"), "got: {text:?}");
+        assert!(text.contains("GUI automation is disabled"), "got: {text:?}");
     }
 
     #[test]
