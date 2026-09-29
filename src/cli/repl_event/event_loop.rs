@@ -1187,6 +1187,18 @@ struct RemoteBrainRunProjection {
     /// Rendered task-list lines per tool call, so the completed call row keeps
     /// showing the list it wrote instead of collapsing to a bare summary.
     task_list_bodies: std::collections::HashMap<String, Vec<String>>,
+    /// A tool approval's decision ("<choice> by <sender>"), staged by
+    /// `ApprovalDecided` until the matching `ToolResult` lands (#439). A tool
+    /// approval's `approval_id` is always the gated call's `tool_id`
+    /// (`handle_tool_approval_request` sets them equal), and `ApprovalDecided`
+    /// is always observed before the later `ToolResult` (the dialog-result
+    /// dispatch pushes the decision, then unblocks the tool-execution task
+    /// that eventually publishes the result) — so staging here and folding it
+    /// into the row's own completion is safe without a resolved-row check.
+    /// Staging here (rather than writing the row immediately) matters because
+    /// `complete_row_with_body` replaces `body_lines` wholesale, so an eager
+    /// write would be clobbered the moment the real result lands.
+    pending_tool_decisions: std::collections::HashMap<String, String>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
     locally_rendered_approval_ids: std::collections::HashSet<String>,
     locally_rendered_program: bool,
@@ -1229,6 +1241,7 @@ fn ensure_remote_brain_run_projection<'a>(
             tool_rows: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
             task_list_bodies: std::collections::HashMap::new(),
+            pending_tool_decisions: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
             locally_rendered_approval_ids: std::collections::HashSet::new(),
             locally_rendered_program: false,
@@ -1411,8 +1424,18 @@ fn project_remote_brain_run_event(
             // A completed task-list write keeps its rendered list as the row
             // body, so the list stays readable in the transcript (#425).
             let task_list = projection.task_list_bodies.remove(tool_id);
+            // An approval decision that already landed for this call (#439)
+            // is staged, never written straight to the row, because
+            // `complete_row_with_body` below replaces `body_lines` wholesale
+            // — an eager write would be clobbered the instant the real
+            // result lands.
+            let decision = projection.pending_tool_decisions.remove(tool_id);
             if *is_error {
-                projection.unit.fail_row(row, output);
+                let message = match &decision {
+                    Some(decision) => format!("{output} ({decision})"),
+                    None => output.clone(),
+                };
+                projection.unit.fail_row(row, message);
             } else {
                 let first = output.lines().next().unwrap_or_default();
                 let summary = if first.chars().count() > 80 {
@@ -1420,8 +1443,11 @@ fn project_remote_brain_run_event(
                 } else {
                     first.to_string()
                 };
-                let body = task_list
+                let mut body = task_list
                     .unwrap_or_else(|| output.lines().skip(1).map(str::to_owned).collect());
+                if let Some(decision) = decision {
+                    body.insert(0, decision);
+                }
                 projection.unit.complete_row_with_body(row, summary, body);
             }
         }
@@ -1437,6 +1463,15 @@ fn project_remote_brain_run_event(
                 .locally_rendered_approval_ids
                 .contains(approval_id)
             {
+                return true;
+            }
+            // A tool approval's `approval_id` is always the gated call's
+            // `tool_id` (`handle_tool_approval_request` sets them equal), and
+            // the call's own row already carries its input — render the
+            // decision on that row instead of a separately correlated one
+            // (#439: "An approval is not an event in its own right. It is a
+            // property of the tool call it gates.").
+            if approval_kind == "tool" && projection.tool_rows.contains_key(approval_id) {
                 return true;
             }
             if !projection.approval_rows.contains_key(approval_id) {
@@ -1473,6 +1508,20 @@ fn project_remote_brain_run_event(
             {
                 return true;
             }
+            let choice = decision
+                .get("choice")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("decided");
+            let summary = format!("{choice} by {}", event.sender);
+            // Same correlation as `ApprovalRequested` above (#439): fold the
+            // decision onto the gated call's own row rather than a row
+            // reachable only by matching an opaque id.
+            if projection.tool_rows.contains_key(approval_id) {
+                projection
+                    .pending_tool_decisions
+                    .insert(approval_id.clone(), summary);
+                return true;
+            }
             let row = *projection
                 .approval_rows
                 .entry(approval_id.clone())
@@ -1481,11 +1530,6 @@ fn project_remote_brain_run_event(
                         .unit
                         .add_activity_row(format!("approval {approval_id}"))
                 });
-            let choice = decision
-                .get("choice")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("decided");
-            let summary = format!("{choice} by {}", event.sender);
             if choice == "deny" {
                 projection.unit.fail_row(row, summary);
             } else {
