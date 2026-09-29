@@ -158,7 +158,17 @@ impl EventLoop {
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("claim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        // This client is the one that may be creating `session_label` for
+        // the very first time (a freshly generated Brain name with no prior
+        // attach/--brain). Send this console's own cwd so a brand-new Brain
+        // records it as its canonical workspace, rather than inheriting the
+        // daemon's own launch-time cwd (#1381). Has no effect when the
+        // Brain already exists.
+        let own_workspace =
+            std::env::current_dir().context("could not identify the frontend workspace")?;
+        let snapshot = ipc
+            .brain_snapshot_for_client(&self.session_label, &own_workspace)
+            .await?;
         verify_local_frontend_environment(&snapshot.environment)?;
         let initial = ipc
             .brain_acquire_runner(

@@ -426,6 +426,17 @@ pub struct BrainMetadata {
     #[serde(flatten)]
     #[serde(default)]
     pub selection: BrainProviderSelection,
+    /// The requesting client's own working directory at the moment this
+    /// Brain was first created, if the caller supplied one (#1381). `None`
+    /// for Brains created before this field existed, or created through a
+    /// path that never had a specific requesting client's cwd (e.g. a
+    /// test fixture) — those fall back to the store-wide default workspace,
+    /// which is the pre-#1381 behaviour. Recorded once, at creation, and
+    /// never overwritten by a later snapshot/attach from a different cwd:
+    /// a Brain's canonical workspace must stay stable across its whole
+    /// lifetime so workspace-mismatch detection stays meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 pub const fn initial_environment_generation() -> u64 {

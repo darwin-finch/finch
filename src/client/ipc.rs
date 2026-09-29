@@ -405,6 +405,26 @@ impl IpcClient {
         decode_snapshot(reply.get()?.get_snapshot()?)
     }
 
+    /// Same as [`Self::brain_snapshot`], but when this client is the one
+    /// creating `brain` for the first time, `requesting_workspace` becomes
+    /// that Brain's own recorded canonical workspace instead of the
+    /// daemon's own launch-time cwd (#1381). Has no effect on a Brain that
+    /// already exists.
+    pub async fn brain_snapshot_for_client(
+        &self,
+        brain: &str,
+        requesting_workspace: &std::path::Path,
+    ) -> Result<crate::brain::BrainSnapshot> {
+        let service = self.brain_service().await?;
+        let mut request = service.snapshot_request();
+        request.get().set_brain(brain);
+        request
+            .get()
+            .set_requesting_workspace(&requesting_workspace.to_string_lossy());
+        let reply = request.send().promise.await?;
+        decode_snapshot(reply.get()?.get_snapshot()?)
+    }
+
     pub async fn brain_inspect_run(
         &self,
         brain: &str,

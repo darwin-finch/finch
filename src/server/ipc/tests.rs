@@ -2867,3 +2867,126 @@ async fn eval_forth_uses_typed_signatures_and_runtime() {
         .unwrap_err();
     assert!(error.to_string().contains("E-FORTH-SIG-001"));
 }
+
+/// #1381: a brand-new Brain, created moments earlier for this exact client
+/// invocation, was immediately flagged as workspace-mismatched against
+/// itself. Root cause: `BrainStore` is one long-lived, daemon-wide struct
+/// with a single `environment.workspace` field, captured once at daemon
+/// construction from the *daemon's own* `std::env::current_dir()`
+/// (`BrainStore::with_root`). Every Brain a shared daemon ever creates
+/// inherited that one fixed value as its "canonical workspace" — regardless
+/// of which directory the actual requesting client ran from — because
+/// neither the `snapshot` nor `attach` Cap'n Proto RPCs carried the
+/// client's own cwd at all.
+///
+/// This drives the real production boundary end to end: a real
+/// `crate::client::IpcClient` (the exact type `register_home_brain` in
+/// `src/cli/repl_event/brain_handler.rs` uses) talks Cap'n Proto over a real
+/// `UnixStream` pair to a real `BrainRpcService::snapshot` handler
+/// (`src/server/ipc.rs`), which calls through `BrainLifecycleService` into
+/// the real `BrainStore::snapshot_for_client` (`crates/finch-brain/src/store.rs`).
+/// Nothing here bypasses the wire encode/decode or calls a store method
+/// directly to fake the client-cwd path.
+///
+/// Fails before the fix: `BrainRpcService::snapshot` ignored any client cwd
+/// and every snapshot's `environment` was always the store's one daemon-wide
+/// default, so a brand-new Brain's workspace equalled the daemon's own
+/// launch-time cwd, not the creating client's.
+#[tokio::test(flavor = "current_thread")]
+async fn test_brain_created_through_real_ipc_records_creating_clients_cwd_not_daemon_launch_cwd() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let daemon_launch_cwd = tempfile::tempdir().unwrap();
+            let client_cwd = tempfile::tempdir().unwrap();
+
+            // Simulates a shared daemon that was started from directory B,
+            // exactly like `AgentServer::new`'s `BrainStore::new(machine)` ->
+            // `BrainStore::with_root` captures `std::env::current_dir()` once
+            // at daemon startup. A test cannot safely `chdir` the whole
+            // process (shared, parallel test binary), so this store is built
+            // with an explicit workspace standing in for "the daemon's own
+            // launch-time cwd", the same way `with_root` would if the daemon
+            // process's cwd were `daemon_launch_cwd`.
+            let store = crate::brain::BrainStore::with_root_and_workspace_for_test(
+                "box.local",
+                Some(temp.path().join("brains")),
+                daemon_launch_cwd.path().to_path_buf(),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::BrainCredentialAuthority::ephemeral([181; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+
+            let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+            let handler_server = std::sync::Arc::clone(&server);
+            let handler = tokio::task::spawn_local(async move {
+                super::handle_connection(server_stream, handler_server).await
+            });
+
+            let client = crate::client::IpcClient::from_stream(client_stream)
+                .await
+                .unwrap();
+
+            // A never-before-seen name, exactly like `finch::brain::generate()`
+            // hands `register_home_brain` a fresh random Brain name with no
+            // prior attach/--brain. This call is the client's very first touch
+            // of this Brain, so it is also what creates it (`ensure_loaded`'s
+            // lazy first-touch metadata creation) — mirroring
+            // `register_home_brain`'s real `ipc.brain_snapshot_for_client(...)`
+            // call at TUI/CLI startup.
+            let brain_name = "gentle-glen-1381test";
+            let snapshot = client
+                .brain_snapshot_for_client(brain_name, client_cwd.path())
+                .await
+                .unwrap();
+
+            let expected_workspace = client_cwd.path().canonicalize().unwrap();
+            let daemon_default = daemon_launch_cwd.path().canonicalize().unwrap();
+            assert_ne!(
+                expected_workspace, daemon_default,
+                "test fixture bug, not a #1381 assertion: the client and \
+                 daemon workspaces must actually differ for this test to be \
+                 meaningful"
+            );
+            assert_eq!(
+                snapshot.environment.workspace,
+                expected_workspace,
+                "#1381: a brand-new Brain must record the creating CLIENT's \
+                 own cwd ({}) as its canonical workspace; got {} (the \
+                 daemon's own simulated launch-time cwd is {})",
+                expected_workspace.display(),
+                snapshot.environment.workspace.display(),
+                daemon_default.display(),
+            );
+
+            // Same client, same cwd, re-fetching the Brain it just created:
+            // this is exactly the symptom reported in #1381 — a brand-new
+            // Brain immediately flagged as workspace-mismatched against the
+            // very client that just created it. Asserting the workspace
+            // still equals this client's own cwd is equivalent to asserting
+            // no mismatch would be reported (the comparison in
+            // `verify_frontend_environment`, `src/cli/repl_event/brain_handler.rs`,
+            // is a plain equality check against exactly this field and is
+            // covered by its own existing tests, not re-derived here).
+            let again = client
+                .brain_snapshot_for_client(brain_name, client_cwd.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                again.environment.workspace, expected_workspace,
+                "re-fetching the same brand-new Brain from the same \
+                 client's cwd must keep reporting that client's own \
+                 workspace, not drift to the daemon-wide default"
+            );
+
+            drop(client);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handler).await;
+        })
+        .await;
+}

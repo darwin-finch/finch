@@ -1624,7 +1624,12 @@ interface BrainWireReceiver {
 # mutation. Remote transports add scoped credential checks before entering the
 # same service implementation.
 interface BrainService {
-  snapshot @0 (brain :Text) -> (snapshot :BrainSnapshot);
+  # `requestingWorkspace`, when non-empty, is the calling client's own
+  # current working directory. It becomes a not-yet-existing Brain's
+  # canonical recorded workspace instead of the daemon's own launch-time
+  # cwd (#1381); it has no effect on a Brain that already exists. Empty
+  # means "no override" — the daemon-wide default applies, as before.
+  snapshot @0 (brain :Text, requestingWorkspace :Text) -> (snapshot :BrainSnapshot);
 
   attach @1 (brain :Text,
              subject :Text,

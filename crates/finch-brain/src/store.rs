@@ -73,6 +73,10 @@ struct BrainState {
     recent_effect_audits: std::collections::VecDeque<finch_runtime::EffectAuditEntry>,
     revision: u64,
     tx: broadcast::Sender<BrainEvent>,
+    /// This Brain's own canonical workspace, recorded once at creation from
+    /// the requesting client's cwd (#1381). `None` falls back to the store's
+    /// daemon-wide default in `snapshot_for_client`.
+    workspace: Option<std::path::PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -184,6 +188,7 @@ impl BrainState {
             recent_effect_audits: std::collections::VecDeque::new(),
             revision: 0,
             tx,
+            workspace: None,
         };
         for mut event in events {
             if event.brain_id == BrainId::nil() {
@@ -720,6 +725,21 @@ impl BrainStore {
         store
     }
 
+    /// Build a store whose daemon-wide default workspace is `workspace`,
+    /// independent of the test process's own `std::env::current_dir()`
+    /// (#1381). Production always derives this from the real daemon's
+    /// launch-time cwd (`with_root`); this lets a test simulate "the daemon
+    /// was launched from a directory the requesting client never visits"
+    /// deterministically, without mutating the whole test process's cwd.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_root_and_workspace_for_test(
+        machine: impl Into<String>,
+        root: Option<PathBuf>,
+        workspace: impl Into<PathBuf>,
+    ) -> Self {
+        Self::with_environment(machine, workspace, root)
+    }
+
     pub fn execution_lock(&self, name: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let name = Self::validate_name(name)?;
         if let Some(lock) = self
@@ -953,7 +973,7 @@ impl BrainStore {
         let _metadata_guard = metadata_lock
             .lock()
             .expect("shared Brain metadata lock poisoned");
-        let mut metadata = self.load_or_create_metadata_unlocked(name)?;
+        let mut metadata = self.load_or_create_metadata_unlocked(name, None)?;
         metadata.selection = selection;
         self.write_metadata(name, &metadata)?;
         Ok(metadata.selection)
@@ -1089,14 +1109,39 @@ impl BrainStore {
     }
 
     pub fn snapshot(&self, name: &str) -> Result<BrainSnapshot> {
+        self.snapshot_for_client(name, None)
+    }
+
+    /// Same as [`Self::snapshot`], but when `requesting_workspace` is
+    /// supplied and this is the very first time `name` is loaded, that
+    /// workspace becomes the Brain's own recorded canonical workspace
+    /// instead of this store's daemon-wide default (#1381: a daemon-wide
+    /// default meant every Brain a shared daemon ever created recorded the
+    /// *daemon's own launch-time cwd*, so a brand-new Brain immediately
+    /// looked workspace-mismatched against the very client that just
+    /// created it). Ignored for a Brain that already exists — a Brain's
+    /// canonical workspace is fixed at creation and never overwritten by a
+    /// later caller's cwd.
+    pub fn snapshot_for_client(
+        &self,
+        name: &str,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<BrainSnapshot> {
         let name = Self::validate_name(name)?;
-        self.ensure_loaded(name)?;
+        self.ensure_loaded_with_workspace(name, requesting_workspace)?;
         let brains = self.brains.read().expect("shared brain lock poisoned");
         let state = brains.get(name).context("Brain was removed concurrently")?;
         Ok(BrainSnapshot {
             brain_id: state.brain_id,
             name: name.to_string(),
-            environment: self.environment.clone(),
+            environment: BrainEnvironment {
+                machine: self.environment.machine.clone(),
+                workspace: state
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| self.environment.workspace.clone()),
+                generation: self.environment.generation,
+            },
             revision: state.revision,
             events: state
                 .events
@@ -5133,6 +5178,18 @@ impl BrainStore {
     }
 
     fn ensure_loaded(&self, name: &str) -> Result<()> {
+        self.ensure_loaded_with_workspace(name, None)
+    }
+
+    /// Same as [`Self::ensure_loaded`], but a not-yet-existing Brain's
+    /// metadata is created with `requesting_workspace` as its canonical
+    /// workspace when supplied (#1381). Has no effect on a Brain that is
+    /// already loaded or already has metadata on disk.
+    fn ensure_loaded_with_workspace(
+        &self,
+        name: &str,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<()> {
         if self
             .brains
             .read()
@@ -5141,7 +5198,9 @@ impl BrainStore {
         {
             return Ok(());
         }
-        let brain_id = self.load_or_create_metadata(name)?.brain_id;
+        let metadata = self.load_or_create_metadata(name, requesting_workspace)?;
+        let brain_id = metadata.brain_id;
+        let workspace = metadata.workspace.clone();
         let initialization = self.load_or_create_initialization(name, brain_id)?;
         let mut events = self.read_events(name)?;
         if self.root.is_some() {
@@ -5331,6 +5390,7 @@ impl BrainStore {
         }
         let cursors = self.read_attachment_cursors(name, brain_id)?;
         let mut state = BrainState::from_events(brain_id, events);
+        state.workspace = workspace;
         if self.root.is_some() {
             state.events.retain(|event| {
                 !matches!(event.kind, BrainEventKind::EffectAuditTransition { .. })
@@ -5676,21 +5736,35 @@ impl BrainStore {
         Ok(())
     }
 
-    fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
+    fn load_or_create_metadata(
+        &self,
+        name: &str,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<BrainMetadata> {
         let metadata_lock = self.metadata_lock(name);
         let _metadata_guard = metadata_lock
             .lock()
             .expect("shared Brain metadata lock poisoned");
-        self.load_or_create_metadata_unlocked(name)
+        self.load_or_create_metadata_unlocked(name, requesting_workspace)
     }
 
-    fn load_or_create_metadata_unlocked(&self, name: &str) -> Result<BrainMetadata> {
+    fn load_or_create_metadata_unlocked(
+        &self,
+        name: &str,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<BrainMetadata> {
+        // Canonicalize the same way `BrainStore::with_environment` does for
+        // the store-wide default, so a Brain's own recorded workspace and
+        // the daemon-wide fallback are directly comparable.
+        let requesting_workspace: Option<std::path::PathBuf> = requesting_workspace
+            .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         let Some(root) = &self.root else {
             return Ok(BrainMetadata {
                 version: BRAIN_METADATA_VERSION,
                 brain_id: BrainId::new(),
                 created_ms: unix_millis(),
                 selection: BrainProviderSelection::default(),
+                workspace: requesting_workspace,
             });
         };
         let directory = root.join(name);
@@ -5714,6 +5788,7 @@ impl BrainStore {
             brain_id: BrainId::new(),
             created_ms: unix_millis(),
             selection: BrainProviderSelection::default(),
+            workspace: requesting_workspace,
         };
         let encoded = serde_json::to_vec_pretty(&metadata)?;
         let temporary = directory.join(format!(".metadata.{}.tmp", uuid::Uuid::new_v4()));

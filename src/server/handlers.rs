@@ -1883,7 +1883,13 @@ fn ensure_named_brain_store_environment(
     snapshot: &crate::brain::BrainSnapshot,
 ) -> anyhow::Result<()> {
     let configured = store.environment();
-    if &snapshot.environment != configured {
+    // Only `machine`/`generation` identify "the same daemon process and
+    // restart epoch" (#1381). `workspace` is a per-Brain value recorded at
+    // that Brain's own creation from its creating client's cwd, and is
+    // expected to differ from this store's daemon-wide default whenever a
+    // client's cwd differs from the daemon's own launch-time cwd — the
+    // ordinary case, not a host mismatch. See `BrainEnvironment::same_host_identity`.
+    if !snapshot.environment.same_host_identity(configured) {
         anyhow::bail!("brain environment generation does not match this execution host");
     }
     let process_workspace = std::env::current_dir()?;

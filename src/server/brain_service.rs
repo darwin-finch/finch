@@ -107,6 +107,17 @@ impl BrainLifecycleService {
         self.store.snapshot(brain)
     }
 
+    /// Same as [`Self::snapshot`], but a not-yet-existing Brain's canonical
+    /// workspace is recorded as `requesting_workspace` rather than this
+    /// daemon's own launch-time cwd (#1381).
+    pub fn snapshot_for_client(
+        &self,
+        brain: &str,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<BrainSnapshot> {
+        self.store.snapshot_for_client(brain, requesting_workspace)
+    }
+
     pub fn pending_effect_delivery(
         &self,
         brain: &str,
@@ -1034,7 +1045,7 @@ impl BrainLifecycleService {
         ttl_ms: u64,
     ) -> Result<BrainRunnerLease> {
         ensure!(
-            environment == self.store.environment(),
+            environment.same_host_identity(self.store.environment()),
             "runner environment does not match the daemon Brain environment"
         );
         let lease = self.store.acquire_runner_lease(
@@ -1145,7 +1156,7 @@ impl BrainLifecycleService {
         ttl_ms: u64,
     ) -> Result<BrainRunnerLease> {
         ensure!(
-            environment == self.store.environment(),
+            environment.same_host_identity(self.store.environment()),
             "runner handoff environment does not match the daemon Brain environment"
         );
         let lease = self.store.accept_runner_handoff(
@@ -1239,6 +1250,65 @@ mod tests {
         assert_eq!(created.revision, 0);
         assert!(created.events.is_empty());
         assert!(service.create("review").await.is_err());
+    }
+
+    /// #1381 regression, discovered while fixing the reported bug: once a
+    /// Brain's own `environment.workspace` genuinely differs from the
+    /// store's daemon-wide default (the whole point of the #1381 fix — a
+    /// Brain's canonical workspace is now its *creating client's* cwd, not
+    /// the daemon's launch-time cwd), `acquire_runner` must still accept a
+    /// runner that supplies exactly that Brain's own environment. Before
+    /// this guard was added, `acquire_runner` compared the full
+    /// `BrainEnvironment` (including `workspace`) against
+    /// `store.environment()` — which was harmless only because, pre-#1381,
+    /// every Brain's `workspace` was *always* identical to the daemon-wide
+    /// default (the bug). Fixing #1381 alone, without narrowing this check
+    /// to `same_host_identity` (machine + generation, not workspace), would
+    /// have turned that dead comparison live and made ordinary runner
+    /// registration fail for exactly the sessions #1381 was reported from
+    /// (client cwd != daemon launch cwd) — the most common case, not an edge
+    /// case.
+    #[tokio::test]
+    async fn acquire_runner_succeeds_when_the_brains_own_workspace_differs_from_the_daemon_default()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon_default_workspace = tempfile::tempdir().unwrap();
+        let client_workspace = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root_and_workspace_for_test(
+            "box.local",
+            Some(temp.path().join("brains")),
+            daemon_default_workspace.path().to_path_buf(),
+        );
+        let service = BrainLifecycleService::new(
+            store,
+            BrainRunnerBroker::default(),
+            BrainApprovalBroker::default(),
+        );
+        let snapshot = service
+            .snapshot_for_client("shared", Some(client_workspace.path()))
+            .unwrap();
+        assert_ne!(
+            snapshot.environment.workspace,
+            daemon_default_workspace.path().canonicalize().unwrap(),
+            "test fixture bug, not a #1381 assertion: client and daemon \
+             workspaces must actually differ for this test to be meaningful"
+        );
+
+        let lease = service
+            .acquire_runner("shared", "runner-1", &snapshot.environment, None, 30_000)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "#1381 regression: a runner supplying its own Brain's real \
+                     environment ({:?}) must be accepted even though it differs \
+                     from the daemon's unrelated default workspace ({}); got: {error}",
+                    snapshot.environment,
+                    daemon_default_workspace.path().display(),
+                )
+            });
+        assert_eq!(
+            lease.environment_generation,
+            snapshot.environment.generation
+        );
     }
 
     #[tokio::test]
