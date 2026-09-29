@@ -29,7 +29,16 @@ to avoid a dev-dependency cycle.
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
 shared unit may be read while the event loop appends output, so preserve the existing lock and
-snapshot discipline. A complete transcript is canonical text for copying and permanent
+snapshot discipline. When a run or turn reaches a terminal outcome, every still-`Running` child
+row (tool rows, approvals, and child-agent rows and their tools) must resolve with that outcome
+instead of freezing at its last in-flight status — `WorkUnit::resolve_running_rows_with_run_outcome`
+(this file) is the single terminalization path callers use for this, wired from
+`apply_brain_run_status` and the `QueryFailed` dispatch handler in
+`src/cli/repl_event/event_loop.rs`/`dispatch.rs` (#910). `BrainRunStatus::Interrupted` is
+deliberately excluded from `is_terminal()` (`crates/finch-brain/src/run/mod.rs`) because an
+interrupted run may resume, so its child rows intentionally stay live rather than being
+force-resolved. `test_run_terminal_status_resolves_stuck_child_rows_on_disconnect` in
+`src/cli/repl_event/event_loop/tests.rs` replays the issue's real disconnect transcript capture. A complete transcript is canonical text for copying and permanent
 scrollback; renderer disclosure may change visible rows but must not change that text. A say-turn
 component action mutates its owning ViewModel under the message lock; unmigrated rows keep the
 renderer-owned `RowId` open set. `MemoryRecalledMessage` (#1235) rides the same component-owned
