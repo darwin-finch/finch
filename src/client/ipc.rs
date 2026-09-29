@@ -2294,6 +2294,46 @@ mod tests {
         Ok(client)
     }
 
+    /// Regression for issue #410: every `#[ignore]`'d live test below (`test_ipc_ping`,
+    /// `test_fresh_daemon_brain_bootstrap_reaches_live_runner`, and friends) creates Brains
+    /// through `connect_isolated_live_socket`, and those leaked into a developer's real
+    /// `~/.finch/brains` store when one of them was run directly, outside
+    /// `scripts/test_brains.sh`. This test is deliberately *not* `#[ignore]`d, so an ordinary
+    /// `cargo test --lib` run (unsupervised, as CI runs it by default) exercises it: without a
+    /// genuine supervisor-issued proof, `connect_isolated_live_socket` must fail before it ever
+    /// opens the IPC socket, not silently address whatever `FINCH_TEST_IPC_SOCKET` happens to
+    /// resolve to. If this process happens to be running under a real supervisor (e.g. someone
+    /// invoked `scripts/test_brains.sh cargo test --lib` with no filter), authority is genuinely
+    /// present and there is nothing unsafe to assert, so the test is a no-op in that case.
+    #[test]
+    fn connect_isolated_live_socket_refuses_before_any_network_io_without_supervisor_proof() {
+        if crate::brain::isolated_test_proof_if_present()
+            .expect("proof presence probe must not itself error")
+            .is_some()
+        {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        // `IpcClient` (the `Ok` arm) is not `Debug`, so match instead of
+        // `expect_err`/`unwrap_err`, which require `Debug` on both arms.
+        let error = match rt.block_on(local.run_until(connect_isolated_live_socket())) {
+            Ok(_) => panic!(
+                "connect_isolated_live_socket must refuse without supervisor authority, \
+                 not fall back to any other daemon"
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("scripts/test_brains.sh") || message.contains("supervisor"),
+            "expected the fail-closed proof-rejection message, got: {message}"
+        );
+    }
+
     #[test]
     fn ipc_protocol_handshake_accepts_only_the_current_generation() {
         ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
@@ -2545,9 +2585,24 @@ mod tests {
 
     /// Connect to the live daemon socket and verify ping round-trip.
     ///
-    /// Requires an owned daemon socket named by `FINCH_TEST_IPC_SOCKET`.
-    /// Run with:
-    ///   ./scripts/test_brains.sh cargo test --lib client::ipc::tests::test_ipc_ping -- --ignored --nocapture
+    /// `./scripts/test_brains.sh cargo test --lib client::ipc::tests::test_ipc_ping -- --ignored
+    /// --nocapture` alone is NOT sufficient to run this: the supervisor isolates this process's
+    /// HOME and Brain root but does not itself start a daemon or populate
+    /// `FINCH_TEST_IPC_SOCKET` with something listening. Without a real, supervisor-spawned
+    /// `finch daemon` already bound to that socket (see `tests/daemon_integration_test.rs`'s
+    /// `TestDaemon::start`, or a sibling test in this binary that calls
+    /// `ensure_supervisor_live_fixture` and so binds the same sealed listener in-process), this
+    /// test fails closed with "live Brain tests require scripts/test_brains.sh" before opening
+    /// any socket — it does not silently fall back to any other daemon.
+    ///
+    /// Never hand-set `FINCH_TEST_IPC_SOCKET`, `FINCH_BRAIN_TEST_ISOLATED`, or the other
+    /// `FINCH_TEST_*`/`FINCH_BRAIN_TEST_*` variables to point this at your own real `finch daemon`
+    /// (e.g. an interactive session's daemon backed by `~/.finch`) to work around the panic
+    /// above. `connect_isolated_live_socket` validates the socket's inode identity, the process
+    /// ancestry and executable digest of the proof-issuing supervisor, and a signed proof blob —
+    /// none of that is satisfiable by hand — but a name-generating test in this family run
+    /// against a real daemon by some other means is exactly how issue #410's
+    /// `bootstrap-smoke-<uuid>` Brains leaked into a developer's real `~/.finch/brains` store.
     /// capnp-rpc uses spawn_local internally so we need a LocalSet.
     #[test]
     #[ignore]
@@ -2570,6 +2625,11 @@ mod tests {
 
     /// A newly spawned daemon from the current binary must establish both its
     /// event watch and reverse runner callback without a manual restart.
+    ///
+    /// See `test_ipc_ping`'s doc comment above: this needs a real, supervisor-spawned daemon
+    /// already listening at `FINCH_TEST_IPC_SOCKET`, and must never be pointed at a real,
+    /// non-supervised `finch daemon` — the `bootstrap-smoke-<uuid>` name this test generates is
+    /// the exact leaked-fixture pattern from issue #410.
     #[test]
     #[ignore]
     fn test_fresh_daemon_brain_bootstrap_reaches_live_runner() {
