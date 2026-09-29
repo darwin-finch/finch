@@ -502,6 +502,16 @@ const UNVERIFIED_TOOL_CLAIM_CAVEAT: &str = "\n\n(unverified -- no tool was \
     actually called this turn; this claim was not checked against a real \
     file or command)";
 
+/// User-facing fallback shown when a self-correcting wire-protocol repair
+/// round could not produce a valid response -- the repair attempt was itself
+/// rejected, errored, or never ran because the turn was cancelled while
+/// waiting on it. The raw wire diagnostic (compiler-style `file:line`,
+/// `error[E-...]`, and `phase:` output) is internal detail that gives a
+/// non-technical user nothing actionable; it goes to `tracing::debug!` only,
+/// never the transcript (#1383).
+const WIRE_REPAIR_FAILED_MESSAGE: &str = "Finch's response needed to be \
+    corrected, and the correction attempt did not succeed either.";
+
 /// Whether `text` asserts it is reporting on content obtained by consulting
 /// an external source. See [`UNVERIFIED_GROUNDING_PHRASES`].
 fn claims_tool_grounded_fact(text: &str) -> bool {
@@ -615,7 +625,20 @@ async fn execute_wire_with_single_repair(
     metric.failure_class = Some(finch_programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = finch_programs::wire_diagnostic_code(&diagnostic);
 
-    output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    if repairable {
+        // A self-correcting repair round is about to fire: keep the raw
+        // compiler-style diagnostic out of the user-facing transcript and
+        // show only the eventual outcome (the successfully repaired
+        // response, or a plain-language fallback if repair itself fails
+        // below). The diagnostic is still fully available for debugging.
+        // #1383.
+        tracing::debug!(
+            diagnostic = %diagnostic,
+            "VM wire error triggering a repair round (not shown in transcript)"
+        );
+    } else {
+        output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    }
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -632,10 +655,11 @@ async fn execute_wire_with_single_repair(
     if cancel.is_cancelled() {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
+        output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
             output_unit,
         };
@@ -758,10 +782,11 @@ async fn execute_wire_with_single_repair(
             output_unit.set_transient_status(None);
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
+            output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
             output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
-                response: diagnostic,
+                response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
                 output_unit,
             };
@@ -772,10 +797,11 @@ async fn execute_wire_with_single_repair(
     if cancel.is_cancelled() {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
+        output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
             output_unit,
         };
@@ -783,13 +809,14 @@ async fn execute_wire_with_single_repair(
     let Ok(repair) = repair else {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
+        output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
         output_unit.set_complete();
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
             output_unit,
         };
@@ -797,13 +824,14 @@ async fn execute_wire_with_single_repair(
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
+        output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
         output_unit.set_complete();
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
             output_unit,
         };
@@ -871,7 +899,15 @@ async fn execute_wire_with_single_repair(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            repair_output_unit.append_response(&format!("VM wire error: {detail}"));
+            // The repaired attempt was rejected too: the raw diagnostic is
+            // still internal detail, not something a non-technical user can
+            // act on. Log it for debugging and show the plain-language
+            // fallback instead (#1383).
+            tracing::debug!(
+                diagnostic = %detail,
+                "repaired VM program still rejected (not shown in transcript)"
+            );
+            repair_output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -879,14 +915,19 @@ async fn execute_wire_with_single_repair(
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
-                response: detail,
+                response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
                 output_unit: repair_output_unit,
             }
         }
         Err(error) => {
-            let detail = format!("VM wire error: {error}");
-            repair_output_unit.append_response(&detail);
+            // Same rationale as above: the repaired program's own execution
+            // errored. Keep the raw error out of the transcript (#1383).
+            tracing::debug!(
+                error = %error,
+                "repaired VM program execution errored (not shown in transcript)"
+            );
+            repair_output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -894,7 +935,7 @@ async fn execute_wire_with_single_repair(
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
-                response: detail,
+                response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
                 output_unit: repair_output_unit,
             }
@@ -5075,6 +5116,112 @@ mod tests {
             .contains("must not run")));
     }
 
+    #[test]
+    fn test_repairable_rejection_diagnostic_reaches_debug_log_not_transcript() {
+        // #1383: before this fix, a repairable rejection's raw compiler-style
+        // diagnostic (`VM wire error: error[E-WIRE-002]: ...`, with its
+        // `file:line`, `error[...]` code, and `phase:` field) was appended to
+        // the user-facing transcript before the eventually-successful
+        // repaired response ever arrived -- exactly the leak the issue
+        // reported. Same production-boundary reproduction as
+        // `fenced_wire_response_is_repaired_once_without_executing_its_body`,
+        // wrapped in a tracing capture: the raw diagnostic must reach
+        // `tracing::debug!` and must never reach the transcript, while the
+        // final repaired text still does.
+        #[derive(Clone)]
+        struct SharedLogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedLogBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+            type Writer = SharedLogBuffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let buffer = SharedLogBuffer(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buffer.clone())
+            .finish();
+
+        let (execution, messages) = tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                let runtime = crate::runtime::ProgramRuntime::new();
+                let output = Arc::new(OutputManager::default());
+                output.disable_stdout();
+                let generator = Arc::new(SingleRepairGenerator {
+                    calls: AtomicUsize::new(0),
+                });
+                let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+                let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+                let execution = execute_wire_with_single_repair(
+                    &runtime,
+                    Arc::clone(&output),
+                    event_tx,
+                    tokio_util::sync::CancellationToken::new(),
+                    generator,
+                    &[crate::providers::Message::user("reply")],
+                    source,
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                    &ToolCallHistory::default(),
+                )
+                .await;
+                let messages = output.get_messages();
+                (execution, messages)
+            })
+        });
+
+        let rendered: Vec<String> = messages
+            .iter()
+            .map(|message| message.format(&crate::theme::ColorScheme::default()))
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("VM wire error") && !line.contains("E-WIRE-002")),
+            "invariant: the raw wire diagnostic must never reach the user-facing \
+             transcript for a repairable rejection (#1383); rendered={rendered:?}"
+        );
+        assert_eq!(
+            execution.response, "repaired",
+            "the final, successfully-repaired response must still reach the caller \
+             even though the pre-repair diagnostic is suppressed"
+        );
+
+        let log = String::from_utf8(
+            buffer
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("captured log is valid utf-8");
+        assert!(
+            log.contains("VM wire error triggering a repair round") && log.contains("E-WIRE-002"),
+            "invariant: the raw diagnostic that triggered the repair round must still be \
+             observable in the debug log, just not the transcript; log={log:?}"
+        );
+    }
+
     #[tokio::test]
     async fn leading_inline_mention_then_a_later_real_fence_is_rejected_not_executed_corrupted() {
         // Full production-boundary reproduction of the reported bug: a
@@ -5550,12 +5697,29 @@ mod tests {
             row.default_open,
             "invariant: failures remain expanded and actionable; row={row:?}"
         );
+        // #1383: the source is repairable (E-WIRE-002), so a repair round
+        // would have fired had the turn not been cancelled first -- the raw
+        // compiler-style diagnostic must never reach the transcript for that
+        // case, only the plain-language fallback.
+        assert!(
+            !row.body
+                .iter()
+                .any(|line| line.contains("VM wire error") || line.contains("E-WIRE-002"))
+                && !execution.output_unit.content().contains("E-WIRE-002"),
+            "invariant: the raw wire diagnostic must never reach the transcript for a \
+             repairable rejection (#1383); row={row:?}; content={:?}",
+            execution.output_unit.content()
+        );
         assert!(
             row.body
                 .iter()
-                .any(|line| line.contains("VM wire error") || line.contains("E-WIRE-002"))
-                || execution.output_unit.content().contains("E-WIRE-002"),
-            "invariant: the diagnostic remains on the failed row; row={row:?}; content={:?}",
+                .any(|line| line.contains(WIRE_REPAIR_FAILED_MESSAGE))
+                || execution
+                    .output_unit
+                    .content()
+                    .contains(WIRE_REPAIR_FAILED_MESSAGE),
+            "invariant: a repairable rejection that never got to retry (cancelled first) \
+             still shows the plain-language fallback; row={row:?}; content={:?}",
             execution.output_unit.content()
         );
         assert!(
@@ -5594,7 +5758,12 @@ mod tests {
 
         assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
         assert_eq!(execution.source_for_history, source);
-        assert!(execution.response.contains("E-WIRE-002"));
+        // #1383: the raw diagnostic no longer surfaces in `response` either --
+        // it goes to tracing::debug! only. The plain-language fallback is
+        // what a caller of `response` (transcript, `finch query`, peer IPC)
+        // actually receives.
+        assert_eq!(execution.response, WIRE_REPAIR_FAILED_MESSAGE);
+        assert!(!execution.response.contains("E-WIRE-002"));
     }
 
     #[tokio::test]
@@ -5641,7 +5810,10 @@ mod tests {
 
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
         assert_eq!(execution.source_for_history, source);
-        assert!(execution.response.contains("E-WIRE-002"));
+        // #1383: cancellation mid-repair is itself a "repair failed" outcome
+        // -- the plain-language fallback replaces the raw diagnostic here too.
+        assert_eq!(execution.response, WIRE_REPAIR_FAILED_MESSAGE);
+        assert!(!execution.response.contains("E-WIRE-002"));
         assert!(event_rx.try_recv().is_err(), "no repaired VM continuation");
         assert!(output.get_messages().iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
