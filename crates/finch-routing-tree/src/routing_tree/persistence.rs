@@ -226,6 +226,34 @@ pub fn load_routing_tree(
         removed_flag.push(removed);
     }
 
+    // Every persisted embedding was written by the same fixed `dim` this store was built and
+    // split under (`RoutingTree::insert` never validates `point.len()` against `self.dim` itself
+    // -- see `RoutingTree::insert`'s own doc). A caller reopening this store with a DIFFERENT
+    // `dim` (the composition root's embedding engine changed since the store was built -- e.g.
+    // Finch deliberately downloads a neural embedding model in the background "for the next
+    // restart", swapping the hashed-n-gram fallback for it on a later run against the SAME
+    // on-disk store) must be refused here, before any node or membership is touched: this
+    // function's own replay-descent below only ever compares a node's persisted `anchor`/
+    // `direction` against that SAME store's persisted embeddings, so it stays internally
+    // consistent and would not itself catch a `dim` mismatch -- the resulting tree's `self.dim`
+    // field would simply stop matching every persisted node's `real_centroid` and every persisted
+    // decision node's `anchor`/`direction`, and the next real insert would index one of those
+    // shorter, persisted arrays with `self.dim` and panic (issue #1384: "index out of bounds: the
+    // len is 0 but the index is 0" at this crate's `routing_tree.rs:181`, `projection`, reached
+    // from a background hydration/indexing worker -- `insert_into`'s own `real_centroid` update
+    // loop, which runs on every visited node before `projection` is ever reached, panics the same
+    // way for other old/new dimension combinations).
+    if let Some(first) = points.first() {
+        anyhow::ensure!(
+            first.len() == dim,
+            "load_routing_tree: this store's persisted embeddings are {}-dimensional, but the \
+             caller's embedding engine is {dim}-dimensional -- the embedding engine changed since \
+             this store was built; refusing to load a routing tree whose self.dim would not match \
+             its own persisted anchor/direction geometry (issue #1384)",
+            first.len()
+        );
+    }
+
     // Node structure.
     let mut node_stmt = conn
         .prepare("SELECT node_id, parent_id, is_leaf, left_id, right_id, anchor, direction, split_at_global_count, real_centroid, real_count FROM routing_nodes ORDER BY node_id")
@@ -634,5 +662,92 @@ mod tests {
             "a removed point must not appear in reload metadata"
         );
         assert_eq!(metadata.len(), points.len() - 1);
+    }
+
+    /// Regression for issue #1384: "Startup panic in RoutingTree::projection on a fresh, empty
+    /// memory index (dimension-0 anchor/direction)".
+    ///
+    /// A store is built and split at one embedding dimension, then reloaded with a DIFFERENT
+    /// dimension -- exactly what happens across an ordinary `finch` restart in production once a
+    /// background-downloaded neural embedding model becomes available and
+    /// `select_memory_embedding_engine` switches away from the hashed-n-gram fallback it used to
+    /// build the existing store (`src/cli/repl.rs`'s own "for the *next* restart" comment: the
+    /// download deliberately does not apply mid-session, but the *next* session reopens the SAME
+    /// on-disk store under a different dimension).
+    ///
+    /// Before the fix, `load_routing_tree` accepted any caller-supplied `dim` unconditionally.
+    /// Hydration itself does not touch `self.dim` -- the replay-descent it does only ever compares
+    /// a node's persisted `anchor`/`direction` against that same store's own persisted embeddings,
+    /// so it stayed internally consistent and returned `Ok` even though the resulting tree's
+    /// `self.dim` field no longer matched its own persisted node geometry (`anchor`/`direction`,
+    /// AND every node's `real_centroid`, all persisted at the OLD dimension). The panic only
+    /// surfaced on the NEXT real insert: `insert_into` indexes every visited node's persisted
+    /// `real_centroid` by `self.dim` before it ever reaches a decision node's `anchor`/`direction`
+    /// via `projection`, so which of the two panics first (`insert_into`, `routing_tree.rs` around
+    /// its real_centroid update loop, or `projection`, `routing_tree.rs:181`) depends on the exact
+    /// old/new dimensions -- both are the same defect (a persisted per-node array whose length no
+    /// longer agrees with `self.dim`), and this test (a larger new `dim`) and #1384's original
+    /// report (a persisted length of 0) happen to hit different ones, verified live below.
+    ///
+    /// This test reproduces the real defect at the production boundary: real SQLite persistence, a
+    /// real split tree (`node_count() > 1` is asserted below so the test cannot pass vacuously
+    /// against a still-unsplit, single-leaf tree), and a real subsequent insert -- not a synthetic
+    /// unit call into `projection` with hand-built mismatched slices. Before the fix, the `Ok` arm
+    /// below is taken and its `insert` call panics, failing this test. After the fix,
+    /// `load_routing_tree` itself returns `Err` and the `Ok` arm -- the only place that could ever
+    /// panic -- is unreachable.
+    #[test]
+    fn test_reloading_a_store_at_a_different_embedding_dimension_never_panics_on_a_later_insert() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
+
+        // Session 1: build and persist a real, split tree at DIM.
+        let points = test_corpus(20);
+        let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
+        for (i, p) in points.iter().enumerate() {
+            let pid = tree.insert(p.clone());
+            assert_eq!(pid, i);
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
+        }
+        save_dirty_nodes(&mut tree, &conn).unwrap();
+        assert!(
+            tree.node_count() > 1,
+            "test setup: expected at least one real split (a decision node with real anchor/\
+             direction) before reloading at a different dimension, got node_count={} -- without a \
+             split this test would pass vacuously (nothing to route a mismatched insert through)",
+            tree.node_count()
+        );
+
+        // Session 2: reopen the SAME store with a LARGER dimension -- a real embedding engine
+        // change between restarts, the shape #1384's report traces back to.
+        let bigger_dim = DIM * 2;
+        match load_routing_tree(&conn, RoutingConfig::default(), bigger_dim, 7) {
+            Err(_) => {
+                // The fix: refused up front, before any node or membership was touched. Nothing
+                // was reloaded, so there is nothing left that could panic on insert -- this is the
+                // fixed behavior and the test is done.
+            }
+            Ok((mut reloaded, _)) => {
+                // Pre-fix (or if the dimension guard in `load_routing_tree` is ever weakened):
+                // `reloaded.dim` is `bigger_dim`, but every persisted node's `real_centroid` (and
+                // every persisted decision node's `anchor`/`direction`) is still `DIM` long. The
+                // root already split (asserted above), so this insert immediately visits it and
+                // panics -- `insert_into`'s real_centroid update loop reaches `self.dim` (32)
+                // against a `DIM`-long (16) persisted `real_centroid` before the descent even
+                // reaches `projection`, confirmed live: "index out of bounds: the len is 16 but
+                // the index is 16". The exact site (this loop vs. `projection`, `routing_tree.rs:
+                // 181`, #1384's own report) depends on the old/new dimensions -- both are the same
+                // defect this fix closes.
+                reloaded.insert(vec![0.5_f32; bigger_dim]);
+            }
+        }
     }
 }

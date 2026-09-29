@@ -48,6 +48,34 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
 - Load is atomic in shape: `load_routing_tree` either returns a fully linked tree or `Err`; there
   is no partial tree. What hydration *scheduling* (background, partial reads, degradation) looks
   like is the caller's lifecycle, not this crate's.
+- **Fixed (issue #1384):** `dim` is fixed for the life of a store, not just for the life of one
+  in-memory tree — `load_routing_tree` now rejects, with a named `Err`, a caller-supplied `dim`
+  that disagrees with the dimensionality of the embeddings that store was actually built and split
+  under (checked against the first loaded `routing_points` row). Before this, reopening an existing
+  store with a different `dim` than the session that built it (the real, reachable trigger: Finch's
+  own composition root deliberately swaps the hashed-n-gram fallback for a neural embedding engine
+  on the *next restart* once a background download completes, against the SAME on-disk store —
+  `src/cli/repl.rs`'s own comment) silently produced a tree whose `self.dim` field no longer matched
+  its own persisted node geometry: every node's `real_centroid`, and every decision node's
+  `anchor`/`direction`, stayed at the OLD dimension. Hydration itself stayed internally consistent
+  (its replay-descent only ever compares a node's persisted data against that same store's own
+  persisted embeddings) and returned `Ok`, so the mismatch surfaced later and unpredictably: the
+  next real insert indexed one of those shorter, persisted per-node arrays with `self.dim` and
+  panicked — in `projection` (`routing_tree.rs:181`, the issue's own report) if it reached a
+  decision node, or earlier still in `insert_into`'s own `real_centroid` update loop (which runs on
+  every visited node, before `projection` is ever reached) for other old/new dimension
+  combinations — on whatever thread happened to be inserting at the time, a background
+  hydration/indexing worker in production. `RoutingTree::insert` itself still does not validate
+  `point.len()` against `self.dim` per-call (see its own doc comment) — the fix is at the tree's
+  construction boundary, not per-insert, since a consistent `dim` for a store's whole lifetime was
+  already the load-bearing (if previously unenforced) assumption every other invariant here
+  depends on. `test_reloading_a_store_at_a_different_embedding_dimension_never_panics_on_a_later_insert`
+  in `src/routing_tree/persistence.rs` reproduces the exact panic end-to-end (real persistence, a
+  real split tree, a real subsequent insert) and fails before this fix, not just against a
+  synthetic mismatched-slice call into `projection`; `crates/finch-memory`'s own
+  `test_hydrating_a_store_built_at_a_different_embedding_dimension_settles_failed_not_stuck`
+  covers the same defect through the real async hydration path a background tokio worker uses in
+  production.
 - **Fixed (issue #1329):** `remove_point`'s two iterative parent-pointer walks (the primary
   root-leaf downdate and the dual-entry-to-divergence-node downdate) used to `.expect()` a
   missing parent and panic if `routing_nodes.parent_id` were ever corrupted on disk — dormant only
