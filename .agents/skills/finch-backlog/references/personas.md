@@ -139,3 +139,78 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   order, in this case) that the tests exercised only in isolated pieces — re-verify live before
   trusting a "fixed" issue closed again, especially for anything touching multi-step
   client/daemon sequencing.
+- **2026-09-29 (later that night)**: focused two-persona pass (Rin, Chen) specifically to
+  live-validate the newest fixes that landed after the full 8-persona pass above: the transcript
+  scroll-position indicator (#1252/#1412), the named-Brain VM-grant security narrowing (#1410),
+  the text-selection-reselect fix, the local-model-crash-after-tool-call fix, and a re-check that
+  the fresh-Brain workspace-mismatch fix (#1381/#1400) still holds. Caught mid-run that the local
+  `main` checkout was one commit behind `origin/main` — the scroll-indicator PR (#1412) had merged
+  minutes into the session — so the first build under-tested it; pulled and rebuilt
+  (`e320bb5d`) before drawing any conclusion, which is itself worth flagging: a build kicked off
+  at session start can go stale if a fix lands mid-session, so re-check `git fetch`/`origin/main`
+  before trusting a "not present" finding on a long-running pass.
+  **Held up, confirmed live:**
+  - Fresh-Brain workspace correctness (#1381/#1400): both personas' brains showed the correct
+    cwd-derived workspace from the very first message, no mismatch banner, across two fresh named
+    Brains (`misty-ford-07f72e`, `quiet-moor-45672f`) and two more spun up mid-pass.
+  - Local-model crash after a tool call: reproduced the exact scenario (local-gemma-2-9b calls a
+    tool, then the continuation round) four separate times across both personas' sessions; every
+    time it returned the clean `"Local models don't yet support continuing a conversation after a
+    tool call (#1228); try a cloud provider for tool-using turns."` 500 response instead of
+    crashing or leaking a raw error. Matches the documented fix framing exactly (turns a hard
+    crash into a named, already-tracked gap).
+  - Named-Brain tool-call round followed by a text-only round (the `tool_work_unit` clear fix):
+    ran a tool-using round then an explicit "no tools, just say hi" round on the same Brain
+    (`quiet-moor-45672f`) — completed cleanly, no stuck "running" tool row, no leftover
+    work-unit indicator.
+  - Background bash task: launched via plain conversational request, completed and wrote its
+    expected output file (`/tmp/finch-persona-chen/bg_task.log` contained `background done`) —
+    functioned correctly end-to-end.
+  - Scroll-position indicator (#1252/#1412) itself: confirmed working correctly across four
+    independent, deliberately-varied fresh sessions and multiple widths — 100 cols (`"↑ 17 more
+    above · ↓ 32 more below"`), 60 cols (correctly shrinks/ellipsizes: `"↑ 26 more above ·…"`),
+    and 40 cols (correctly drops entirely, leaving identity the full width, exactly as documented
+    — identity keeps priority over the hint on a narrow terminal). Also confirmed it survives a
+    live resize and a mid-flight provider switch (the same `/model`/`/providers`/`/provider`
+    sequence that produced a "could not be persisted" warning) without misbehaving.
+  - VM-grant security narrowing (#1410): not isolated with a dedicated adversarial test, but every
+    tool call across both personas' many named-Brain turns (which all go through the fixed
+    `dispatch_named_brain_run` path) correctly re-prompted for approval rather than silently
+    reusing an earlier grant — consistent with, not a substitute for, the fix's own regression
+    test.
+  **One anomaly, investigated but NOT filed (no clean repro):** the scroll-position hint never
+  appeared in exactly one session (`misty-ford-07f72e`, Rin's very first session of the pass),
+  reproducibly within that session across repeated PageUp presses and even after a live resize,
+  despite the transcript visibly scrolling (different numbered items came into view) and `offset()`
+  clearly nonzero. Tried to isolate the trigger — fresh session, fresh session with the same
+  #1228 failure + provider switch, fresh session with a resize, fresh session with the exact
+  mid-flight `/model`/`/providers`/`/provider`-during-an-active-query sequence that produced the
+  "could not be persisted" warning in the original — and the hint appeared correctly in every one
+  of those four deliberate reproduction attempts. Given the bar for filing is a clean, reproducible
+  repro and this one only reproduces inside one specific, heavily-interacted-with session whose
+  exact triggering state couldn't be isolated, this is recorded here as a maybe-real, low-confidence
+  lead rather than filed as an issue — worth another look if a future pass hits the same
+  no-hint-while-clearly-scrolled symptom, since a second independent occurrence would raise
+  confidence a lot.
+  **Also observed, not filed (pre-existing environmental condition, not a new regression):**
+  every Brain touched this pass showed `"recalled 0 · index did not finish loading"` for its whole
+  session, and the daemon log showed a permanent per-Brain `MemTree hydration failed` state
+  (`"the MemTree loader ended without finishing"`) recurring every ~10s indefinitely once
+  triggered. Traced this to the already-shipped #1384/#1398 fail-closed fix (refuses writes on an
+  embedding-dimension mismatch instead of panicking) — this dev daemon's on-disk memory store has
+  clearly been rebuilt across multiple different embedding engines over many days of testing, so
+  the fail-closed path is firing as designed, not a new bug. Confirmed it is environment-wide, not
+  specific to a fresh Brain: a brand-new Brain with nothing in its own history hit it too. The
+  10-second-forever retry with no backoff once a run's memory projection is permanently `Failed`
+  for the process's lifetime is mildly wasteful log spam, but out of scope for this pass's five
+  target fixes — flagging here rather than filing a new ticket for it.
+  **spawn_task on local-gemma-2-9b**: the 9B local model could not reliably emit a well-formed
+  Finch wire tool-call for `spawn_task` (emitted a raw XML `<tool_use>` block instead of the
+  expected Forth program, got the wire-repair prompt, then gave up with an empty code fence) — a
+  model-capability limitation consistent with CLAUDE.md's own "local routing and provider parity
+  remain experimental" framing (#74/#98), not something to file. `spawn_task` and
+  `background_bash` are also confirmed absent from the Claude CLI Subscription provider's own
+  restricted MCP bridge tool list (`src/cli/claude_cli_bridge.rs`'s `register_tool_schemas` only
+  registers Bash/Edit/Glob/Grep/Read/Write) — consistent with the prior pass's note that this is
+  intentional subprocess scoping, not a gap.
+  **Net result: no new issues filed.** All five targeted fixes held up under live re-testing.
