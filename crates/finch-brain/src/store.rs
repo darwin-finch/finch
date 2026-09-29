@@ -968,12 +968,43 @@ impl BrainStore {
         name: &str,
         selection: BrainProviderSelection,
     ) -> Result<BrainProviderSelection> {
+        self.set_provider_selection_for_client(name, selection, None)
+    }
+
+    /// Same as [`Self::set_provider_selection`], but when `requesting_workspace`
+    /// is supplied and this is the very first time `name`'s metadata is
+    /// created, that workspace becomes the Brain's own recorded canonical
+    /// workspace instead of this store's daemon-wide default (issue #1381,
+    /// second creation path).
+    ///
+    /// [`Self::snapshot_for_client`] closed the *first* place a fresh Brain's
+    /// metadata could be created without knowing the requesting client's cwd
+    /// (the Cap'n Proto `snapshot` RPC `register_home_brain` calls). This is
+    /// the *second*, independent creation path: `EventLoop::run`'s startup
+    /// sequence calls `hydrate_brain_selection` (which can persist an
+    /// inherited default provider selection for a genuinely new Brain, over
+    /// the HTTP `PUT /v1/brains/named/:name/selection` route) *before*
+    /// `register_home_brain` ever runs. Before this fix, that earlier call
+    /// created the Brain's metadata first, with the daemon's own default
+    /// workspace baked in — Brain creation is a first-write-wins operation
+    /// (`load_or_create_metadata_unlocked` never revisits an existing file),
+    /// so by the time `register_home_brain`'s already-fixed call ran, the
+    /// Brain "already existed" and its wrong workspace was never corrected.
+    /// Both creation paths must independently carry the requesting client's
+    /// cwd, since whichever one happens to run first for a given Brain name
+    /// is the one that determines its workspace forever.
+    pub fn set_provider_selection_for_client(
+        &self,
+        name: &str,
+        selection: BrainProviderSelection,
+        requesting_workspace: Option<&std::path::Path>,
+    ) -> Result<BrainProviderSelection> {
         let name = Self::validate_name(name)?;
         let metadata_lock = self.metadata_lock(name);
         let _metadata_guard = metadata_lock
             .lock()
             .expect("shared Brain metadata lock poisoned");
-        let mut metadata = self.load_or_create_metadata_unlocked(name, None)?;
+        let mut metadata = self.load_or_create_metadata_unlocked(name, requesting_workspace)?;
         metadata.selection = selection;
         self.write_metadata(name, &metadata)?;
         Ok(metadata.selection)

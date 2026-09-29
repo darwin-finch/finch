@@ -54,6 +54,32 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
   `test_brain_created_through_real_ipc_records_creating_clients_cwd_not_daemon_launch_cwd` in
   `src/server/ipc/tests.rs` (root crate), which drives a real `IpcClient` against a real
   `BrainRpcService` over an actual Cap'n Proto `UnixStream` pair.
+- **`BrainStore::snapshot_for_client` is not the only first-touch Brain-creation path — every one
+  of them must independently carry the requesting client's cwd, or whichever runs first for a
+  given Brain name wins the race and the others are silently moot (#1381, found live after the
+  fix above shipped and still reproduced).** `BrainStore::set_provider_selection_for_client` is
+  the second: the root crate's `EventLoop::run` startup sequence calls `hydrate_brain_selection`
+  (which can persist an inherited default provider selection for a genuinely new Brain, over the
+  HTTP `PUT /v1/brains/named/:name/selection` route) *before* `register_home_brain`'s
+  already-fixed Cap'n Proto `snapshot` call ever runs. Brain-metadata creation is first-write-wins
+  (`load_or_create_metadata_unlocked` never revisits an existing file), so the earlier,
+  unfixed-at-the-time write baked in the daemon's own default workspace, and the later, correctly
+  workspace-aware `snapshot_for_client` call found the Brain "already existed" and never corrected
+  it — exactly the original bug, reintroduced through a sibling path the first fix never touched.
+  `set_provider_selection` is now a thin `set_provider_selection_for_client(name, selection, None)`
+  wrapper, mirroring `snapshot`/`snapshot_for_client`'s own shape; the root crate's HTTP layer
+  carries the caller's cwd as the `x-finch-workspace` request header (not a field on
+  `BrainProviderSelection` itself, which is also the persisted `metadata.selection` value and
+  should not carry an unrelated concern). Covered by
+  `set_provider_selection_for_client_records_the_requesting_workspace_on_first_creation`,
+  `set_provider_selection_for_client_never_overwrites_an_existing_brains_workspace`, and
+  `either_creation_path_running_first_records_the_requesting_workspace` (this file's own
+  `store/tests.rs`), plus `requesting_workspace_header_parses_present_value_and_treats_absent_or_empty_as_none`
+  in `src/server/handlers/handler_tests.rs` (root crate). Before trusting any future "fixed" claim
+  about this invariant, grep for every caller of `load_or_create_metadata`/
+  `load_or_create_metadata_unlocked` and confirm each one that can be a Brain's *first* touch has a
+  `requesting_workspace`-aware entry point reachable from wherever the real client's cwd is known —
+  this bug shipped twice because the first fix addressed one call site instead of the invariant.
 - **A caller comparing `BrainEnvironment`s to gate runner-lease acquisition, handoff acceptance,
   or submission readiness must use `BrainEnvironment::same_host_identity` (machine + generation),
   never `==` (whole-struct, includes `workspace`).** Before the #1381 per-Brain-workspace fix

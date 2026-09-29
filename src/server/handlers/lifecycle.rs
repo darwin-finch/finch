@@ -180,6 +180,29 @@ pub(super) async fn get_named_brain_selection(
         .map_err(|error| AppError(error).into_response())
 }
 
+/// Carries the requesting client's own cwd on `PUT /v1/brains/named/:name/selection`
+/// so a Brain first created through this route (issue #1381, second creation
+/// path: `EventLoop::hydrate_brain_selection` can persist an inherited
+/// default selection for a brand-new Brain before `register_home_brain`'s
+/// own Cap'n Proto `snapshot` call ever runs) still records its creating
+/// client's real cwd, not this daemon's own launch-time default. Not part of
+/// `BrainProviderSelection` itself: that type is also the persisted
+/// `metadata.selection` value and the workspace is a separate concern.
+/// Absent or unparseable means "no override", matching every other
+/// already-shipped caller of this route.
+const X_FINCH_WORKSPACE_HEADER: &str = "x-finch-workspace";
+
+/// Extracted so the header-parsing rule (absent, empty, or non-UTF-8 all
+/// mean "no override") is directly unit-testable without standing up a real
+/// `AgentServer`/axum extractor stack.
+pub(super) fn requesting_workspace_from_headers(headers: &HeaderMap) -> Option<std::path::PathBuf> {
+    headers
+        .get(X_FINCH_WORKSPACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub(super) async fn put_named_brain_selection(
     State(server): State<Arc<AgentServer>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -194,6 +217,7 @@ pub(super) async fn put_named_brain_selection(
         ))
         .into_response());
     }
+    let requesting_workspace = requesting_workspace_from_headers(&headers);
     let selection_lock = server
         .brain_store()
         .execution_lock(&name)
@@ -201,7 +225,7 @@ pub(super) async fn put_named_brain_selection(
     let _selection_write = selection_lock.lock_owned().await;
     server
         .brain_store()
-        .set_provider_selection(&name, selection)
+        .set_provider_selection_for_client(&name, selection, requesting_workspace.as_deref())
         .map(Json)
         .map_err(|error| AppError(error).into_response())
 }

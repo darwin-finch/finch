@@ -1795,6 +1795,46 @@ async fn prompt_submission_reaches_running_when_the_brains_own_workspace_differs
     );
 }
 
+/// #1381, second creation path: the `x-finch-workspace` header on
+/// `PUT /v1/brains/named/:name/selection` is what lets a Brain first
+/// created through `EventLoop::hydrate_brain_selection` (which can persist
+/// an inherited default provider selection before `register_home_brain`'s
+/// own Cap'n Proto `snapshot` call ever runs) still record its creating
+/// client's real cwd. Absent, empty, or non-UTF-8 must all mean "no
+/// override" — the pre-#1381-second-path behavior for every existing
+/// caller of this route that never sends the header at all.
+#[test]
+fn requesting_workspace_header_parses_present_value_and_treats_absent_or_empty_as_none() {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    let mut present = HeaderMap::new();
+    present.insert(
+        "x-finch-workspace",
+        HeaderValue::from_static("/Users/example/project"),
+    );
+    assert_eq!(
+        lifecycle::requesting_workspace_from_headers(&present),
+        Some(std::path::PathBuf::from("/Users/example/project")),
+        "a present, non-empty header value must parse into an override path"
+    );
+
+    let absent = HeaderMap::new();
+    assert_eq!(
+        lifecycle::requesting_workspace_from_headers(&absent),
+        None,
+        "no header at all — every pre-#1381-second-path caller — must mean no override, \
+         not a spurious empty-path override"
+    );
+
+    let mut empty = HeaderMap::new();
+    empty.insert("x-finch-workspace", HeaderValue::from_static(""));
+    assert_eq!(
+        lifecycle::requesting_workspace_from_headers(&empty),
+        None,
+        "an empty header value must mean no override, not an override to the empty path"
+    );
+}
+
 #[tokio::test]
 async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_sequence() {
     let temp = tempfile::tempdir().unwrap();
