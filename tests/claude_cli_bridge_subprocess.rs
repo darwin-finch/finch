@@ -211,6 +211,205 @@ async fn a_real_second_process_forwards_a_tools_call_to_the_real_permission_and_
 }
 
 #[tokio::test]
+async fn two_pipelined_tools_call_requests_on_stdin_are_still_answered_correctly_one_at_a_time() {
+    // Issue #1351: does the real bridge subprocess deadlock, drop a call, or
+    // cross-talk between two calls if its own stdin already holds a *second*
+    // `tools/call` line before it has replied to the first -- the shape a
+    // real `claude` CLI's MCP client would produce if it ever pipelined two
+    // requests for a "parallel" tool-calling turn instead of waiting for
+    // each reply before sending the next.
+    //
+    // Live investigation (three separate turns against the real, logged-in
+    // `claude` CLI 2.1.284 -- one plain multi-file request, one explicitly
+    // asking for the reads to happen "in parallel", one asking for three
+    // independent `bash` commands "in parallel") found the real CLI's own
+    // MCP client never does this: every `tools/call` line arrived only
+    // *after* this bridge had already written the previous call's reply to
+    // stdout, even when the model's own narration said "in parallel" and
+    // even when the very next request arrived within single-digit
+    // milliseconds of that reply. See `crates/finch-providers/AGENTS.md`'s
+    // Claude CLI invariant block for the full finding.
+    //
+    // This test exists anyway, deterministically, because `run()`'s own
+    // stdin-processing loop (`src/cli/claude_cli_bridge.rs`) is what
+    // actually decides whether pipelined input would be handled correctly,
+    // regardless of whether the real CLI happens to produce it today: two
+    // requests are written back-to-back, with **no read of any reply in
+    // between**, before either is answered -- genuine pipelining pressure at
+    // the wire, not merely fast sequential dispatch. The bridge's own loop
+    // fully awaits one `tools/call`'s socket round trip (including an
+    // artificial delay standing in for slow interactive approval) before
+    // ever reading the second line, so the second request simply waits,
+    // buffered, in the kernel pipe until the first is done -- no deadlock,
+    // no drop, and the two replies must still pair with their own requests,
+    // not each other's.
+    // `/tmp` directly, not `tempfile::tempdir()` (which resolves under
+    // `$TMPDIR`): `sockaddr_un.sun_path` is a short, fixed buffer and
+    // `$TMPDIR` -- especially under an isolated test harness's own longer
+    // per-test directory -- is frequently long enough on its own to blow the
+    // whole budget, exactly the reason `ClaudeCliProvider::bind_tool_socket`
+    // (`crates/finch-providers/src/claude_cli.rs`) hardcodes `/tmp` in
+    // production rather than using the platform temp dir.
+    let socket_path = std::path::PathBuf::from("/tmp").join(format!(
+        "finch-test-bridge-{}.sock",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .expect("bind the bridge socket exactly as ClaudeCliProvider does");
+
+    let frontend_task = tokio::spawn(async move {
+        // First connection: simulate slow, real interactive approval before
+        // replying, so any premature second request would have every chance
+        // to race ahead if the bridge were not genuinely sequential.
+        let (stream, _addr) = listener
+            .accept()
+            .await
+            .expect("accept the first pipelined tools/call connection");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read the first pipelined request");
+        let request_a: finch_providers::ClaudeCliBridgeToolRequest =
+            serde_json::from_str(line.trim()).expect("the first request must be well-formed");
+        assert_eq!(request_a.name, "read");
+        assert_eq!(request_a.input, serde_json::json!({"probe": "A"}));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut stream = reader.into_inner();
+        let mut payload = serde_json::to_string(&finch_providers::ClaudeCliBridgeToolResponse {
+            is_error: false,
+            content: "result-for-A".to_string(),
+        })
+        .unwrap();
+        payload.push('\n');
+        stream.write_all(payload.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Second connection: the bridge must not even attempt this until the
+        // first is fully answered -- proving the two calls were still
+        // processed one at a time despite arriving pipelined on stdin.
+        let (stream, _addr) = listener
+            .accept()
+            .await
+            .expect("accept the second pipelined tools/call connection");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read the second pipelined request");
+        let request_b: finch_providers::ClaudeCliBridgeToolRequest =
+            serde_json::from_str(line.trim()).expect("the second request must be well-formed");
+        assert_eq!(request_b.name, "read");
+        assert_eq!(
+            request_b.input,
+            serde_json::json!({"probe": "B"}),
+            "the second call's own input must not be confused with the first's"
+        );
+
+        let mut stream = reader.into_inner();
+        let mut payload = serde_json::to_string(&finch_providers::ClaudeCliBridgeToolResponse {
+            is_error: false,
+            content: "result-for-B".to_string(),
+        })
+        .unwrap();
+        payload.push('\n');
+        stream.write_all(payload.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let mut child = spawn_real_bridge(&socket_path);
+    let mut stdin = child.stdin.take().expect("bridge stdin");
+    let stdout = child.stdout.take().expect("bridge stdout");
+    let mut bridge_out = BufReader::new(stdout).lines();
+
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
+              \"params\":{\"protocolVersion\":\"2024-11-05\"}}\n",
+        )
+        .await
+        .expect("send initialize to the real bridge subprocess");
+    tokio::time::timeout(std::time::Duration::from_secs(10), bridge_out.next_line())
+        .await
+        .expect("the real bridge subprocess must answer initialize")
+        .expect("read the initialize response")
+        .expect("the real bridge subprocess must not close stdout after initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("send the initialized notification");
+
+    // The crux of the test: both `tools/call` requests are written back to
+    // back, with no intervening read of either reply -- real pipelining
+    // pressure on the bridge's own stdin, not just fast sequential dispatch.
+    let call_a = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "read", "arguments": {"probe": "A"}},
+    });
+    let call_b = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "read", "arguments": {"probe": "B"}},
+    });
+    stdin
+        .write_all(format!("{call_a}\n{call_b}\n").as_bytes())
+        .await
+        .expect("write both pipelined tools/call requests to the real bridge subprocess's stdin");
+
+    let reply_1 = tokio::time::timeout(std::time::Duration::from_secs(10), bridge_out.next_line())
+        .await
+        .expect("the real bridge subprocess must not deadlock on pipelined stdin input")
+        .expect("read the first reply")
+        .expect("the real bridge subprocess must not close stdout before answering");
+    let reply_2 = tokio::time::timeout(std::time::Duration::from_secs(10), bridge_out.next_line())
+        .await
+        .expect("the real bridge subprocess must answer the second pipelined request too")
+        .expect("read the second reply")
+        .expect("the real bridge subprocess must not close stdout before answering both");
+
+    let reply_1: serde_json::Value = serde_json::from_str(&reply_1).unwrap();
+    let reply_2: serde_json::Value = serde_json::from_str(&reply_2).unwrap();
+    assert_eq!(
+        reply_1["id"], 2,
+        "replies must come back in request order, correctly paired by id: {reply_1}"
+    );
+    assert_eq!(
+        reply_1["result"]["content"][0]["text"], "result-for-A",
+        "the first reply must carry the first call's own real result, not the second's: {reply_1}"
+    );
+    assert_eq!(
+        reply_2["id"], 3,
+        "replies must come back in request order, correctly paired by id: {reply_2}"
+    );
+    assert_eq!(
+        reply_2["result"]["content"][0]["text"], "result-for-B",
+        "the second reply must carry the second call's own real result, not the first's: {reply_2}"
+    );
+
+    frontend_task
+        .await
+        .expect("the frontend-side task must not panic");
+    drop(stdin);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .expect("the real bridge subprocess must exit cleanly once stdin closes")
+        .expect("wait for the real bridge subprocess");
+    assert!(
+        status.success(),
+        "the real bridge subprocess must exit 0 on a clean stdin close: {status}"
+    );
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
 async fn a_real_second_process_never_falls_back_to_local_execution_without_the_socket() {
     // Hostile configuration (issue #1341): if the bridge's own env is somehow
     // missing the socket path, the real subprocess must fail the call closed
