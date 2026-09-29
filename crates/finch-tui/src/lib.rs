@@ -8624,6 +8624,123 @@ mod tests {
         );
     }
 
+    /// #1248 continued: two prior investigations (PR #1267, PR #1359) proved
+    /// the *message-push* order into `OutputManager` is correct for a plain,
+    /// idle, non-queued streaming local-model turn -- `display_recalled_memories`
+    /// always runs before the deferred `pending_echo` write, with zero
+    /// `.await` between them, and `OutputManager::add_trait_message` pushes
+    /// onto a plain `Vec` in call order. Neither investigation exercised the
+    /// two rendering functions that actually turn that push order into
+    /// terminal bytes: `commit_complete_messages` (the canonical-commit
+    /// writer `flush_output_safe` calls) and `projected_scroll_union` /
+    /// `scroll_window_committed_source` (the full-viewport re-render that
+    /// `flush_output_safe` forces after *every* canonical commit, to keep a
+    /// scrolled reader's window anchored -- see the `#806, #897` comment
+    /// immediately before `redraw_full_viewport_inner(true)` in
+    /// `flush_output_safe`). This closes that gap: it stages a
+    /// `MemoryRecalledMessage` then a `UserQueryMessage` then an in-progress
+    /// `WorkUnit`, in the exact order `process_query_with_tools` pushes them
+    /// (`display_recalled_memories`, then `pending_echo`'s `write_user`,
+    /// then `start_work_unit`), and asserts the notice's byte offset
+    /// precedes the echo's byte offset in (a) the real bytes
+    /// `commit_complete_messages` stages for the terminal and (b) the line
+    /// order `projected_scroll_union` builds for the scroll-window
+    /// re-render -- both come back correct, so this rules out the entire
+    /// client-side rendering pipeline (push, plan, canonical write, and
+    /// scroll-window re-render) as the source of #1248's reported ordering.
+    #[test]
+    fn test_memory_notice_precedes_echo_in_both_canonical_bytes_and_scroll_union() {
+        use finch_messages::{MemoryRecallRow, MemoryRecalledMessage, WorkUnit};
+
+        let colors = ColorScheme::default();
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&manager),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+
+        // Same push order `process_query_with_tools` uses: recall notice,
+        // then the deferred echo, then the response WorkUnit (left
+        // in-progress here, matching a streaming turn still receiving
+        // deltas).
+        let notice = Arc::new(MemoryRecalledMessage::new(
+            "2 memories retrieved",
+            vec![MemoryRecallRow {
+                label: "recalled · score 0.71 · node 9".to_string(),
+                summary: "40 chars, sent raw".to_string(),
+                body_lines: vec!["user: prior turn".to_string()],
+            }],
+        ));
+        manager.add_trait_message(notice.clone() as MessageRef);
+        let echo = Arc::new(finch_messages::UserQueryMessage::new("hello gemma"));
+        manager.add_trait_message(echo.clone() as MessageRef);
+        let work = Arc::new(WorkUnit::new("Streaming"));
+        manager.add_trait_message(work.clone() as MessageRef);
+
+        // (a) The real bytes `commit_complete_messages` stages for the
+        // terminal -- the function `flush_output_safe` calls to commit
+        // `plan.emit` to native scrollback.
+        let messages = manager.get_messages();
+        let plan = plan_canonical_commit(&messages, &renderer.printed_ids);
+        assert_eq!(
+            plan.emit.len(),
+            2,
+            "only the two Complete messages ahead of the in-progress WorkUnit should be \
+             planned for commit; plan={:?}",
+            plan.emit.iter().map(|m| m.content()).collect::<Vec<_>>()
+        );
+        let mut staged = Vec::new();
+        commit_complete_messages(
+            &mut staged,
+            &plan.emit,
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("commit the notice and echo");
+        let staged_text = String::from_utf8(staged).expect("staged bytes are valid UTF-8");
+        let notice_byte = staged_text
+            .find("2 memories retrieved")
+            .expect("the recall notice must appear in the committed bytes");
+        let echo_byte = staged_text
+            .find("hello gemma")
+            .expect("the echoed question must appear in the committed bytes");
+        assert!(
+            notice_byte < echo_byte,
+            "the recall notice must precede the echoed question in the real committed \
+             terminal bytes (issue #1248) -- notice_byte={notice_byte}, echo_byte={echo_byte}, \
+             staged={staged_text:?}"
+        );
+
+        // (b) The scroll-window re-render `flush_output_safe` forces after
+        // every canonical commit (`redraw_full_viewport_inner(true)`, to
+        // keep a scrolled reader's window anchored) reads this same union.
+        // `renderer.printed_ids` now reflects the commit above, matching
+        // production timing (the re-render always runs after the commit).
+        let (union, _live_start) = renderer.projected_scroll_union(80);
+        let union_text = union
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notice_line = union_text
+            .find("2 memories retrieved")
+            .expect("the recall notice must appear in the scroll union");
+        let echo_line = union_text
+            .find("hello gemma")
+            .expect("the echoed question must appear in the scroll union");
+        assert!(
+            notice_line < echo_line,
+            "the recall notice must precede the echoed question in the scroll-window \
+             re-render's own line union (issue #1248) -- notice_line={notice_line}, \
+             echo_line={echo_line}, union={union_text:?}"
+        );
+    }
+
     #[test]
     fn test_redraw_predicate_triggers_when_dirty() {
         assert!(should_redraw_live_area(true));

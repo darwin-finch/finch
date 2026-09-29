@@ -219,6 +219,27 @@ release-on-first-wheel hybrid is retired, native history stays the copyable reco
 `canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
 the reader.
 
+**A message's relative order in `OutputManager::get_messages()` is preserved end to end, by
+every stage this crate owns (#1248).** `plan_canonical_commit` and `commit_complete_messages`
+(canonical-commit planning and the real bytes staged for the terminal) and
+`projected_scroll_union`/`scroll_window_committed_source` (the scroll-window re-render
+`flush_output_safe` forces after every canonical commit, per the #806/#897 anchoring above)
+all iterate the message slice in a single forward pass with no reordering step — each only
+*skips* an already-printed id or *stops* the whole remaining batch at the first in-progress
+message. The client-side "recall notice commits before its turn's echo" guarantee
+(`src/cli/repl_event/query_processor.rs`'s `display_recalled_memories` then the deferred
+`pending_echo` write, with zero `.await` between them — see that file for the full mechanism
+across the fresh-query, queued-turn, and streaming-local-model paths, #1194/#1242/#1248) relies
+on this: as long as the notice is pushed to `OutputManager` before its echo, this crate cannot
+reorder them, in the canonical bytes or in the scroll union. `test_memory_notice_precedes_echo_in_both_canonical_bytes_and_scroll_union`
+(`src/lib.rs`) pins both. #1248's live repro (recall notice appearing after the echo on a
+plain, idle, non-queued local-model streaming turn) remains open and unreproduced as of this
+writing — three independent investigations (test-only PRs #1267, #1359, and this one) traced
+message push order, the full production `EventLoop`/`LlmLoop` wiring, and now this crate's own
+canonical-commit and scroll-union rendering, and found the ordering correct at every layer.
+If it resurfaces, the remaining unaudited surface is genuine terminal/OS-scheduler timing
+against a real daemon SSE connection, not reproducible by any in-process fake generator.
+
 ## Click-drag transcript text selection (#221)
 
 Mouse capture is held by default (#806, above), so the terminal never gets a native click-drag
