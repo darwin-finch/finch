@@ -732,7 +732,10 @@ preserved_home="$(find "$temp_parent" -type d -name 'finch-brain-test-home.*' -p
 test -n "$preserved_home" && test -d "$preserved_home"
 rg -q 'process group was not quiescent' "$scratch/inspection.err"
 preserved_socket_root="$(sed -n 's/.*socket root at \([^ ]*\) because.*/\1/p' "$scratch/inspection.err")"
-[[ "$preserved_socket_root" == /private/tmp/ft.* || "$preserved_socket_root" == /tmp/ft.* ]]
+if [[ "$preserved_socket_root" != /private/tmp/ft.* && "$preserved_socket_root" != /tmp/ft.* ]]; then
+  echo "inspection-failure-preserves-home: preserved socket root did not match an expected temp prefix: ${preserved_socket_root:-<empty>}" >&2
+  exit 1
+fi
 test -d "$preserved_socket_root"
 rm -rf -- "$preserved_home"
 rm -rf -- "$preserved_socket_root"
@@ -1202,7 +1205,11 @@ scripts/test_tool_passthrough.sh
 scripts/test_tui_debug.sh
 EOF
 )"
-[[ "$script_inventory" == "$expected_script_inventory" ]]
+if [[ "$script_inventory" != "$expected_script_inventory" ]]; then
+  echo 'brain-entrypoint-inventory: scripts/*.sh matching brain|finch daemon|target/(debug|release)/finch|cargo test drifted from the maintained closure in expected_script_inventory' >&2
+  diff -u <(printf '%s\n' "$expected_script_inventory") <(printf '%s\n' "$script_inventory") >&2 || true
+  exit 1
+fi
 
 integration_inventory="$(
   cd "$repo_root"
@@ -1230,7 +1237,11 @@ tests/tui_scrollback_commit.rs
 tests/worker_integration_test.rs
 EOF
 )"
-[[ "$integration_inventory" == "$expected_integration_inventory" ]]
+if [[ "$integration_inventory" != "$expected_integration_inventory" ]]; then
+  echo 'brain-entrypoint-inventory: tests/*.rs matching brain|daemon|IpcClient drifted from the maintained closure in expected_integration_inventory' >&2
+  diff -u <(printf '%s\n' "$expected_integration_inventory") <(printf '%s\n' "$integration_inventory") >&2 || true
+  exit 1
+fi
 
 # Exercise the maintained HTTP launchers beyond their re-exec probe. The
 # synthetic Finch consumes inherited FD 11, records the exact sealed bind
@@ -1316,7 +1327,11 @@ src/daemon/spawn.rs:if nix::libc::setsid() == -1 {
 tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF
 )"
-[[ "$escape_uses" == "$expected_escape_uses" ]]
+if [[ "$escape_uses" != "$expected_escape_uses" ]]; then
+  echo 'escape-api-allowlist: setsid/setpgid/process_group/set -m usage drifted from the maintained allowlist in expected_escape_uses' >&2
+  diff -u <(printf '%s\n' "$expected_escape_uses") <(printf '%s\n' "$escape_uses") >&2 || true
+  exit 1
+fi
 
 # set -e is not inherited across a bash process boundary, so an inline child
 # interpreter started without errexit observes only its last command's status:
