@@ -236,11 +236,13 @@ pub fn load_routing_tree(
     // function's own replay-descent below only ever compares a node's persisted `anchor`/
     // `direction` against that SAME store's persisted embeddings, so it stays internally
     // consistent and would not itself catch a `dim` mismatch -- the resulting tree's `self.dim`
-    // field would simply stop matching its own persisted node geometry, and the next real insert
-    // through an existing decision node would index a shorter, persisted `anchor`/`direction`
-    // with a longer, newly-embedded point and panic in `projection` (issue #1384: "index out of
-    // bounds: the len is 0 but the index is 0" at this crate's `routing_tree.rs:181`, reached
-    // from a background hydration/indexing worker).
+    // field would simply stop matching every persisted node's `real_centroid` and every persisted
+    // decision node's `anchor`/`direction`, and the next real insert would index one of those
+    // shorter, persisted arrays with `self.dim` and panic (issue #1384: "index out of bounds: the
+    // len is 0 but the index is 0" at this crate's `routing_tree.rs:181`, `projection`, reached
+    // from a background hydration/indexing worker -- `insert_into`'s own `real_centroid` update
+    // loop, which runs on every visited node before `projection` is ever reached, panics the same
+    // way for other old/new dimension combinations).
     if let Some(first) = points.first() {
         anyhow::ensure!(
             first.len() == dim,
@@ -677,12 +679,15 @@ mod tests {
     /// Hydration itself does not touch `self.dim` -- the replay-descent it does only ever compares
     /// a node's persisted `anchor`/`direction` against that same store's own persisted embeddings,
     /// so it stayed internally consistent and returned `Ok` even though the resulting tree's
-    /// `self.dim` field no longer matched its own persisted node geometry. The panic only surfaced
-    /// on the NEXT real insert: a new, longer point descending into an existing decision node
-    /// indexed past the end of that node's shorter, persisted `anchor`/`direction` --
-    /// `index out of bounds` in `projection` (`routing_tree.rs:181`), matching #1384's report
-    /// exactly (there, the persisted axis had length 0; here, `DIM`, to reproduce deterministically
-    /// without depending on any particular historical store contents).
+    /// `self.dim` field no longer matched its own persisted node geometry (`anchor`/`direction`,
+    /// AND every node's `real_centroid`, all persisted at the OLD dimension). The panic only
+    /// surfaced on the NEXT real insert: `insert_into` indexes every visited node's persisted
+    /// `real_centroid` by `self.dim` before it ever reaches a decision node's `anchor`/`direction`
+    /// via `projection`, so which of the two panics first (`insert_into`, `routing_tree.rs` around
+    /// its real_centroid update loop, or `projection`, `routing_tree.rs:181`) depends on the exact
+    /// old/new dimensions -- both are the same defect (a persisted per-node array whose length no
+    /// longer agrees with `self.dim`), and this test (a larger new `dim`) and #1384's original
+    /// report (a persisted length of 0) happen to hit different ones, verified live below.
     ///
     /// This test reproduces the real defect at the production boundary: real SQLite persistence, a
     /// real split tree (`node_count() > 1` is asserted below so the test cannot pass vacuously
@@ -732,11 +737,15 @@ mod tests {
             }
             Ok((mut reloaded, _)) => {
                 // Pre-fix (or if the dimension guard in `load_routing_tree` is ever weakened):
-                // `reloaded.dim` is `bigger_dim`, but every persisted decision node's `anchor`/
-                // `direction` is still `DIM` long. The root already split (asserted above), so
-                // this insert immediately routes through it and panics in `projection` --
-                // `index out of bounds: the len is 16 but the index is 16` at
-                // `routing_tree.rs:181`, the exact defect class #1384 reports.
+                // `reloaded.dim` is `bigger_dim`, but every persisted node's `real_centroid` (and
+                // every persisted decision node's `anchor`/`direction`) is still `DIM` long. The
+                // root already split (asserted above), so this insert immediately visits it and
+                // panics -- `insert_into`'s real_centroid update loop reaches `self.dim` (32)
+                // against a `DIM`-long (16) persisted `real_centroid` before the descent even
+                // reaches `projection`, confirmed live: "index out of bounds: the len is 16 but
+                // the index is 16". The exact site (this loop vs. `projection`, `routing_tree.rs:
+                // 181`, #1384's own report) depends on the old/new dimensions -- both are the same
+                // defect this fix closes.
                 reloaded.insert(vec![0.5_f32; bigger_dim]);
             }
         }

@@ -56,12 +56,15 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
   own composition root deliberately swaps the hashed-n-gram fallback for a neural embedding engine
   on the *next restart* once a background download completes, against the SAME on-disk store —
   `src/cli/repl.rs`'s own comment) silently produced a tree whose `self.dim` field no longer matched
-  its own persisted `anchor`/`direction` geometry. Hydration itself stayed internally consistent
+  its own persisted node geometry: every node's `real_centroid`, and every decision node's
+  `anchor`/`direction`, stayed at the OLD dimension. Hydration itself stayed internally consistent
   (its replay-descent only ever compares a node's persisted data against that same store's own
   persisted embeddings) and returned `Ok`, so the mismatch surfaced later and unpredictably: the
-  next real insert reaching an existing decision node indexed past the end of its shorter,
-  persisted `anchor`/`direction` with a longer, newly-embedded point and panicked in `projection`
-  (`routing_tree.rs:181`) on whatever thread happened to be inserting at the time — a background
+  next real insert indexed one of those shorter, persisted per-node arrays with `self.dim` and
+  panicked — in `projection` (`routing_tree.rs:181`, the issue's own report) if it reached a
+  decision node, or earlier still in `insert_into`'s own `real_centroid` update loop (which runs on
+  every visited node, before `projection` is ever reached) for other old/new dimension
+  combinations — on whatever thread happened to be inserting at the time, a background
   hydration/indexing worker in production. `RoutingTree::insert` itself still does not validate
   `point.len()` against `self.dim` per-call (see its own doc comment) — the fix is at the tree's
   construction boundary, not per-insert, since a consistent `dim` for a store's whole lifetime was

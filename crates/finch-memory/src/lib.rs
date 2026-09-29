@@ -7368,12 +7368,14 @@ mod tests {
     ///
     /// Before the fix, `RoutingMemTree::load` (via `load_routing_tree`) accepted any caller-
     /// supplied `dim` unconditionally, so the reloaded tree's `self.dim` field silently stopped
-    /// matching its own persisted `anchor`/`direction` geometry. Hydration itself does not touch
-    /// `self.dim` (the replay-descent it does only ever compares a node's own persisted data
+    /// matching its own persisted node geometry (every node's `real_centroid`, and every decision
+    /// node's `anchor`/`direction`, all still at the OLD dimension). Hydration itself does not
+    /// touch `self.dim` (the replay-descent it does only ever compares a node's own persisted data
     /// against itself), so hydration used to complete "successfully" -- the actual panic waited
-    /// for the next real insert to route through an old decision node, which is why #1384 was hard
-    /// to pin to hydration alone. This test still asserts hydration's own outcome, since the fix
-    /// moves the failure earlier (into `load_routing_tree` itself, before any insert is possible).
+    /// for the next real insert to visit an existing node and index one of those shorter,
+    /// persisted arrays with the new `self.dim`, which is why #1384 was hard to pin to hydration
+    /// alone. This test still asserts hydration's own outcome, since the fix moves the failure
+    /// earlier (into `load_routing_tree` itself, before any insert is possible).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_hydrating_a_store_built_at_a_different_embedding_dimension_settles_failed_not_stuck(
     ) -> Result<()> {
