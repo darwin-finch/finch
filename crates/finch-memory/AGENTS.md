@@ -263,7 +263,12 @@ modules, including `memory_status`, are private.
   persisted. `LinkNextError::Conflict` there is logged and does NOT fail the call or roll back
   the transaction: the new occurrence and its point are still real and committed, only the
   backward link from `prev` did not win — `test_a_link_conflict_does_not_fail_or_corrupt_the_losing_turn`
-  in `lib.rs`. Retry-safety for a named-Brain turn needs no extra bookkeeping at the occurrence
+  in `lib.rs`. It is logged at `tracing::debug!`, never `warn!` or above: the finch binary's
+  `OutputManagerLayer` (`src/cli/output_layer.rs`, root crate) forwards every WARN/ERROR event
+  from a non-`finch::`-prefixed crate straight into the interactive transcript, unframed, and
+  this is a self-recovering, non-fatal outcome with nothing actionable for a user to see, not an
+  operational warning — `test_link_conflict_recovery_message_does_not_reach_a_warn_level_sink` in
+  `tests/link_conflict_observability_test.rs` (#1383). Retry-safety for a named-Brain turn needs no extra bookkeeping at the occurrence
   layer: the existing `already_classified` / deterministic-id short-circuit in
   `insert_conversation_record` already gates the entire projection (point AND occurrence
   together) on `conversation_id`, the same guarantee it already gave the point alone —

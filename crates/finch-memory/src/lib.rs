@@ -2340,7 +2340,17 @@ impl MemorySystem {
             match RoutingMemTree::link_next(&tx, prev_uuid, occurrence.uuid) {
                 Ok(()) => {}
                 Err(LinkNextError::Conflict(_)) => {
-                    tracing::warn!(
+                    // Self-recovering and non-fatal (the occurrence and its point are
+                    // still recorded; only the chain link is missing), so this is
+                    // debug-level diagnostic, not a warning. The finch binary's
+                    // `OutputManagerLayer` (src/cli/output_layer.rs) forwards every
+                    // `tracing::warn!`/`error!` from a non-`finch::`-prefixed crate
+                    // straight into the interactive transcript, unframed -- a
+                    // WARN here previously surfaced as raw internal detail
+                    // (`⚠️  [finch_memory] occurrence chain link lost a race...`) in
+                    // the ordinary conversation, with no distinction from Finch's own
+                    // reply (#1383).
+                    tracing::debug!(
                         prev = %prev_uuid,
                         next = %occurrence.uuid,
                         conversation_id,
