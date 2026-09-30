@@ -4134,6 +4134,175 @@ fn tool_approval_decision_renders_on_the_gated_tool_row_not_a_separate_section()
     );
 }
 
+/// Issue #1426: #439's fold-in only reached a row created by
+/// `project_remote_brain_run_event`'s own `RemoteBrainRunProjection` -- the
+/// row keyed by `tool_rows`/correlated through `locally_rendered_tool_ids`.
+/// A plain home-session tool call needing approval (the single most common
+/// scenario: `?tools require confirmation`, an ordinary interactive `write`)
+/// is never drawn through that function at all. It is drawn directly by
+/// `dispatch_tool_uses`'s `active_tool_uses` row and completed by
+/// `EventLoop::handle_tool_result` (tools.rs) -- a completely different
+/// mechanism #439's own regression test never exercised, since that test
+/// fed events straight into `project_remote_brain_run_event`.
+///
+/// This test drives the real production boundary instead: a real
+/// `ConversationHistory::stage_assistant` round, `EventLoop::
+/// handle_tool_approval_request` (opens the real dialog), `EventLoop::
+/// resolve_dialog_result` (answers it, exactly as `DialogResult` delivery
+/// does in production), and `EventLoop::handle_tool_result` (completes the
+/// row, exactly as the real tool-execution task's `ReplEvent::ToolResult`
+/// does). Before the fix, the decision is computed and sent to unblock the
+/// tool but never reaches the row at all; the row's own rendered content
+/// carries no trace of who approved it or how.
+#[tokio::test]
+async fn home_session_tool_approval_decision_renders_on_its_own_row_not_nowhere() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            // Default mode is Normal -- a real dialog, no AutoAccept short-circuit.
+
+            let query_id = uuid::Uuid::new_v4();
+            let tool_use = crate::tools::ToolUse::new(
+                "write".to_string(),
+                serde_json::json!({"file_path": "notes.txt", "content": "hello"}),
+            );
+            let tool_id = tool_use.id.clone();
+
+            // Stage the real conversation round the way `dispatch_tool_uses`
+            // does, so `handle_tool_result`'s own `record_tool_result` call
+            // succeeds instead of hitting the "discarded after closed tool
+            // round" fallback.
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::providers::Message {
+                        role: "assistant".into(),
+                        content: vec![crate::providers::ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: tool_use.name.clone(),
+                            input: tool_use.input.clone(),
+                        }],
+                    },
+                )
+                .expect("stage the real tool round");
+
+            // Draw the real row the way `dispatch_tool_uses` does: one
+            // WorkUnit shared by every tool call in the turn, one row for
+            // this call, tracked in `active_tool_uses` by tool_id.
+            use crate::cli::repl_event::tool_display::format_tool_label;
+            let work_unit = event_loop.output_manager.start_work_unit("Tools");
+            let row_idx = work_unit.add_row(format_tool_label(&tool_use.name, &tool_use.input));
+            event_loop.active_tool_uses.write().await.insert(
+                tool_id.clone(),
+                (
+                    tool_use.name.clone(),
+                    tool_use.input.clone(),
+                    Arc::clone(&work_unit),
+                    row_idx,
+                ),
+            );
+
+            // Request approval -- opens the real dialog (Normal mode).
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_tool_approval_request(query_id, tool_use.clone(), Vec::new(), response_tx)
+                .await
+                .expect("tool approval request must be accepted");
+            assert!(
+                event_loop.tui_renderer.lock().await.active_dialog.is_some(),
+                "Normal mode must show a real approval dialog for this write"
+            );
+
+            // Answer it: "1. Yes" (index 0), exactly as a real user approving
+            // once from the compact dialog would.
+            event_loop
+                .resolve_dialog_result(crate::cli::tui::DialogResult::Selected(0))
+                .await
+                .expect("resolving the dialog result must succeed");
+
+            let confirmation = response_rx
+                .await
+                .expect("the tool execution task must receive the real confirmation");
+            assert!(
+                matches!(
+                    confirmation,
+                    crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+                ),
+                "expected ApproveOnce for a plain 'Yes'; got {confirmation:?}"
+            );
+
+            // Complete the row exactly as the real tool-execution task's
+            // `ReplEvent::ToolResult` handling does.
+            event_loop
+                .handle_tool_result(
+                    query_id,
+                    round_token,
+                    tool_id.clone(),
+                    Ok("wrote 5 bytes to notes.txt".to_string()),
+                )
+                .await
+                .expect("handle_tool_result must succeed");
+
+            assert!(
+                !event_loop
+                    .active_tool_uses
+                    .read()
+                    .await
+                    .contains_key(&tool_id),
+                "the completed row must be removed from active_tool_uses"
+            );
+
+            let projected = crate::cli::test_projection::try_project_for_test(
+                work_unit.as_ref(),
+                &crate::theme::ColorScheme::default(),
+            )
+            .unwrap();
+            let dump = format!("{projected:#?}");
+
+            // Exactly one row for this call -- no second, separately
+            // correlated "approval <tool_id>" row anywhere (the pre-#439,
+            // and still-current-for-this-path, shape #1426 reports).
+            assert_eq!(
+                projected.children.len(),
+                1,
+                "the write call must be the only row in its Tools group, no \
+                 separate approval row: {dump}"
+            );
+            assert!(
+                !projected
+                    .children
+                    .iter()
+                    .any(|row| row.label.starts_with("approval")),
+                "an approval must not render as its own row, separately \
+                 correlated by id to the tool call it gates: {dump}"
+            );
+
+            // The call's own row must carry who approved it and how.
+            let call_row = &projected.children[0];
+            assert!(
+                call_row.label.contains("write"),
+                "the only row must be the write call itself: {dump}"
+            );
+            let call_body: String = call_row
+                .children
+                .iter()
+                .flat_map(|child| child.body.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expected_decision = format!("approve_once by {}", event_loop.participant_subject);
+            assert!(
+                call_body.contains(&expected_decision),
+                "the write call's own row must show who approved it and how \
+                 ({expected_decision:?}): {dump}"
+            );
+        })
+        .await;
+}
+
 #[test]
 fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
     use crate::brain::{
