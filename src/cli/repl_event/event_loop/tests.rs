@@ -6757,7 +6757,6 @@ async fn test_mode_indicator_planning_executor_restricts_write_instead_of_waivin
             None,           // plan_content
             None,           // live_output
             None,           // effect_audit
-            None,           // grant_ceiling
         )
         .await
         .expect("planning restriction returns ToolResult, not a transport error");
@@ -8953,7 +8952,6 @@ async fn test_auto_accept_executor_allows_write() {
             None,              // plan_content
             None,              // live_output
             None,              // effect_audit
-            None,              // grant_ceiling
         )
         .await
         .expect("auto-accept write returns ToolResult");
@@ -9213,7 +9211,6 @@ async fn test_auto_accept_does_not_waive_permission_deny() {
             None,              // plan_content
             None,              // live_output
             None,              // effect_audit
-            None,              // grant_ceiling
         )
         .await
         .expect("deny returns ToolResult");

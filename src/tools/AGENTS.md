@@ -49,13 +49,13 @@ timeout, disconnect, retry, and late-result-after-terminal must not admit anothe
 append another result. Generators and provider adapters must not import or invoke `ToolExecutor`
 themselves.
 
-**Provider-native `submit_program` inherits the query's authority ceiling.** `ToolExecutor` copies
-the application-authored `ToolContext::grant_ceiling` into each invocation, and
-`SubmitProgramTool` passes it unchanged into `ProgramRuntime`; neither the provider payload nor a
-shared runtime may widen it. `None` is reserved for ordinary local-owner/child calls and preserves
-their existing reusable-grant semantics. The ceiling is stored with a suspended runtime
-continuation, so approval, cancellation, late decisions, and resume cannot replace it with newer
-ambient grants.
+**Provider-native `submit_program` inherits the query's authority ceiling.** The named-Brain
+coordinator calls `ToolExecutor::execute_tool_with_grant_ceiling`, which copies the
+application-authored ceiling into `ToolContext`; the established `execute_tool` entry point remains
+the unbounded local-owner compatibility path. `SubmitProgramTool` passes a present ceiling
+unchanged into `ProgramRuntime`; neither the provider payload nor a shared runtime may widen it.
+The ceiling is stored with a suspended runtime continuation, so approval, cancellation, late
+decisions, and resume cannot replace it with newer ambient grants.
 
 **Audit result for the legacy headless `finch agent` loop (issue #1058, `AgentLoop::run_task` in
 `src/agent/mod.rs`).** Before this issue, `run_task` called `ToolExecutor::execute_tool` directly

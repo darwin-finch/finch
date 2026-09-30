@@ -22,6 +22,7 @@ fn dummy_ctx() -> ToolContext<'static> {
         plan_content: None,
         live_output: None,
         effect_audit: None,
+        grant_ceiling: None,
         skip_interactive_review: false,
     }
 }

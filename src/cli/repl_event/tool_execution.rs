@@ -636,7 +636,7 @@ async fn execute_admitted_tool(
     tool_executor.lock().await.poset = poset.clone();
     let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
     let executor = tool_executor.lock().await;
-    let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+    let execute = executor.execute_tool_with_grant_ceiling::<fn() -> anyhow::Result<()>>(
         tool_use,
         None,
         Some(Arc::clone(repl_mode)),

@@ -433,9 +433,34 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool use
+    pub async fn execute_tool<F>(
+        &self,
+        tool_use: &ToolUse,
+        save_models_fn: Option<F>,
+        repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
+        plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
+        live_output: Option<crate::tools::types::LiveOutput>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) -> Result<ToolResult>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        self.execute_tool_with_grant_ceiling(
+            tool_use,
+            save_models_fn,
+            repl_mode,
+            plan_content,
+            live_output,
+            effect_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Execute a tool use under an application-authored VM grant ceiling.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit, grant_ceiling), fields(tool = %tool_use.name, id = %tool_use.id))]
-    pub async fn execute_tool<F>(
+    pub async fn execute_tool_with_grant_ceiling<F>(
         &self,
         tool_use: &ToolUse,
         save_models_fn: Option<F>,
@@ -658,7 +683,6 @@ impl ToolExecutor {
                     plan_content.clone(),
                     None, // live_output
                     None, // effect_audit
-                    None, // grant_ceiling
                 )
                 .await?;
             results.push(result);
@@ -1017,7 +1041,6 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
-                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1043,7 +1066,6 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
-                None, // grant_ceiling
             )
             .await;
         assert!(result.is_err());
@@ -1063,7 +1085,6 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
-                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1169,7 +1190,6 @@ mod tests {
                     None,                    // plan_content
                     None,                    // live_output
                     None,                    // effect_audit
-                    None,                    // grant_ceiling
                 )
                 .await
             {
@@ -1208,7 +1228,6 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
-                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1512,7 +1531,6 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
-                None, // grant_ceiling,
             )
             .await
             .expect("granted edit must return ToolResult");
@@ -1920,7 +1938,6 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
-                None, // grant_ceiling
             )
             .await
             .expect("edit execution must not error at the executor boundary")
@@ -2073,7 +2090,6 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
-                None, // grant_ceiling,
             )
             .await
             .expect("write execution");
@@ -2123,7 +2139,6 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
-                None, // grant_ceiling,
             )
             .await
             .expect("patch execution");
