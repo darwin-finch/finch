@@ -321,17 +321,6 @@ pub fn load_routing_tree(
         // (`routing_tree.rs:181`) indexes a shorter anchor/direction against a full-length point --
         // on whatever thread happens to be inserting at the time, a background hydration/indexing
         // worker in production. Refuse up front instead, before any node is wired into the tree.
-        // A decision node's `anchor`/`direction` are set exactly once, together, at split time
-        // (`try_split`, both always length `self.dim` by construction -- see `routing_tree.rs`),
-        // and frozen forever after. A decision node whose persisted `anchor`/`direction` is
-        // missing or a different length than this store's own `dim` (most commonly a fully
-        // degenerate, zero-length pair -- issue #1384's actual reported shape, distinct from the
-        // whole-store dimension mismatch #1398 already refuses above) can never have been produced
-        // by this crate's own write path; loading it anyway leaves a tree that looks fully hydrated
-        // but panics the first time descent or insert reaches this node and `projection`
-        // (`routing_tree.rs:181`) indexes a shorter anchor/direction against a full-length point --
-        // on whatever thread happens to be inserting at the time, a background hydration/indexing
-        // worker in production. Refuse up front instead, before any node is wired into the tree.
         anyhow::ensure!(
             node.is_leaf || (node.anchor.len() == dim && node.direction.len() == dim),
             "load_routing_tree: decision node {node_id} has a degenerate anchor/direction (anchor \
