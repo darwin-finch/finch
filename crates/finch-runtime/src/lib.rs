@@ -3064,6 +3064,28 @@ impl ProgramRuntime {
         .await
     }
 
+    /// Execute provider text decoded as VM wire with an application-owned
+    /// authority ceiling. A named-Brain caller supplies `Some` from its daemon
+    /// request; a local owner query supplies `None` and retains ordinary grant
+    /// reuse. The ceiling is captured with any suspended continuation.
+    pub async fn submit_provider_wire_program(
+        &self,
+        submission: ProgramSubmission,
+        effect_sink: TypedEffectSink,
+        grant_ceiling: Option<EffectSet>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            Some(effect_sink),
+            DeferredHostEffects::ProgramInvocations,
+            grant_ceiling,
+            effect_audit,
+        )
+        .await
+    }
+
     /// Submit with a portable host boundary for every awaited capability.
     /// The caller receives each request through `effect_sink` and resumes the
     /// exact `(execution_id, sequence)` later with [`VmResume`]. This is for

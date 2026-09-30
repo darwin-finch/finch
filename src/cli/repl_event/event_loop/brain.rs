@@ -542,6 +542,9 @@ impl EventLoop {
                 },
             )
             .await;
+        self.query_states
+            .bind_grant_ceiling(query_id, request.grant_ceiling)
+            .await;
         let mut effect_audit = request.effect_audit;
         #[cfg(test)]
         if let Some(wrapper) = &self.effect_audit_test_wrapper {

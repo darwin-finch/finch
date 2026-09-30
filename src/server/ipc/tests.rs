@@ -411,6 +411,73 @@ struct ProviderSubmitProgramGenerator {
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+struct RawWireGenerator {
+    source: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for RawWireGenerator {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        anyhow::ensure!(
+            tools.as_ref().is_none_or(Vec::is_empty),
+            "raw-wire authority fixture must not receive provider tool definitions"
+        );
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            call == 0,
+            "raw-wire provider received an unexpected continuation"
+        );
+        Ok(crate::generators::GeneratorResponse {
+            text: self.source.clone(),
+            content_blocks: vec![crate::providers::ContentBlock::Text {
+                text: self.source.clone(),
+            }],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "raw-wire-authority-test".into(),
+                model: "raw-wire-authority-test".into(),
+                confidence: None,
+                stop_reason: Some("end_turn".into()),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: false,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "raw-wire-authority-test"
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::generators::Generator for ProviderSubmitProgramGenerator {
     async fn generate(
@@ -1400,6 +1467,184 @@ async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_tea
                     }
                 } if outcome_kind == "acknowledged")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let task_output = temp.path().join("task-output");
+            std::fs::create_dir_all(&task_output).unwrap();
+            let target = task_output.join("leaked.txt");
+            let store = crate::brain::BrainStore::with_root(
+                "box.local",
+                Some(temp.path().join("brains")),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::BrainCredentialAuthority::ephemeral([57; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let daemon: super::finch_ipc_capnp::finch_daemon::Client =
+                capnp_rpc::new_client(FinchDaemonImpl::new(
+                    std::sync::Arc::clone(&server),
+                    uuid::Uuid::new_v4(),
+                ));
+            let ipc = crate::client::IpcClient::from_test_client(daemon);
+            let initial = ipc.brain_snapshot("shared").await.unwrap();
+            let runner_subject = "runner@box.local/frontend-prompt-ceiling";
+            ipc.brain_claim_runner_identity(runner_subject).await.unwrap();
+            let lease = ipc
+                .brain_acquire_runner(
+                    "shared",
+                    runner_subject,
+                    &initial.environment,
+                    None,
+                    300_000,
+                )
+                .await
+                .unwrap();
+
+            let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+            runtime.bind_task_output_root(&task_output).unwrap();
+            runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Write,
+                    crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+                ))
+                .unwrap();
+            let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                std::sync::Arc::new(RawWireGenerator {
+                    source: "s\" leaked.txt\" task-output-path s\" stolen\" bytes task-output-file-write"
+                        .into(),
+                    calls: std::sync::Arc::clone(&provider_calls),
+                });
+            let registry = crate::tools::ToolRegistry::new();
+            let permissions = crate::tools::PermissionManager::new()
+                .with_default_rule(crate::tools::PermissionRule::Allow);
+            let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::tools::ToolExecutor::new(
+                    registry,
+                    permissions,
+                    temp.path().join("tool-patterns.json"),
+                )
+                .unwrap(),
+            ));
+            let event_loop = crate::cli::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                executor,
+                runtime,
+            );
+            let (event_tx, event_driver) =
+                event_loop.start_named_brain_test_runner("shared".into());
+            let _bootstrap = ipc
+                .register_brain_runner("shared", lease.lease_id, event_tx.clone())
+                .await
+                .unwrap();
+            let attachment = ipc
+                .brain_attach(
+                    "shared",
+                    "alice",
+                    crate::brain::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut watch = ipc.brain_watch("shared", &attachment).await.unwrap();
+            let _initial_watch = watch.recv().await.unwrap().unwrap();
+            let submit_ipc = ipc.clone();
+            let submit_attachment = attachment.clone();
+            let submission = tokio::task::spawn_local(async move {
+                submit_ipc
+                    .brain_submit(
+                        "shared",
+                        &submit_attachment,
+                        crate::brain::BrainEventKind::Prompt {
+                            text: "write through raw provider VM wire".into(),
+                            attached_mentions: Vec::new(),
+                        },
+                    )
+                    .await
+            });
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let (run_id, approval) = loop {
+                let snapshot = store.snapshot("shared").unwrap();
+                let approval = snapshot.events.iter().find(|event| {
+                    matches!(event.kind, crate::brain::BrainEventKind::ApprovalRequested { .. })
+                });
+                let run = snapshot.runs.iter().find(|run| {
+                    matches!(
+                        run.status,
+                        crate::brain::BrainRunStatus::Running
+                            | crate::brain::BrainRunStatus::AwaitingApproval
+                    )
+                });
+                if approval.is_some() {
+                    break (run.expect("approval must belong to an active run").run_id, true);
+                }
+                assert!(
+                    !target.exists(),
+                    "named-Brain Prompt raw VM wire spent a pre-existing owner FileWrite grant \
+                     without a new approval; target={}; run_states={:?}; event_kinds={:?}",
+                    target.display(),
+                    snapshot.runs.iter().map(|run| run.status).collect::<Vec<_>>(),
+                    snapshot
+                        .events
+                        .iter()
+                        .map(|event| &event.kind)
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "named-Brain Prompt did not reach the expected bounded approval; \
+                     target={}; run_states={:?}; event_kinds={:?}",
+                    target.display(),
+                    snapshot.runs.iter().map(|run| run.status).collect::<Vec<_>>(),
+                    snapshot
+                        .events
+                        .iter()
+                        .map(|event| &event.kind)
+                        .collect::<Vec<_>>()
+                );
+                tokio::task::yield_now().await;
+            };
+            assert!(approval);
+            assert!(
+                !target.exists(),
+                "bounded named-Brain Prompt must leave the attempted write absent; target={}",
+                target.display()
+            );
+            assert_eq!(
+                provider_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the authority boundary must not depend on a repair or provider continuation"
+            );
+
+            let cancelled = ipc
+                .brain_cancel_run("shared", &attachment, run_id)
+                .await
+                .unwrap();
+            assert_eq!(cancelled.status, crate::brain::BrainRunStatus::Cancelled);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), submission)
+                .await
+                .expect("bounded prompt cancellation did not quiesce")
+                .unwrap();
+            event_tx.send(crate::cli::ReplEvent::Shutdown).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
+                .await
+                .expect("bounded prompt runner shutdown exceeded the teardown bound")
+                .unwrap()
+                .unwrap();
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

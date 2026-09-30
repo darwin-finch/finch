@@ -2102,6 +2102,7 @@ mod tests {
                         Vec::new(),
                         approval_audience,
                         Some(connection_id),
+                        crate::vm::TypedRuntime::intrinsic_grants(),
                     )
                     .await
             })

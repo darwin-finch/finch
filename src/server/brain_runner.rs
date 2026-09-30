@@ -132,6 +132,9 @@ pub struct RunnerTurnRequest {
     pub context: Vec<crate::providers::Message>,
     pub approval_audience: crate::brain::BrainApprovalAudience,
     pub approval_connection_id: Option<crate::brain::ConnectionId>,
+    /// Application-owned maximum VM authority for every provider response in
+    /// this turn. Named-Brain Prompt dispatch always supplies this explicitly.
+    pub grant_ceiling: crate::vm::EffectSet,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -872,6 +875,7 @@ impl BrainRunnerBroker {
         context: Vec<crate::providers::Message>,
         approval_audience: crate::brain::BrainApprovalAudience,
         approval_connection_id: Option<crate::brain::ConnectionId>,
+        grant_ceiling: crate::vm::EffectSet,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -904,6 +908,7 @@ impl BrainRunnerBroker {
                     context,
                     approval_audience,
                     approval_connection_id,
+                    grant_ceiling,
                     approval_tx: None,
                     effect_audit: None,
                     response_tx,
@@ -1344,6 +1349,11 @@ mod tests {
             assert_eq!(request.context.len(), 1);
             assert_eq!(request.context[0].text(), "21");
             assert_eq!(request.approval_audience.brain, "brain");
+            assert_eq!(
+                request.grant_ceiling,
+                crate::vm::TypedRuntime::intrinsic_grants(),
+                "named-Brain turn request must carry the daemon-issued intrinsic VM grant ceiling"
+            );
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
                 .revision_history()
@@ -1379,6 +1389,7 @@ mod tests {
                 vec![crate::providers::Message::user("21")],
                 test_approval_audience(),
                 Some(crate::brain::ConnectionId(uuid::Uuid::new_v4())),
+                crate::vm::TypedRuntime::intrinsic_grants(),
             )
             .await
             .unwrap();

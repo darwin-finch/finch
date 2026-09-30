@@ -2680,6 +2680,12 @@ async fn forward_runner_request(
                     )
                     .map_err(|error| error.to_string());
                     if encoded.is_ok() {
+                        crate::runtime::encode_effects(
+                            payload
+                                .reborrow()
+                                .init_grant_ceiling(request.grant_ceiling.0.len() as u32),
+                            &request.grant_ceiling,
+                        );
                         encode_approval_audience(
                             payload.reborrow().init_approval_audience(),
                             &request.approval_audience,

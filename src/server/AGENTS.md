@@ -30,6 +30,14 @@ mutates Brain state or dispatches a runner request. An IPC disconnect or retry m
 a second committed Brain turn. Keep runner callback and approval protocol changes covered by
 the server and supervised IPC tests, not just a helper unit test.
 
+**Named-Brain provider wire is intrinsically bounded.** Every delegated `Prompt` and
+`SpeculativePrompt` receives the daemon-authored `TypedRuntime::intrinsic_grants()` ceiling in its
+`RunnerTurnRequest`; the frontend may transport and apply that ceiling but may not reconstruct it
+from provider output or ambient runtime grants. Restored queued prompts retain the same ceiling.
+`named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant` in `ipc/tests.rs` exercises
+the real Cap'n Proto/runner/provider-wire boundary, and
+`restarted_queued_prompts_dispatch_task_state_at_their_exact_request_sequence` pins restart replay.
+
 **Local generation calls run on `tokio::task::spawn_blocking`, never inline on an axum worker
 thread** — `LocalGenerator::try_generate_from_pattern`/`_with_tools`/`_streaming` are synchronous,
 CPU/GPU-bound llama.cpp calls with no internal `.await`; every HTTP call site in this directory

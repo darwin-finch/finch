@@ -1445,6 +1445,14 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(audience) => audience,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let grant_ceiling = match request
+            .get_grant_ceiling()
+            .map_err(anyhow::Error::new)
+            .and_then(crate::runtime::decode_effects)
+        {
+            Ok(grants) => grants,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let control = match request.get_control() {
             Ok(control) => control,
             Err(error) => return Promise::err(error),
@@ -1478,6 +1486,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     context,
                     approval_audience,
                     approval_connection_id: None,
+                    grant_ceiling,
                     approval_tx: Some(approval_tx),
                     effect_audit: Some(effect_audit),
                     response_tx,
@@ -2355,7 +2364,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 10);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 11);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2374,7 +2383,7 @@ mod tests {
                 "ping must name the leftover daemon generation; error={error}"
             );
             assert!(
-                error.contains("protocol 10"),
+                error.contains("protocol 11"),
                 "ping must name this Finch generation; error={error}"
             );
             assert!(

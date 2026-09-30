@@ -18,6 +18,13 @@ handles through named facade exports. The application injects provider,
 tool, Brain, and UI dependencies; this module may coordinate them but must not become their
 owner. No lower-level crate should depend on the REPL event loop.
 
+**Named-Brain provider wire carries application authority, not ambient owner authority.**
+`QueryMetadata::grant_ceiling` is bound from the daemon-issued runner request before provider
+dispatch and is passed unchanged through direct, deterministic-wrap, and repaired wire
+submission. Local owner queries leave it unset so their explicit reusable grants retain their
+existing meaning. The runtime captures a present ceiling with any suspended continuation, so a
+late ambient grant cannot expand a resumed named-Brain program.
+
 **Where the code lives.** `event_loop.rs` holds the `EventLoop` struct, `new`, and `run`. The
 handlers live beside it, grouped by what they handle, and are `pub(super)` so only the loop calls
 them:

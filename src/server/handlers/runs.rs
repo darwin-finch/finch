@@ -459,6 +459,7 @@ pub(super) async fn dispatch_named_brain_turn(
             named_brain_provider_messages_at(&snapshot, request_seq),
             approval_audience.clone(),
             approval_connection_id,
+            crate::vm::TypedRuntime::intrinsic_grants(),
         )
         .await
     {

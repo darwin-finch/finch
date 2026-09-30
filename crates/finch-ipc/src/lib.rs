@@ -29,8 +29,9 @@ pub use value_codec::{decode_json_value, encode_json_value};
 /// Generation 9 requires packed `RuntimeApplicationMessage` envelopes on
 /// runner-result delivery and exposes `pendingDelivery` / cursor ack.
 /// Generation 10 carries named-Brain Prompt mention snapshots (path, digest,
-/// content) on Cap'n Proto submit and event Prompt.
-pub const IPC_PROTOCOL_VERSION: u32 = 10;
+/// content) on Cap'n Proto submit and event Prompt. Generation 11 carries the
+/// daemon-authored VM grant ceiling on runner Prompt requests.
+pub const IPC_PROTOCOL_VERSION: u32 = 11;
 
 /// Short package identity advertised on `/health` and IPC ping.
 pub fn package_identity() -> &'static str {
