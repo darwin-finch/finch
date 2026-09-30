@@ -55,6 +55,20 @@ pub struct AccordionState {
 }
 
 impl AccordionState {
+    #[cfg(test)]
+    pub(crate) fn diagnostic_state(&self) -> String {
+        format!(
+            "focused={:?} expanded={:?} visible_expanded={:?} hit_regions={:?} \
+             component_regions={:?} visible_order={:?}",
+            self.focused,
+            self.expanded,
+            self.visible_expanded,
+            self.hit_regions,
+            self.component_regions,
+            self.visible_order
+        )
+    }
+
     pub fn is_expanded(&self, row: &TranscriptNode) -> bool {
         self.expanded
             .get(&row.id)

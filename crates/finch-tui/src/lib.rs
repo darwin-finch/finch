@@ -2567,7 +2567,12 @@ fn viewport_tail_rendered_lines(
             return selected;
         }
         let mut compact = header.clone();
-        compact.text = compact_disclosure_label(header, terminal_width.max(1));
+        // The compact row remains the same interactive disclosure. Keep its
+        // marker and label prefix instead of replacing it with a detached
+        // `[expanded]`/`[collapsed]` word that can escape into immutable
+        // terminal history when a dialog reconstruction scrolls the live
+        // area's previous bytes.
+        compact.text = compact_disclosure_header(header, terminal_width.max(1));
         return vec![compact];
     }
     let mut pinned = vec![header.clone()];
@@ -2577,22 +2582,6 @@ fn viewport_tail_rendered_lines(
         row_budget.saturating_sub(header_rows),
     ));
     pinned
-}
-
-fn compact_disclosure_label(header: &RenderedTranscriptLine, width: usize) -> String {
-    let expanded = header.row_expanded.unwrap_or(false);
-    let state = if expanded {
-        if width >= "[expanded]".len() {
-            "[expanded]"
-        } else {
-            "open"
-        }
-    } else if width >= "[collapsed]".len() {
-        "[collapsed]"
-    } else {
-        "closed"
-    };
-    visible_prefix(state, width)
 }
 
 fn rendered_tail_without_pinning(
@@ -2623,6 +2612,17 @@ fn rendered_tail_without_pinning(
     }
     selected.reverse();
     selected
+}
+
+fn compact_disclosure_header(header: &RenderedTranscriptLine, width: usize) -> String {
+    let marker_index = header.text.find(|character| matches!(character, '▼' | '▶'));
+    let disclosure = marker_index
+        .map(|index| &header.text[index..])
+        .unwrap_or(header.text.as_str());
+    if header.text.starts_with("> ") && width >= 3 {
+        return format!("> {}", visible_prefix(disclosure, width.saturating_sub(2)));
+    }
+    visible_prefix(disclosure, width)
 }
 
 fn rendered_metadata_for_visible(
@@ -5990,6 +5990,189 @@ mod tests {
         );
     }
 
+    /// Reopened retained-accordion regression: a plan dialog can consume the
+    /// viewport between the message's first projection and later keyboard
+    /// disclosure. The reconstructed row must remain the same interactive
+    /// row at every geometry; marker and body change together, and a compact
+    /// projection never turns into a detached `[expanded]`/`[collapsed]`
+    /// transcript row.
+    #[test]
+    fn test_plan_dialog_teardown_retains_atomic_keyboard_disclosure_across_resize() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth source retained after plan review");
+        work.set_response("program output remains visible");
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        renderer.add_trait_message(work);
+
+        renderer.active_dialog = Some(
+            Dialog::select(
+                "Review Implementation Plan",
+                vec![DialogOption::new("Approve"), DialogOption::new("Reject")],
+            )
+            .with_body("inspect the complete plan before returning to the transcript"),
+        );
+        let width = 40usize;
+        let height = 12usize;
+        let dialog = renderer.active_dialog.clone();
+        let sources = renderer.live_frame_sources(width);
+        let vm = live_view_model(&sources, width, height, dialog.as_ref(), None);
+        let dialog_frame = plan_live_frame(&vm, &mut renderer.autocomplete_state);
+        let mut dialog_bytes = Vec::new();
+        write_live_frame(&mut dialog_bytes, &dialog_frame, width)
+            .expect("the production live-frame writer must paint the plan dialog");
+        let mut dialog_terminal = VtOracle::new(width, height);
+        dialog_terminal.feed(&dialog_bytes);
+        assert_vt(
+            dialog_terminal
+                .find_row("Review Implementation Plan")
+                .is_some(),
+            "the real live-frame path must open the full plan dialog before teardown",
+            &dialog_terminal,
+        );
+
+        renderer.active_dialog = None;
+        let node = view_model::try_project_for_test(message.as_ref(), &colors)
+            .expect("the retained Program source message projects an accordion node");
+        let compact_width = 12usize;
+        let compact = viewport_tail_rendered_lines(
+            &renderer.projected_message_lines(&message, compact_width),
+            compact_width,
+            1,
+        );
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&compact, 3, compact_width);
+        let state = renderer.accordion.diagnostic_state();
+        assert_eq!(
+            compact.first().and_then(|line| line.row_id.as_ref()),
+            Some(&node.id),
+            "dialog teardown must reconstruct the same stable row identity; row_id={:?} \
+             expected={:?} visible={compact:?} geometry={compact_width}x1 {state}",
+            compact.first().and_then(|line| line.row_id.as_ref()),
+            node.id
+        );
+        assert!(
+            compact[0].text.contains('▶')
+                && !compact[0].text.contains("[expanded]")
+                && !compact[0].text.contains("[collapsed]"),
+            "the reconstructed collapsed row must keep its actionable marker without a \
+             detached state label; visible={compact:?} geometry={compact_width}x1 {state}"
+        );
+        assert_eq!(
+            renderer.accordion.hit_regions.len(),
+            1,
+            "the reconstructed row must own exactly one hit region; visible={compact:?} \
+             geometry={compact_width}x1 {state}"
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&node.id),
+            "F6 must focus the reconstructed stable row; expected={:?} {}",
+            node.id,
+            renderer.accordion.diagnostic_state()
+        );
+
+        for (cycle, expected_open) in [true, false, true, false, true].into_iter().enumerate() {
+            let key = if cycle == 0 {
+                KeyCode::Right
+            } else {
+                KeyCode::Enter
+            };
+            assert!(
+                renderer.handle_accordion_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                "keyboard disclosure action {cycle} must be handled; {}",
+                renderer.accordion.diagnostic_state()
+            );
+            let visible = renderer.projected_message_lines(&message, 80);
+            let marker = if expected_open { '▼' } else { '▶' };
+            let body_visible = visible
+                .iter()
+                .any(|line| line.body_of.as_ref() == Some(&node.id));
+            assert!(
+                visible[0].text.contains(marker) && body_visible == expected_open,
+                "marker and body must transition atomically after dialog teardown; cycle={cycle} \
+                 expected_open={expected_open} body_visible={body_visible} visible={visible:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+            renderer
+                .accordion
+                .rebuild_retained_hit_regions(&visible, 1, 80);
+        }
+
+        for narrow_width in [80usize, 12, 3, 2] {
+            let projected = renderer.projected_message_lines(&message, narrow_width);
+            let visible = viewport_tail_rendered_lines(&projected, narrow_width, 1);
+            renderer
+                .accordion
+                .rebuild_retained_hit_regions(&visible, 0, narrow_width);
+            let state = renderer.accordion.diagnostic_state();
+            assert!(
+                visible[0].row_id.as_ref() == Some(&node.id)
+                    && visible[0].text.contains('▼')
+                    && renderer.accordion.focused.as_ref() == Some(&node.id)
+                    && renderer.accordion.hit_regions.len() == 1
+                    && renderer.accordion.hit_regions[0].row_id == node.id
+                    && renderer.accordion.hit_regions[0].top == 0
+                    && renderer.accordion.hit_regions[0].bottom == 0
+                    && renderer.accordion.hit_regions[0].right
+                        == narrow_width.saturating_sub(1) as u16
+                    && (narrow_width < 3 || visible[0].text.starts_with("> "))
+                    && !visible[0].text.contains("[expanded]")
+                    && !visible[0].text.contains("[collapsed]"),
+                "resize must preserve identity, focus, the exact one-row hit region, and the \
+                 actionable expanded marker even in tiny geometry; width={narrow_width} \
+                 visible={visible:?} {state}"
+            );
+            let mut paint = Vec::new();
+            begin_full_viewport_paint(
+                &mut paint,
+                viewport_redraw_plan(4, 3, 1),
+                &[visible[0].text.clone()],
+            )
+            .expect("the production full-viewport writer must paint the reconstructed row");
+            let mut terminal = VtOracle::new(narrow_width, 4);
+            terminal.feed(&paint);
+            assert_vt(
+                !terminal.diagnostic().contains("[expanded]")
+                    && !terminal.diagnostic().contains("[collapsed]"),
+                &format!(
+                    "terminal reconstruction must not retain a detached state label; \
+                     width={narrow_width} visible={visible:?} {state}"
+                ),
+                &terminal,
+            );
+        }
+
+        let mut canonical = Vec::new();
+        let mut printed = HashSet::new();
+        commit_complete_messages(
+            &mut canonical,
+            std::slice::from_ref(&message),
+            &mut renderer.accordion,
+            &colors,
+            &mut printed,
+            4,
+            40,
+        )
+        .expect("the complete message must commit to immutable native scrollback");
+        let canonical = String::from_utf8(canonical).expect("canonical transcript is UTF-8");
+        assert!(
+            !canonical.contains("[expanded]") && !canonical.contains("[collapsed]"),
+            "immutable native scrollback must not advertise detached disclosure state; \
+             canonical={canonical:?} {}",
+            renderer.accordion.diagnostic_state()
+        );
+    }
+
     fn wheel_up() -> MouseEvent {
         MouseEvent {
             kind: event::MouseEventKind::ScrollUp,
@@ -7737,6 +7920,29 @@ mod tests {
             tiny[0].text
         );
         assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
+        let source = Arc::new(WorkUnit::new("program"));
+        source.set_program_source("forth source that remains retained");
+        source.set_response("program output");
+        source.set_complete();
+        let source_message: MessageRef = source;
+        let mut source_state = AccordionState::default();
+        let source_initial = render_via_view_model(&source_state, &source_message, &colors);
+        source_state.rebuild_retained_hit_regions(&source_initial, 0, 80);
+        assert!(source_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(source_state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let source_expanded = render_via_view_model(&source_state, &source_message, &colors);
+        let literal_state_width = 12;
+        let literal_state = viewport_tail_rendered_lines(&source_expanded, literal_state_width, 1);
+        assert!(
+            !literal_state[0].text.contains("[expanded]")
+                && !literal_state[0].text.contains("[collapsed]"),
+            "an interactively projected retained header must keep its disclosure glyph instead \
+             of replacing the row with a detached literal state token; width={literal_state_width} \
+             row_id={:?} row_expanded={:?} visible={:?}",
+            literal_state[0].row_id,
+            literal_state[0].row_expanded,
+            literal_state
+        );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
         assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
