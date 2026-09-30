@@ -5546,43 +5546,76 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
 /// constitutional denylist) check at match time. File-mutating tools arrive
 /// with the "Edit in $EDITOR" index already shifted out by the call sites.
 ///
+/// The minted pattern itself comes from [`approval_pattern_for_dialog`]: for
+/// a qualifying `bash` command it is a narrower `Structured` pattern
+/// (#427 item 3) rather than the `tool:*` wildcard the dialog label still
+/// describes — approving something narrower than the label suggests is
+/// safe; the label text itself is not updated to preview the derived
+/// skeleton (follow-up UX, not this change).
+///
 /// Exported `pub(crate)` so it can be unit-tested directly.
 pub(crate) fn dialog_result_to_confirmation(
     dialog_result: crate::cli::tui::DialogResult,
     tool_use: &crate::tools::ToolUse,
 ) -> super::events::ConfirmationResult {
     use super::events::ConfirmationResult;
-    use crate::tools::ToolPattern;
 
     match dialog_result {
         crate::cli::tui::DialogResult::Selected(index) => match index {
             0 => ConfirmationResult::ApproveOnce,
             1 => {
-                // Session-wide wildcard: don't ask again for any call to this tool.
-                let pattern = ToolPattern::new(
-                    "*".to_string(),
-                    tool_use.name.clone(),
-                    format!("Allow all {} calls (session)", tool_use.name),
-                );
+                // Don't ask again for any call to this tool shape (session).
+                let pattern = approval_pattern_for_dialog(tool_use, "session");
                 ConfirmationResult::ApprovePatternSession(pattern)
             }
             2 => {
-                // Durable wildcard: always allow this tool, persisted to disk
-                // (#902). Still gated by the pattern security checks at match time.
-                let pattern = ToolPattern::new(
-                    "*".to_string(),
-                    tool_use.name.clone(),
-                    format!(
-                        "Allow all {} calls (persistent, always allow)",
-                        tool_use.name
-                    ),
-                );
+                // Always allow this tool shape, persisted to disk (#902).
+                // Still gated by the pattern security checks at match time.
+                let pattern = approval_pattern_for_dialog(tool_use, "persistent, always allow");
                 ConfirmationResult::ApprovePatternPersistent(pattern)
             }
             _ => ConfirmationResult::Deny, // "4. No" or anything beyond
         },
         _ => ConfirmationResult::Deny,
     }
+}
+
+/// Build the pattern a dialog "yes, and remember this shape" choice mints.
+///
+/// #427 item 3: for `bash`, prefer a `Structured` pattern over a blanket
+/// `tool:*` wildcard when the observed command has a genuine
+/// fixed-skeleton-plus-flag-values shape (`gh issue create --repo <arg>
+/// --title <arg> --body <arg>`, not `bash -c '...'` or a bare positional
+/// command like `cp <src> <dst>`) — see
+/// [`crate::tools::ToolPattern::structured_from_bash_command`] for exactly
+/// which shapes qualify and why. Anything that doesn't fit falls back to
+/// the pre-existing `tool:*` wildcard unchanged, never a new, less-safe
+/// behaviour. Non-bash tools are unaffected: their path-bearing arguments
+/// are already workspace-contained at match time regardless of pattern
+/// type (#429), so a blanket wildcard there is not the same hazard a bash
+/// wildcard is.
+fn approval_pattern_for_dialog(
+    tool_use: &crate::tools::ToolUse,
+    scope_label: &str,
+) -> crate::tools::ToolPattern {
+    use crate::tools::ToolPattern;
+
+    if tool_use.name == "bash" {
+        if let Some(command) = tool_use.input.get("command").and_then(|v| v.as_str()) {
+            if let Some(pattern) = ToolPattern::structured_from_bash_command(
+                command,
+                format!("Allow this command shape ({scope_label})"),
+            ) {
+                return pattern;
+            }
+        }
+    }
+
+    ToolPattern::new(
+        "*".to_string(),
+        tool_use.name.clone(),
+        format!("Allow all {} calls ({scope_label})", tool_use.name),
+    )
 }
 
 fn confirmation_audit_value(confirmation: &super::events::ConfirmationResult) -> serde_json::Value {

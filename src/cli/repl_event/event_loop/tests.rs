@@ -6401,6 +6401,107 @@ fn test_pattern_persistent_tool_name_matches_tool_use() {
     );
 }
 
+// ── #427 item 3: Structured patterns instead of bash:* ────────────────────
+
+#[test]
+fn test_dialog_result_bash_flag_shape_mints_structured_pattern_not_wildcard() {
+    // The issue's own example: `gh issue create --repo <arg> --title <arg>
+    // --body <arg>` — a single invocation with a fixed subcommand skeleton
+    // and only flag *values* varying. Both the session (1) and persistent
+    // (2) dialog choices must mint a Structured pattern for this shape
+    // instead of the blanket `bash:*` wildcard.
+    let tool = make_tool_use(
+        "bash",
+        serde_json::json!({"command": "gh issue create --repo owner/repo --title fix --body details"}),
+    );
+
+    let session = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(1), &tool);
+    match session {
+        crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
+            assert_eq!(
+                p.pattern_type,
+                crate::tools::PatternType::Structured,
+                "qualifying bash command must mint Structured, not Wildcard; pattern={:?}",
+                p
+            );
+            assert_eq!(p.command_pattern.as_deref(), Some("gh"));
+            assert_eq!(
+                p.args_pattern.as_deref(),
+                Some("issue create --repo * --title * --body *")
+            );
+        }
+        other => panic!("expected ApprovePatternSession, got {:?}", other),
+    }
+
+    let persistent =
+        dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
+    match persistent {
+        crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+            assert_eq!(
+                p.pattern_type,
+                crate::tools::PatternType::Structured,
+                "qualifying bash command must mint Structured, not Wildcard; pattern={:?}",
+                p
+            );
+            assert_eq!(p.command_pattern.as_deref(), Some("gh"));
+            assert_eq!(
+                p.args_pattern.as_deref(),
+                Some("issue create --repo * --title * --body *")
+            );
+        }
+        other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_dialog_result_bash_positional_shape_falls_back_to_wildcard() {
+    // `cp <src> <dst>` — bare positional arguments, not `--flag value`
+    // pairs — is exactly the shape #427/#429 call unsafe to templatize
+    // (the wildcarded slot could be a filesystem path with no containment
+    // check). Must fall back to the pre-existing `tool:*` wildcard, not a
+    // new, less-safe behaviour, and never silently drop the approval.
+    let tool = make_tool_use(
+        "bash",
+        serde_json::json!({"command": "cp ./target/out.txt /tmp/backup.txt"}),
+    );
+    let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
+    match result {
+        crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+            assert_eq!(
+                p.pattern_type,
+                crate::tools::PatternType::Wildcard,
+                "a bare-positional bash command must fall back to Wildcard, not \
+                 templatize an unconstrained path slot; pattern={:?}",
+                p
+            );
+            assert_eq!(p.pattern, "*");
+        }
+        other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_dialog_result_bash_short_flag_does_not_absorb_a_path_value() {
+    // `rm -v <path>` must not be misread as "`-v` takes a value" and
+    // wildcard the path — short flags are always boolean/literal here.
+    // The stray positional after `-v` must trigger the same safe fallback
+    // as the bare-positional case.
+    let tool = make_tool_use("bash", serde_json::json!({"command": "rm -v /etc/passwd"}));
+    let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
+    match result {
+        crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+            assert_eq!(
+                p.pattern_type,
+                crate::tools::PatternType::Wildcard,
+                "a short flag must never absorb a following path as its value; \
+                 pattern={:?}",
+                p
+            );
+        }
+        other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+    }
+}
+
 /// Clock-free `ReplMode` fixtures. `Planning` and `Executing` carry timestamps,
 /// so they are pinned to the epoch: nothing here reads a clock.
 fn modes_under_test() -> Vec<(&'static str, crate::cli::repl::ReplMode)> {
