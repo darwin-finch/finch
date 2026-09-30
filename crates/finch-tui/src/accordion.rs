@@ -54,6 +54,12 @@ pub struct AccordionState {
     component_regions: Vec<TranscriptHitRegion>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Interactive,
+    Canonical,
+}
+
 impl AccordionState {
     #[cfg(test)]
     pub(crate) fn diagnostic_state(&self) -> String {
@@ -102,17 +108,17 @@ impl AccordionState {
     /// disclosure choices.
     pub fn render_node(&self, node: &TranscriptNode) -> Vec<RenderedTranscriptLine> {
         let mut lines = Vec::new();
-        self.render_row(node, 0, false, &mut lines);
+        self.render_row(node, 0, RenderMode::Interactive, &mut lines);
         lines
     }
 
-    /// Render one node with every disclosure forced open, for the canonical
-    /// transcript commit. The commit renders the node's RAW source body when
-    /// one exists (#756): native scrollback is the copyable record, so a
-    /// markdown-rendered viewport body never replaces it there.
+    /// Render one node as a static, fully expanded canonical transcript.
+    /// Native scrollback preserves the label hierarchy and RAW source body
+    /// when one exists (#756), but carries no focus or disclosure marker:
+    /// committed rows are immutable and cannot honor an interaction promise.
     pub fn render_node_fully_expanded(&self, node: &TranscriptNode) -> Vec<RenderedTranscriptLine> {
         let mut lines = Vec::new();
-        self.render_row(node, 0, true, &mut lines);
+        self.render_row(node, 0, RenderMode::Canonical, &mut lines);
         lines
     }
 
@@ -131,20 +137,22 @@ impl AccordionState {
         &self,
         row: &TranscriptNode,
         depth: usize,
-        force_expanded: bool,
+        mode: RenderMode,
         lines: &mut Vec<RenderedTranscriptLine>,
     ) {
         let expandable = !row.body.is_empty() || !row.children.is_empty();
-        let expanded = expandable && (force_expanded || self.is_expanded(row));
+        let canonical = mode == RenderMode::Canonical;
+        let expanded = expandable && (canonical || self.is_expanded(row));
         // A leaf shows the label alone: the ViewModel's label already carries
         // the status glyph, and a second invented bullet is chrome in the
         // wrong layer (#821).
-        let marker = match (expandable, expanded) {
-            (true, true) => "▼ ",
-            (true, false) => "▶ ",
-            (false, _) => "",
+        let marker = match (canonical, expandable, expanded) {
+            (true, _, _) => "",
+            (false, true, true) => "▼ ",
+            (false, true, false) => "▶ ",
+            (false, false, _) => "",
         };
-        let focus = if self.focused.as_ref() == Some(&row.id) {
+        let focus = if !canonical && self.focused.as_ref() == Some(&row.id) {
             "> "
         } else {
             "  "
@@ -152,8 +160,8 @@ impl AccordionState {
         lines.push(RenderedTranscriptLine {
             text: format!("{focus}{}{}{}", "  ".repeat(depth), marker, row.label),
             spans: Vec::new(),
-            row_id: expandable.then(|| row.id.clone()),
-            row_expanded: expandable.then_some(expanded),
+            row_id: (!canonical && expandable).then(|| row.id.clone()),
+            row_expanded: (!canonical && expandable).then_some(expanded),
             role: Some(row.role),
             body_of: None,
             component_owned: false,
@@ -161,11 +169,11 @@ impl AccordionState {
         if !expanded {
             return;
         }
-        // The canonical commit (force_expanded) renders the raw source body —
+        // The canonical commit renders the raw source body —
         // the copyable record (#756). Every other projection renders the
         // viewport body, which is a markdown rendering when the node carries
         // a raw body, and the same text otherwise.
-        let body = match (force_expanded, &row.raw_body) {
+        let body = match (canonical, &row.raw_body) {
             (true, Some(raw)) => raw,
             _ => &row.body,
         };
@@ -181,7 +189,7 @@ impl AccordionState {
             });
         }
         for child in &row.children {
-            self.render_row(child, depth + 1, force_expanded, lines);
+            self.render_row(child, depth + 1, mode, lines);
         }
     }
 
@@ -598,6 +606,17 @@ mod tests {
         assert!(!fully_expanded
             .iter()
             .any(|line| line.text.contains("Output (0)")));
+        assert!(
+            fully_expanded.iter().all(|line| {
+                line.row_id.is_none()
+                    && line.row_expanded.is_none()
+                    && !line.text.contains('▶')
+                    && !line.text.contains('▼')
+                    && !line.text.starts_with("> ")
+            }),
+            "canonical transcript rows are static while retaining their label/body indentation; \
+             lines={fully_expanded:?}"
+        );
         assert_eq!(
             work.complete_transcript(&colors),
             canonical_before_disclosure
