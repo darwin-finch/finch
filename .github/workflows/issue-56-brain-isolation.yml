@@ -134,9 +134,9 @@ jobs:
           install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
         fi
 
-    # The whole module, not a list of names. Naming tests individually meant a test added to this
-    # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so
-    # its body returned at the guard and it reported pass without asserting anything (#614).
+    # The whole module remains the default so a newly added test cannot become unscheduled. Two
+    # reviewed proof tests mutate shared sealed-listener challenge state, so this process skips
+    # exactly those names and the following supervised processes run each one exactly.
     - name: Brain isolation boundaries under the supervisor contract
       # Coarse liveness bound, not a latency claim (#476): shared 4 vCPU
       # runners vary 20x under load (proof-validation workers measured
@@ -148,6 +148,22 @@ jobs:
         ./scripts/test_brains.sh cargo test -p finch-brain --lib
         isolation_tests::
         -- --nocapture
+        --skip isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        --skip isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+
+    - name: Reject self-issued environment authority in its own process
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test -p finch-brain --lib
+        isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --exact --nocapture
+
+    - name: Validate isolation proof offsets in its own process
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test -p finch-brain --lib
+        isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        -- --exact --nocapture
 
     - name: Reject rewritten proof at the production constructor
       timeout-minutes: 15
@@ -247,9 +263,9 @@ jobs:
           install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
         fi
 
-    # The whole module, not a list of names. Naming tests individually meant a test added to this
-    # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so
-    # its body returned at the guard and reported pass without asserting anything (#614).
+    # The whole module remains the default so a newly added test cannot become unscheduled. Two
+    # reviewed proof tests mutate shared sealed-listener challenge state, so this process skips
+    # exactly those names and the following supervised processes run each one exactly.
     - name: Brain isolation boundaries under the supervisor contract
       # Coarse liveness bound, not a latency claim (#476): shared 4 vCPU
       # runners vary 20x under load (proof-validation workers measured
@@ -261,6 +277,22 @@ jobs:
         ./scripts/test_brains.sh cargo test -p finch-brain --lib
         isolation_tests::
         -- --nocapture
+        --skip isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        --skip isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+
+    - name: Reject self-issued environment authority in its own process
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test -p finch-brain --lib
+        isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --exact --nocapture
+
+    - name: Validate isolation proof offsets in its own process
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test -p finch-brain --lib
+        isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        -- --exact --nocapture
 
     - name: Reject rewritten proof at the production constructor
       timeout-minutes: 15

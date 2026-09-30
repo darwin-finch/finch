@@ -102,6 +102,10 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
 ISOLATION_WORKFLOW = "issue-56-brain-isolation.yml"
 ISOLATION_SCHEDULE = [{"cron": "0 9 * * 1"}]
 ISOLATION_JOBS = {"isolation-boundaries": "ubuntu-24.04", "isolation-boundaries-macos": "macos-14"}
+ISOLATED_BRAIN_PROOF_TESTS = (
+    "isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
+    "isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency",
+)
 
 # The complete fatal sequence each isolation platform must run, in order.
 # Duplicate crate-wide cargo check and no_external_provider_binary_test stay on
@@ -123,10 +127,20 @@ ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned",
         "fi",
     )),
-    # The module, not two of its tests: a name list leaves anything added to the module scheduled
-    # nowhere, and a test that never runs under the contract reports pass without asserting (#614).
+    # Keep the module as the default so new tests cannot become unscheduled (#614). The two reviewed
+    # proof tests below mutate shared sealed-listener challenge state, so the broad process skips
+    # exactly those names and dedicated supervised processes run each one exactly.
     ("Brain isolation boundaries under the supervisor contract", (
-        "./scripts/test_brains.sh cargo test -p finch-brain --lib isolation_tests:: -- --nocapture",
+        "./scripts/test_brains.sh cargo test -p finch-brain --lib isolation_tests:: -- --nocapture "
+        f"--skip {ISOLATED_BRAIN_PROOF_TESTS[0]} --skip {ISOLATED_BRAIN_PROOF_TESTS[1]}",
+    )),
+    ("Reject self-issued environment authority in its own process", (
+        "./scripts/test_brains.sh cargo test -p finch-brain --lib "
+        f"{ISOLATED_BRAIN_PROOF_TESTS[0]} -- --exact --nocapture",
+    )),
+    ("Validate isolation proof offsets in its own process", (
+        "./scripts/test_brains.sh cargo test -p finch-brain --lib "
+        f"{ISOLATED_BRAIN_PROOF_TESTS[1]} -- --exact --nocapture",
     )),
     ("Reject rewritten proof at the production constructor", (
         "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --nocapture",
