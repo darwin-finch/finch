@@ -98,6 +98,7 @@ impl EventLoop {
                 {
                     work_unit.fail_row(row_idx, "discarded after closed tool round");
                 }
+                self.pending_tool_decisions.remove(&tool_id);
                 self.flush_genuinely_unbound_agent_lifecycle().await;
                 if named_turn_finished {
                     self.finish_named_brain_turn(query_id, String::new()).await;
@@ -117,6 +118,13 @@ impl EventLoop {
             Some(entry) => entry,
             None => self.attach_untracked_tool_result(query_id, &tool_id).await,
         };
+
+        // An approval decision that already landed for this call (#1426,
+        // mirroring #439's own `pending_tool_decisions`) is staged, never
+        // written straight to the row, because `complete_row_with_body`/
+        // `fail_row_with_body` below replace `body_lines` wholesale -- an
+        // eager write would be clobbered the instant the real result lands.
+        let decision = self.pending_tool_decisions.remove(&tool_id);
 
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
@@ -148,6 +156,9 @@ impl EventLoop {
                         body = source_body;
                     }
                 }
+                if let Some(decision) = &decision {
+                    body.insert(0, decision.clone());
+                }
                 work_unit.complete_row_with_body(row_idx, summary, body);
             }
             Err(e) => {
@@ -163,6 +174,10 @@ impl EventLoop {
                     .await;
                 }
                 let (short_err, body) = tool_error_display(&text);
+                let short_err = match &decision {
+                    Some(decision) => format!("{short_err} ({decision})"),
+                    None => short_err,
+                };
                 work_unit.fail_row_with_body(row_idx, short_err, body);
             }
         }

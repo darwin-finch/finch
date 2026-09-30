@@ -467,6 +467,21 @@ pub struct EventLoop {
     /// tool occupies one row identified by its index.
     active_tool_uses: ActiveToolUsesMap,
 
+    /// A tool approval's decision ("<choice> by <sender>"), staged by
+    /// `resolve_dialog_result` until the matching `handle_tool_result` lands
+    /// (#1426). #439's fold-in (`project_remote_brain_run_event`'s
+    /// `pending_tool_decisions`) only reaches a row drawn by that function's
+    /// own `RemoteBrainRunProjection` -- never the row a home session's own
+    /// turn draws directly through `active_tool_uses`
+    /// (`dispatch_tool_uses`/`handle_tool_result`), which is what actually
+    /// renders the common "plain tool call needing approval in an ordinary
+    /// interactive session" scenario. Staging here, rather than writing the
+    /// row immediately, matters for the same reason as #439's version:
+    /// `complete_row_with_body`/`fail_row_with_body` replace `body_lines`
+    /// wholesale, so an eager write would be clobbered the moment the real
+    /// result lands.
+    pending_tool_decisions: std::collections::HashMap<String, String>,
+
     /// Root child identity to the provider `spawn_agent` row that owns its
     /// lifecycle transcript. Task roots let nested/tool-only events inherit
     /// that same binding without claiming later await/cancel rows.
@@ -2321,6 +2336,7 @@ impl EventLoop {
             memtree_handler,
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
             active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_tool_decisions: std::collections::HashMap::new(),
             agent_lifecycle_bindings: std::collections::HashMap::new(),
             agent_task_roots: std::collections::HashMap::new(),
             active_agent_root_tasks: std::collections::HashMap::new(),
@@ -3169,6 +3185,25 @@ impl EventLoop {
                                 decision: confirmation_audit_value(&confirmation),
                             });
                     }
+
+                    // Stage the decision so `handle_tool_result` (tools.rs)
+                    // folds it onto this exact row instead of it going
+                    // unrendered on the home session's own display (#1426).
+                    // `approval_id` is always the gated call's own `tool_id`
+                    // (mirrors #439's correlation), so the same `tool_use.id`
+                    // resolves both.
+                    let choice = confirmation_audit_value(&confirmation);
+                    let choice = choice
+                        .get("choice")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("decided");
+                    let sender = self
+                        .pending_named_brain_turns
+                        .get(&query_id)
+                        .map(|turn| turn.approval_audience.subject.clone())
+                        .unwrap_or_else(|| self.participant_subject.clone());
+                    self.pending_tool_decisions
+                        .insert(tool_use.id.clone(), format!("{choice} by {sender}"));
 
                     // Send confirmation back to tool execution task
                     let _ = response_tx.send(confirmation);
