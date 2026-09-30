@@ -12114,14 +12114,15 @@ mod tests {
 
     #[test]
     fn test_live_frame_measured_height_equals_the_rows_it_paints() {
-        // A status line wider than the terminal wraps. The frame's own row
-        // count is what erase_live_area() clears, so it must equal the rows the
-        // painted bytes actually occupy — not the number of logical lines.
+        // A draft wider than the terminal intentionally wraps. Fixed-height
+        // status chrome is width-bounded, but editable input still exercises
+        // the renderer's physical-row accounting: erase_live_area() must clear
+        // every row the painted bytes actually occupy, not just each logical
+        // frame line.
         let width = 30;
-        let status = "a".repeat(95);
-        let input = vec![String::new()];
+        let input = vec!["a".repeat(95)];
         let mut autocomplete = AutocompleteState::new();
-        let frame = plan_live_frame(&live_inputs(width, 40, &input, &status), &mut autocomplete);
+        let frame = plan_live_frame(&live_inputs(width, 40, &input, "idle"), &mut autocomplete);
 
         let buffer = frame.to_shadow_buffer(width, 40);
 
