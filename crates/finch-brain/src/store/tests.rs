@@ -8177,6 +8177,31 @@ fn backdate_brain_created_ms(root: &std::path::Path, name: &str, created_ms: u64
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
+fn durable_file_fingerprints(
+    directory: &std::path::Path,
+) -> Vec<(std::path::PathBuf, usize, String)> {
+    let mut pending = vec![directory.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                files.push((
+                    entry.path().strip_prefix(directory).unwrap().to_path_buf(),
+                    bytes.len(),
+                    hex::encode(Sha256::digest(bytes)),
+                ));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 #[test]
 fn test_sweep_removes_a_zero_event_brain_past_the_age_threshold() {
     let temp = tempfile::tempdir().unwrap();
@@ -8201,6 +8226,40 @@ fn test_sweep_removes_a_zero_event_brain_past_the_age_threshold() {
     assert!(
         !temp.path().join("stale").exists(),
         "the swept Brain's directory must be gone from disk"
+    );
+}
+
+#[test]
+fn test_swept_brain_stays_absent_after_store_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let fixture = BrainStore::with_root("box.local", Some(temp.path().into()));
+        fixture.snapshot("stale").unwrap();
+        backdate_brain_created_ms(temp.path(), "stale", 0);
+    }
+
+    let first_restart = BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert_eq!(
+        first_restart.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS),
+        1,
+        "the first restarted store must sweep the old zero-event Brain"
+    );
+    drop(first_restart);
+
+    let second_restart = BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert_eq!(
+        second_restart.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS),
+        0,
+        "a later restart must not resurrect or re-delete a Brain already swept"
+    );
+    assert!(
+        !temp.path().join("stale").exists(),
+        "the swept Brain must remain absent from durable state after restart"
+    );
+    assert_eq!(
+        second_restart.resident_brain_count(),
+        0,
+        "verifying post-sweep absence must not hydrate any Brain"
     );
 }
 
@@ -8231,6 +8290,148 @@ fn test_sweep_never_removes_a_brain_with_real_events_regardless_of_age() {
     assert!(
         temp.path().join("active").join("events.jsonl").exists(),
         "the Brain with real history must survive the sweep untouched"
+    );
+}
+
+#[test]
+fn test_sweep_reads_an_old_active_brain_without_hydrating_or_mutating_it_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("active");
+    {
+        let fixture = BrainStore::with_root("box.local", Some(temp.path().into()));
+        fixture
+            .push(
+                "active",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "preserve this".into(),
+                    attached_mentions: Vec::new(),
+                },
+            )
+            .unwrap();
+        backdate_brain_created_ms(temp.path(), "active", 0);
+        std::fs::remove_file(directory.join("initialization.json")).unwrap();
+    }
+    let before = durable_file_fingerprints(&directory);
+    assert!(
+        !before
+            .iter()
+            .any(|(path, _, _)| path == std::path::Path::new("initialization.json")),
+        "precondition: the restarted Brain must be missing initialization.json so hydration would be observable; files={before:?}"
+    );
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let removed = restarted.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+    let after = durable_file_fingerprints(&directory);
+
+    assert_eq!(
+        removed, 0,
+        "an old Brain with a substantive Prompt must never be swept"
+    );
+    assert_eq!(
+        after, before,
+        "classifying a protected old Brain during startup sweep must leave every existing byte unchanged and create no files"
+    );
+    assert_eq!(
+        restarted.resident_brain_count(),
+        0,
+        "startup sweep must classify protected Brains from durable state without leaving them resident"
+    );
+}
+
+#[test]
+fn test_sweep_preserves_a_resident_pending_attachment_without_hydrating_other_brains() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let pending = store
+        .attach("pending", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    backdate_brain_created_ms(temp.path(), "pending", 0);
+    assert!(
+        pending.connection_id.is_some(),
+        "precondition: attach must reserve a live pending connection"
+    );
+
+    let removed = store.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(
+        removed, 0,
+        "an in-memory pending attachment must protect its Brain even before ClientAttached is durable"
+    );
+    assert!(
+        temp.path().join("pending").exists(),
+        "the pending participant's Brain must remain on disk"
+    );
+    assert_eq!(
+        store.resident_brain_count(),
+        1,
+        "the sweep may observe the already-resident pending Brain but must not hydrate another"
+    );
+}
+
+#[test]
+fn test_sweep_preserves_a_durable_runner_lease_without_hydrating_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let fixture = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = fixture.environment().generation;
+        fixture
+            .acquire_runner_lease("runner", "alice", generation, None, 60_000)
+            .unwrap();
+        backdate_brain_created_ms(temp.path(), "runner", 0);
+    }
+    let before = durable_file_fingerprints(&temp.path().join("runner"));
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let removed = restarted.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(removed, 0, "a durable runner lease must protect its Brain");
+    assert_eq!(
+        durable_file_fingerprints(&temp.path().join("runner")),
+        before,
+        "checking a durable runner lease must not mutate its Brain"
+    );
+    assert_eq!(
+        restarted.resident_brain_count(),
+        0,
+        "checking a durable runner lease must not hydrate its Brain"
+    );
+}
+
+#[test]
+fn test_sweep_preserves_a_persisted_provider_selection_without_hydrating_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let fixture = BrainStore::with_root("box.local", Some(temp.path().into()));
+        fixture
+            .set_provider_selection(
+                "selected",
+                BrainProviderSelection {
+                    provider: Some("work".into()),
+                    ..BrainProviderSelection::default()
+                },
+            )
+            .unwrap();
+        backdate_brain_created_ms(temp.path(), "selected", 0);
+    }
+    let before = durable_file_fingerprints(&temp.path().join("selected"));
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let removed = restarted.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(
+        removed, 0,
+        "a persisted provider selection must protect its Brain"
+    );
+    assert_eq!(
+        durable_file_fingerprints(&temp.path().join("selected")),
+        before,
+        "checking a persisted provider selection must not mutate its Brain"
+    );
+    assert_eq!(
+        restarted.resident_brain_count(),
+        0,
+        "checking a persisted provider selection must not hydrate its Brain"
     );
 }
 
@@ -8292,5 +8493,90 @@ fn test_sweep_does_not_hydrate_or_repair_a_brain_missing_metadata_json() {
         "the sweep must not mint a fresh BrainId for a candidate it is only \
          inspecting -- that would be the exact resurrection #393 reports, \
          just reached from a new caller"
+    );
+}
+
+#[test]
+fn test_sweep_leaves_corrupt_metadata_byte_identical_and_unhydrated() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("corrupt-metadata");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("metadata.json"), b"{not json\n").unwrap();
+    std::fs::write(directory.join("events.jsonl"), b"important bytes\n").unwrap();
+    let before = durable_file_fingerprints(&directory);
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+    let removed = store.sweep_unused(0);
+
+    assert_eq!(removed, 0, "corrupt metadata must fail closed during sweep");
+    assert_eq!(
+        durable_file_fingerprints(&directory),
+        before,
+        "a corrupt-metadata candidate must remain byte-identical with no new files"
+    );
+    assert_eq!(
+        store.resident_brain_count(),
+        0,
+        "a corrupt-metadata candidate must not be hydrated or repaired"
+    );
+}
+
+#[test]
+fn test_sweep_leaves_a_torn_journal_byte_identical_and_unhydrated() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("torn-journal");
+    {
+        let fixture = BrainStore::with_root("box.local", Some(temp.path().into()));
+        fixture.snapshot("torn-journal").unwrap();
+        backdate_brain_created_ms(temp.path(), "torn-journal", 0);
+    }
+    std::fs::write(directory.join("events.jsonl"), b"{\"torn\":true}").unwrap();
+    let before = durable_file_fingerprints(&directory);
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+    let removed = store.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(removed, 0, "a torn journal must fail closed during sweep");
+    assert_eq!(
+        durable_file_fingerprints(&directory),
+        before,
+        "read-only sweep classification must not truncate or repair a torn journal"
+    );
+    assert_eq!(
+        store.resident_brain_count(),
+        0,
+        "a torn-journal candidate must not be hydrated"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sweep_ignores_a_directory_symlink_without_mutating_its_target() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("sentinel"), b"outside durable state").unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("linked-brain")).unwrap();
+    let before = durable_file_fingerprints(outside.path());
+    let store = BrainStore::with_root("box.local", Some(root.path().into()));
+
+    let removed = store.sweep_unused(0);
+
+    assert_eq!(
+        removed, 0,
+        "a directory symlink must never be a sweep candidate"
+    );
+    assert!(
+        root.path().join("linked-brain").is_symlink(),
+        "the sweep must leave the directory symlink itself untouched"
+    );
+    assert_eq!(
+        durable_file_fingerprints(outside.path()),
+        before,
+        "the sweep must not read through or mutate a directory symlink's target"
+    );
+    assert_eq!(
+        store.resident_brain_count(),
+        0,
+        "ignoring a directory symlink must not create resident Brain state"
     );
 }

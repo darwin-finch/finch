@@ -1711,6 +1711,33 @@ mod tests {
         std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
     }
 
+    fn durable_file_fingerprints(
+        directory: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, usize, String)> {
+        use sha2::Digest as _;
+
+        let mut pending = vec![directory.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    files.push((
+                        entry.path().strip_prefix(directory).unwrap().to_path_buf(),
+                        bytes.len(),
+                        hex::encode(sha2::Sha256::digest(bytes)),
+                    ));
+                }
+            }
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
     fn request_id_tracing_router(server: Arc<AgentServer>) -> axum::Router {
         let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
         isolated_http_router(server).layer(
@@ -2334,11 +2361,15 @@ mod tests {
             value["created_ms"] = serde_json::json!(old_enough);
             std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         }
+        let active_directory = root.join(&active);
+        std::fs::remove_file(active_directory.join("initialization.json")).unwrap();
         // #393 shape: durable state present, metadata.json absent. Must
         // never be handed to anything that would mint it an identity.
         let half_deleted_dir = root.join(&half_deleted);
         std::fs::create_dir_all(&half_deleted_dir).unwrap();
         std::fs::write(half_deleted_dir.join("events.jsonl"), "not empty\n").unwrap();
+        drop(fixture_store);
+        let active_before = durable_file_fingerprints(&active_directory);
 
         let config =
             crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
@@ -2353,7 +2384,7 @@ mod tests {
         // The real daemon-startup constructor. The sweep this test exists to
         // prove runs synchronously inside this call, before the returned
         // server has bound a listener or accepted any connection.
-        let _server = AgentServer::new(
+        let server = AgentServer::new(
             config,
             ServerConfig {
                 bind_address: daemon_address,
@@ -2379,6 +2410,16 @@ mod tests {
             root.join(&active).join("events.jsonl").exists(),
             "a Brain with a real Prompt event must survive the sweep even \
              though it is just as old as the one that was removed"
+        );
+        assert_eq!(
+            durable_file_fingerprints(&active_directory),
+            active_before,
+            "the real AgentServer::new startup sweep must leave an old active Brain byte-identical and create no missing initialization or audit files"
+        );
+        assert_eq!(
+            server.brain_store.resident_brain_count(),
+            0,
+            "the real AgentServer::new startup sweep must not leave any inspected Brain resident"
         );
         assert!(
             root.join(&fresh).exists(),
