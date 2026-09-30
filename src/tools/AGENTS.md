@@ -177,6 +177,50 @@ cooperatively fails after 20 seconds or 256 MiB of aggregate source reads, inclu
 `test_escaped_path_is_not_pattern_admissible_through_approval_path`, and
 `test_star_pattern_does_not_match_escaped_path` pin this.
 
+**A persistent pattern match persists its own count (issue #427 item 2).**
+`ToolConfirmationCache::is_approved` used to set the in-memory `dirty` flag on a
+persistent match and defer the actual disk write to the next brand-new
+approval or to the one clean-shutdown `save_if_dirty()` call in
+`EventLoop::run` — so a session that ended any other way (the Cap'n Proto
+quit-watcher's `std::process::exit(0)`, a crash, a killed terminal) lost
+every match-count increment for that session, which is why
+`~/.finch/tool_patterns.json` could show `match_count: 0` on every pattern
+despite matches actually happening. `ToolConfirmationCache::persist_match_count`
+(`src/tools/executor.rs`) now flushes immediately, best-effort, on every
+persistent exact/pattern match, not only on a new approval.
+`test_persistent_pattern_match_count_survives_process_exit_without_a_clean_shutdown`
+in `src/tools/executor.rs` reproduces the exact failure shape: match, then
+reload from disk with no save/shutdown call in between.
+
+**Bash patterns narrow to a flag-skeleton template, not `bash:*` (issue #427
+item 3).** `ToolPattern::structured_from_bash_command`
+(`crates/finch-tools-api/src/patterns.rs`) builds a `Structured` pattern for
+a bash command with a genuine fixed-skeleton-plus-flag-values shape (`gh
+issue create --repo <arg> --title <arg> --body <arg>`) instead of the
+blanket `tool:*` wildcard the TUI approval dialog used to always mint
+(`approval_pattern_for_dialog` in `src/cli/repl_event/event_loop.rs`, called
+from both the session and persistent dialog choices). It declines — falling
+back to the pre-existing Wildcard behavior, never a new, less-safe one — for
+anything with a shell operator (not a single invocation), a bare positional
+argument outside the recognised skeleton/flag structure (`cp <src> <dst>`,
+`rm -rf <arg>`), or nothing that actually varies. Short flags (`-v`, `-f`)
+never absorb a following token as a value, specifically so `rm -v <path>`
+is not misread as "`-v` takes a value" and wildcard the path. This is
+**not** a solution to #429's still-open bash gap: a long flag's value is
+wildcarded without checking whether it is a filesystem path, because bash
+has no path slot and no execution-time containment exists yet (#429's
+sandbox/`is_readonly_bash`-fragment options remain undecided). It is still a
+strict narrowing versus today's default — the pattern only matches the
+observed program + subcommand + flag skeleton, never an unrelated command —
+and every match, Structured or Wildcard, still passes through
+`pattern_may_admit`'s constitutional-denylist and never-widen gates.
+`test_structured_from_bash_command_captures_flag_skeleton`,
+`test_structured_from_bash_command_falls_back_on_bare_positional_args`, and
+`test_structured_from_bash_command_short_flag_never_absorbs_a_value` in
+`crates/finch-tools-api/src/patterns.rs` pin the shape test;
+`test_dialog_result_bash_flag_shape_mints_structured_pattern_not_wildcard` in
+`src/cli/repl_event/event_loop/tests.rs` pins the dialog wiring.
+
 **Effects are declared, not guessed (issue #466).** Every `Tool` implements `fn effect(&self) ->
 ExecutionEffect` with no default, so a new tool cannot exist without stating its authority and a
 rename carries the declaration with it. There is no string-keyed effect table left in this

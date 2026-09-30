@@ -109,6 +109,77 @@ impl ToolPattern {
         }
     }
 
+    /// Try to build a `Structured` bash pattern that captures one command's
+    /// fixed skeleton (program + subcommand words + literal flag names) and
+    /// wildcards only the *values* of long (`--flag`) options — e.g.
+    /// `gh issue create --repo owner/repo --title X --body Y` becomes
+    /// `command_pattern: "gh"`, `args_pattern: "issue create --repo *
+    /// --title * --body *"`.
+    ///
+    /// Returns `None` — the caller falls back to its existing `Wildcard`
+    /// pattern generation, never a new, less-safe behaviour — whenever the
+    /// command does not cleanly fit that shape:
+    ///
+    /// - it contains a shell operator (`;`, `|`, `>`, `<`, `&`): a template
+    ///   over `bash -c '...'` is a template over an entire shell language,
+    ///   not a single invocation, and is not analysable (#429);
+    /// - any token outside the leading skeleton and the recognised
+    ///   `--flag`/`--flag value`/`--flag=value` positions is a bare
+    ///   positional argument (e.g. `cp <src> <dst>`, `rm -rf <arg>`) —
+    ///   these are exactly the shapes #427/#429 call unsafe to templatize,
+    ///   because the wildcarded slot could be a filesystem path with no
+    ///   containment check;
+    /// - nothing actually varies (a bare command, or only boolean flags) —
+    ///   templating buys nothing a literal pattern doesn't already give.
+    ///
+    /// Short flags (`-v`, `-f`) are always treated as boolean/literal and
+    /// never absorb a following token as a value, specifically so
+    /// `rm -v <path>` does not get misread as "`-v` takes a value" and
+    /// wildcard the path — only long (`--flag`) options can claim a value,
+    /// matching the issue's own example.
+    ///
+    /// **What this does not do (still #429's open gap, not this issue's):**
+    /// a long flag's *value* is wildcarded without checking whether it is a
+    /// filesystem path — bash has no path slot and no execution-time
+    /// containment exists yet (#429's bash sandbox/`is_readonly_bash`
+    /// options remain undecided). This is still a strict narrowing versus
+    /// today's `bash:*`-shaped default: the resulting pattern only matches
+    /// the observed program + subcommand + flag skeleton, never an
+    /// unrelated command, and the existing constitutional-denylist and
+    /// never-widen gates in [`ToolPattern::matches`] still apply to every
+    /// match attempt regardless of pattern type.
+    pub fn structured_from_bash_command(command: &str, description: String) -> Option<Self> {
+        let (command_pattern, args_pattern) = bash_skeleton_pattern(command)?;
+
+        // Self-verify: the generated pattern must match the exact command
+        // it was derived from. A construction bug here must never persist
+        // a pattern that doesn't even admit its own source invocation —
+        // fall back to the caller's existing behaviour instead of guessing.
+        let space_idx = command.find(' ')?;
+        let observed_args = command[space_idx..].trim();
+        if !pattern_matches(&args_pattern, observed_args) {
+            return None;
+        }
+
+        let pattern = format!("cmd:{command_pattern} args:{args_pattern}");
+        Some(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern,
+            tool_name: "bash".to_string(),
+            description,
+            created_at: Utc::now(),
+            match_count: 0,
+            pattern_type: PatternType::Structured,
+            last_used: None,
+            created_by: None,
+            compiled_regex: None,
+            command_pattern: Some(command_pattern),
+            args_pattern: Some(args_pattern),
+            dir_pattern: None,
+            path_slot: PathSlot::Any,
+        })
+    }
+
     /// Create a new structured pattern. Crate-internal: structured patterns
     /// are constructed by the approval pipeline and tests, never by callers
     /// outside this crate.
@@ -484,6 +555,157 @@ fn pattern_may_admit(signature: &ToolSignature) -> bool {
         }
     }
     true
+}
+
+/// Build `(command_pattern, args_pattern)` for
+/// [`ToolPattern::structured_from_bash_command`]. See that method's doc
+/// comment for the full safety rationale; this function only implements the
+/// shape test and the pattern construction.
+fn bash_skeleton_pattern(command: &str) -> Option<(String, String)> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Only a single invocation is analysable — the same reasoning
+    // `is_readonly_bash` documents for its own, narrower fragment.
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '>' | '<' | '&'))
+    {
+        return None;
+    }
+
+    let space_idx = trimmed.find(char::is_whitespace)?;
+    let base_cmd = &trimmed[..space_idx];
+    if base_cmd.is_empty() {
+        return None;
+    }
+    let args_text = trimmed[space_idx..].trim();
+    if args_text.is_empty() {
+        return None;
+    }
+
+    let spans = shell_token_spans(args_text)?;
+    if spans.is_empty() {
+        return None;
+    }
+
+    // Leading run of non-flag tokens is the subcommand skeleton
+    // ("issue create"). If there is no flag anywhere, every token is a bare
+    // positional (or the whole thing is subcommand words with nothing to
+    // parameterise) — bail rather than guess which ones are safe to vary.
+    let mut skeleton_end = 0;
+    while skeleton_end < spans.len()
+        && !args_text[spans[skeleton_end].0..spans[skeleton_end].1].starts_with('-')
+    {
+        skeleton_end += 1;
+    }
+    if skeleton_end == spans.len() {
+        return None;
+    }
+
+    let mut pattern = String::new();
+    let mut cursor = 0usize;
+    let mut saw_wildcard = false;
+    let mut i = skeleton_end;
+    while i < spans.len() {
+        let (start, end) = spans[i];
+        let token = &args_text[start..end];
+        if !token.starts_with('-') {
+            // A bare positional outside the skeleton/flag structure — the
+            // `cp <src> <dst>` / `rm -rf <arg>` shape. Unsafe to templatize.
+            return None;
+        }
+
+        if let Some(eq) = token.find('=') {
+            if !token.starts_with("--") {
+                // `-f=x` is nonstandard/ambiguous; don't guess.
+                return None;
+            }
+            pattern.push_str(&args_text[cursor..start + eq + 1]);
+            pattern.push('*');
+            saw_wildcard = true;
+            cursor = end;
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with("--") {
+            // A long flag may claim the following token as its value.
+            if i + 1 < spans.len() {
+                let (next_start, next_end) = spans[i + 1];
+                let next = &args_text[next_start..next_end];
+                if !next.starts_with('-') {
+                    pattern.push_str(&args_text[cursor..end]);
+                    pattern.push_str(&args_text[end..next_start]);
+                    pattern.push('*');
+                    saw_wildcard = true;
+                    cursor = next_end;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        // Short flag, or a long flag with nothing following it (or
+        // followed by another flag): boolean, stays entirely literal.
+        // Short flags NEVER absorb a following token as a value — that is
+        // what keeps `rm -v <path>` from being misread as "`-v` takes a
+        // value" and wildcarding the path.
+        i += 1;
+    }
+    pattern.push_str(&args_text[cursor..]);
+
+    if !saw_wildcard {
+        return None;
+    }
+
+    Some((base_cmd.to_string(), pattern))
+}
+
+/// Split `s` into shell-word byte-offset spans on whitespace, treating a
+/// `'...'`/`"..."` run as part of one token (so a quoted value containing a
+/// space is not mistaken for two tokens). Returns `None` on an unbalanced
+/// quote rather than guessing where it closes.
+fn shell_token_spans(s: &str) -> Option<Vec<(usize, usize)>> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let len = s.len();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = chars[i].0;
+        let mut quote: Option<char> = None;
+        while i < chars.len() {
+            let ch = chars[i].1;
+            if let Some(q) = quote {
+                i += 1;
+                if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                i += 1;
+                continue;
+            }
+            if ch.is_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        if quote.is_some() {
+            return None;
+        }
+        let end = if i < chars.len() { chars[i].0 } else { len };
+        spans.push((start, end));
+    }
+    Some(spans)
 }
 
 fn canonical_directory(dir: &str) -> String {
@@ -1299,5 +1521,173 @@ mod tests {
         std::fs::write(temp_file.path(), v2).unwrap();
         let store = PersistentPatternStore::load(temp_file.path()).unwrap();
         assert_eq!(store.patterns[0].path_slot, PathSlot::Any);
+    }
+
+    // ── #427 item 3: structured_from_bash_command ──────────────────────────
+
+    #[test]
+    fn test_structured_from_bash_command_captures_flag_skeleton() {
+        // The issue's own motivating example.
+        let pattern = ToolPattern::structured_from_bash_command(
+            "gh issue create --repo owner/repo --title fix --body details",
+            "test".to_string(),
+        )
+        .expect("a flag-value shape must mint a Structured pattern");
+
+        assert_eq!(pattern.pattern_type, PatternType::Structured);
+        assert_eq!(pattern.tool_name, "bash");
+        assert_eq!(pattern.command_pattern.as_deref(), Some("gh"));
+        assert_eq!(
+            pattern.args_pattern.as_deref(),
+            Some("issue create --repo * --title * --body *")
+        );
+
+        // The pattern generated from one observation must match that same
+        // observation's signature (self-consistency, not just a different
+        // gh issue create invocation).
+        let sig = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "irrelevant".to_string(),
+            command: Some("gh".to_string()),
+            args: Some("issue create --repo owner/repo --title fix --body details".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            pattern.matches(&sig),
+            "generated pattern must match its own source command"
+        );
+
+        // A different subcommand under the same program must NOT match —
+        // the changing-subcommand collapse #427/#429 call out by name.
+        let different_subcommand = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "irrelevant".to_string(),
+            command: Some("gh".to_string()),
+            args: Some("repo delete owner/repo --confirm".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !pattern.matches(&different_subcommand),
+            "invariant: `gh issue create` and `gh repo delete` must never \
+             collapse into one template"
+        );
+
+        // A same-shape call with different flag values must still match —
+        // that is the entire point of templating.
+        let same_shape_different_values = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "irrelevant".to_string(),
+            command: Some("gh".to_string()),
+            args: Some(
+                "issue create --repo other/repo --title \"another bug\" --body \"more details\""
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            pattern.matches(&same_shape_different_values),
+            "same command shape with different flag values must still match"
+        );
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_falls_back_on_bare_positional_args() {
+        // `cp <src> <dst>` — no flags at all, just positionals. Templating
+        // this would wildcard an unconstrained filesystem path (#429).
+        assert!(
+            ToolPattern::structured_from_bash_command(
+                "cp ./target/out.txt /tmp/backup.txt",
+                "test".to_string(),
+            )
+            .is_none(),
+            "a bare-positional command must not be templatized"
+        );
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_falls_back_on_positional_after_flags() {
+        // `git commit -m msg file.txt` — a positional trailing a flag's
+        // value is still a positional; must not templatize.
+        assert!(
+            ToolPattern::structured_from_bash_command(
+                "git commit -m msg file.txt",
+                "test".to_string(),
+            )
+            .is_none(),
+            "a positional argument after a flag must not be templatized"
+        );
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_short_flag_never_absorbs_a_value() {
+        // `rm -v /etc/passwd` must not be read as "-v takes a value" —
+        // short flags are always boolean/literal here, so the path falls
+        // through as a stray positional and the whole command is declined.
+        assert!(
+            ToolPattern::structured_from_bash_command("rm -v /etc/passwd", "test".to_string())
+                .is_none(),
+            "a short flag must never absorb a following path as its value"
+        );
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_falls_back_on_shell_operators() {
+        for command in [
+            "ls foo && rm -rf bar",
+            "cat file | tee out",
+            "echo hi > file",
+            "ls; rm -rf /",
+        ] {
+            assert!(
+                ToolPattern::structured_from_bash_command(command, "test".to_string()).is_none(),
+                "a command with a shell operator must never be templatized: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_falls_back_when_nothing_varies() {
+        // All-boolean-flags / bare commands: nothing to parameterize, so
+        // templating buys nothing over the existing Wildcard/exact paths.
+        for command in ["ls -la", "cargo fmt", "git status", "pwd"] {
+            assert!(
+                ToolPattern::structured_from_bash_command(command, "test".to_string()).is_none(),
+                "a command with nothing varying must fall back: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_supports_flag_equals_value() {
+        let pattern =
+            ToolPattern::structured_from_bash_command("cargo build --target=aarch64", "t".into())
+                .expect("--flag=value shape must templatize");
+        assert_eq!(pattern.command_pattern.as_deref(), Some("cargo"));
+        assert_eq!(pattern.args_pattern.as_deref(), Some("build --target=*"));
+    }
+
+    #[test]
+    fn test_structured_from_bash_command_never_admits_a_constitutionally_denied_match() {
+        // Even a Structured pattern goes through the same never-widen gate
+        // as Wildcard: `pattern_may_admit` still refuses a constitutionally
+        // Denied bash command at match time, regardless of pattern type.
+        let pattern = ToolPattern::structured_from_bash_command(
+            "gh issue create --repo owner/repo --title x --body y",
+            "test".to_string(),
+        )
+        .expect("control: this shape must templatize");
+        let denied_sig = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "irrelevant".to_string(),
+            command: Some("gh".to_string()),
+            args: Some("issue create --repo owner/repo --title x --body y".to_string()),
+            constitutionally_denied: true,
+            ..Default::default()
+        };
+        assert!(
+            !pattern.matches(&denied_sig),
+            "invariant: Structured patterns must not admit a constitutionally \
+             Denied command either"
+        );
     }
 }

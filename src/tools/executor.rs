@@ -119,6 +119,7 @@ impl ToolConfirmationCache {
             // Increment match count (this makes it dirty)
             if let Some(MatchType::Exact(_)) = self.persistent.matches(sig) {
                 self.dirty = true;
+                self.persist_match_count();
                 return ApprovalSource::PersistentExact;
             }
         }
@@ -136,6 +137,7 @@ impl ToolConfirmationCache {
         // 3. Check persistent patterns
         if let Some(MatchType::Pattern(id)) = self.persistent.matches(sig) {
             self.dirty = true; // Match count was incremented
+            self.persist_match_count();
             return ApprovalSource::PersistentPattern(id);
         }
 
@@ -148,6 +150,28 @@ impl ToolConfirmationCache {
         }
 
         ApprovalSource::NotApproved
+    }
+
+    /// Flush a `match_count`/`last_used` bump to disk immediately.
+    ///
+    /// Before this, an ordinary persistent-pattern *match* (as opposed to a
+    /// brand-new approval, which already saves immediately) only set the
+    /// in-memory `dirty` flag; nothing durably recorded it unless the
+    /// session later minted a new approval or reached the one clean-shutdown
+    /// `save_if_dirty()` call in `EventLoop::run`. A session that exits any
+    /// other way — the Cap'n Proto quit-watcher's `std::process::exit(0)`,
+    /// a crash, a killed terminal — lost every match-count increment for
+    /// that session, which is why `~/.finch/tool_patterns.json` could show
+    /// `match_count: 0` on every pattern despite matches actually happening
+    /// (issue #427, item 2). Best-effort: a write failure is logged and
+    /// leaves `dirty` set so a later save attempt can retry; it must never
+    /// fail the approval itself.
+    fn persist_match_count(&mut self) {
+        if let Err(e) = self.persistent.save(&self.persistent_path) {
+            warn!("Failed to persist pattern match count: {}", e);
+            return;
+        }
+        self.dirty = false;
     }
 
     /// Approve exact command for session only
@@ -1631,6 +1655,82 @@ mod tests {
             "the grant minted in the previous session must still approve after \
              restart; got {:?}",
             restarted.is_approved(&sig)
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_persistent_pattern_match_count_survives_process_exit_without_a_clean_shutdown() {
+        // #427 item 2: `~/.finch/tool_patterns.json` showed `match_count: 0`
+        // on every stored pattern, weeks after creation. Before this fix,
+        // `is_approved()` bumped the in-memory `match_count` on a persistent
+        // match but only flushed it to disk on a later *new* approval or on
+        // the one clean-shutdown `save_if_dirty()` call in `EventLoop::run`.
+        // A session that ends any other way (the quit-watcher's
+        // `std::process::exit(0)`, a crash, a killed terminal) lost the
+        // increment. Reproduce that exact failure shape: approve a pattern
+        // persistently, record a match through the real `is_approved` path,
+        // and load a FRESH executor from the same file WITHOUT ever calling
+        // `save_patterns()`/`save_if_dirty()` in between — simulating the
+        // non-clean-exit case. Before the fix this asserts 0 and fails.
+        let (workspace, root) = isolated_workspace();
+        let tempdir = tempfile::tempdir().expect("pattern store");
+        let store_path = tempdir.path().join("patterns.json");
+
+        let make = || {
+            let mut registry = crate::tools::ToolRegistry::new();
+            registry.register(Box::new(crate::tools::ReadTool));
+            ToolExecutor::new(
+                registry,
+                crate::tools::PermissionManager::new().with_workspace_root(root.clone()),
+                store_path.clone(),
+            )
+            .expect("executor")
+        };
+
+        let mut first = make();
+        first.approve_pattern_persistent(crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "read".to_string(),
+            "allow all reads".to_string(),
+        ));
+        first
+            .save_patterns()
+            .expect("the new approval itself must still save immediately");
+
+        let inside = root.join("ok.txt");
+        std::fs::write(&inside, "ok").expect("seed");
+        let tool_use = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": inside.to_string_lossy()}),
+        );
+        let sig = generate_tool_signature(&tool_use, &root);
+
+        // The match itself — no explicit save call follows, reproducing a
+        // session that never reaches a clean shutdown.
+        assert!(
+            matches!(
+                first.is_approved(&sig),
+                ApprovalSource::PersistentPattern(_)
+            ),
+            "control: the freshly-approved pattern must match the same signature"
+        );
+
+        // A brand new process reloads the store from disk, as if `first`
+        // had just been killed rather than exited cleanly.
+        let reloaded = make();
+        let stored = reloaded
+            .persistent_store()
+            .patterns
+            .iter()
+            .find(|p| p.tool_name == "read")
+            .expect("the persisted pattern must still be on disk");
+        assert_eq!(
+            stored.match_count, 1,
+            "match_count must be durably 1 after a single real match even \
+             though no save/shutdown call ran between the match and the \
+             reload; got {} (pattern={:?})",
+            stored.match_count, stored
         );
         let _keep = workspace;
     }
