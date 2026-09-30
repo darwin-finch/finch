@@ -214,3 +214,81 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   registers Bash/Edit/Glob/Grep/Read/Write) — consistent with the prior pass's note that this is
   intentional subprocess scoping, not a gap.
   **Net result: no new issues filed.** All five targeted fixes held up under live re-testing.
+- **2026-09-29 (still later that night)**: focused two-persona pass (Jordan, Chen) against a build
+  with four more fixes landed: the `present_plan`-in-a-batch deadlock (#26/#363), GUI/Excel
+  automation tools registering unconditionally on macOS (#421), approval decisions rendering
+  inline on the tool-call row (#439), and stale-runner-lease reattach showing a calm transition
+  (#423). Built via `cargo install --path . --locked --force` (commit `c99ca1a9`), daemon
+  restarted. Session-naming note: the plain `persona-jordan`/`persona-chen` tmux session names
+  collided mid-run with another concurrent agent independently running the same task in this
+  session (its content showed up under `persona-jordan-<timestamp>` after a rename) — switched to
+  PID+timestamp-suffixed session names (`jrd-<ts>-<pid>`/`chn-<ts>-<pid>`) to isolate cleanly;
+  future passes should default to unique suffixes from the start rather than the bare persona name
+  when multiple agents might be active in the same session.
+  **Plan-approval deadlock (#26/#363) — held up, tried hard to break it:** drove the full flow live
+  on a fresh Brain (`hollow-shore-dd3a65`): entered `/plan`, had the model read the directory,
+  present a plan via `present_plan`, approved it through the real dialog ("Approve and execute").
+  Confirmed the specific batch shape the fix targets — a round with `present_plan` *and* a `write`
+  tool call together (`Tools (2 calls): present_plan(...), write(one.txt)`) — completed normally,
+  not just a trivial single-call case. After approval the session was immediately responsive (no
+  hang), `one.txt` was created with correct content, and five more turns/approvals (further writes,
+  a `gui_inspect` call) all completed normally in the same session afterward. No hang, no stuck
+  spinner, no dead composer at any point. This is the single most important result of the pass:
+  the deadlock fix holds live, under genuine multi-tool-call batch pressure, not just its own unit
+  test.
+  **Stale-runner-lease reattach (#423) — held up:** started Chen's session (`dark-moor-39d8b9`),
+  `kill -9`'d the client process to leave the lease dangling (a graceful exit releases it, so this
+  is the real ungraceful-death trigger), then immediately ran `finch attach dark-moor-39d8b9`.
+  Transcript showed exactly one calm line — `dark-moor-39d8b9: Runner role is transferring from a
+  previous session — reconnecting…` — matching `RunnerRecovery::LeaseTransferring`'s
+  `human_message()` verbatim, with no raw exception text and no "Failed:" line, then reconnected
+  automatically within moments and resumed the prior conversation history correctly.
+  **Approval decision inline on the tool-call row (#439) — did NOT hold up for the common case,
+  filed as #1426:** in a subagent/remote-Brain-viewing context #439's fix works as designed, but
+  the single most common scenario — a plain home-session `write` needing approval, the exact
+  scenario #439's own bug report described — still rendered the decision as a separate,
+  opaque-id-labelled row (`approval toolu_9XLCrgChNywWovb9OX6gqhBT — approve_once by
+  shammah@...`), not folded onto the `write(...)` row. Root-caused: `project_remote_brain_run_event`
+  (`src/cli/repl_event/event_loop.rs`) skips creating a `tool_rows` entry for a tool call already in
+  `locally_rendered_tool_ids` (populated by the separate `LocalBrainProjection` mechanism that
+  renders a home session's own turns directly), so #439's `tool_rows.contains_key(approval_id)`
+  check never matches for a locally-rendered call — exactly the common path. #439's own regression
+  test doesn't exercise `LocalBrainProjection` at all, which is why it passed without catching this.
+  Filed as #1426 with the full trace.
+  **GUI automation tools (#421) — registration confirmed correct by source, not confirmed via a
+  live model response:** `src/cli/repl.rs` registers all nine GUI/Excel tools unconditionally
+  inside one `#[cfg(target_os = "macos")]` block, matching the fix. Tried to get a live
+  `gui_inspect(query: "availability")` response through the TUI, but both usable local providers
+  hit the pre-existing #1228 "can't continue after a tool call" wall on the very next round (so the
+  model's own text summary of the result never renders), and `finch query` (single-shot mode) uses
+  a different, more minimal tool registry that doesn't include `gui_inspect` at all (not a bug —
+  wrong test surface, not the interactive REPL path #421 touched). Did not attempt to expand the
+  collapsed tool-call row in the TUI to read the raw result directly (out of budget for this pass).
+  Net: registration and the tool's own unit tests (`test_gui_inspect_availability_reports_disabled_
+  state_even_when_flag_is_off`) are solid evidence #421 is correctly wired, but this pass did not
+  get a live end-to-end confirmation of the actual returned text the way the other four fixes got.
+  **Bonus finding, unrelated to this pass's four target fixes, filed as a reopen of #1384:** every
+  fresh `finch` launch tonight (5/5, two brand-new directories/Brains dedicated to this check plus
+  three more used for the main tests) panicked a background `tokio-rt-worker` thread with the exact
+  signature `#1384` was originally filed against (`routing_tree.rs:181`, "index out of bounds: the
+  len is 0 but the index is 0" — a dimension-0 anchor/direction). #1384 was closed by #1398, but
+  #1398's fix and its own regression test address a different mechanism (reopening an existing
+  store built under one *nonzero* embedding dimension with a different *nonzero* dimension) than
+  what #1384 actually reported (a degenerate, completely empty anchor/direction on a decision
+  node) — `load_routing_tree`'s new dimension check wouldn't fire for the latter. Reopened #1384
+  with the live evidence rather than filing a duplicate, since the signature and repro match
+  exactly. Caveat noted in the reopened issue: this dev machine's single shared `~/.finch/memory.db`
+  has been rebuilt across many embedding engines over many days of testing, so a clean-machine
+  fresh install might not reproduce it — but the fact that it still reproduces on the very build
+  that was supposed to fix it is the point.
+  **Chen's other checks (named Brains, background tasks, a memory ack) all held up**: two
+  sequential background bash tasks both completed and wrote their expected files
+  (`bg_task.log`/`bg2.log`); one query round did fail with `"Tool continuation could not be
+  admitted: LLM continuation is unavailable"` immediately after the *first* background-task
+  round (a 2-second admission-handshake timeout in `commit_tool_round_and_continue`,
+  `src/cli/repl_event/event_loop.rs`) — but the background task's own side effect (the file write)
+  completed correctly regardless, and an identical second background-task request right after
+  succeeded cleanly with no error. Only reproduced once, immediately following the forced
+  `kill -9`-and-reattach test on the same session, so plausibly leftover session state from that
+  rather than a background-task-specific bug; below the bar for filing (not independently
+  reproducible), noted here in case a future pass hits the same message after a reattach.
