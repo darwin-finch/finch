@@ -12,6 +12,16 @@ use crate::ipc::leftover_daemon_message;
 pub enum RunnerRecovery {
     Reconnecting,
     NoLiveLease,
+    /// The daemon still considers a previous session's lease live (it has
+    /// not yet expired), so this attach was rejected — the ordinary shape of
+    /// reattaching a second console after the first one closed without a
+    /// clean release. Nothing is actually wrong: the stale lease clears (or
+    /// hands off) on its own and the scheduled reconnect (#423) claims it,
+    /// so this is a transition to report once and move on, not a failure
+    /// (#380's warm-up transition logging established the same shape: say
+    /// it when it changes, name what is happening, never present a
+    /// recoverable state as an error).
+    LeaseTransferring,
     OtherOwner {
         subject: String,
     },
@@ -67,6 +77,9 @@ impl RunnerRecovery {
         if error.contains("no runner lease") {
             return Self::NoLiveLease;
         }
+        if error.contains("already has a live runner lease") {
+            return Self::LeaseTransferring;
+        }
         if error.contains("lease expired") || error.contains("lease reacquired") {
             return Self::Reconnecting;
         }
@@ -81,6 +94,9 @@ impl RunnerRecovery {
             Self::Reconnecting => "Queued — no runner connected · reconnecting…".into(),
             Self::NoLiveLease => {
                 "No runner is connected. Run this Brain here with: /brain runner claim".into()
+            }
+            Self::LeaseTransferring => {
+                "Runner role is transferring from a previous session — reconnecting…".into()
             }
             Self::OtherOwner { subject } => {
                 format!("Queued — runner belongs to {subject} · request handoff")
@@ -113,6 +129,7 @@ impl RunnerRecovery {
         match self {
             Self::Reconnecting => "reconnecting runner".into(),
             Self::NoLiveLease => "no runner · /brain runner claim".into(),
+            Self::LeaseTransferring => "runner role transferring".into(),
             Self::OtherOwner { subject } => format!("runner belongs to {subject}"),
             Self::MachineMismatch { .. } => "machine mismatch".into(),
             Self::WorkspaceMismatch { .. } => "workspace mismatch".into(),
@@ -129,6 +146,9 @@ impl RunnerRecovery {
             Self::Reconnecting => "Queued — no runner connected · reconnecting…".into(),
             Self::NoLiveLease => {
                 "Queued — no runner connected · /brain runner claim".into()
+            }
+            Self::LeaseTransferring => {
+                "Queued — runner role transferring · reconnecting…".into()
             }
             Self::OtherOwner { subject } => {
                 format!("Queued — runner belongs to {subject} · request handoff")
@@ -161,6 +181,7 @@ impl RunnerRecovery {
         match self {
             Self::Reconnecting => "wait for automatic reconnect, or /brain runner claim",
             Self::NoLiveLease => "/brain runner claim",
+            Self::LeaseTransferring => "wait for automatic reconnect, or /brain runner claim",
             Self::OtherOwner { .. } | Self::HandoffRequired => {
                 "/brain handoff accept  (or ask the owner to /brain handoff <this identity>)"
             }
@@ -187,7 +208,10 @@ impl RunnerRecovery {
     pub fn should_auto_reconnect(&self) -> bool {
         matches!(
             self,
-            Self::Reconnecting | Self::DaemonIpcUnavailable { .. } | Self::Other { .. }
+            Self::Reconnecting
+                | Self::LeaseTransferring
+                | Self::DaemonIpcUnavailable { .. }
+                | Self::Other { .. }
         )
     }
 }
@@ -368,6 +392,57 @@ mod tests {
         assert!(
             workspace.blocks_driver_attach(),
             "workspace mismatch must not attach as a mute driver; recovery={workspace:?}"
+        );
+    }
+
+    #[test]
+    fn test_stale_lease_from_error_classifies_as_transferring_not_generic_failure() {
+        // The exact daemon rejection from `BrainStore::acquire_runner`
+        // (crates/finch-brain/src/store.rs) when a previous console's lease
+        // has not yet expired, wrapped the way the IPC client reports it
+        // (#423's reported reproduction).
+        let recovery = RunnerRecovery::from_error(
+            "Failed: remote exception: Brain already has a live runner lease",
+        );
+        assert_eq!(
+            recovery,
+            RunnerRecovery::LeaseTransferring,
+            "a still-live-but-stale lease is the ordinary reattach case, not the generic \
+             Other bucket that would print the raw exception text; recovery={recovery:?}"
+        );
+        assert!(
+            !recovery.human_message().to_lowercase().contains("failed")
+                && !recovery.human_message().contains("remote exception"),
+            "the calm transition message must not surface the raw failure-shaped exception \
+             text; message={}",
+            recovery.human_message()
+        );
+        assert!(
+            recovery
+                .human_message()
+                .to_lowercase()
+                .contains("transferring")
+                || recovery
+                    .human_message()
+                    .to_lowercase()
+                    .contains("reconnecting"),
+            "the message must name the transition in progress; message={}",
+            recovery.human_message()
+        );
+        assert!(
+            !recovery.header_suffix().contains("unavailable"),
+            "the status strip must not call a recoverable transition unavailable; \
+             header_suffix={}",
+            recovery.header_suffix()
+        );
+        assert!(
+            recovery.should_auto_reconnect(),
+            "a stale lease must still trigger the existing bounded reconnect; recovery={recovery:?}"
+        );
+        assert!(
+            !recovery.blocks_driver_attach(),
+            "a stale lease pending reconnect must still allow observing as a driver; \
+             recovery={recovery:?}"
         );
     }
 
