@@ -7012,6 +7012,279 @@ async fn test_pending_user_message_folds_into_plan_approval_directive() {
         .await;
 }
 
+/// Production-boundary regression for #363 ("Plan approval can wedge the
+/// active query and suppress later turns"): drives the exact reported
+/// scenario -- `/plan` -> `present_plan` -> "Approve and execute" -> its
+/// execution continuation -> terminal result -> next user turn -- through
+/// the real `dispatch_tool_uses` (query_processor.rs) and the real
+/// `EventLoop::handle_event` pipeline, not a synthetic `ExecutingTools`
+/// fixture.
+///
+/// This closes the gap between two narrower regressions that each cover half
+/// of the reported wedge: `test_present_plan_dispatch_does_not_deadlock_on_its_own_mode_read_guard`
+/// (query_processor.rs) proves `dispatch_tool_uses` no longer self-deadlocks
+/// on the `ReplMode` lock when it calls `handle_present_plan` inline (#26,
+/// landed on main as commit a71482f6 the night this test was written), and
+/// `test_pending_user_message_folds_into_plan_approval_directive` above
+/// proves `finalize_tool_execution`'s plan-approval fast path folds queued
+/// text and keeps `active_query_id` correctly. Neither one starts from the
+/// real dispatch entry point *and* carries the continuation through to a
+/// terminal completion that must free the query and admit a queued turn --
+/// exactly the "subsequent turns receive no GPT response" symptom #363
+/// reported. Before #26's fix this test hangs (bounded by the timeout below)
+/// at the same `mode.read().await` guard the isolated dispatch test catches;
+/// after it, the approval, continuation, and next-turn admission all
+/// terminalize and this test passes.
+#[tokio::test]
+async fn test_plan_approval_wedge_363_next_turn_is_admitted_after_continuation() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+
+            let mut llm_rx = event_loop
+                .llm_rx
+                .take()
+                .expect("test fixture must observe LlmRequest before any worker starts");
+
+            let plan_path = std::env::temp_dir().join(format!(
+                "finch_363_plan_wedge_{}.md",
+                uuid::Uuid::new_v4()
+            ));
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Planning {
+                task: "explore".to_string(),
+                plan_path: plan_path.clone(),
+                created_at: chrono::Utc::now(),
+            };
+
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_id);
+
+            let present_plan_id = "toolu_363_present_plan".to_string();
+            let present_plan_use = crate::tools::ToolUse {
+                id: present_plan_id.clone(),
+                name: "present_plan".to_string(),
+                input: serde_json::json!({"plan": "1. Do the thing\n2. Verify the thing"}),
+            };
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::providers::Message {
+                        role: "assistant".to_string(),
+                        content: vec![crate::providers::ContentBlock::ToolUse {
+                            id: present_plan_id.clone(),
+                            name: "present_plan".to_string(),
+                            input: present_plan_use.input.clone(),
+                        }],
+                    },
+                )
+                .expect("stage the provider tool round dispatch_tool_uses consumes");
+            assert!(
+                event_loop
+                    .query_states
+                    .begin_tool_execution(query_id, 1)
+                    .await,
+                "production stages ExecutingTools before dispatch_tool_uses runs"
+            );
+
+            let work_unit = output.start_work_unit("present-plan wedge regression");
+
+            // Clone every argument `dispatch_tool_uses` needs out of Arcs so the
+            // pinned call below borrows nothing from `event_loop` -- keeping
+            // `event_loop.handle_event` (a `&mut self` call) legal from inside
+            // the pump loop below while the dispatch future is still live.
+            let mode_arc = Arc::clone(&event_loop.mode);
+            let tool_call_history_arc = Arc::clone(&event_loop.tool_call_history);
+            let event_tx_clone = event_loop.event_tx.clone();
+            let active_tool_uses_arc = Arc::clone(&event_loop.active_tool_uses);
+            let tui_renderer_arc = Arc::clone(&event_loop.tui_renderer);
+            let output_manager_arc = Arc::clone(&event_loop.output_manager);
+            let query_states_arc = Arc::clone(&event_loop.query_states);
+            let tool_coordinator_clone = event_loop.tool_coordinator.clone();
+            let memory_system_clone = event_loop.memory_system.clone();
+            let session_label_clone = event_loop.session_label.clone();
+            let cwd_clone = event_loop.cwd.clone();
+            let status_bar_arc = Arc::clone(&event_loop.status_bar);
+
+            let dispatch = crate::cli::repl_event::query_processor::dispatch_tool_uses(
+                vec![present_plan_use],
+                query_id,
+                round_token,
+                &work_unit,
+                &mode_arc,
+                &tool_call_history_arc,
+                &event_tx_clone,
+                &active_tool_uses_arc,
+                &tui_renderer_arc,
+                &output_manager_arc,
+                &query_states_arc,
+                &tool_coordinator_clone,
+                &memory_system_clone,
+                finch_memory::Recall::none(),
+                &session_label_clone,
+                &cwd_clone,
+                &status_bar_arc,
+                4,
+            );
+            tokio::pin!(dispatch);
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut dispatch_done = false;
+            let mut tool_result_handled = false;
+            while !(dispatch_done && tool_result_handled) {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::select! {
+                    _ = &mut dispatch, if !dispatch_done => {
+                        dispatch_done = true;
+                    }
+                    event = tokio::time::timeout(remaining, event_loop.event_rx.recv()) => {
+                        let event = event.unwrap_or_else(|_| {
+                            panic!(
+                                "invariant: the real present_plan dispatch/approval/finalize \
+                                 pipeline must terminalize within {remaining:?} instead of \
+                                 hanging -- dispatch_done={dispatch_done} \
+                                 tool_result_handled={tool_result_handled}. A hang here is \
+                                 #363's reported wedge: the ReplMode read guard in \
+                                 dispatch_tool_uses held across handle_present_plan's \
+                                 mode.write() (#26)."
+                            )
+                        }).expect("event channel must stay open while dispatch is in flight");
+                        let is_present_plan_result = matches!(
+                            &event,
+                            ReplEvent::ToolResult { tool_id, .. } if tool_id == &present_plan_id
+                        );
+                        if let ReplEvent::ShowDialog { response_tx, .. } = event {
+                            response_tx
+                                .send(crate::cli::tui::DialogResult::Selected(0))
+                                .expect("present_plan dialog receiver must still be waiting");
+                        } else {
+                            if is_present_plan_result {
+                                tool_result_handled = true;
+                            }
+                            // Drive the real EventLoop dispatch, exactly as
+                            // production's run() loop does -- ToolResult here
+                            // reaches handle_tool_result -> finalize_tool_execution,
+                            // the fast path #363 suspected of bypassing continuation.
+                            let _ = event_loop.handle_event(event).await;
+                        }
+                    }
+                }
+            }
+
+            assert!(
+                matches!(
+                    &*event_loop.mode.read().await,
+                    crate::cli::repl::ReplMode::Executing { .. }
+                ),
+                "approving present_plan through the real dispatch path must land mode in Executing"
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                Some(query_id),
+                "the plan continuation must reuse the in-flight query, not wedge or orphan it"
+            );
+
+            let continuation = tokio::time::timeout(std::time::Duration::from_secs(3), llm_rx.recv())
+                .await
+                .expect("plan approval must send exactly one execution continuation")
+                .expect("the LLM request channel must stay open");
+            let LlmRequest::Query { id, text, admission, .. } = continuation;
+            assert_eq!(id, query_id, "the continuation must carry the same query id");
+            assert_eq!(text, "", "the continuation is a tool-round follow-up, not fresh user text");
+            assert!(
+                admission.is_none(),
+                "the plan-approval fast path sends its continuation ungated (finalize_tool_execution); \
+                 seeing `admission: Some(_)` here would mean it started going through \
+                 commit_tool_round_and_continue instead"
+            );
+
+            // A user keeps typing while the approved plan's continuation is
+            // still in flight -- exactly what the maintainer reported doing
+            // right before the session went dead.
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "run the tests too".to_string(),
+                })
+                .await
+                .expect("typing during the plan continuation must not itself hang or error");
+            assert_eq!(
+                event_loop.pending_queries.len(),
+                1,
+                "a turn typed while the plan continuation is active must queue, not stall silently; \
+                 queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                Some(query_id),
+                "queuing a turn must not disturb the still-active plan continuation"
+            );
+
+            // The continuation terminalizes with a plain-text response -- the
+            // same two-step sequence `process_query_with_tools`'s text-only
+            // path performs before emitting `StreamingComplete`.
+            let final_response = "Implemented the plan.".to_string();
+            let published = event_loop
+                .query_states
+                .try_publish_completion_content(
+                    query_id,
+                    final_response.clone(),
+                    vec![crate::providers::ContentBlock::Text {
+                        text: final_response.clone(),
+                    }],
+                    &event_loop.conversation,
+                )
+                .await;
+            assert!(
+                published,
+                "the continuation's terminal completion must publish; the query must not have \
+                 gone terminal or cancelled underneath it"
+            );
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: final_response,
+                })
+                .await
+                .expect("the continuation's StreamingComplete must dispatch cleanly");
+
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "the plan continuation's terminal completion must drain the queued turn, not \
+                 strand it behind a dead query id; queued={:?}",
+                event_loop.pending_queries
+            );
+            let next_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("draining the queued turn must start it as a new active query -- \
+                         this is exactly #363's 'subsequent turns receive no GPT response'");
+            assert_ne!(
+                next_id, query_id,
+                "the drained turn must be its own new query, not a reuse of the finished plan query"
+            );
+
+            let next = tokio::time::timeout(std::time::Duration::from_secs(3), llm_rx.recv())
+                .await
+                .expect("the drained turn must send its own LlmRequest::Query")
+                .expect("the LLM request channel must stay open for the drained turn");
+            let LlmRequest::Query { id: next_req_id, text: next_text, .. } = next;
+            assert_eq!(next_req_id, next_id);
+            assert_eq!(
+                next_text, "run the tests too",
+                "the turn queued during plan execution must actually run once the plan's \
+                 continuation completes"
+            );
+
+            let _ = std::fs::remove_file(&plan_path);
+        })
+        .await;
+}
+
 /// Continuation publication failure must restore live history and put the
 /// drained queue back in FIFO order so QueryFailed can start those turns.
 #[tokio::test]
