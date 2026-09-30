@@ -309,6 +309,38 @@ pub fn load_routing_tree(
         node.real_centroid = decode_f64(&real_centroid);
         node.real_count = real_count;
         node.parent = parent;
+
+        // A decision node's `anchor`/`direction` are set exactly once, together, at split time
+        // (`try_split`, both always length `self.dim` by construction -- see `routing_tree.rs`),
+        // and frozen forever after. A decision node whose persisted `anchor`/`direction` is
+        // missing or a different length than this store's own `dim` (most commonly a fully
+        // degenerate, zero-length pair -- issue #1384's actual reported shape, distinct from the
+        // whole-store dimension mismatch #1398 already refuses above) can never have been produced
+        // by this crate's own write path; loading it anyway leaves a tree that looks fully hydrated
+        // but panics the first time descent or insert reaches this node and `projection`
+        // (`routing_tree.rs:181`) indexes a shorter anchor/direction against a full-length point --
+        // on whatever thread happens to be inserting at the time, a background hydration/indexing
+        // worker in production. Refuse up front instead, before any node is wired into the tree.
+        // A decision node's `anchor`/`direction` are set exactly once, together, at split time
+        // (`try_split`, both always length `self.dim` by construction -- see `routing_tree.rs`),
+        // and frozen forever after. A decision node whose persisted `anchor`/`direction` is
+        // missing or a different length than this store's own `dim` (most commonly a fully
+        // degenerate, zero-length pair -- issue #1384's actual reported shape, distinct from the
+        // whole-store dimension mismatch #1398 already refuses above) can never have been produced
+        // by this crate's own write path; loading it anyway leaves a tree that looks fully hydrated
+        // but panics the first time descent or insert reaches this node and `projection`
+        // (`routing_tree.rs:181`) indexes a shorter anchor/direction against a full-length point --
+        // on whatever thread happens to be inserting at the time, a background hydration/indexing
+        // worker in production. Refuse up front instead, before any node is wired into the tree.
+        anyhow::ensure!(
+            node.is_leaf || (node.anchor.len() == dim && node.direction.len() == dim),
+            "load_routing_tree: decision node {node_id} has a degenerate anchor/direction (anchor \
+             len {}, direction len {}, expected {dim}) -- this store has a corrupted routing node \
+             that predates this check; refusing to load a tree that would panic in `projection` on \
+             its next insert or descent (issue #1384)",
+            node.anchor.len(),
+            node.direction.len(),
+        );
         nodes.push(node);
     }
 
@@ -749,5 +781,85 @@ mod tests {
                 reloaded.insert(vec![0.5_f32; bigger_dim]);
             }
         }
+    }
+
+    /// Regression for the #1384 REOPENING: live re-testing found the original panic still
+    /// reproduced 5/5 on "fresh workspaces", but every one of those actually shared one
+    /// pre-existing, already-corrupted `~/.finch/memory.db` (memory stores are keyed by `$HOME`,
+    /// not by the working directory a "fresh workspace" repro changes into) -- not a genuinely
+    /// fresh, empty store. Reading #1398's fix closely shows it addresses a DIFFERENT mechanism: a
+    /// whole-store `dim` mismatch, checked against the first loaded `routing_points` row. That
+    /// check does nothing here, because this store's `dim` is perfectly consistent with every
+    /// point's own embedding -- only ONE already-corrupted decision node's persisted
+    /// `anchor`/`direction` is degenerate (zero-length), a persisted row this crate's own write
+    /// path (`try_split`, always sets both together to length `self.dim`) could never have
+    /// produced from a genuinely fresh store; the true creation-time root cause of the corrupted
+    /// row itself was not identified.
+    ///
+    /// This test reproduces the real defect at the production boundary: real SQLite persistence, a
+    /// real split tree (`node_count() > 1` asserted below), then the SAME degenerate shape live
+    /// reports actually hit -- a zero-length `anchor`/`direction` written directly into
+    /// `routing_nodes` for a real decision node -- not a synthetic unit call into `projection` with
+    /// a hand-built empty slice. Before the fix, `load_routing_tree` accepts this row unchanged
+    /// (`Option<Vec<u8>>::None` decodes to an empty `Vec` via `unwrap_or_default`) and returns
+    /// `Ok`; the very next `insert` that reaches this node panics in `projection`
+    /// (`routing_tree.rs:181`) exactly as #1384 reports: "index out of bounds: the len is 0 but
+    /// the index is 0". After the fix, `load_routing_tree` itself returns `Err` up front and the
+    /// panicking `insert` is never reached.
+    #[test]
+    fn test_loading_a_decision_node_with_a_degenerate_anchor_fails_closed_instead_of_panicking() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
+
+        let points = test_corpus(20);
+        let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
+        for (i, p) in points.iter().enumerate() {
+            let pid = tree.insert(p.clone());
+            assert_eq!(pid, i);
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
+        }
+        save_dirty_nodes(&mut tree, &conn).unwrap();
+        assert!(
+            !tree.is_leaf(0),
+            "test setup: expected the root to have split into a real decision node before \
+             corrupting it, got node_count={} -- without a split there is no decision node to \
+             corrupt and this test would pass vacuously",
+            tree.node_count()
+        );
+
+        // Directly corrupt the root's persisted anchor/direction to NULL/zero-length -- the exact
+        // on-disk shape live reports hit, independent of how it was actually produced (an older,
+        // already-superseded write path, or on-disk damage; not reproduced here since the true
+        // creation-time cause is a separate, unresolved question from this defensive fix).
+        conn.execute(
+            "UPDATE routing_nodes SET anchor = NULL, direction = NULL WHERE node_id = 0",
+            [],
+        )
+        .unwrap();
+
+        // Same `dim` the store was built under -- #1398's whole-store dimension check does not and
+        // should not fire here; only the new per-node degenerate-anchor check should.
+        let result = load_routing_tree(&conn, RoutingConfig::default(), DIM, 7);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "load_routing_tree must refuse a decision node with a degenerate anchor/direction \
+                 instead of returning Ok and deferring the panic to the next insert or descent"
+            ),
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("node 0") && message.contains("1384"),
+            "error must name the corrupted node id and reference issue #1384 so an operator can \
+             act on it, got: {message}"
+        );
     }
 }
