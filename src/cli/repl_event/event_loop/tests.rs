@@ -8889,6 +8889,74 @@ async fn other_owner_inner_failure_still_allows_driver_attach() {
         .await;
 }
 
+/// Reproduces #423's reported reattach through the real startup path:
+/// `EventLoop::run` feeds `register_home_brain`'s result straight into
+/// `apply_home_runner_startup`, so a stale lease from a closed console
+/// surfaces here first, exactly as it does live. Before the fix this printed
+/// the raw daemon exception text under a "runner unavailable" header — a
+/// failure-shaped line for a condition the bounded reconnect (already
+/// scheduled a few lines below in production) resolves on its own.
+#[tokio::test]
+async fn test_stale_lease_reattach_reports_calm_transition_not_raw_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut event_loop = runner_recovery_test_event_loop();
+            let attach =
+                event_loop.apply_home_runner_startup(Ok(Some(super::HomeRunnerRegistration {
+                    target: crate::cli::repl_event::events::RunnerReconnectTarget {
+                        brain: "pale-glen-de0e39".into(),
+                        environment: crate::brain::BrainEnvironment {
+                            machine: "box.local".into(),
+                            workspace: std::path::PathBuf::from("/tmp/ws"),
+                            generation: 1,
+                        },
+                        lease_id: None,
+                    },
+                    registration: Err(
+                        "Failed: remote exception: Brain already has a live runner lease".into(),
+                    ),
+                })));
+            assert!(
+                attach,
+                "a stale lease pending its own reconnect must still allow this console to \
+                 attach as a driver; attach={attach}"
+            );
+
+            let messages = runner_recovery_messages(&event_loop);
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| !message.contains("remote exception")
+                        && !message.contains("Failed:")),
+                "a stale lease is the expected reattach case, not a raw remote-exception \
+                 failure line; messages={messages:?}"
+            );
+            assert!(
+                messages.iter().any(|message| message.contains("pale-glen-de0e39")
+                    && message.to_lowercase().contains("transferring")),
+                "the stale lease must be reported once, naming the brain and the transition \
+                 in progress, in place of the three old failure-shaped lines; messages={messages:?}"
+            );
+
+            let header = event_loop
+                .status_bar
+                .get_line(&crate::cli::status_bar::StatusLineType::SessionLabel)
+                .expect("startup must project a session header");
+            assert!(
+                header.contains("transferring"),
+                "the status strip must agree with the transcript's calm transition wording, \
+                 not say something else; header={header}"
+            );
+            assert!(
+                !header.contains("unavailable") && !header.contains("online"),
+                "the status strip must not call a recoverable transition unavailable, nor \
+                 falsely claim the runner is already online while it is still transferring; \
+                 header={header}"
+            );
+        })
+        .await;
+}
+
 fn transcript_projection_haystack(event_loop: &super::EventLoop) -> String {
     let colors = crate::theme::ColorScheme::default();
     event_loop
