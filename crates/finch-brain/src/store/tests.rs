@@ -8154,3 +8154,143 @@ fn test_provider_selection_does_not_hydrate_the_event_log() {
         hydrated_names(&store)
     );
 }
+
+// ── #411: sweep unused Brains at daemon startup ─────────────────────────
+//
+// `remove_if_unused` was already correct -- it refuses to delete any Brain
+// with real activity -- but nothing ever called it except six lifecycle
+// paths for one specific named Brain. `BrainStore::sweep_unused` is the
+// missing caller: it runs once, synchronously, from `AgentServer::new`
+// before any listener accepts a connection (see that method's doc comment
+// for why the ordering matters).
+
+/// Overwrite `created_ms` directly on disk, the way a Brain minted hours or
+/// days ago would actually read, without touching anything else in
+/// `metadata.json`. Mirrors the hand-written fixtures already used in this
+/// file (`test_provider_selection_does_not_hydrate_the_event_log`) rather
+/// than adding a production backdating API that only a test would ever call.
+fn backdate_brain_created_ms(root: &std::path::Path, name: &str, created_ms: u64) {
+    let path = root.join(name).join("metadata.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["created_ms"] = serde_json::json!(created_ms);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[test]
+fn test_sweep_removes_a_zero_event_brain_past_the_age_threshold() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("stale").unwrap();
+    assert!(
+        temp.path().join("stale").join("metadata.json").exists(),
+        "precondition: snapshot must have created durable metadata for 'stale'"
+    );
+    backdate_brain_created_ms(
+        temp.path(),
+        "stale",
+        unix_millis().saturating_sub(BrainStore::SWEEP_MIN_AGE_MS + 1),
+    );
+
+    let removed = store.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(
+        removed, 1,
+        "a zero-event Brain older than the age threshold must be swept"
+    );
+    assert!(
+        !temp.path().join("stale").exists(),
+        "the swept Brain's directory must be gone from disk"
+    );
+}
+
+#[test]
+fn test_sweep_never_removes_a_brain_with_real_events_regardless_of_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store
+        .push(
+            "active",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap();
+    // Backdate far past the threshold: age alone must never override real
+    // activity, however old that activity is.
+    backdate_brain_created_ms(temp.path(), "active", 0);
+
+    let removed = store.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(
+        removed, 0,
+        "a Brain holding a real Prompt event must never be swept, regardless of age"
+    );
+    assert!(
+        temp.path().join("active").join("events.jsonl").exists(),
+        "the Brain with real history must survive the sweep untouched"
+    );
+}
+
+#[test]
+fn test_sweep_does_not_remove_a_brand_new_zero_event_brain() {
+    // The instant-delete trap the issue calls out by name: sweeping a
+    // zero-event Brain the moment it is created would delete the one the
+    // current session is about to type into.
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("fresh").unwrap();
+    // No backdating: `created_ms` stays at "now", well under the threshold.
+
+    let removed = store.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+
+    assert_eq!(
+        removed, 0,
+        "a Brain created moments ago must survive the sweep even with zero events"
+    );
+    assert!(
+        temp.path().join("fresh").exists(),
+        "the brand-new Brain's directory must be untouched"
+    );
+}
+
+#[test]
+fn test_sweep_does_not_hydrate_or_repair_a_brain_missing_metadata_json() {
+    // The #393 trap: a directory that survives while its metadata.json does
+    // not must be left alone, never handed to anything that would mint a
+    // fresh identity for it. `ensure_loaded` -> `load_or_create_metadata`
+    // does exactly that the instant it is called on such a directory, so the
+    // sweep must never reach that call for a candidate whose metadata it has
+    // not already confirmed exists.
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("half-deleted");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("events.jsonl"), "not empty\n").unwrap();
+    assert!(
+        !directory.join("metadata.json").exists(),
+        "precondition: the fixture must reproduce the #393 shape -- durable \
+         state present, metadata.json absent"
+    );
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+    // min_age_ms = 0 so the age gate cannot be the reason nothing is swept;
+    // only the missing-metadata gate may skip this candidate.
+    let removed = store.sweep_unused(0);
+
+    assert_eq!(
+        removed, 0,
+        "a directory with no metadata.json must never be swept"
+    );
+    assert!(
+        directory.exists(),
+        "the half-deleted directory itself must be left in place, not deleted"
+    );
+    assert!(
+        !directory.join("metadata.json").exists(),
+        "the sweep must not mint a fresh BrainId for a candidate it is only \
+         inspecting -- that would be the exact resurrection #393 reports, \
+         just reached from a new caller"
+    );
+}

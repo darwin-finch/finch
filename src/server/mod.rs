@@ -620,6 +620,21 @@ impl AgentServer {
             crate::brain::BrainCredentialAuthority::load_or_create(&credential_state)?;
         let mcp_servers = config.mcp_servers.clone();
 
+        // #411: sweep Brains with no recorded activity before anything can
+        // attach, archive, or schedule-deliver against one -- see
+        // `BrainStore::sweep_unused`'s doc comment for why that ordering is
+        // load-bearing rather than incidental. One line only when it found
+        // something to do; per #380's lesson, an unchanging "nothing swept"
+        // must stay silent rather than confirm itself every restart.
+        let brain_store = crate::brain::BrainStore::new(machine);
+        let swept = brain_store.sweep_unused(crate::brain::BrainStore::SWEEP_MIN_AGE_MS);
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "daemon startup: swept unused Brains with no recorded activity"
+            );
+        }
+
         Ok(Self {
             started_at: std::time::Instant::now(),
             claude_client: Arc::new(claude_client),
@@ -631,7 +646,7 @@ impl AgentServer {
             bootstrap_loader,
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::new()?),
-            brain_store: crate::brain::BrainStore::new(machine),
+            brain_store,
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
             claude_cli_sessions: ClaudeCliSessionRegistry::default(),
@@ -2265,6 +2280,117 @@ mod tests {
             )
             .unwrap();
         assert!(expected_root.join(name).join("events.jsonl").is_file());
+    }
+
+    /// Production boundary for #411: `remove_if_unused` already refused to
+    /// delete a Brain with real activity, but nothing ever called it as a
+    /// sweep -- every named Brain minted by a launch (`names::generate`)
+    /// just accumulated. This drives the real daemon-startup constructor
+    /// (`AgentServer::new`, the same call `main.rs` makes before `serve()`)
+    /// over a root pre-seeded with the four cases the issue calls out, and
+    /// checks the real on-disk outcome rather than calling
+    /// `BrainStore::sweep_unused` directly -- that would only prove the
+    /// store method works, not that daemon startup actually reaches it.
+    #[test]
+    fn production_constructor_sweeps_unused_brains_before_anything_can_touch_them() {
+        if !supervisor_contract_present() {
+            return;
+        }
+        let proof = crate::brain::isolated_test_proof()
+            .expect("sweep boundary test requires supervisor authority");
+        let daemon_address = proof.daemon_address().to_owned();
+        let brain_password = proof.brain_password().unwrap();
+        let home = proof.home.clone();
+        let root = proof.root.clone();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stale = format!("sweep-boundary-stale-{suffix}");
+        let active = format!("sweep-boundary-active-{suffix}");
+        let fresh = format!("sweep-boundary-fresh-{suffix}");
+        let half_deleted = format!("sweep-boundary-half-deleted-{suffix}");
+
+        // Seed through the real store API, so the fixtures are byte-for-byte
+        // what production writes -- then backdate `created_ms` by hand,
+        // which is the one fact the API has no reason to let a caller set.
+        let fixture_store =
+            crate::brain::BrainStore::with_root("sweep-fixture", Some(root.clone()));
+        fixture_store.snapshot(&stale).unwrap();
+        fixture_store
+            .push(
+                &active,
+                "alice",
+                crate::brain::BrainEventKind::Prompt {
+                    text: "boundary proof".into(),
+                    attached_mentions: Vec::new(),
+                },
+            )
+            .unwrap();
+        fixture_store.snapshot(&fresh).unwrap();
+        let old_enough = crate::brain::unix_millis()
+            .saturating_sub(crate::brain::BrainStore::SWEEP_MIN_AGE_MS + 60_000);
+        for name in [&stale, &active] {
+            let path = root.join(name).join("metadata.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            value["created_ms"] = serde_json::json!(old_enough);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        // #393 shape: durable state present, metadata.json absent. Must
+        // never be handed to anything that would mint it an identity.
+        let half_deleted_dir = root.join(&half_deleted);
+        std::fs::create_dir_all(&half_deleted_dir).unwrap();
+        std::fs::write(half_deleted_dir.join("events.jsonl"), "not empty\n").unwrap();
+
+        let config =
+            crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
+                api_key: "sweep-boundary-test".into(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("sweep-boundary-test".into()),
+            }]);
+        let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+        // The real daemon-startup constructor. The sweep this test exists to
+        // prove runs synchronously inside this call, before the returned
+        // server has bound a listener or accepted any connection.
+        let _server = AgentServer::new(
+            config,
+            ServerConfig {
+                bind_address: daemon_address,
+                brain_password,
+                ..ServerConfig::default()
+            },
+            ClaudeClient::new("sweep-boundary-test".to_string()).unwrap(),
+            Router::new(crate::models::ThresholdRouter::new()),
+            MetricsLogger::new(home.join(".finch/sweep-boundary-metrics")).unwrap(),
+            Arc::new(RwLock::new(LocalGenerator::new())),
+            Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
+            generator_state,
+            isolated_provider_graph(),
+        )
+        .unwrap();
+
+        assert!(
+            !root.join(&stale).exists(),
+            "a zero-event Brain older than the sweep threshold must be gone \
+             after the real daemon-startup constructor runs"
+        );
+        assert!(
+            root.join(&active).join("events.jsonl").exists(),
+            "a Brain with a real Prompt event must survive the sweep even \
+             though it is just as old as the one that was removed"
+        );
+        assert!(
+            root.join(&fresh).exists(),
+            "a Brain created moments ago must survive even with zero events \
+             -- it may be the one the current session is about to type into"
+        );
+        assert!(
+            half_deleted_dir.exists() && !half_deleted_dir.join("metadata.json").exists(),
+            "a directory with durable state but no metadata.json (#393) must \
+             be left exactly as found -- not deleted, and not given a fresh \
+             identity by whatever the sweep uses to decide"
+        );
     }
 
     #[test]

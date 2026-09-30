@@ -4195,6 +4195,87 @@ impl BrainStore {
         Ok(true)
     }
 
+    /// Minimum age, in milliseconds, a Brain with no recorded activity must
+    /// reach before [`Self::sweep_unused`] will remove it (#411).
+    ///
+    /// A Brain is minted on every launch (`names::generate`), so the store
+    /// grows monotonically and nothing else ever revisits one that never
+    /// became a real conversation. But sweeping the instant a zero-event
+    /// Brain appears would delete the one the current session is about to
+    /// type into. Twenty-four hours is chosen to comfortably outlast that
+    /// race -- including a daemon restart minutes after a Brain was minted,
+    /// where the user has not typed yet but fully intends to -- while still
+    /// reclaiming the common case (a Brain from a launch nobody returned to)
+    /// well before it accumulates with hundreds of others.
+    pub const SWEEP_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Remove every named Brain this store can prove, from durable on-disk
+    /// state alone, has held no real activity for at least `min_age_ms`.
+    /// Returns the number removed.
+    ///
+    /// Intended to run once, synchronously, during daemon startup
+    /// (`AgentServer::new`) -- before any listener accepts a connection and
+    /// so before any concurrent caller could be attaching, archiving, or
+    /// delivering a schedule against a candidate this is inspecting. That
+    /// ordering is load-bearing: [`Self::remove_if_unused`] briefly
+    /// hydrates (`ensure_loaded`) each candidate it is handed, to run its
+    /// own full-fidelity eligibility check, and hydrating a Brain
+    /// concurrently with another caller's `archive` or an external deletion
+    /// is exactly the resurrection hazard #383 and #396 describe. A sweep
+    /// with no listener up yet has no such concurrent caller. A later
+    /// periodic re-sweep is deliberately not added: the set of Brains only
+    /// grows at launch, so a once-per-daemon-start pass is sufficient, and
+    /// per #380's lesson a step that finds nothing new to do must not keep
+    /// announcing that on a timer.
+    ///
+    /// A candidate is only ever handed to `remove_if_unused` -- which makes
+    /// the real deletion decision, including the full substantive-event
+    /// list, persisted provider selection, live attachments, and runner
+    /// lease -- once durable state already on disk clears two independent
+    /// gates, both read with the same plain `std::fs` calls
+    /// [`projection::summarize_unhydrated`] uses, never `ensure_loaded`:
+    ///
+    /// 1. `metadata.json` exists and parses as valid current-version
+    ///    metadata. A directory that lacks it is the #393 half-deleted
+    ///    case: minting a fresh identity for it via `ensure_loaded` would
+    ///    be exactly the resurrection this function must not cause, so it
+    ///    is left untouched for that issue's own repair path instead.
+    /// 2. That metadata's `created_ms` is at least `min_age_ms` in the
+    ///    past.
+    ///
+    /// A candidate that fails either gate is never touched at all, hydrated
+    /// or otherwise -- not read further, not created, not deleted.
+    pub fn sweep_unused(&self, min_age_ms: u64) -> usize {
+        let now = unix_millis();
+        let mut removed = 0usize;
+        for name in self.list_names_unhydrated() {
+            let Ok(Some(metadata)) = self.read_metadata(&name) else {
+                // No metadata.json, or it failed to parse: either a healthy
+                // Brain this store has never touched (impossible here --
+                // `list_names_unhydrated` only returns directories that
+                // already exist on disk) or the #393 half-deleted case.
+                // Either way, do not call anything that would create or
+                // repair it; leave it exactly as found.
+                continue;
+            };
+            if now.saturating_sub(metadata.created_ms) < min_age_ms {
+                continue;
+            }
+            match self.remove_if_unused(&name) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        brain = %name,
+                        %error,
+                        "startup sweep: could not evaluate Brain for removal"
+                    );
+                }
+            }
+        }
+        removed
+    }
+
     pub fn require_connection(
         &self,
         name: &str,
