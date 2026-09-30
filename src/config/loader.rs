@@ -16,6 +16,10 @@ use crate::errors;
 /// TOML before replacing the user's file.
 #[derive(serde::Deserialize)]
 struct TomlConfig {
+    /// Targeted tombstone for the removed local-only prompt file setting.
+    /// Other unknown keys retain the loader's existing compatibility behavior.
+    #[serde(default, rename = "constitution_path")]
+    removed_constitution_path: Option<toml::Value>,
     #[serde(default)]
     streaming_enabled: bool,
     #[serde(default = "default_tui_enabled")]
@@ -460,10 +464,9 @@ fn legacy_teacher_entry_to_provider(entry: &LegacyTeacherEntry) -> ProviderEntry
 pub(crate) fn load_config_from_path_with_paths(
     config_path: &std::path::Path,
     metrics_dir: std::path::PathBuf,
-    constitution_path: Option<std::path::PathBuf>,
 ) -> Result<Config> {
     load_config_from_path_with_factory(config_path, move |providers| {
-        Config::with_providers_and_paths(providers, metrics_dir, constitution_path)
+        Config::with_providers_and_paths(providers, metrics_dir)
     })
 }
 
@@ -535,6 +538,13 @@ where
 
     let toml_config: TomlConfig = toml::from_str(&contents)
         .map_err(|e| anyhow::anyhow!(errors::config_parse_error(&e.to_string())))?;
+
+    if toml_config.removed_constitution_path.is_some() {
+        bail!(
+            "Configuration {} contains the removed `constitution_path` setting. Remove that line and use `active_persona` or a persona file under ~/.finch/personas/ to customize Finch's system prompt. Finch did not modify your configuration or the referenced legacy file.",
+            config_path.display()
+        );
+    }
 
     // Determine providers: prefer new format; fall back to legacy teachers/backend.
     let providers = if !toml_config.providers.is_empty() {
@@ -643,26 +653,86 @@ mod tests {
                 name: Some("claude".to_string()),
             }],
             metrics_dir.clone(),
-            None,
         );
         source.save_to(&config_path).unwrap();
 
         let loaded = load_config_from_path_with_factory(&config_path, |providers| {
-            Config::with_providers_and_paths_using_resolver(
-                providers,
-                metrics_dir.clone(),
-                None,
-                || {
-                    resolver_calls.set(resolver_calls.get() + 1);
-                    panic!("explicit config loader must bypass ambient default resolution");
-                },
-            )
+            Config::with_providers_and_paths_using_resolver(providers, metrics_dir.clone(), || {
+                resolver_calls.set(resolver_calls.get() + 1);
+                panic!("explicit config loader must bypass ambient default resolution");
+            })
         })
         .unwrap();
 
         assert_eq!(resolver_calls.get(), 0);
         assert_eq!(loaded.metrics_dir, metrics_dir);
-        assert_eq!(loaded.constitution_path, None);
+    }
+
+    #[test]
+    fn test_removed_constitution_path_is_rejected_with_persona_migration_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let legacy_path = directory.path().join("legacy-constitution.md");
+        let legacy_contents = b"user-owned legacy prompt\n";
+        std::fs::write(&legacy_path, legacy_contents).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+constitution_path = {:?}
+
+[[providers]]
+type = "claude"
+api_key = "sk-ant-test-key-1234567890"
+"#,
+                legacy_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let original_config = std::fs::read(&config_path).unwrap();
+
+        let error = load_config_from_path(&config_path)
+            .expect_err("the removed constitution_path key must not be silently ignored")
+            .to_string();
+
+        assert!(
+            error.contains("constitution_path"),
+            "the error must name the removed key: {error}"
+        );
+        assert!(
+            error.contains("persona"),
+            "the error must direct the user to the supported persona replacement: {error}"
+        );
+        assert!(
+            std::fs::read(&config_path).unwrap() == original_config,
+            "rejecting a removed key must not rewrite the user's configuration"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap().as_slice(),
+            legacy_contents,
+            "rejecting a removed key must not modify the referenced user-owned legacy file"
+        );
+    }
+
+    #[test]
+    fn test_unrelated_unknown_top_level_key_retains_compatibility_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+future_compatible_key = "preserved behavior"
+
+[[providers]]
+type = "claude"
+api_key = "sk-ant-test-key-1234567890"
+"#,
+        )
+        .unwrap();
+
+        load_config_from_path(&config_path).expect(
+            "the constitution_path tombstone must not become a global unknown-field rejection",
+        );
     }
 
     #[test]
@@ -1022,7 +1092,7 @@ api_key = "sk-ant-unknown-name-1234567890"
         .unwrap();
 
         let loaded = load_config_from_path_with_factory(&config_path, |providers| {
-            Config::with_providers_and_paths(providers, directory.path().join("metrics"), None)
+            Config::with_providers_and_paths(providers, directory.path().join("metrics"))
         })
         .expect("a legacy [[teachers]] config must still load");
 
@@ -1075,7 +1145,7 @@ api_key = "sk-ant-legacy-key-1234567890"
         .unwrap();
 
         let loaded = load_config_from_path_with_factory(&config_path, |providers| {
-            Config::with_providers_and_paths(providers, directory.path().join("metrics"), None)
+            Config::with_providers_and_paths(providers, directory.path().join("metrics"))
         })
         .expect("a legacy [[teachers]] config must still load");
 

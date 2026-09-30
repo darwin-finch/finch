@@ -47,7 +47,7 @@ yet wired to a live `BrainStore` in production (tracked as a follow-up, not a de
   - `bash` (side effects): AskUser
   - `restart`/`spawn`: always Deny
 
-Constitutional constraints apply to **both** roles: `rm -rf`, `sudo`, `dd if=`, fork bombs, system file reads, dangerous URL schemes, and private IPs are blocked unconditionally.
+The built-in dangerous-input denylist applies to **both** roles: named dangerous bash substrings (`rm -rf`, `sudo`, `dd if=`, fork bombs, and related entries), dangerous URL schemes, and private IPs are denied unconditionally. A discrete path outside the workspace, including a system-file read such as `/etc/passwd`, is not part of that denylist: it returns `AskUser` and a stored pattern cannot bypass that one-shot review.
 
 `is_readonly_bash()` approves commands that: (1) start with a known safe prefix AND (2) contain no shell operators (`;`, `|`, `>`, `<`, `&`). Operator presence always returns false.
 

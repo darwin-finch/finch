@@ -380,6 +380,65 @@ impl Default for LocalGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct CapturingBackend {
+        captured_prompt: Arc<Mutex<String>>,
+    }
+
+    impl crate::models::TextGeneration for CapturingBackend {
+        fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+            Ok(b"the vm reply"
+                .iter()
+                .map(|byte| u32::from(*byte))
+                .collect())
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+            *self.captured_prompt.lock().expect("lock captured prompt") = text.to_string();
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+            let bytes = tokens.iter().map(|token| *token as u8).collect();
+            Ok(String::from_utf8(bytes)?)
+        }
+
+        fn name(&self) -> &str {
+            "Gemma 2 test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    fn local_generator_with_captured_prompt() -> (LocalGenerator, Arc<Mutex<String>>) {
+        use crate::config::ExecutionTarget;
+        use crate::models::{
+            GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+        };
+
+        let captured_prompt = Arc::new(Mutex::new(String::new()));
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            model_path: None,
+        });
+        let backend = CapturingBackend {
+            captured_prompt: Arc::clone(&captured_prompt),
+        };
+        let model = GeneratorModel::from_test_backend(Box::new(backend), config);
+        let shared = Arc::new(RwLock::new(model));
+
+        (LocalGenerator::with_models(Some(shared)), captured_prompt)
+    }
 
     #[test]
     fn generation_has_no_adapter_hot_reload_path() {
@@ -443,66 +502,11 @@ mod tests {
     /// entry point with a mock `TextGeneration` backend that records exactly
     /// what text got tokenized, proving the caller's system message (the
     /// Finch VM wire contract) reaches the model instead of being replaced
-    /// by the generic local constitution.
+    /// by the generic local fallback.
     #[test]
     fn local_daemon_boundary_forwards_caller_system_prompt_to_model_backend() {
-        use crate::config::ExecutionTarget;
-        use crate::models::{
-            GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
-        };
         use crate::providers::ContentBlock;
-        use std::sync::Mutex;
-
-        struct CapturingBackend {
-            captured_prompt: Arc<Mutex<String>>,
-        }
-
-        impl crate::models::TextGeneration for CapturingBackend {
-            fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
-                Ok(b"the vm reply"
-                    .iter()
-                    .map(|byte| u32::from(*byte))
-                    .collect())
-            }
-
-            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-                *self.captured_prompt.lock().expect("lock captured prompt") = text.to_string();
-                Ok(text.bytes().map(u32::from).collect())
-            }
-
-            fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
-                let bytes = tokens.iter().map(|token| *token as u8).collect();
-                Ok(String::from_utf8(bytes)?)
-            }
-
-            fn name(&self) -> &str {
-                "Gemma 2 test"
-            }
-
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
-        }
-
-        let captured_prompt = Arc::new(Mutex::new(String::new()));
-        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-            provider: InferenceProvider::LlamaCpp,
-            family: ModelFamily::Gemma2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            model_path: None,
-        });
-        let backend = CapturingBackend {
-            captured_prompt: Arc::clone(&captured_prompt),
-        };
-        let model = GeneratorModel::from_test_backend(Box::new(backend), config);
-        let shared = Arc::new(RwLock::new(model));
-
-        let mut local_generator = LocalGenerator::with_models(Some(shared));
+        let (mut local_generator, captured_prompt) = local_generator_with_captured_prompt();
 
         let messages = vec![
             Message {
@@ -530,9 +534,68 @@ mod tests {
             sent_to_model.contains("FINCH VM WIRE CONTRACT"),
             "the caller's system contract must reach the tokenizer input, got: {sent_to_model}"
         );
+        let default_fallback = crate::config::Persona::default().to_system_message();
         assert!(
-            !sent_to_model.contains("helpful coding assistant"),
-            "the generic local constitution must not replace the caller's system contract, got: {sent_to_model}"
+            !sent_to_model.contains(default_fallback.as_str()),
+            "the generic local fallback must not replace the caller's system contract, got: {sent_to_model}"
+        );
+    }
+
+    /// Production-boundary regression for the removed legacy prompt file.
+    /// The parent test launches one isolated child test process so changing
+    /// `HOME` cannot race another test in this process. The child puts the
+    /// retired file at the exact legacy location and records the prompt sent
+    /// through `LocalGenerator::try_generate_from_pattern_with_tools`.
+    #[test]
+    fn local_daemon_boundary_uses_default_persona_without_reading_legacy_constitution_file() {
+        const CHILD_MARKER: &str = "FINCH_ISSUE_449_LOCAL_PROMPT_CHILD";
+        const LEGACY_SENTINEL: &str = "LEGACY CONSTITUTION MUST NOT REACH THE MODEL";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let finch_dir = directory.path().join(".finch");
+            std::fs::create_dir_all(&finch_dir).unwrap();
+            std::fs::write(finch_dir.join("constitution.md"), LEGACY_SENTINEL).unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local::tests::local_daemon_boundary_uses_default_persona_without_reading_legacy_constitution_file",
+                    "--nocapture",
+                ])
+                .env("HOME", directory.path())
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("launch isolated local-generator regression child");
+
+            assert!(
+                output.status.success(),
+                "isolated local-generator regression child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (mut local_generator, captured_prompt) = local_generator_with_captured_prompt();
+        let response = local_generator
+            .try_generate_from_pattern_with_tools(&[Message::user("what should I run")], None)
+            .expect("local daemon boundary must not error")
+            .expect("neural backend is configured, so a response must be produced");
+        assert_eq!(
+            response.text, "the vm reply",
+            "unexpected response: {response:?}"
+        );
+
+        let expected = crate::config::Persona::default().to_system_message();
+        let sent_to_model = captured_prompt.lock().expect("lock captured prompt");
+        assert!(
+            sent_to_model.contains(&expected),
+            "the no-system-message fallback must be the canonical default persona; expected {expected:?}, got {sent_to_model:?}"
+        );
+        assert!(
+            !sent_to_model.contains(LEGACY_SENTINEL),
+            "the retired ~/.finch/constitution.md file must not be read; got {sent_to_model:?}"
         );
     }
 

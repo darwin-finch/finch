@@ -28,7 +28,7 @@ composition root injects the concrete handles (see `src/tools/executor.rs`); car
 downcast must fail loud or degrade conservatively, never silently drop authority.
 
 **Permissions are authority.** The peer hard-deny, silent-allow, and reviewed-changeset tables, the
-constitutional denials, `is_readonly_bash`, and the bash readonly refinement moved here verbatim
+dangerous-input denylist, `is_readonly_bash`, and the bash readonly refinement moved here verbatim
 from `src/tools/permissions.rs`. The pure policy tests live beside them in
 `src/permissions.rs`. The tests that exercise real registered tool implementations remain at the
 composition root (`src/tools/permissions/tests.rs`), at their original

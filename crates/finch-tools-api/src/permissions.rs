@@ -1,6 +1,6 @@
 //! Permission system for tool execution
 //!
-//! Implements constitutional constraints: "Would 1000 users do this?"
+//! Implements the built-in dangerous-input denylist.
 //! Multi-layer defense: Allow, Ask, or Deny tool execution
 //!
 //! Moved verbatim from `src/tools/permissions.rs` (production code and the
@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 
 use crate::effects::ExecutionEffect;
 
-/// Constitutional bash denials. A pattern must not admit any of these
+/// Built-in bash denials. A pattern must not admit any of these
 /// commands: the one-shot path Denies them, and a generalised approval
 /// cannot widen that.
 const BASH_DENIED_SUBSTRINGS: &[(&str, &str)] = &[
@@ -33,11 +33,11 @@ const BASH_DENIED_SUBSTRINGS: &[(&str, &str)] = &[
 /// Tools whose discrete path argument is `file_path`.
 const FILE_PATH_TOOLS: &[&str] = &["read", "write", "edit", "patch"];
 
-/// True when a bash command is constitutionally Denied on the one-shot path.
+/// True when a bash command is denylisted on the one-shot path.
 ///
 /// Patterns consult this at match time so a stored `*` grant cannot admit
 /// `rm -rf` (or the rest of the denylist) after seeing a harmless command.
-pub fn bash_command_is_constitutionally_denied(command: &str) -> bool {
+pub fn bash_command_is_denylisted(command: &str) -> bool {
     BASH_DENIED_SUBSTRINGS
         .iter()
         .any(|(pattern, _)| command.contains(pattern))
@@ -483,7 +483,7 @@ impl PermissionManager {
 
     /// Whether policy allows advertising this tool to a provider.
     ///
-    /// Input-dependent constitutional checks run at execution, not
+    /// Input-dependent denylist checks run at execution, not
     /// advertisement. Disabled tools and explicit Deny rules are not
     /// advertised. Peer hard-deny tools are never advertised to a peer.
     pub(crate) fn allows_advertising(&self, tool_name: &str) -> bool {
@@ -515,8 +515,8 @@ impl PermissionManager {
             }
         }
 
-        // Apply constitutional constraints (safety checks)
-        if let Some(reason) = self.check_constitutional_constraints(tool_name, input) {
+        // Apply the built-in dangerous-input denylist.
+        if let Some(reason) = self.check_denylist(tool_name, input) {
             return PermissionCheck::Deny(reason);
         }
 
@@ -569,8 +569,8 @@ impl PermissionManager {
             return PermissionCheck::Deny("Peer cannot restart or spawn processes".to_string());
         }
 
-        // Constitutional constraints still apply to everyone
-        if let Some(reason) = self.check_constitutional_constraints(tool_name, input) {
+        // The built-in dangerous-input denylist applies to everyone.
+        if let Some(reason) = self.check_denylist(tool_name, input) {
             return PermissionCheck::Deny(reason);
         }
 
@@ -614,8 +614,8 @@ impl PermissionManager {
         PermissionCheck::AskUser(format!("Peer wants to use '{}' — approve?", tool_name))
     }
 
-    /// Apply constitutional constraints (safety checks)
-    fn check_constitutional_constraints(&self, tool_name: &str, input: &Value) -> Option<String> {
+    /// Apply the built-in dangerous-input denylist.
+    fn check_denylist(&self, tool_name: &str, input: &Value) -> Option<String> {
         match tool_name {
             // The background bash sibling runs the same shell authority as
             // `bash`, so the same denied substrings apply to it.
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_background_bash_constitutional_deny_applies() {
+    fn test_background_bash_denylist_applies() {
         let input = serde_json::json!({"command": "echo ok; rm -rf /"});
         for role in [PermissionManager::new(), PermissionManager::for_peer()] {
             assert!(
@@ -1052,7 +1052,7 @@ mod tests {
                     role.check_tool_use("background_bash", &input),
                     PermissionCheck::Deny(_)
                 ),
-                "constitutional denied substrings must apply to \
+                "denylisted substrings must apply to \
                  background_bash for owner and peer alike"
             );
         }
@@ -1081,13 +1081,13 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_constitutional_constraints_still_apply() {
+    fn test_peer_denylist_still_applies() {
         let mgr = PermissionManager::for_peer();
         // Even a peer cannot run rm -rf
         let input = serde_json::json!({"command": "rm -rf /"});
         assert!(
             matches!(mgr.check_tool_use("bash", &input), PermissionCheck::Deny(_)),
-            "Constitutional constraints must apply to peers too"
+            "The dangerous-input denylist must apply to peers too"
         );
     }
 

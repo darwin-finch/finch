@@ -31,6 +31,12 @@ tools. A configured family name is an identity hint, not proof that a model is l
 The streaming path calls the injected model's `TextGeneration` port, not a concrete engine type;
 keep tokenization, callbacks, and final decode backend-neutral when extending it.
 
+**System-message precedence is explicit.** A caller-provided system message wins. When none is
+present, `TemplateGenerator` uses `Persona::default().to_system_message()` as its one canonical
+fallback; it never reads the retired `~/.finch/constitution.md` file. The recording-backend
+regression `local_daemon_boundary_uses_default_persona_without_reading_legacy_constitution_file`
+pins this through `LocalGenerator::try_generate_from_pattern_with_tools`.
+
 Local-model history compaction (#1266, design #1260) makes no generator/model call and never
 regresses a history entry to a less-compressed tier: `TierAssigner::assign_and_compress`
 (`tiered_history.rs`) takes only `(current_question, history, budget_tokens, count_tokens)` --

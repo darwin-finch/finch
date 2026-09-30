@@ -75,7 +75,7 @@ pub struct TemplateGenerator {
     stats: ModelStats,
     /// Optional neural generator for trained model generation
     neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
-    /// System prompt / constitution for guiding responses
+    /// System prompt used when the caller supplies no system message.
     system_prompt: String,
     /// Model adapter for formatting prompts and cleaning output
     model_adapter: Box<dyn LocalModelAdapter>,
@@ -111,8 +111,7 @@ impl TemplateGenerator {
         neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
         model_name: &str,
     ) -> Self {
-        // Load system prompt from constitution file
-        let system_prompt = Self::load_constitution();
+        let system_prompt = Self::default_system_prompt();
 
         // Get appropriate model adapter
         let model_adapter = AdapterRegistry::get_adapter(model_name);
@@ -232,7 +231,7 @@ impl TemplateGenerator {
 
     /// Generate from a provider message array without discarding its caller-owned
     /// system contract. The interactive client injects the Finch VM wire ABI in
-    /// that system message, so replacing it with the generic local constitution
+    /// that system message, so replacing it with the generic local fallback
     /// makes an otherwise healthy model answer in prose.
     pub fn generate_messages(
         &mut self,
@@ -314,31 +313,8 @@ impl TemplateGenerator {
         ))
     }
 
-    /// Load constitution from file or use default
-    fn load_constitution() -> String {
-        let home = dirs::home_dir().expect("Could not determine home directory");
-        let constitution_path = home.join(".finch/constitution.md");
-
-        if constitution_path.exists() {
-            match std::fs::read_to_string(&constitution_path) {
-                Ok(content) => {
-                    tracing::info!("Loaded constitution from {:?}", constitution_path);
-                    content
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to read constitution file: {}, using default", e);
-                    Self::default_constitution()
-                }
-            }
-        } else {
-            tracing::info!("No constitution file found, using default");
-            Self::default_constitution()
-        }
-    }
-
-    /// Default constitution if no file exists
-    fn default_constitution() -> String {
-        "You are Shammah, a helpful coding assistant. Be concise and accurate.".to_string()
+    fn default_system_prompt() -> String {
+        crate::config::Persona::default().to_system_message()
     }
 
     fn format_chat_prompt_with_system(&self, system_prompt: &str, user_query: &str) -> String {
@@ -958,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_system_contract_replaces_generic_local_constitution() {
+    fn provider_system_contract_replaces_generic_local_fallback() {
         let mut generator = TemplateGenerator::new(PatternClassifier::new());
         let messages = vec![
             crate::providers::Message {
@@ -1258,17 +1234,23 @@ mod tests {
     /// model's real context window.
     #[test]
     fn prompt_parts_trims_oldest_history_to_stay_within_the_models_real_token_budget() {
-        // reserve (100 response + 64 overhead) + the default constitution's
-        // real word-count cost as `system_prompt` (11 words: "You are
-        // Shammah, a helpful coding assistant. Be concise and accurate." --
+        // reserve (100 response + 64 overhead) + the default persona's
+        // real word-count cost as `system_prompt` --
         // no caller system message is attached below, so `prompt_parts`
         // falls back to `TemplateGenerator::system_prompt`, and since #1310
         // that real cost is subtracted from the history budget too, not
         // just a flat overhead reserve) + budget (10), chosen so only the
         // two most recent history messages below fit.
-        const CONTEXT_LENGTH: usize = 185;
+        let context_length = LOCAL_RESPONSE_TOKEN_RESERVE
+            + LOCAL_PROMPT_OVERHEAD_RESERVE
+            + TemplateGenerator::default_system_prompt()
+                .split_whitespace()
+                .count()
+            + 10;
 
-        struct SmallContextBackend;
+        struct SmallContextBackend {
+            context_length: usize,
+        }
 
         impl TextGeneration for SmallContextBackend {
             fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
@@ -1288,7 +1270,7 @@ mod tests {
             }
 
             fn context_length(&self) -> u32 {
-                CONTEXT_LENGTH as u32
+                self.context_length as u32
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
@@ -1307,7 +1289,10 @@ mod tests {
             target: ExecutionTarget::Cpu,
             model_path: None,
         });
-        let model = GeneratorModel::from_test_backend(Box::new(SmallContextBackend), config);
+        let model = GeneratorModel::from_test_backend(
+            Box::new(SmallContextBackend { context_length }),
+            config,
+        );
         let shared = Arc::new(RwLock::new(model));
         let mut generator =
             TemplateGenerator::with_models(PatternClassifier::new(), Some(shared), "Qwen");
@@ -1343,10 +1328,10 @@ mod tests {
         let formatted = generator.format_chat_prompt_with_system(&system_prompt, &query);
         let prompt_tokens = formatted.split_whitespace().count();
         assert!(
-            prompt_tokens + LOCAL_RESPONSE_TOKEN_RESERVE <= CONTEXT_LENGTH,
+            prompt_tokens + LOCAL_RESPONSE_TOKEN_RESERVE <= context_length,
             "formatted prompt ({prompt_tokens} tokens) plus the reserved response budget \
              ({LOCAL_RESPONSE_TOKEN_RESERVE}) must fit inside the model's real context \
-             window ({CONTEXT_LENGTH} tokens), not overflow it: {formatted:?}"
+             window ({context_length} tokens), not overflow it: {formatted:?}"
         );
     }
 
@@ -1542,7 +1527,7 @@ impl<'de> serde::Deserialize<'de> for TemplateGenerator {
             learned_responses: data.learned_responses,
             stats: data.stats,
             neural_generator: None,
-            system_prompt: Self::load_constitution(),
+            system_prompt: Self::default_system_prompt(),
             model_adapter: AdapterRegistry::get_adapter("Qwen"), // Default to Qwen
             model_name: "Qwen".to_string(),
             tier_assigner: TierAssigner::new(),

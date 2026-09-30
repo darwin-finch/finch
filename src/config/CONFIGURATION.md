@@ -127,7 +127,8 @@ directly — no shell — in the workspace root after a successful write/edit/pa
 of a covered file. The result of that check is appended, bounded, to the same
 tool result. The command's authority is evaluated through the existing bash
 approval path: a command your bash policy would not allow (including a peer
-session) is skipped, and constitutionally denied commands are never executed.
+session) is skipped, and commands matched by the built-in dangerous-input
+denylist are never executed.
 Shell operators and command substitution are rejected at load. LSP-server
 sources are not accepted yet; unknown keys fail closed at parse time.
 

@@ -265,7 +265,7 @@ next to the tests that prove them. This index only maps them to owners:
 
 | Invariant group | Owning subsystem |
 |-----------------|------------------|
-| [Security](CLAUDE.md#security): peer permissions, read-only bash, constitutional constraints | Tools and authority |
+| [Security](CLAUDE.md#security): peer permissions, read-only bash, dangerous-input denylist | Tools and authority |
 | [Security](CLAUDE.md#security): license key parsing | Config, context, license |
 | [Routing](CLAUDE.md#routing) | Memory and local models |
 | [TUI](CLAUDE.md#tui) | Frontend |
