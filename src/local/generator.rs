@@ -41,6 +41,18 @@ const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 100;
 /// cannot see, since it only assembles the `query` half of the prompt.
 const LOCAL_PROMPT_OVERHEAD_RESERVE: usize = 64;
 
+/// Return nonempty text using the same effective-content rule at every local
+/// prompt-assembly seam. Empty/whitespace text and non-text blocks do not
+/// suppress the canonical system fallback.
+pub(super) fn nonempty_text_content(block: &crate::providers::ContentBlock) -> Option<&str> {
+    match block {
+        crate::providers::ContentBlock::Text { text } if !text.trim().is_empty() => {
+            Some(text.as_str())
+        }
+        _ => None,
+    }
+}
+
 /// Shown when `prompt_parts` finds a last "user"-role message but it carries
 /// no `ContentBlock::Text` -- concretely, a tool result posted back after a
 /// tool call (`Message::with_content("user", vec![ContentBlock::ToolResult
@@ -416,14 +428,7 @@ impl TemplateGenerator {
                 let text = message
                     .content
                     .iter()
-                    .filter_map(|block| match block {
-                        crate::providers::ContentBlock::Text { text }
-                            if !text.trim().is_empty() =>
-                        {
-                            Some(text.as_str())
-                        }
-                        _ => None,
-                    })
+                    .filter_map(nonempty_text_content)
                     .collect::<Vec<_>>()
                     .join("\n");
                 if text.is_empty() {
@@ -445,12 +450,7 @@ impl TemplateGenerator {
             .iter()
             .filter(|message| message.role == "system")
             .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                crate::providers::ContentBlock::Text { text } if !text.trim().is_empty() => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
+            .filter_map(nonempty_text_content)
             .collect::<Vec<_>>()
             .join("\n\n");
         let system_prompt = if caller_system.is_empty() {

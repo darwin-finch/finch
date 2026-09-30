@@ -302,14 +302,19 @@ impl LocalGenerator {
         );
         let mut augmented = Vec::with_capacity(messages.len() + 1);
         let mut last_system_idx = None;
+        let mut has_effective_caller_system = false;
         for (idx, message) in messages.iter().enumerate() {
             augmented.push(message.clone());
             if message.role == "system" {
                 last_system_idx = Some(idx);
+                has_effective_caller_system |= message
+                    .content
+                    .iter()
+                    .any(|block| generator::nonempty_text_content(block).is_some());
             }
         }
 
-        let tool_message_text = if last_system_idx.is_some() {
+        let tool_message_text = if has_effective_caller_system {
             tool_prompt
         } else {
             format!(
@@ -633,6 +638,43 @@ mod tests {
         assert!(
             !sent_to_model.contains(LEGACY_SENTINEL),
             "the retired ~/.finch/constitution.md file must not be read; got {sent_to_model:?}"
+        );
+        drop(sent_to_model);
+
+        let (mut local_generator, captured_prompt) = local_generator_with_captured_prompt();
+        let ineffective_system = Message {
+            role: "system".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: " \n\t ".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "ignored-system-tool".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": "/tmp/ignored"}),
+                },
+            ],
+        };
+        local_generator
+            .try_generate_from_pattern_with_tools(
+                &[ineffective_system, Message::user("what should I run")],
+                Some(vec![recording_tool_definition()]),
+            )
+            .expect("ineffective caller system content must not break the local daemon boundary")
+            .expect("neural backend is configured, so a response must be produced");
+
+        let sent_to_model = captured_prompt.lock().expect("lock captured prompt");
+        assert!(
+            sent_to_model.contains(&expected),
+            "whitespace and non-text system content must not suppress the canonical default persona; expected {expected:?}, got {sent_to_model:?}"
+        );
+        assert!(
+            sent_to_model.contains("read(file_path: string)"),
+            "tool definitions must remain present after an ineffective caller system message, got: {sent_to_model:?}"
+        );
+        assert!(
+            !sent_to_model.contains(LEGACY_SENTINEL),
+            "an ineffective caller system message must not restore the retired legacy-file read, got {sent_to_model:?}"
         );
     }
 
