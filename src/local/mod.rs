@@ -275,11 +275,12 @@ impl LocalGenerator {
     /// in-process `QwenGenerator` path.
     ///
     /// The block is inserted immediately after the last existing system
-    /// message (or at the front, if there is none) so it joins with the
-    /// caller's own system content the same way `TemplateGenerator::
-    /// prompt_parts` already joins multiple system messages -- the caller's
-    /// system contract (e.g. the Finch VM wire ABI) is preserved verbatim,
-    /// never replaced.
+    /// message so it joins with the caller's own system content the same way
+    /// `TemplateGenerator::prompt_parts` already joins multiple system
+    /// messages. With no caller system message, the block is appended to the
+    /// canonical default persona so synthetic tool instructions do not
+    /// accidentally suppress the fallback. A caller's system contract (e.g.
+    /// the Finch VM wire ABI) is preserved verbatim and never replaced.
     fn inject_tool_definitions(
         &self,
         messages: &[Message],
@@ -308,9 +309,20 @@ impl LocalGenerator {
             }
         }
 
+        let tool_message_text = if last_system_idx.is_some() {
+            tool_prompt
+        } else {
+            format!(
+                "{}\n\n{}",
+                TemplateGenerator::default_system_prompt(),
+                tool_prompt
+            )
+        };
         let tool_message = Message {
             role: "system".to_string(),
-            content: vec![ContentBlock::Text { text: tool_prompt }],
+            content: vec![ContentBlock::Text {
+                text: tool_message_text,
+            }],
         };
 
         match last_system_idx {
@@ -440,6 +452,17 @@ mod tests {
         (LocalGenerator::with_models(Some(shared)), captured_prompt)
     }
 
+    fn recording_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file from disk".to_string(),
+            input_schema: crate::tools::ToolInputSchema::simple(vec![(
+                "file_path",
+                "Path to the file",
+            )]),
+        }
+    }
+
     #[test]
     fn generation_has_no_adapter_hot_reload_path() {
         let source = include_str!("mod.rs");
@@ -520,7 +543,10 @@ mod tests {
         ];
 
         let response = local_generator
-            .try_generate_from_pattern_with_tools(&messages, None)
+            .try_generate_from_pattern_with_tools(
+                &messages,
+                Some(vec![recording_tool_definition()]),
+            )
             .expect("local daemon boundary must not error")
             .expect("neural backend is configured, so a response must be produced");
 
@@ -533,6 +559,10 @@ mod tests {
         assert!(
             sent_to_model.contains("FINCH VM WIRE CONTRACT"),
             "the caller's system contract must reach the tokenizer input, got: {sent_to_model}"
+        );
+        assert!(
+            sent_to_model.contains("read(file_path: string)"),
+            "tool definitions must be composed after the caller's system contract, got: {sent_to_model}"
         );
         let default_fallback = crate::config::Persona::default().to_system_message();
         assert!(
@@ -579,7 +609,10 @@ mod tests {
 
         let (mut local_generator, captured_prompt) = local_generator_with_captured_prompt();
         let response = local_generator
-            .try_generate_from_pattern_with_tools(&[Message::user("what should I run")], None)
+            .try_generate_from_pattern_with_tools(
+                &[Message::user("what should I run")],
+                Some(vec![recording_tool_definition()]),
+            )
             .expect("local daemon boundary must not error")
             .expect("neural backend is configured, so a response must be produced");
         assert_eq!(
@@ -592,6 +625,10 @@ mod tests {
         assert!(
             sent_to_model.contains(&expected),
             "the no-system-message fallback must be the canonical default persona; expected {expected:?}, got {sent_to_model:?}"
+        );
+        assert!(
+            sent_to_model.contains("read(file_path: string)"),
+            "tool definitions must be composed after the canonical default persona, got: {sent_to_model:?}"
         );
         assert!(
             !sent_to_model.contains(LEGACY_SENTINEL),

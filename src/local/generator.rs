@@ -313,7 +313,7 @@ impl TemplateGenerator {
         ))
     }
 
-    fn default_system_prompt() -> String {
+    pub(super) fn default_system_prompt() -> String {
         crate::config::Persona::default().to_system_message()
     }
 
