@@ -3046,6 +3046,7 @@ impl ProgramRuntime {
         caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         defer_program_effects: bool,
+        grant_ceiling: Option<EffectSet>,
         effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         let deferred_host_effects = if defer_program_effects && caller.is_none() {
@@ -3058,7 +3059,7 @@ impl ProgramRuntime {
             caller,
             effect_sink,
             deferred_host_effects,
-            None,
+            grant_ceiling,
             effect_audit,
         )
         .await

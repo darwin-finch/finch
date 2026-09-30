@@ -152,6 +152,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("tool result");
@@ -249,6 +250,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("tool result");
@@ -293,6 +295,7 @@ mod tests {
                     serde_json::json!({"path": "sample.rs"}),
                 ),
                 None::<fn() -> anyhow::Result<()>>,
+                None,
                 None,
                 None,
                 None,

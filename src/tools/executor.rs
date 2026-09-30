@@ -434,7 +434,7 @@ impl ToolExecutor {
 
     /// Execute a single tool use
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit), fields(tool = %tool_use.name, id = %tool_use.id))]
+    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit, grant_ceiling), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
@@ -443,6 +443,7 @@ impl ToolExecutor {
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -546,6 +547,7 @@ impl ToolExecutor {
             }),
             effect_audit: effect_audit
                 .map(|authority| Arc::new(authority) as Arc<dyn EffectAuditAuthority>),
+            grant_ceiling,
             // The coordinator already showed the dialog, applied edit:*, or
             // AutoAccept. execute() must not open $EDITOR again.
             skip_interactive_review: true,
@@ -656,6 +658,7 @@ impl ToolExecutor {
                     plan_content.clone(),
                     None, // live_output
                     None, // effect_audit
+                    None, // grant_ceiling
                 )
                 .await?;
             results.push(result);
@@ -1014,6 +1017,7 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
+                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1039,6 +1043,7 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
+                None, // grant_ceiling
             )
             .await;
         assert!(result.is_err());
@@ -1058,6 +1063,7 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
+                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1163,6 +1169,7 @@ mod tests {
                     None,                    // plan_content
                     None,                    // live_output
                     None,                    // effect_audit
+                    None,                    // grant_ceiling
                 )
                 .await
             {
@@ -1201,6 +1208,7 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
+                None, // grant_ceiling
             )
             .await
             .unwrap();
@@ -1504,6 +1512,7 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
+                None, // grant_ceiling,
             )
             .await
             .expect("granted edit must return ToolResult");
@@ -1911,6 +1920,7 @@ mod tests {
                 None, // plan_content
                 None, // live_output
                 None, // effect_audit
+                None, // grant_ceiling
             )
             .await
             .expect("edit execution must not error at the executor boundary")
@@ -2063,6 +2073,7 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
+                None, // grant_ceiling,
             )
             .await
             .expect("write execution");
@@ -2112,6 +2123,7 @@ mod tests {
                 None, // plan_content,
                 None, // live_output,
                 None, // effect_audit,
+                None, // grant_ceiling,
             )
             .await
             .expect("patch execution");

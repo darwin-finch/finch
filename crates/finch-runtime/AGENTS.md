@@ -59,10 +59,11 @@ contracts without opening those implementations. Root callers may use the
   Bump finch-vm's `RUNTIME_APPLICATION_ABI_VERSION` and fail closed on incompatible frames; do
   not create a second journal or alternate encoding. Host effects remain subject to typed grants
   and the effect-audit fence.
-- Provider-wire submission may carry an application-authored grant ceiling. A present ceiling
-  replaces ambient reusable grants for the execution and remains captured across yield,
-  approval, cancellation, and resume; `None` preserves local-owner grant reuse. Empty program
-  capability declarations still mean VM inference, never unbounded authority.
+- Provider-wire and provider-native `submit_program` submission may carry an
+  application-authored grant ceiling. A present ceiling replaces ambient reusable grants for the
+  execution and remains captured across yield, approval, cancellation, and resume; `None`
+  preserves local-owner and child-caller grant reuse. Empty program capability declarations still
+  mean VM inference, never unbounded authority.
 - `AutomationBroker::execute` (`src/automation.rs`) must fail with a readable sentence, not a
   serialized `AutomationAvailability` blob, whenever `state != Available` — CLAUDE.md's GUI
   Accessibility invariant requires an actionable message, and for `PermissionRequired`

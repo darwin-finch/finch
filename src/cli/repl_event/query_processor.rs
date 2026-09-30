@@ -1304,10 +1304,11 @@ pub(super) async fn dispatch_tool_uses(
         query_id,
         tool_uses: tool_uses.clone(),
     });
-    let effect_audit = query_states
-        .get_metadata(query_id)
-        .await
-        .and_then(|metadata| metadata.effect_audit);
+    let query_metadata = query_states.get_metadata(query_id).await;
+    let effect_audit = query_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.effect_audit.clone());
+    let grant_ceiling = query_metadata.and_then(|metadata| metadata.grant_ceiling);
     // Snapshot the mode instead of holding the `RwLockReadGuard` across this
     // loop (#26): `handle_present_plan`, called below for an approved
     // `present_plan` in the same batch, does `mode.write().await` on this
@@ -1448,6 +1449,7 @@ pub(super) async fn dispatch_tool_uses(
                 round_token,
                 calls,
                 effect_audit.clone(),
+                grant_ceiling.clone(),
             );
         } else {
             for (tool_use, row_idx) in group {
@@ -1458,6 +1460,7 @@ pub(super) async fn dispatch_tool_uses(
                     Arc::clone(work_unit),
                     row_idx,
                     effect_audit.clone(),
+                    grant_ceiling.clone(),
                 );
             }
         }

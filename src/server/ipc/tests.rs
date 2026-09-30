@@ -1469,18 +1469,15 @@ async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_tea
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
+async fn named_brain_prompt_wire_cannot_reuse_an_owner_file_write_grant(provider_tool: bool) {
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
             let task_output = temp.path().join("task-output");
             std::fs::create_dir_all(&task_output).unwrap();
             let target = task_output.join("leaked.txt");
-            let store = crate::brain::BrainStore::with_root(
-                "box.local",
-                Some(temp.path().join("brains")),
-            );
+            let store =
+                crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
             let server = std::sync::Arc::new(
                 crate::server::AgentServer::for_brain_protocol_test(
                     store.clone(),
@@ -1490,15 +1487,15 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
                 )
                 .unwrap(),
             );
-            let daemon: super::finch_ipc_capnp::finch_daemon::Client =
-                capnp_rpc::new_client(FinchDaemonImpl::new(
-                    std::sync::Arc::clone(&server),
-                    uuid::Uuid::new_v4(),
-                ));
+            let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
+            );
             let ipc = crate::client::IpcClient::from_test_client(daemon);
             let initial = ipc.brain_snapshot("shared").await.unwrap();
             let runner_subject = "runner@box.local/frontend-prompt-ceiling";
-            ipc.brain_claim_runner_identity(runner_subject).await.unwrap();
+            ipc.brain_claim_runner_identity(runner_subject)
+                .await
+                .unwrap();
             let lease = ipc
                 .brain_acquire_runner(
                     "shared",
@@ -1512,20 +1509,48 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
 
             let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
             runtime.bind_task_output_root(&task_output).unwrap();
-            runtime
-                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                    crate::vm::FileOperation::Write,
-                    crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
-                ))
-                .unwrap();
+            let requirement = crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Write,
+                crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+            );
+            runtime.grant_typed_capability(requirement.clone()).unwrap();
             let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let generator: std::sync::Arc<dyn crate::generators::Generator> =
-                std::sync::Arc::new(RawWireGenerator {
-                    source: "s\" leaked.txt\" task-output-path s\" stolen\" bytes task-output-file-write"
-                        .into(),
-                    calls: std::sync::Arc::clone(&provider_calls),
+            let source =
+                "s\" leaked.txt\" task-output-path s\" stolen\" bytes task-output-file-write";
+            let (generator, definitions, registry): (
+                std::sync::Arc<dyn crate::generators::Generator>,
+                Vec<crate::tools::ToolDefinition>,
+                crate::tools::ToolRegistry,
+            ) = if provider_tool {
+                use crate::tools::Tool;
+
+                let input = serde_json::json!({
+                    "language": "forth",
+                    "source": source,
+                    "intent": "attempt a bounded provider tool write",
+                    "declared_capabilities": [requirement],
+                    "manifest_generation": runtime.manifest_generation(),
                 });
-            let registry = crate::tools::ToolRegistry::new();
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input,
+                        calls: std::sync::Arc::clone(&provider_calls),
+                    });
+                let tool = crate::tools::SubmitProgramTool::new(std::sync::Arc::clone(&runtime));
+                let definitions = vec![tool.definition()];
+                let mut registry = crate::tools::ToolRegistry::new();
+                registry.register(Box::new(tool));
+                (generator, definitions, registry)
+            } else {
+                (
+                    std::sync::Arc::new(RawWireGenerator {
+                        source: source.into(),
+                        calls: std::sync::Arc::clone(&provider_calls),
+                    }),
+                    Vec::new(),
+                    crate::tools::ToolRegistry::new(),
+                )
+            };
             let permissions = crate::tools::PermissionManager::new()
                 .with_default_rule(crate::tools::PermissionRule::Allow);
             let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -1538,7 +1563,7 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
             ));
             let event_loop = crate::cli::EventLoop::new_named_brain_test_runner(
                 generator,
-                Vec::new(),
+                definitions,
                 executor,
                 runtime,
             );
@@ -1567,7 +1592,7 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
                         "shared",
                         &submit_attachment,
                         crate::brain::BrainEventKind::Prompt {
-                            text: "write through raw provider VM wire".into(),
+                            text: "attempt a bounded provider VM write".into(),
                             attached_mentions: Vec::new(),
                         },
                     )
@@ -1575,24 +1600,34 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
             });
 
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            let (run_id, approval) = loop {
-                let snapshot = store.snapshot("shared").unwrap();
-                let approval = snapshot.events.iter().find(|event| {
-                    matches!(event.kind, crate::brain::BrainEventKind::ApprovalRequested { .. })
-                });
-                let run = snapshot.runs.iter().find(|run| {
-                    matches!(
-                        run.status,
-                        crate::brain::BrainRunStatus::Running
-                            | crate::brain::BrainRunStatus::AwaitingApproval
-                    )
-                });
-                if approval.is_some() {
-                    break (run.expect("approval must belong to an active run").run_id, true);
-                }
-                assert!(
+            let (run_id, request_seq, approval_id) =
+                loop {
+                    let snapshot = store.snapshot("shared").unwrap();
+                    let approval = snapshot.events.iter().find_map(|event| match &event.kind {
+                        crate::brain::BrainEventKind::ApprovalRequested {
+                            request_seq,
+                            approval_id,
+                            ..
+                        } => Some((*request_seq, approval_id.clone())),
+                        _ => None,
+                    });
+                    let run = snapshot.runs.iter().find(|run| {
+                        matches!(
+                            run.status,
+                            crate::brain::BrainRunStatus::Running
+                                | crate::brain::BrainRunStatus::AwaitingApproval
+                        )
+                    });
+                    if let Some((request_seq, approval_id)) = approval {
+                        break (
+                            run.expect("approval must belong to an active run").run_id,
+                            request_seq,
+                            approval_id,
+                        );
+                    }
+                    assert!(
                     !target.exists(),
-                    "named-Brain Prompt raw VM wire spent a pre-existing owner FileWrite grant \
+                    "named-Brain Prompt provider wire spent a pre-existing owner FileWrite grant \
                      without a new approval; target={}; run_states={:?}; event_kinds={:?}",
                     target.display(),
                     snapshot.runs.iter().map(|run| run.status).collect::<Vec<_>>(),
@@ -1602,21 +1637,24 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
                         .map(|event| &event.kind)
                         .collect::<Vec<_>>()
                 );
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "named-Brain Prompt did not reach the expected bounded approval; \
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "named-Brain Prompt did not reach the expected bounded approval; \
                      target={}; run_states={:?}; event_kinds={:?}",
-                    target.display(),
-                    snapshot.runs.iter().map(|run| run.status).collect::<Vec<_>>(),
-                    snapshot
-                        .events
-                        .iter()
-                        .map(|event| &event.kind)
-                        .collect::<Vec<_>>()
-                );
-                tokio::task::yield_now().await;
-            };
-            assert!(approval);
+                        target.display(),
+                        snapshot
+                            .runs
+                            .iter()
+                            .map(|run| run.status)
+                            .collect::<Vec<_>>(),
+                        snapshot
+                            .events
+                            .iter()
+                            .map(|event| &event.kind)
+                            .collect::<Vec<_>>()
+                    );
+                    tokio::task::yield_now().await;
+                };
             assert!(
                 !target.exists(),
                 "bounded named-Brain Prompt must leave the attempted write absent; target={}",
@@ -1637,14 +1675,58 @@ async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
                 .await
                 .expect("bounded prompt cancellation did not quiesce")
                 .unwrap();
+            let late_decision = ipc
+                .brain_submit(
+                    "shared",
+                    &attachment,
+                    crate::brain::BrainEventKind::ApprovalDecided {
+                        request_seq,
+                        approval_id,
+                        decision: serde_json::to_value(crate::vm::ApprovalChoice::AllowOnce)
+                            .unwrap(),
+                    },
+                )
+                .await;
+            let late_decision_diagnostic = match &late_decision {
+                Ok(_) => "accepted".to_string(),
+                Err(error) => format!("rejected: {error:#}"),
+            };
             event_tx.send(crate::cli::ReplEvent::Shutdown).unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
                 .await
                 .expect("bounded prompt runner shutdown exceeded the teardown bound")
                 .unwrap()
                 .unwrap();
+            assert!(
+                !target.exists(),
+                "late approval after named-Brain cancellation created the bounded target: {}; late_decision={late_decision_diagnostic}",
+                target.display(),
+            );
+            let terminal = store.snapshot("shared").unwrap();
+            assert!(
+                !terminal.events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::brain::BrainEventKind::ToolResult { .. }
+                        | crate::brain::BrainEventKind::Result { .. }
+                        | crate::brain::BrainEventKind::Program { .. }
+                        | crate::brain::BrainEventKind::RuntimeCommitted { .. }
+                        | crate::brain::BrainEventKind::EffectRecorded { .. }
+                )),
+                "cancelled named-Brain provider execution published a terminal effect after its late approval; late_decision={late_decision_diagnostic}; events={:?}",
+                terminal.events,
+            );
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn named_brain_prompt_raw_wire_cannot_reuse_an_owner_file_write_grant() {
+    named_brain_prompt_wire_cannot_reuse_an_owner_file_write_grant(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn named_brain_prompt_submit_program_cannot_reuse_an_owner_file_write_grant() {
+    named_brain_prompt_wire_cannot_reuse_an_owner_file_write_grant(true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1791,9 +1873,57 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                         .await
                 });
 
+                let approval_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                let (request_seq, approval_id) = loop {
+                    let snapshot = store.snapshot("shared").unwrap();
+                    if let Some(approval) = snapshot.events.iter().find_map(|event| {
+                        match &event.kind {
+                            crate::brain::BrainEventKind::ApprovalRequested {
+                                request_seq,
+                                approval_id,
+                                ..
+                            } => Some((*request_seq, approval_id.clone())),
+                            _ => None,
+                        }
+                    }) {
+                        break approval;
+                    }
+                    assert!(
+                        !task_output.join("late.txt").exists(),
+                        "named-Brain submit_program spent ambient FileWrite before an exact VM approval; events={:?}",
+                        snapshot
+                            .events
+                            .iter()
+                            .map(|event| &event.kind)
+                            .collect::<Vec<_>>()
+                    );
+                    assert!(
+                        tokio::time::Instant::now() < approval_deadline,
+                        "named-Brain submit_program did not publish the required VM approval; events={:?}",
+                        snapshot
+                            .events
+                            .iter()
+                            .map(|event| &event.kind)
+                            .collect::<Vec<_>>()
+                    );
+                    tokio::task::yield_now().await;
+                };
+                ipc.brain_submit(
+                    "shared",
+                    &attachment,
+                    crate::brain::BrainEventKind::ApprovalDecided {
+                        request_seq,
+                        approval_id,
+                        decision: serde_json::to_value(crate::vm::ApprovalChoice::AllowOnce)
+                            .unwrap(),
+                    },
+                )
+                .await
+                .expect("exact VM approval should resume the retained provider tool program");
                 tokio::time::timeout(std::time::Duration::from_secs(2), finish_started_rx)
                     .await
-                    .expect("physical effect did not reach its late finish boundary")
+                    .expect("approved physical effect did not reach its late finish boundary")
                     .unwrap();
                 assert_eq!(
                     std::fs::read(task_output.join("late.txt")).unwrap(),
