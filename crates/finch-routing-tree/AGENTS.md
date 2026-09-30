@@ -76,6 +76,30 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
   `test_hydrating_a_store_built_at_a_different_embedding_dimension_settles_failed_not_stuck`
   covers the same defect through the real async hydration path a background tokio worker uses in
   production.
+- **Reopened and fixed again, a different mechanism (issue #1384):** the fix above only catches a
+  whole-store `dim` mismatch (checked against the first loaded `routing_points` row); it does
+  nothing for a single already-corrupted decision node whose OWN persisted `anchor`/`direction`
+  is missing or wrong-length while the store's overall `dim` is perfectly consistent with every
+  point's embedding — the shape #1384 was reopened over after live re-testing found the original
+  panic still reproduced 5/5 on "fresh workspaces" that in fact all shared one pre-existing,
+  already-corrupted `~/.finch/memory.db` (memory stores are keyed by `$HOME`, not by the working
+  directory a "fresh workspace" repro changes into). `try_split` (`routing_tree.rs`) always sets a
+  decision node's `anchor`/`direction` together, once, to length `self.dim` — a genuinely fresh
+  store, at any current fixed nonzero embedding dimension, cannot produce this in memory — so the
+  only reachable way to load a decision node with a degenerate (most commonly zero-length) pair is
+  a persisted row this crate's own write path never wrote (an older, already-superseded write path,
+  or on-disk damage). The true creation-time root cause was not identified within this fix's
+  timebox and is left as an open question, not asserted to be any specific one of those causes.
+  `load_routing_tree` (`src/routing_tree/persistence.rs`) now checks every loaded decision node's
+  `anchor.len()`/`direction.len()` against the caller's `dim` right after reconstructing it, before
+  it is wired into the tree, and refuses with a named `Err` naming the node id and the actual vs.
+  expected lengths if either disagrees — the same "fail closed at the load boundary, before a later
+  insert or descent can reach `projection` and panic" shape as the dimension-mismatch fix above, not
+  a change to `projection` itself. `test_loading_a_decision_node_with_a_degenerate_anchor_fails_closed_instead_of_panicking`
+  in `src/routing_tree/persistence.rs` builds a real split tree, corrupts one decision node's
+  persisted `anchor`/`direction` to zero-length directly in `routing_nodes` (the exact shape from
+  live reports, not a synthetic mismatched-slice call), and asserts `load_routing_tree` returns
+  `Err` instead of the caller's next `insert` panicking.
 - **Fixed (issue #1329):** `remove_point`'s two iterative parent-pointer walks (the primary
   root-leaf downdate and the dual-entry-to-divergence-node downdate) used to `.expect()` a
   missing parent and panic if `routing_nodes.parent_id` were ever corrupted on disk — dormant only
