@@ -980,11 +980,11 @@ pub(crate) async fn deliver_due_named_brain_schedules(
 
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
-    let queued = store.queue_due_schedules(&name, now_ms)?;
+    let (queued, completion) = store.queue_due_schedules_observed(&name, now_ms)?;
     if queued.is_empty() || !named_brain_runner_is_ready(&store, &runners, &name)? {
         return Ok(ScheduleDeliveryAttempt {
             delivered: queued.len(),
-            completion: store.schedule_lifecycle_observation(&name),
+            completion,
         });
     }
 
@@ -1004,7 +1004,7 @@ pub(crate) async fn deliver_due_named_brain_schedules(
     }
     Ok(ScheduleDeliveryAttempt {
         delivered: dispatched,
-        completion: store.schedule_lifecycle_observation(&name),
+        completion,
     })
 }
 

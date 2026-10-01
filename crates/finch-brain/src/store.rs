@@ -2624,11 +2624,25 @@ impl BrainStore {
     /// for each delivery. The returned runs are durable before this method
     /// returns and are safe for the runner broker to dispatch immediately.
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
+        self.queue_due_schedules_observed(name, now_ms)
+            .map(|(queued, _)| queued)
+    }
+
+    /// Queue due runs and atomically return the resulting schedule lifecycle.
+    ///
+    /// The observation is sampled while the Brain write guard is still held,
+    /// before runner dispatch can await. Callers use it to distinguish the
+    /// delivery's own one-shot retirement from a later external cancellation.
+    pub fn queue_due_schedules_observed(
+        &self,
+        name: &str,
+        now_ms: u64,
+    ) -> Result<(Vec<BrainRun>, Option<(BrainId, u64, bool)>)> {
         let name = Self::validate_name(name)?;
         // Before the load, not after a failed one: a Brain that is gone is
         // pruned, a Brain that is merely unreadable is reported (#383).
         if self.prune_schedules_if_brain_is_absent(name) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), self.schedule_lifecycle_observation(name)));
         }
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
@@ -2770,7 +2784,8 @@ impl BrainStore {
                 }
             }
         }
-        Ok(queued)
+        let lifecycle = self.schedule_lifecycle_observation(name);
+        Ok((queued, lifecycle))
     }
 
     pub fn inspect_schedule(

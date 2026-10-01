@@ -1790,6 +1790,8 @@ mod tests {
         // populate the successor epoch or suppress its first real WARN.
         let (replacement_id, replacement_attachment_id, replacement_subject, replacement_healthy) =
             replacement_fixture.lock().unwrap().clone().unwrap();
+        let awaited_successor_fixture = Arc::new(std::sync::Mutex::new(None));
+        let hook_successor_fixture = Arc::clone(&awaited_successor_fixture);
         let hook_store = store.clone();
         let hook_root = brain_root.clone();
         schedule_delivery::set_after_attempt_hook(Box::new(move || {
@@ -1814,7 +1816,14 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            hook_store
+            let successor_attachment = hook_store
+                .activate_connection(
+                    NAME,
+                    successor_attachment.attachment_id,
+                    successor_attachment.connection_id.unwrap(),
+                )
+                .unwrap();
+            let successor = hook_store
                 .create_schedule(
                     NAME,
                     &successor_attachment.subject,
@@ -1827,6 +1836,13 @@ mod tests {
                     crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
                 )
                 .unwrap();
+            let healthy = std::fs::read(hook_root.join(NAME).join("events.jsonl")).unwrap();
+            *hook_successor_fixture.lock().unwrap() = Some((
+                successor.schedule_id,
+                successor_attachment.attachment_id,
+                successor_attachment.subject,
+                healthy,
+            ));
             assert!(hook_store.evict_resident_brain_for_tests(NAME));
             corrupt_brain_journal(&hook_root, NAME);
         }));
@@ -1839,6 +1855,123 @@ mod tests {
         );
         tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
         wait_for_schedule_events(&captured, FAILURE, 6).await;
+
+        // Park a real runner dispatch after queueing, then cancel the last
+        // recurring schedule through the lifecycle service while the handler
+        // is awaiting that runner. The atomic queue observation predates this
+        // external retirement, so the eventual successful runner reply must
+        // not masquerade as recovery of the failed delivery episode.
+        let (awaited_schedule_id, awaited_attachment_id, awaited_subject, awaited_healthy) =
+            awaited_successor_fixture.lock().unwrap().clone().unwrap();
+        std::fs::write(&journal, awaited_healthy).unwrap();
+        let cancellation_attachment = store
+            .attach(
+                NAME,
+                &awaited_subject,
+                crate::brain::AttachmentRole::Driver,
+                Some(awaited_attachment_id),
+            )
+            .unwrap();
+        let cancellation_attachment = store
+            .activate_connection(
+                NAME,
+                cancellation_attachment.attachment_id,
+                cancellation_attachment.connection_id.unwrap(),
+            )
+            .unwrap();
+        let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+        let lease = store
+            .acquire_runner_lease(NAME, "runner", store.environment().generation, None, 60_000)
+            .unwrap();
+        let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .brain_runners
+            .register(NAME, lease.lease_id, runner_tx);
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        let request = loop {
+            tokio::task::yield_now().await;
+            if let Ok(request) = runner_rx.try_recv() {
+                break request;
+            }
+        };
+        let crate::server::RunnerRequest::Program(request) = request else {
+            panic!("scheduled Lisp delivery must park on a program runner request")
+        };
+        assert!(
+            lifecycle
+                .cancel_schedule(
+                    NAME,
+                    cancellation_attachment.attachment_id,
+                    cancellation_attachment.connection_id.unwrap(),
+                    awaited_schedule_id,
+                )
+                .unwrap(),
+            "the real lifecycle cancellation path must retire the parked attempt's final schedule"
+        );
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: finch_programs::ProgramLanguage::Lisp,
+                source_id: Some("schedule-cancel-race".into()),
+                source: request.source,
+                intent: "schedule cancellation race".into(),
+                effect: finch_programs::ExecutionEffect::Unclassified,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == outcome.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: outcome.output,
+                runtime_revision: outcome.output_revision,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }))
+            .unwrap();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "external cancellation during awaited dispatch must retire the episode silently"
+        );
+
+        let fresh_attachment = store
+            .attach(
+                NAME,
+                "post-race",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &fresh_attachment.subject,
+                fresh_attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"fresh after cancellation\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        wait_for_schedule_events(&captured, FAILURE, 7).await;
 
         // Archive and recreate the display name under a new BrainId. Force a
         // second archive in the exact window after that successor's failed
@@ -1873,7 +2006,7 @@ mod tests {
         );
         assert_eq!(
             captured.schedule_events(FAILURE).len(),
-            6,
+            7,
             "a failed completion crossing retirement must not reinsert or log a stale episode"
         );
         assert_eq!(
@@ -1893,16 +2026,16 @@ mod tests {
         assert!(store.evict_resident_brain_for_tests(NAME));
         corrupt_brain_journal(&brain_root, NAME);
         drop(final_turn);
-        wait_for_schedule_events(&captured, FAILURE, 7).await;
+        wait_for_schedule_events(&captured, FAILURE, 8).await;
         let failures = captured.schedule_events(FAILURE);
         let final_id_text = final_id.0.to_string();
         assert_eq!(
             failures.len(),
-            7,
+            8,
             "the successor's first failure must warn; events={failures:?}"
         );
         assert_eq!(
-            failures[6].fields.get("brain_id").map(String::as_str),
+            failures[7].fields.get("brain_id").map(String::as_str),
             Some(final_id_text.as_str()),
             "the reused name must start a new identity-keyed episode; event={:?}",
             failures[2]
@@ -1925,7 +2058,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(store.active_schedule_identity(NAME), None);
-        assert_eq!(captured.schedule_events(FAILURE).len(), 7);
+        assert_eq!(captured.schedule_events(FAILURE).len(), 8);
         assert_eq!(
             captured.schedule_events(RECOVERY).len(),
             2,
@@ -1947,11 +2080,11 @@ mod tests {
         assert!(store.evict_resident_brain_for_tests(NAME));
         corrupt_brain_journal(&brain_root, NAME);
         drop(external_successor_turn);
-        wait_for_schedule_events(&captured, FAILURE, 8).await;
+        wait_for_schedule_events(&captured, FAILURE, 9).await;
         let failures = captured.schedule_events(FAILURE);
         let external_successor_id_text = external_successor_id.0.to_string();
         assert_eq!(
-            failures[7].fields.get("brain_id").map(String::as_str),
+            failures[8].fields.get("brain_id").map(String::as_str),
             Some(external_successor_id_text.as_str()),
             "name reuse after external absence must start a fresh episode"
         );
@@ -1990,15 +2123,15 @@ mod tests {
         assert!(restarted_store.evict_resident_brain_for_tests(NAME));
         corrupt_brain_journal(&brain_root, NAME);
         drop(restart_turn);
-        wait_for_schedule_events(&captured, FAILURE, 9).await;
+        wait_for_schedule_events(&captured, FAILURE, 10).await;
         let failures = captured.schedule_events(FAILURE);
         assert_eq!(
             failures.len(),
-            9,
+            10,
             "restart may warn once for its first real failed attempt"
         );
         assert_eq!(
-            failures[8].fields.get("brain_id").map(String::as_str),
+            failures[9].fields.get("brain_id").map(String::as_str),
             Some(external_successor_id_text.as_str())
         );
         assert_eq!(

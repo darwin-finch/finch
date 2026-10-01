@@ -38,7 +38,9 @@ unchanged retries are silent; the first real success emits one INFO and clears t
 Archive, unused removal, external absence, and schedule retirement silently reconcile the entry,
 and a completion that crossed one of those boundaries cannot reinsert it. A successful one-shot
 captures its completion observation while the execution lane is still held, so its natural final
-retirement does not hide the real recovery. Restart deliberately
+retirement does not hide the real recovery. That observation comes from the atomic schedule-queue
+commit before runner dispatch awaits; a later external cancellation therefore cannot masquerade
+as the delivery's own retirement. Restart deliberately
 starts empty, so the first real post-restart failure may warn again but never invents recovery.
 
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and
