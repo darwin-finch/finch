@@ -1220,6 +1220,7 @@ async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -
         live_output: None,
         host_mode_state: None,
         effect_audit: None,
+        grant_ceiling: None,
         skip_interactive_review: true,
     };
     tool.execute(input, &context).await

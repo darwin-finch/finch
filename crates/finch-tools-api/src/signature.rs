@@ -22,10 +22,10 @@ pub struct ToolSignature {
     /// Whether [`Self::path`] resolved inside the workspace root. `true` when
     /// there is no path slot (not an escape).
     pub path_in_workspace: bool,
-    /// True when the one-shot path would constitutionally Deny this command.
+    /// True when the one-shot path would denylist this command.
     /// Patterns must not match; the application executor rejects approval
     /// with `ApprovalSource::NotApproved`.
-    pub constitutionally_denied: bool,
+    pub denylisted: bool,
 }
 
 impl ToolSignature {
@@ -50,7 +50,7 @@ impl Default for ToolSignature {
             directory: None,
             path: None,
             path_in_workspace: true,
-            constitutionally_denied: false,
+            denylisted: false,
         }
     }
 }

@@ -900,6 +900,7 @@ impl Tool for SubmitProgramTool {
                 self.caller.clone(),
                 effect_sink,
                 defer_program_effects,
+                context.grant_ceiling.clone(),
                 effect_audit,
             )
             .await?;
@@ -974,6 +975,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let definition = tool
@@ -1002,6 +1004,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result: Value =
@@ -1028,6 +1031,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1055,6 +1059,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1088,6 +1093,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
 
@@ -1124,6 +1130,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let found: Value = serde_json::from_str(
@@ -1177,6 +1184,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1336,6 +1344,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result = tool
@@ -1353,6 +1362,61 @@ mod tests {
         let result: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["status"], "completed");
         assert_eq!(result["values"][0]["value"], 42);
+    }
+
+    #[tokio::test]
+    async fn local_owner_submit_program_without_ceiling_reuses_explicit_grant() {
+        let task_output = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        let requirement = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Write,
+            crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+        );
+        runtime.grant_typed_capability(requirement.clone()).unwrap();
+
+        let tool = SubmitProgramTool::new(Arc::clone(&runtime));
+        let context = ToolContext {
+            save_models: None,
+            host_mode_state: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            grant_ceiling: None,
+            skip_interactive_review: false,
+        };
+        let result: Value = serde_json::from_str(
+            &tool
+                .execute(
+                    json!({
+                        "language": "forth",
+                        "source": "s\" local.txt\" task-output-path s\" owner\" bytes task-output-file-write",
+                        "intent": "reuse the local owner's explicit grant",
+                        "declared_capabilities": [requirement],
+                        "manifest_generation": runtime.manifest_generation(),
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["status"], "completed",
+            "an unbounded local-owner submit_program call must preserve ordinary explicit-grant reuse; outcome={result}"
+        );
+        let contents = std::fs::read_to_string(task_output.path().join("local.txt")).unwrap_or_else(
+            |error| {
+                panic!(
+                    "local owner grant reuse must dispatch the authorized write; outcome={result}; error={error}"
+                )
+            },
+        );
+        assert_eq!(
+            contents, "owner",
+            "local owner grant reuse must preserve the written bytes; outcome={result}"
+        );
     }
 
     #[tokio::test]
@@ -1389,6 +1453,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: Some(Arc::new(effect_audit) as _),
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1429,6 +1494,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
 
@@ -1480,6 +1546,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
 
@@ -1521,6 +1588,7 @@ mod tests {
                 Arc::new(move |text| emitted.lock().unwrap().push(text))
             }),
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
 

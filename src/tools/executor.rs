@@ -4,7 +4,7 @@
 
 use crate::cli::ReplModeState;
 use crate::tools::permissions::{
-    bash_command_is_constitutionally_denied, path_argument_for_tool, raw_path_escapes_workspace,
+    bash_command_is_denylisted, path_argument_for_tool, raw_path_escapes_workspace,
     resolve_workspace_root, PermissionCheck, PermissionManager,
 };
 use crate::tools::types::{EffectAuditAuthority, ToolResult, ToolUse};
@@ -110,7 +110,7 @@ impl ToolConfirmationCache {
 
     /// Check if a signature is approved, returning the approval source
     pub fn is_approved(&mut self, sig: &ToolSignature) -> ApprovalSource {
-        if sig.constitutionally_denied {
+        if sig.denylisted {
             return ApprovalSource::NotApproved;
         }
 
@@ -433,8 +433,6 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool use
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
@@ -443,6 +441,34 @@ impl ToolExecutor {
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) -> Result<ToolResult>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        self.execute_tool_with_grant_ceiling(
+            tool_use,
+            save_models_fn,
+            repl_mode,
+            plan_content,
+            live_output,
+            effect_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Execute a tool use under an application-authored VM grant ceiling.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit, grant_ceiling), fields(tool = %tool_use.name, id = %tool_use.id))]
+    pub async fn execute_tool_with_grant_ceiling<F>(
+        &self,
+        tool_use: &ToolUse,
+        save_models_fn: Option<F>,
+        repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
+        plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
+        live_output: Option<crate::tools::types::LiveOutput>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -546,6 +572,7 @@ impl ToolExecutor {
             }),
             effect_audit: effect_audit
                 .map(|authority| Arc::new(authority) as Arc<dyn EffectAuditAuthority>),
+            grant_ceiling,
             // The coordinator already showed the dialog, applied edit:*, or
             // AutoAccept. execute() must not open $EDITOR again.
             skip_interactive_review: true,
@@ -704,7 +731,7 @@ fn signature(
     directory: Option<String>,
     path: Option<String>,
     path_in_workspace: bool,
-    constitutionally_denied: bool,
+    denylisted: bool,
 ) -> ToolSignature {
     ToolSignature {
         tool_name: tool_name.into(),
@@ -714,7 +741,7 @@ fn signature(
         directory,
         path,
         path_in_workspace,
-        constitutionally_denied,
+        denylisted,
     }
 }
 
@@ -753,7 +780,7 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
                 directory,
                 None,
                 true,
-                bash_command_is_constitutionally_denied(command),
+                bash_command_is_denylisted(command),
             )
         }
         "read" => signature(
@@ -1794,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn test_constitutional_bash_is_not_pattern_admissible() {
+    fn test_denylisted_bash_is_not_pattern_admissible() {
         let (workspace, root) = isolated_workspace();
         let mut executor = create_test_executor(true, false);
         executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
@@ -1804,14 +1831,11 @@ mod tests {
         ));
         let denied = ToolUse::new("bash".to_string(), json!({"command": "rm -rf /"}));
         let sig = generate_tool_signature(&denied, &root);
-        assert!(
-            sig.constitutionally_denied,
-            "invariant: rm -rf is constitutionally denied"
-        );
+        assert!(sig.denylisted, "invariant: rm -rf is denylisted");
         assert_eq!(
             executor.is_approved(&sig),
             ApprovalSource::NotApproved,
-            "invariant: a pattern must not admit a constitutionally Denied bash command; \
+            "invariant: a pattern must not admit a denylisted bash command; \
              got {:?}",
             executor.is_approved(&sig)
         );

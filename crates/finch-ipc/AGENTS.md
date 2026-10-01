@@ -18,9 +18,11 @@ private `events`, `transport`, or `value_codec` modules. Do not recreate a signa
 **Dependencies:** this core is domain-neutral. It must not depend on Brain, server, runtime,
 client, CLI, scheduler, generators, providers, tools, programs, or VM.
 
-**Schema:** this crate owns the unchanged schema, build script, and generated include. Do not change
-schema, discriminants, packing, nesting limits, protocol generation, or wire bytes in a
-boundary-only change.
+**Schema:** this crate owns the schema, build script, and generated include. Protocol generation
+11 adds `BrainTurnRequest.grantCeiling`, an application-authored maximum that must round-trip
+without widening or provider inference. Change discriminants, packing, nesting limits, protocol
+generation, or wire bytes only for an explicit transport contract change with supervised
+client/server coverage.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-ipc --lib`. Run supervised
 client/server integration tests if the schema, version, or wire codec changes.

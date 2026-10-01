@@ -79,6 +79,29 @@ impl VtOracle {
         self.parser = parser;
     }
 
+    /// Resize the same modeled terminal before feeding a full repaint. Finch's
+    /// resize path clears and reconstructs the visible viewport immediately,
+    /// so preserving the intersecting cells is sufficient to expose any bytes
+    /// that the repaint fails to replace without inventing a second terminal.
+    pub fn resize(&mut self, width: usize, height: usize) {
+        assert!(
+            width > 0 && height > 0,
+            "VT oracle dimensions must be non-zero"
+        );
+        let mut cells = vec![VtCell::default(); width * height];
+        for row in 0..self.height.min(height) {
+            for column in 0..self.width.min(width) {
+                cells[row * width + column] = self.cells[row * self.width + column];
+            }
+        }
+        self.width = width;
+        self.height = height;
+        self.cells = cells;
+        self.cursor_row = self.cursor_row.min(height - 1);
+        self.cursor_col = self.cursor_col.min(width - 1);
+        self.wrap_pending = false;
+    }
+
     pub fn cell(&self, row: usize, col: usize) -> VtCell {
         self.cells[row * self.width + col]
     }
@@ -95,6 +118,10 @@ impl VtOracle {
 
     pub fn find_row(&self, needle: &str) -> Option<usize> {
         (0..self.height).find(|&row| self.row(row).contains(needle))
+    }
+
+    pub fn contains_visible(&self, needle: &str) -> bool {
+        (0..self.height).any(|row| self.row(row).contains(needle))
     }
 
     pub fn cursor(&self) -> (usize, usize, bool) {

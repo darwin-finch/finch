@@ -1304,7 +1304,6 @@ fn state_with_step(step: AddProviderStep) -> WizardState {
             name: Some("claude".to_string()),
         }],
         std::path::PathBuf::from("unused-test-metrics"),
-        None,
     );
     let mut state = WizardState::new_with_catalog_cache_dir(Some(&hermetic_config), None);
     if let Some(SectionState::Models {
@@ -2296,8 +2295,6 @@ fn manual_openai_id_survives_save_reopen_and_fallback_installation() {
     let config_path = directory.path().join("config.toml");
     let cache_dir = directory.path().join("model-catalog-cache");
     let metrics_dir = directory.path().join("metrics");
-    let constitution_path = directory.path().join("constitution.md");
-    std::fs::write(&constitution_path, "test-only constitution").unwrap();
     let openai_idx = CLOUD_PROVIDERS
         .iter()
         .position(|(id, ..)| *id == "openai")
@@ -2318,20 +2315,11 @@ fn manual_openai_id_survives_save_reopen_and_fallback_installation() {
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
 
     let first_save = build_setup_result(&state).unwrap();
-    let config = config_from_setup_result_with_paths(
-        &first_save,
-        metrics_dir.clone(),
-        Some(constitution_path.clone()),
-    );
+    let config = config_from_setup_result_with_paths(&first_save, metrics_dir.clone());
     config.save_to(&config_path).unwrap();
-    let loaded = crate::config::load_config_from_path_with_paths(
-        &config_path,
-        metrics_dir.clone(),
-        Some(constitution_path.clone()),
-    )
-    .unwrap();
+    let loaded =
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir.clone()).unwrap();
     assert_eq!(loaded.metrics_dir, metrics_dir);
-    assert_eq!(loaded.constitution_path, Some(constitution_path.clone()));
     assert!(matches!(
         loaded.providers.first(),
         Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model
@@ -2381,21 +2369,12 @@ fn manual_openai_id_survives_save_reopen_and_fallback_installation() {
 
     handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
     let second_save = build_setup_result(&reopened).unwrap();
-    config_from_setup_result_with_paths(
-        &second_save,
-        metrics_dir.clone(),
-        Some(constitution_path.clone()),
-    )
-    .save_to(&config_path)
-    .unwrap();
-    let reloaded = crate::config::load_config_from_path_with_paths(
-        &config_path,
-        metrics_dir.clone(),
-        Some(constitution_path.clone()),
-    )
-    .unwrap();
+    config_from_setup_result_with_paths(&second_save, metrics_dir.clone())
+        .save_to(&config_path)
+        .unwrap();
+    let reloaded =
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir.clone()).unwrap();
     assert_eq!(reloaded.metrics_dir, metrics_dir);
-    assert_eq!(reloaded.constitution_path, Some(constitution_path));
     assert!(matches!(
         reloaded.providers.first(),
         Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model
@@ -2531,7 +2510,6 @@ fn persisted_fallback_id_is_not_replaced_by_refresh() {
     let config = crate::config::Config::with_providers_and_paths(
         vec![persisted.clone()],
         std::path::PathBuf::from("unused-test-metrics"),
-        None,
     );
     let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
@@ -3041,11 +3019,11 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     let metrics_dir = directory.path().join("metrics");
-    config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+    config_from_setup_result_with_paths(&result, metrics_dir.clone())
         .save_to(&config_path)
         .unwrap();
     let reloaded =
-        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir).unwrap();
     assert_eq!(reloaded.backend.model_path.as_deref(), Some(path.as_path()));
     let mut reopened = WizardState::new(Some(&reloaded));
     assert!(
@@ -3126,11 +3104,11 @@ fn test_managed_gguf_selection_survives_provider_save_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     let metrics_dir = directory.path().join("metrics");
-    config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+    config_from_setup_result_with_paths(&result, metrics_dir.clone())
         .save_to(&config_path)
         .unwrap();
     let reloaded =
-        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir).unwrap();
     assert_eq!(reloaded.backend.model_path, None);
     assert_eq!(reloaded.backend.managed_artifact.as_ref(), Some(&expected));
 
@@ -3541,12 +3519,12 @@ fn gemini_25_default_survives_save_load_and_reopen() {
     });
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
     let result = build_setup_result(&state).unwrap();
-    config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+    config_from_setup_result_with_paths(&result, metrics_dir.clone())
         .save_to(&config_path)
         .unwrap();
 
     let loaded =
-        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir).unwrap();
     assert!(matches!(
         loaded.providers.first(),
         Some(ProviderEntry::Gemini { model: Some(model), .. }) if model == canonical_model
@@ -4419,12 +4397,9 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
         },
         revocation: Default::default(),
     };
-    let source = crate::config::Config::with_providers_and_paths(
-        providers.clone(),
-        metrics_dir.clone(),
-        None,
-    )
-    .with_credentials(vec![credential.clone()]);
+    let source =
+        crate::config::Config::with_providers_and_paths(providers.clone(), metrics_dir.clone())
+            .with_credentials(vec![credential.clone()]);
     source.save_to(&config_path).unwrap();
 
     // Model a real short-lived OAuth access lease aging after it was saved.
@@ -4439,7 +4414,7 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
     std::fs::write(&config_path, serialized).unwrap();
     let before_open = std::fs::read(&config_path).unwrap();
 
-    let opened = load_config_from_path_with_paths(&config_path, metrics_dir.clone(), None)
+    let opened = load_config_from_path_with_paths(&config_path, metrics_dir.clone())
         .expect("refreshable expiry must not make static configuration unloadable");
     let mut expected_credential = credential;
     expected_credential.lifecycle = CredentialLifecycle::Active {
@@ -4506,7 +4481,7 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
         })
         .unwrap();
         let reopened =
-            load_config_from_path_with_paths(&invocation_path, metrics_dir.clone(), None).unwrap();
+            load_config_from_path_with_paths(&invocation_path, metrics_dir.clone()).unwrap();
         assert_eq!(reopened.providers, providers, "{invocation:?}");
         assert_eq!(
             reopened.credentials(),
@@ -4635,15 +4610,11 @@ fn persisted_subscription_config(
     let credential = chatgpt_subscription_credential();
     let metrics_dir = directory.join("metrics");
     let path = directory.join("before.toml");
-    crate::config::Config::with_providers_and_paths(
-        vec![provider.clone()],
-        metrics_dir.clone(),
-        None,
-    )
-    .with_credentials(vec![credential.clone()])
-    .save_to(&path)
-    .unwrap();
-    let loaded = crate::config::load_config_from_path_with_paths(&path, metrics_dir, None)
+    crate::config::Config::with_providers_and_paths(vec![provider.clone()], metrics_dir.clone())
+        .with_credentials(vec![credential.clone()])
+        .save_to(&path)
+        .unwrap();
+    let loaded = crate::config::load_config_from_path_with_paths(&path, metrics_dir)
         .unwrap_or_else(|error| {
             panic!(
                 "the persisted one-provider fixture at {} must load: {error:#}",
@@ -4660,7 +4631,7 @@ fn save_and_reload_wizard_state(
 ) -> crate::config::Config {
     let path = directory.join(name);
     let result = build_setup_result(state).expect("build setup result after provider change");
-    config_from_setup_result_with_paths(&result, directory.join("metrics"), None)
+    config_from_setup_result_with_paths(&result, directory.join("metrics"))
         .save_to(&path)
         .unwrap_or_else(|error| {
             panic!(
@@ -4669,7 +4640,7 @@ fn save_and_reload_wizard_state(
                 result.providers
             )
         });
-    crate::config::load_config_from_path_with_paths(&path, directory.join("metrics"), None)
+    crate::config::load_config_from_path_with_paths(&path, directory.join("metrics"))
         .unwrap_or_else(|error| {
             panic!(
                 "the provider graph written to {} must reload: {error:#}",
@@ -4715,18 +4686,14 @@ fn test_delete_provider_through_reducer_preserves_survivors_after_save_and_reloa
                 crate::config::Config::with_providers_and_paths(
                     providers[..count].to_vec(),
                     metrics_dir.clone(),
-                    None,
                 )
                 .with_credentials(credentials.clone())
                 .save_to(&original_path)
                 .unwrap();
                 let original_bytes = std::fs::read(&original_path).unwrap();
-                let loaded = crate::config::load_config_from_path_with_paths(
-                    &original_path,
-                    metrics_dir,
-                    None,
-                )
-                .unwrap();
+                let loaded =
+                    crate::config::load_config_from_path_with_paths(&original_path, metrics_dir)
+                        .unwrap();
                 let mut state = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
                 state.current_section = WizardSection::Models;
                 for _ in 0..selected {
@@ -5133,13 +5100,12 @@ async fn test_provider_editor_preserves_chatgpt_named_credential_through_save_an
     crate::config::Config::with_providers_and_paths(
         original_providers.clone(),
         metrics_dir.clone(),
-        None,
     )
     .with_credentials(vec![credential.clone()])
     .save_to(&original_path)
     .unwrap();
     let original =
-        crate::config::load_config_from_path_with_paths(&original_path, metrics_dir.clone(), None)
+        crate::config::load_config_from_path_with_paths(&original_path, metrics_dir.clone())
             .unwrap();
     let mut state = WizardState::new_with_catalog_cache_dir(Some(&original), None);
     state.current_section = WizardSection::Models;
@@ -5202,7 +5168,7 @@ async fn test_provider_editor_preserves_chatgpt_named_credential_through_save_an
     })
     .unwrap();
     let reloaded =
-        crate::config::load_config_from_path_with_paths(&saved_path, metrics_dir, None).unwrap();
+        crate::config::load_config_from_path_with_paths(&saved_path, metrics_dir).unwrap();
     assert_eq!(
         reloaded.providers, expected_providers,
         "the edited provider graph must survive save/reload without defaulting its identity"

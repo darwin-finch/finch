@@ -289,7 +289,6 @@ claude-proxy/
 ├── Cargo.lock
 ├── README.md
 ├── CLAUDE.md
-└── CONSTITUTIONAL_PROXY_SPEC.md
 ```
 
 ## Coding Standards
@@ -719,8 +718,6 @@ Add exponential backoff when rate limited.
 - [ ] Commit messages follow convention
 
 ## Development Roadmap
-
-See [CONSTITUTIONAL_PROXY_SPEC.md](../CONSTITUTIONAL_PROXY_SPEC.md) for full roadmap.
 
 ### Current Phase: Phase 0 (Setup)
 

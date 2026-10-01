@@ -154,10 +154,6 @@ pub struct Config {
     /// Enable TUI (Ratatui-based interface) (default: true)
     pub tui_enabled: bool,
 
-    /// Path to constitutional guidelines for local LLM (optional)
-    /// Only used for local inference, NOT sent to Claude API
-    pub constitution_path: Option<PathBuf>,
-
     /// Active persona name (e.g., "default", "expert-coder", "louis")
     pub active_persona: String,
 
@@ -476,16 +472,12 @@ impl ProviderEntry {
 
 pub(crate) struct ConfigPaths {
     metrics_dir: PathBuf,
-    constitution_path: Option<PathBuf>,
 }
 
 fn resolve_default_config_paths() -> ConfigPaths {
     let home = dirs::home_dir().expect("Could not determine home directory");
-    let constitution_path = home.join(".finch/constitution.md");
-    let constitution_path = constitution_path.exists().then_some(constitution_path);
     ConfigPaths {
         metrics_dir: home.join(".finch/metrics"),
-        constitution_path,
     }
 }
 
@@ -767,16 +759,6 @@ impl Config {
             ));
         }
 
-        // Validate paths exist if specified
-        if let Some(ref path) = self.constitution_path {
-            if !path.exists() {
-                anyhow::bail!(errors::file_not_found_error(
-                    &path.display().to_string(),
-                    "Constitution file"
-                ));
-            }
-        }
-
         // Declared post-edit diagnostics sources (issue #757): fail closed on
         // declarations this build must not mis-execute.
         self.diagnostics
@@ -806,12 +788,10 @@ impl Config {
     pub(crate) fn with_providers_and_paths(
         providers: Vec<ProviderEntry>,
         metrics_dir: PathBuf,
-        constitution_path: Option<PathBuf>,
     ) -> Self {
         Self::with_providers_and_paths_using_resolver(
             providers,
             metrics_dir,
-            constitution_path,
             resolve_default_config_paths,
         )
     }
@@ -819,7 +799,6 @@ impl Config {
     pub(crate) fn with_providers_and_paths_using_resolver<F>(
         providers: Vec<ProviderEntry>,
         metrics_dir: PathBuf,
-        constitution_path: Option<PathBuf>,
         resolve_default_paths: F,
     ) -> Self
     where
@@ -827,10 +806,7 @@ impl Config {
     {
         Self::with_providers_from_paths_or_else(
             providers,
-            Some(ConfigPaths {
-                metrics_dir,
-                constitution_path,
-            }),
+            Some(ConfigPaths { metrics_dir }),
             resolve_default_paths,
         )
     }
@@ -851,19 +827,13 @@ impl Config {
                 enabled: false,
                 ..BackendConfig::default()
             });
-        Self::new_with_all_and_paths(
-            backend,
-            providers,
-            paths.metrics_dir,
-            paths.constitution_path,
-        )
+        Self::new_with_all_and_paths(backend, providers, paths.metrics_dir)
     }
 
     fn new_with_all_and_paths(
         backend: BackendConfig,
         providers: Vec<ProviderEntry>,
         metrics_dir: PathBuf,
-        constitution_path: Option<PathBuf>,
     ) -> Self {
         let features = FeaturesConfig::default();
 
@@ -871,7 +841,6 @@ impl Config {
             metrics_dir,
             streaming_enabled: features.streaming_enabled,
             tui_enabled: true,
-            constitution_path,
             active_persona: "default".to_string(),
             active_theme: "dark".to_string(),
             huggingface_token: None,
@@ -1257,24 +1226,17 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let metrics_dir = directory.path().join("metrics-not-created");
-        let constitution_path = directory.path().join("constitution-not-created.md");
         let resolver_calls = Cell::new(0);
         assert!(!metrics_dir.exists());
-        assert!(!constitution_path.exists());
 
-        let config = Config::with_providers_and_paths_using_resolver(
-            vec![],
-            metrics_dir.clone(),
-            Some(constitution_path.clone()),
-            || {
+        let config =
+            Config::with_providers_and_paths_using_resolver(vec![], metrics_dir.clone(), || {
                 resolver_calls.set(resolver_calls.get() + 1);
                 panic!("explicit config paths must bypass ambient default resolution");
-            },
-        );
+            });
 
         assert_eq!(resolver_calls.get(), 0);
         assert_eq!(config.metrics_dir, metrics_dir);
-        assert_eq!(config.constitution_path, Some(constitution_path));
     }
 
     #[test]

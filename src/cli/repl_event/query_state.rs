@@ -62,6 +62,11 @@ pub struct QueryMetadata {
     /// in this named-Brain turn. This is never reconstructed from provenance.
     pub effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 
+    /// Application-owned maximum VM authority for provider wire produced by
+    /// this query. Local owner queries leave it unset; named-Brain turns bind
+    /// the daemon-issued ceiling before dispatch.
+    pub grant_ceiling: Option<crate::vm::EffectSet>,
+
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
@@ -104,6 +109,7 @@ impl QueryStateManager {
             conversation_snapshot,
             brain_turn_provenance: None,
             effect_audit: None,
+            grant_ceiling: None,
             cancellation_token: CancellationToken::new(),
             invocation_metadata: None,
             created_at: std::time::Instant::now(),
@@ -134,6 +140,14 @@ impl QueryStateManager {
     ) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.effect_audit = Some(effect_audit);
+        }
+    }
+
+    /// Bind an application-authored VM authority ceiling before provider
+    /// dispatch. Provider output has no path to mutate this metadata.
+    pub async fn bind_grant_ceiling(&self, query_id: Uuid, grant_ceiling: crate::vm::EffectSet) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.grant_ceiling = Some(grant_ceiling);
         }
     }
 
@@ -660,6 +674,25 @@ mod tests {
             .await
             .and_then(|metadata| metadata.effect_audit)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_named_brain_grant_ceiling_binding_survives_query_metadata_round_trip() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let ceiling = crate::vm::TypedRuntime::intrinsic_grants();
+
+        manager.bind_grant_ceiling(id, ceiling.clone()).await;
+
+        let metadata = manager
+            .get_metadata(id)
+            .await
+            .expect("named-Brain query metadata must remain resident until turn completion");
+        assert_eq!(
+            metadata.grant_ceiling,
+            Some(ceiling),
+            "named-Brain query metadata lost the daemon-issued VM grant ceiling before provider wire execution"
+        );
     }
 
     #[tokio::test]

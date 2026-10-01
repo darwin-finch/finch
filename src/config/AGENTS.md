@@ -32,6 +32,11 @@ read but never written back (#76). Only intentional changes save, and every save
 mode preserved, atomic rename, temporary removed on failure. The production-boundary regressions
 that drive the real binary are `tests/startup_is_readonly_on_config.rs`.
 
+**Removed settings fail narrowly and actionably.** The retired `constitution_path` key has a
+targeted loader tombstone that directs users to personas and does not rewrite either the config or
+the referenced file. Other unknown keys retain the existing compatibility behavior; do not replace
+this tombstone with a global `deny_unknown_fields` policy.
+
 **Instruction loading is an invariant.** The load order and deduplication rules live in
 [context assembly](../context/ASSEMBLY.md) and are pinned by the root
 [Context invariant](../../CLAUDE.md#context).

@@ -530,6 +530,24 @@ survives re-projection, streaming appends, terminal reflow, and reconnects. Comp
 cannot collapse a result. Leaf lines render exactly the ViewModel's label — which carries the
 status glyph — and never invent a `•` bullet or sniff glyph characters (#821).
 
+**A retained disclosure squeezed to one physical row stays the same disclosure (#69 reopened
+defect).** `viewport_tail_rendered_lines` compacts an oversized header from the header's own
+`▼`/`▶` marker and label prefix while preserving its `RowId`, expanded state, keyboard focus, and
+hit region; it never substitutes a detached `[expanded]`/`[collapsed]` word. Live viewport
+windowing and full-viewport reconstruction carry that `RenderedTranscriptLine` through planning,
+painting, and hit-region rebuild without recovering metadata by text; compaction also clears spans
+whose text described the pre-compaction header. This matters after a bottom-owned plan dialog
+reconstructs the final visible row: a substituted word could disagree with the body on the next
+toggle. Canonical native scrollback uses a separate static, fully-expanded projection that preserves
+labels, hierarchy, and bodies but emits no focus prefix or `▶`/`▼` marker because immutable rows
+cannot honor interaction. `test_plan_dialog_teardown_retains_atomic_keyboard_disclosure_across_resize`
+drives message projection, the renderer's real plan-dialog erase/draw open and completion-driven
+close in one continuous resizable VT model, F6 focus, repeated keyboard toggles, wide/narrow/tiny
+full-viewport reconstruction, hit regions, terminal bytes, and the canonical transition; failures
+report row/focus/open maps, geometry, visible lines, hit regions, and the VT state. Every status row
+is truncated to its claimed terminal width before paint, so fixed-row chrome cannot wrap and displace
+the retained row while its hit region still claims the original coordinate in tiny viewports.
+
 The renderer no longer accepts or stores Finch's `Poset`. The old `set_poset` injection was
 write-only and its Finch-to-`GraphView` adapter had no production caller, so #996 removed both.
 The remaining graph-to-Forth projection and its public view vocabulary then had only self-tests,

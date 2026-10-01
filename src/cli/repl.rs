@@ -289,7 +289,6 @@ mod disabled_training_tests {
             metrics_dir: temp.path().join("metrics"),
             streaming_enabled: false,
             tui_enabled: false,
-            constitution_path: None,
             active_persona: "default".to_string(),
             active_theme: "dark".to_string(),
             huggingface_token: None,
@@ -551,7 +550,7 @@ pub enum ReplMode {
     /// Auto-accept host-effect tools and VM/program capability prompts.
     ///
     /// The REPL AskUser / VM dialog is skipped. `PermissionManager` Deny and
-    /// constitutional constraints still apply at execute time. Planning
+    /// built-in dangerous-input denials still apply at execute time. Planning
     /// restrictions do not apply. This is a working mode like `Normal`, not a
     /// temporary overlay: Esc cancels a query without leaving it, and idle
     /// Esc exits Finch.
@@ -5294,7 +5293,6 @@ mod local_generation_blocking_tests {
             metrics_dir: temp.path().join("metrics"),
             streaming_enabled: false,
             tui_enabled: false,
-            constitution_path: None,
             active_persona: "default".to_string(),
             active_theme: "dark".to_string(),
             huggingface_token: None,

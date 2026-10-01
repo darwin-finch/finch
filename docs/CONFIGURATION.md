@@ -104,9 +104,6 @@ classifier = "~/.claude-proxy/models/classifier.mlmodel"
 # Path to generator model
 generator = "~/.claude-proxy/models/generator-7b.mlmodel"
 
-# Path to constitutional validator model
-validator = "~/.claude-proxy/models/constitutional.mlmodel"
-
 # Frontend semantic memory owns its ONNX embedder separately and remains
 # unaffected by the daemon chat-backend migration.
 
@@ -276,7 +273,7 @@ Configuration:
 Systemd service example:
 ```ini
 [Unit]
-Description=Shammah Constitutional AI Proxy
+Description=Finch AI Assistant
 After=network.target
 
 [Service]
@@ -547,4 +544,3 @@ Feedback federation is not implemented. Finch does not upload feedback.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture
 - [DEVELOPMENT.md](DEVELOPMENT.md) - Development setup
-- [CONSTITUTIONAL_PROXY_SPEC.md](../CONSTITUTIONAL_PROXY_SPEC.md) - Full specification

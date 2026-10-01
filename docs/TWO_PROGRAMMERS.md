@@ -58,14 +58,15 @@ Both programmers operate on the same VM instance:
 | `bash` (read-only: `ls`, `cat`, `find`) | Silently allowed |
 | `bash` with side effects (`rm`, `git commit`, `mkdir`) | Requires human approval |
 | `restart`, `spawn`, `kill` | **Hard blocked** — peer can never restart or spawn processes |
-| Constitutional limits (`rm -rf`, `/etc/passwd`, etc.) | **Hard blocked** for both owner and peer |
+| Built-in dangerous-input denylist (`rm -rf`, dangerous URL schemes/private IPs) | **Denied** for both owner and peer |
+| Reads outside the workspace (for example `/etc/passwd`) | **AskUser** one-shot review; stored patterns cannot approve them |
 
 See `src/tools/permissions.rs` for the implementation. Key invariants are tested there:
 - `test_peer_cannot_restart`
 - `test_peer_cannot_spawn`
 - `test_peer_read_glob_grep_silently_allowed`
 - `test_peer_write_edit_patch_surfaces_as_ask`
-- `test_peer_constitutional_constraints_still_apply`
+- `test_peer_denylist_still_applies`
 
 ---
 

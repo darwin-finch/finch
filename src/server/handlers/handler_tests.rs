@@ -1976,6 +1976,12 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
                 }
                 other => panic!("expected queued turn request, got {other:?}"),
             };
+            assert_eq!(
+                request.grant_ceiling,
+                crate::vm::TypedRuntime::intrinsic_grants(),
+                "restored named-Brain request {} resumed without the daemon-issued intrinsic VM grant ceiling",
+                request.request_seq
+            );
             let context = request
                 .context
                 .iter()

@@ -108,6 +108,11 @@ pub struct ToolContext<'a> {
     /// `None`; provenance fields can never manufacture this capability.
     pub effect_audit: Option<Arc<dyn EffectAuditAuthority>>,
 
+    /// Application-authored maximum VM authority for provider-originated
+    /// program tools. Named-Brain turns inject this independently of provider
+    /// input; ordinary owner and child calls leave it unset.
+    pub grant_ceiling: Option<finch_vm::EffectSet>,
+
     /// True when the REPL (or another caller) already obtained approval.
     ///
     /// The TUI dialog includes "Yes, and don't ask again for: edit:*". After
@@ -124,6 +129,7 @@ impl Default for ToolContext<'_> {
             live_output: None,
             host_mode_state: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         }
     }

@@ -208,6 +208,12 @@ ignored daemon spawn/health smoke:
 ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored
 ```
 
+The broad `finch-brain` isolation-module process covers every ordinary and newly added isolation
+test. Two proof-validation tests that mutate shared sealed-listener challenge state are explicit
+exceptions: the broad process names each with `--skip`, and the workflow immediately runs each
+skipped test in its own supervised `--exact` process. `scripts/check_ci_workflow_manifest.py` pins
+that skip/exact pairing on both Ubuntu and macOS so a skipped test cannot silently lose coverage.
+
 ## Future Improvements
 
 - [ ] Expand PTY-based TUI interaction tests

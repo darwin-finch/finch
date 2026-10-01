@@ -295,10 +295,28 @@ fn live_viewport_lines(
     terminal_width: usize,
     row_budget: usize,
 ) -> (Vec<String>, usize) {
+    let rendered = lines
+        .iter()
+        .map(|text| RenderedTranscriptLine {
+            text: text.clone(),
+            ..RenderedTranscriptLine::default()
+        })
+        .collect::<Vec<_>>();
+    let (visible, omitted) = live_viewport_rendered_lines(&rendered, terminal_width, row_budget);
+    (visible.into_iter().map(|line| line.text).collect(), omitted)
+}
+
+/// Select the newest live transcript rows without discarding the row identity,
+/// expansion state, spans, or body ownership attached by projection.
+fn live_viewport_rendered_lines(
+    lines: &[RenderedTranscriptLine],
+    terminal_width: usize,
+    row_budget: usize,
+) -> (Vec<RenderedTranscriptLine>, usize) {
     let width = terminal_width.max(1);
     let total_rows = lines
         .iter()
-        .map(|line| shadow_buffer::physical_rows(line, width))
+        .map(|line| shadow_buffer::physical_rows(&line.text, width))
         .sum::<usize>();
     if row_budget == 0 {
         return (Vec::new(), total_rows);
@@ -316,16 +334,19 @@ fn live_viewport_lines(
         if remaining == 0 {
             break;
         }
-        let rows = shadow_buffer::physical_rows(line, width);
+        let rows = shadow_buffer::physical_rows(&line.text, width);
         if rows <= remaining {
             selected.push(line.clone());
             remaining -= rows;
             selected_rows += rows;
         } else {
-            let fragment = visible_tail(line, remaining.saturating_mul(width));
+            let fragment = visible_tail(&line.text, remaining.saturating_mul(width));
             if !fragment.is_empty() {
                 selected_rows += shadow_buffer::physical_rows(&fragment, width);
-                selected.push(fragment);
+                selected.push(RenderedTranscriptLine {
+                    text: fragment,
+                    ..RenderedTranscriptLine::default()
+                });
             }
             break;
         }
@@ -333,7 +354,13 @@ fn live_viewport_lines(
     selected.reverse();
     let omitted_rows = total_rows.saturating_sub(selected_rows);
     let marker = format!("… {omitted_rows} earlier live rows clipped; retained until completion …");
-    selected.insert(0, visible_prefix(&marker, width));
+    selected.insert(
+        0,
+        RenderedTranscriptLine {
+            text: visible_prefix(&marker, width),
+            ..RenderedTranscriptLine::default()
+        },
+    );
     (selected, omitted_rows)
 }
 
@@ -1159,21 +1186,15 @@ pub(crate) fn plan_live_frame(
         // A Brain can have more than one live work unit (a streamed VM program
         // alongside a child task or output handle). Rendering only the newest
         // made earlier source appear and then vanish on the next redraw.
-        let all_live_lines = vm
-            .live_rendered
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
         // The furniture tracks claim their own rows between the viewport and
         // the composer (#966), so the live transcript windows over the whole
         // viewport claim.
-        let mut live_lines = if all_live_lines.is_empty() {
+        let mut visible_live = if vm.live_rendered.is_empty() {
             Vec::new()
         } else {
-            live_viewport_lines(&all_live_lines, width, rects.transcript.height).0
+            live_viewport_rendered_lines(vm.live_rendered, width, rects.transcript.height).0
         };
-        pin_live_disclosure_header(vm.live_rendered, &mut live_lines, width);
-        let mut visible_live = rendered_metadata_for_visible(vm.live_rendered, &live_lines);
+        pin_live_disclosure_header(vm.live_rendered, &mut visible_live, width);
         viewport_content.extend(visible_live.iter().cloned());
 
         // Pin the composer in the viewport: the live window was painted in
@@ -1302,6 +1323,7 @@ pub(crate) fn plan_live_frame(
         .lines()
         .take(claimed_rects.status.height)
     {
+        let line = shadow_buffer::truncate_to_columns(line, width);
         frame.push(format!("{DIM_GRAY}{line}{RESET}"));
     }
 
@@ -2057,7 +2079,13 @@ impl TuiRenderer {
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
+        self.erase_live_area_to(&mut io::stdout())
+    }
+
+    /// Run the production erase bookkeeping against an injected terminal
+    /// sink. The blocking and async dialog paths use the public stdout
+    /// wrapper; boundary tests keep erase and redraw bytes in one VT model.
+    fn erase_live_area_to(&mut self, out: &mut impl Write) -> Result<()> {
         // Begin the synchronized update here so erase + draw are one atomic
         // terminal operation — eliminates the blank-flash between them.
         // Never clear from the cursor to the bottom of the terminal here. A
@@ -2065,7 +2093,7 @@ impl TuiRenderer {
         // program) would then erase committed scrollback above the live area.
         // Clear only the rows this renderer previously owned. If accounting is
         // ever short, a stale live row is recoverable; lost transcript is not.
-        write_live_area_erase(&mut stdout, self.active_rows, self.cursor_row_from_top)?;
+        write_live_area_erase(out, self.active_rows, self.cursor_row_from_top)?;
         if self.active_rows == 0 && self.cursor_row_from_top == 0 {
             return Ok(()); // Sync block is closed by the following draw.
         }
@@ -2088,8 +2116,20 @@ impl TuiRenderer {
     /// Paint the live area to `out`. Tests capture the attention bell here.
     fn draw_live_area_to(&mut self, out: &mut impl Write) -> Result<()> {
         let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (term_width, term_h) = (term_width as usize, term_h as usize);
+        self.draw_live_area_to_at(out, term_width as usize, term_h as usize, None)
+    }
 
+    /// Paint at an already-resolved terminal size. A full-viewport rebuild
+    /// supplies the exact retained window it just painted so hit regions
+    /// cannot re-project a different compact row on the second half of the
+    /// same synchronized update.
+    fn draw_live_area_to_at(
+        &mut self,
+        out: &mut impl Write,
+        term_width: usize,
+        term_h: usize,
+        retained_window: Option<&[RenderedTranscriptLine]>,
+    ) -> Result<()> {
         if term_h <= 3
             && self.active_dialog.is_none()
             && self.expanded_tool.is_none()
@@ -2199,7 +2239,7 @@ impl TuiRenderer {
         self.active_rows = rows;
         self.last_live_frame_rows = rows;
         self.cursor_row_from_top = frame.cursor_row;
-        self.rebuild_transcript_hit_regions(&frame, rows, term_width, term_h);
+        self.rebuild_transcript_hit_regions(&frame, rows, term_width, term_h, retained_window);
         self.paint_selection_overlay(out)?;
         out.flush()?;
         Ok(())
@@ -2567,7 +2607,16 @@ fn viewport_tail_rendered_lines(
             return selected;
         }
         let mut compact = header.clone();
-        compact.text = compact_disclosure_label(header, terminal_width.max(1));
+        // The compact row remains the same interactive disclosure. Keep its
+        // marker and label prefix instead of replacing it with a detached
+        // `[expanded]`/`[collapsed]` word that can escape into immutable
+        // terminal history when a dialog reconstruction scrolls the live
+        // area's previous bytes.
+        compact.text = compact_disclosure_header(header, terminal_width.max(1));
+        // Spans describe the original long header byte-for-byte. Once the
+        // compact projection changes that text, retaining them would make the
+        // paint seam emit the old header instead of the compact row.
+        compact.spans.clear();
         return vec![compact];
     }
     let mut pinned = vec![header.clone()];
@@ -2577,22 +2626,6 @@ fn viewport_tail_rendered_lines(
         row_budget.saturating_sub(header_rows),
     ));
     pinned
-}
-
-fn compact_disclosure_label(header: &RenderedTranscriptLine, width: usize) -> String {
-    let expanded = header.row_expanded.unwrap_or(false);
-    let state = if expanded {
-        if width >= "[expanded]".len() {
-            "[expanded]"
-        } else {
-            "open"
-        }
-    } else if width >= "[collapsed]".len() {
-        "[collapsed]"
-    } else {
-        "closed"
-    };
-    visible_prefix(state, width)
 }
 
 fn rendered_tail_without_pinning(
@@ -2625,31 +2658,15 @@ fn rendered_tail_without_pinning(
     selected
 }
 
-fn rendered_metadata_for_visible(
-    all: &[RenderedTranscriptLine],
-    visible: &[String],
-) -> Vec<RenderedTranscriptLine> {
-    let mut search_end = all.len();
-    let mut matched = visible
-        .iter()
-        .rev()
-        .map(|text| {
-            let found = all[..search_end]
-                .iter()
-                .rposition(|line| line.text == *text);
-            if let Some(index) = found {
-                search_end = index;
-                all[index].clone()
-            } else {
-                RenderedTranscriptLine {
-                    text: text.clone(),
-                    ..RenderedTranscriptLine::default()
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    matched.reverse();
-    matched
+fn compact_disclosure_header(header: &RenderedTranscriptLine, width: usize) -> String {
+    let marker_index = header.text.find(|character| matches!(character, '▼' | '▶'));
+    let disclosure = marker_index
+        .map(|index| &header.text[index..])
+        .unwrap_or(header.text.as_str());
+    if header.text.starts_with("> ") && width >= 3 {
+        return format!("> {}", visible_prefix(disclosure, width.saturating_sub(2)));
+    }
+    visible_prefix(disclosure, width)
 }
 
 /// When the transcript viewport shows no expandable row at all, re-window the
@@ -2657,24 +2674,20 @@ fn rendered_metadata_for_visible(
 /// the disclosure reachable while the tree owns the viewport).
 fn pin_live_disclosure_header(
     all: &[RenderedTranscriptLine],
-    live_lines: &mut Vec<String>,
+    live_lines: &mut Vec<RenderedTranscriptLine>,
     terminal_width: usize,
 ) {
     if live_lines.is_empty() || !all.iter().any(|line| line.row_id.is_some()) {
         return;
     }
-    let visible = rendered_metadata_for_visible(all, live_lines);
-    if visible.iter().any(|line| line.row_id.is_some()) {
+    if live_lines.iter().any(|line| line.row_id.is_some()) {
         return;
     }
     let budget = live_lines
         .iter()
-        .map(|line| shadow_buffer::physical_rows(line, terminal_width.max(1)))
+        .map(|line| shadow_buffer::physical_rows(&line.text, terminal_width.max(1)))
         .sum();
-    *live_lines = viewport_tail_rendered_lines(all, terminal_width, budget)
-        .into_iter()
-        .map(|line| line.text)
-        .collect();
+    *live_lines = viewport_tail_rendered_lines(all, terminal_width, budget);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3356,6 +3369,7 @@ impl TuiRenderer {
         live_rows: usize,
         width: usize,
         height: usize,
+        retained_window: Option<&[RenderedTranscriptLine]>,
     ) {
         // The transcript claim of the last painted frame is the conversation
         // ScrollView's wheel hitbox: the leftover frame under the bottom
@@ -3367,8 +3381,13 @@ impl TuiRenderer {
         // repaint paints, so hit regions stay aligned with the visible rows
         // while the conversation is scrolled. The derivation also anchors
         // and bounds the offset.
-        let source = self.scroll_window_committed_source(width);
-        let transcript = viewport_tail_rendered_lines(&source, width, transcript_budget);
+        let transcript = match retained_window {
+            Some(painted) => painted.to_vec(),
+            None => {
+                let source = self.scroll_window_committed_source(width);
+                viewport_tail_rendered_lines(&source, width, transcript_budget)
+            }
+        };
         let transcript_rows = transcript
             .iter()
             .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
@@ -4196,6 +4215,14 @@ impl TuiRenderer {
     }
 
     fn redraw_full_viewport_inner(&mut self, synchronized_update_open: bool) -> Result<()> {
+        self.redraw_full_viewport_inner_to(&mut io::stdout(), synchronized_update_open)
+    }
+
+    fn redraw_full_viewport_inner_to(
+        &mut self,
+        out: &mut impl Write,
+        synchronized_update_open: bool,
+    ) -> Result<()> {
         // A full repaint rewrites every row this function touches from
         // scratch (a new committed message, an explicit scroll, or a
         // terminal resize) — whatever a selection pointed at may no longer
@@ -4232,35 +4259,35 @@ impl TuiRenderer {
         // Stage 4 (#1141): the scrolled transcript lowers spans at paint, the
         // same lowering the live viewport uses, so a scrolled reader sees the
         // styled rows.
-        let transcript = source
+        let transcript = viewport_tail_rendered_lines(&source, term_width, transcript_budget);
+        let transcript_rows = transcript
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(&line.text, term_width))
+            .sum();
+        let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
+        let painted_transcript = transcript
             .iter()
             .map(span_render::lower_rendered_line)
             .collect::<Vec<_>>();
-        let transcript = viewport_tail_lines(&transcript, term_width, transcript_budget);
-        let transcript_rows = transcript
-            .iter()
-            .map(|line| shadow_buffer::physical_rows(line, term_width))
-            .sum();
-        let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
 
-        let mut stdout = io::stdout();
         let paint = if synchronized_update_open {
-            continue_full_viewport_paint(&mut stdout, plan, &transcript)
+            continue_full_viewport_paint(out, plan, &painted_transcript)
         } else {
-            begin_full_viewport_paint(&mut stdout, plan, &transcript)
+            begin_full_viewport_paint(out, plan, &painted_transcript)
         };
         if let Err(error) = paint {
-            let _ = execute!(stdout, EndSynchronizedUpdate);
+            let _ = execute!(out, EndSynchronizedUpdate);
             return Err(error);
         }
 
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
         self.viewport_invalidated = false;
-        // draw_live_area closes the synchronized update begun above.
-        let draw = self.draw_live_area();
+        // The live draw closes the synchronized update begun above and uses
+        // this exact retained window for hit-region reconstruction.
+        let draw = self.draw_live_area_to_at(out, term_width, term_height, Some(&transcript));
         if draw.is_err() {
-            let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+            let _ = execute!(out, EndSynchronizedUpdate);
         }
         draw
     }
@@ -5990,6 +6017,245 @@ mod tests {
         );
     }
 
+    /// Reopened retained-accordion regression: a plan dialog can consume the
+    /// viewport between the message's first projection and later keyboard
+    /// disclosure. The reconstructed row must remain the same interactive
+    /// row at every geometry; marker and body change together, and a compact
+    /// projection never turns into a detached `[expanded]`/`[collapsed]`
+    /// transcript row.
+    #[test]
+    fn test_plan_dialog_teardown_retains_atomic_keyboard_disclosure_across_resize() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth source retained after plan review");
+        work.set_response("program output remains visible");
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        renderer.add_trait_message(work);
+
+        let compact_width = 12usize;
+        let compact_height = 12usize;
+        let mut terminal = VtOracle::new(compact_width, compact_height);
+        renderer.active_dialog = Some(
+            Dialog::select(
+                "Plan review",
+                vec![DialogOption::new("Approve"), DialogOption::new("Reject")],
+            )
+            .with_body("DIALOGONLY"),
+        );
+        let mut lifecycle_bytes = Vec::new();
+        renderer
+            .erase_live_area_to(&mut lifecycle_bytes)
+            .expect("the production dialog-open erase must succeed");
+        renderer
+            .draw_live_area_to_at(&mut lifecycle_bytes, compact_width, compact_height, None)
+            .expect("the production renderer must draw the open plan dialog");
+        terminal.feed(&lifecycle_bytes);
+        assert_vt(
+            terminal.find_row("Plan").is_some()
+                && terminal.find_row("[ Cancel ]").is_some()
+                && !terminal.cursor().2,
+            "the real renderer draw must open the plan dialog before teardown",
+            &terminal,
+        );
+
+        renderer.complete_dialog(DialogResult::Cancelled);
+        lifecycle_bytes.clear();
+        renderer
+            .erase_live_area_to(&mut lifecycle_bytes)
+            .expect("the production dialog-close erase must succeed");
+        renderer
+            .draw_live_area_to_at(&mut lifecycle_bytes, compact_width, compact_height, None)
+            .expect("the production renderer must reconstruct after plan teardown");
+        terminal.feed(&lifecycle_bytes);
+        let node = view_model::try_project_for_test(message.as_ref(), &colors)
+            .expect("the retained Program source message projects an accordion node");
+        let state = renderer.accordion.diagnostic_state();
+        assert!(
+            terminal.find_row("[ Cancel ]").is_none()
+                && terminal.contains_visible("▶")
+                && !terminal.contains_visible("[expanded]")
+                && !terminal.contains_visible("[collapsed]")
+                && terminal.cursor().2,
+            "one continuous terminal must lose every dialog cell and gain the reconstructed \
+             disclosure marker after the real close erase/draw; bytes={lifecycle_bytes:?} {state}"
+        );
+        assert_eq!(
+            renderer
+                .accordion
+                .hit_regions
+                .first()
+                .map(|region| &region.row_id),
+            Some(&node.id),
+            "the real close draw must rebuild the compact row's hitbox with its stable identity; \
+             bytes={lifecycle_bytes:?} geometry={compact_width}x{compact_height} {state}"
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&node.id),
+            "F6 must focus the reconstructed stable row; expected={:?} {}",
+            node.id,
+            renderer.accordion.diagnostic_state()
+        );
+
+        for (cycle, expected_open) in [true, false, true, false, true].into_iter().enumerate() {
+            let key = if cycle == 0 {
+                KeyCode::Right
+            } else {
+                KeyCode::Enter
+            };
+            assert!(
+                renderer.handle_accordion_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                "keyboard disclosure action {cycle} must be handled; {}",
+                renderer.accordion.diagnostic_state()
+            );
+            terminal.resize(80, 12);
+            renderer
+                .handle_resize(80, 12)
+                .expect("the production resize handler must accept wide geometry");
+            lifecycle_bytes.clear();
+            renderer
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .expect("the production full repaint must reconstruct at wide geometry");
+            terminal.feed(&lifecycle_bytes);
+            let marker = if expected_open { '▼' } else { '▶' };
+            let body_rows = (0..12)
+                .filter(|row| {
+                    terminal
+                        .row(*row)
+                        .contains("program output remains visible")
+                })
+                .collect::<Vec<_>>();
+            let body_visible = !body_rows.is_empty();
+            assert!(
+                terminal.contains_visible(&marker.to_string())
+                    && body_visible == expected_open
+                    && terminal.find_row("[ Cancel ]").is_none(),
+                "marker and body must transition atomically after dialog teardown; cycle={cycle} \
+                 expected_open={expected_open} body_visible={body_visible} \
+                 body_rows={body_rows:?} bytes={lifecycle_bytes:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+            terminal.resize(compact_width, compact_height);
+            renderer
+                .handle_resize(compact_width as u16, compact_height as u16)
+                .expect("the production resize handler must accept compact geometry");
+            lifecycle_bytes.clear();
+            renderer
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .expect("the production full repaint must reconstruct compact geometry");
+            terminal.feed(&lifecycle_bytes);
+            assert_eq!(
+                renderer
+                    .accordion
+                    .hit_regions
+                    .first()
+                    .map(|region| &region.row_id),
+                Some(&node.id),
+                "every compact toggle frame must claim the same hitbox; cycle={cycle} \
+                 expected_open={expected_open} bytes={lifecycle_bytes:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+        }
+
+        for narrow_width in [80usize, 12, 3, 2] {
+            let resize_height = 8usize;
+            terminal.resize(narrow_width, resize_height);
+            renderer
+                .handle_resize(narrow_width as u16, resize_height as u16)
+                .expect("the production resize handler must accept retained-row geometry");
+            lifecycle_bytes.clear();
+            renderer
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .expect("the production resize repaint must reconstruct the retained row");
+            terminal.feed(&lifecycle_bytes);
+            let state = renderer.accordion.diagnostic_state();
+            assert!(
+                renderer.accordion.focused.as_ref() == Some(&node.id)
+                    && renderer.accordion.hit_regions.len() == 1
+                    && renderer.accordion.hit_regions[0].row_id == node.id
+                    && renderer.accordion.hit_regions[0].top
+                        == renderer.accordion.hit_regions[0].bottom
+                    && renderer.accordion.hit_regions[0].right
+                        == narrow_width.saturating_sub(1) as u16
+                    && terminal.contains_visible("▼")
+                    && !terminal.contains_visible("[expanded]")
+                    && !terminal.contains_visible("[collapsed]")
+                    && terminal.find_row("[ Cancel ]").is_none(),
+                "resize must preserve identity, focus, the exact one-row hit region, and the \
+                 actionable expanded marker even in tiny geometry; width={narrow_width} \
+                 bytes={lifecycle_bytes:?} terminal={} {state}",
+                terminal.diagnostic()
+            );
+        }
+
+        lifecycle_bytes.clear();
+        prepare_canonical_commit(&mut lifecycle_bytes)
+            .expect("the production canonical transition must clear the visible projection");
+        renderer.active_rows = 0;
+        renderer.cursor_row_from_top = 0;
+        let canonical_start = lifecycle_bytes.len();
+        commit_complete_messages(
+            &mut lifecycle_bytes,
+            std::slice::from_ref(&message),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            8,
+            2,
+        )
+        .expect("the complete message must commit to immutable native scrollback");
+        let canonical_end = lifecycle_bytes.len();
+        let canonical = String::from_utf8(lifecycle_bytes[canonical_start..canonical_end].to_vec())
+            .expect("canonical transcript is UTF-8");
+        assert!(
+            canonical.contains("Program source")
+                && canonical.contains("forth source retained after plan review")
+                && !canonical.contains("[expanded]")
+                && !canonical.contains("[collapsed]")
+                && !canonical.contains('▶')
+                && !canonical.contains('▼'),
+            "immutable native scrollback must keep the label and full body without advertising \
+             any unsupported disclosure interaction; \
+             canonical={canonical:?} {}",
+            renderer.accordion.diagnostic_state()
+        );
+
+        renderer.pending_viewport_size = Some((2, 8));
+        renderer.viewport_invalidated = true;
+        renderer
+            .redraw_full_viewport_inner_to(&mut lifecycle_bytes, true)
+            .expect("the production full-viewport reconstruction must repaint after commit");
+        terminal.feed(&lifecycle_bytes);
+        let repaint_state = renderer.accordion.diagnostic_state();
+        assert!(
+            renderer.accordion.hit_regions.len() == 1
+                && renderer.accordion.hit_regions[0].row_id == node.id,
+            "the post-commit full-viewport projection must rebuild one interactive hitbox for \
+             the visible retained row, while only the separately asserted native commit stays \
+             immutable; bytes={lifecycle_bytes:?} {repaint_state}"
+        );
+        assert_vt(
+            terminal.contains_visible("▼")
+                && !terminal.contains_visible("[expanded]")
+                && !terminal.contains_visible("[collapsed]")
+                && terminal.find_row("[ Cancel ]").is_none(),
+            &format!(
+                "the continuous terminal must finish the canonical transition with the visible \
+                 retained projection interactive and without stranded dialog or state-label \
+                 chrome; {repaint_state}"
+            ),
+            &terminal,
+        );
+    }
+
     fn wheel_up() -> MouseEvent {
         MouseEvent {
             kind: event::MouseEventKind::ScrollUp,
@@ -6182,7 +6448,7 @@ mod tests {
             .map(|message| message.id())
             .expect("the tool message was added");
         renderer.printed_ids.insert(message_id);
-        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24, None);
         (renderer, output_row)
     }
 
@@ -6285,7 +6551,7 @@ mod tests {
         renderer.add_trait_message(second.clone());
         let second_id = second.id();
         renderer.printed_ids.insert(second_id);
-        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24, None);
 
         let first_scroll = {
             let regions = renderer.tool_viewports.regions();
@@ -6436,7 +6702,7 @@ mod tests {
         // it through the same rebuild that stores the wheel hitbox.
         let frame = plan_frame_for_test(80, 24, &[]);
         let live_rows = frame.physical_rows(80);
-        renderer.rebuild_transcript_hit_regions(&frame, live_rows, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&frame, live_rows, 80, 24, None);
 
         let claim = renderer.transcript_scroll.claim();
         let rects = frame.rects;
@@ -6872,7 +7138,7 @@ mod tests {
     #[test]
     fn test_keyboard_scroll_and_expand_of_focused_tool_result() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
-        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24, None);
 
         // F6 cycles through the four expandable rows of the grouped turn:
         // unit root, tool call, Input, Output.
@@ -7737,6 +8003,48 @@ mod tests {
             tiny[0].text
         );
         assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
+        let source = Arc::new(WorkUnit::new("program"));
+        source.set_program_source("forth source that remains retained");
+        source.set_response("program output");
+        source.set_complete();
+        let source_message: MessageRef = source;
+        let mut source_state = AccordionState::default();
+        let source_initial = render_via_view_model(&source_state, &source_message, &colors);
+        source_state.rebuild_retained_hit_regions(&source_initial, 0, 80);
+        assert!(source_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(source_state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let source_expanded = render_via_view_model(&source_state, &source_message, &colors);
+        let literal_state_width = 12;
+        let mut styled_source = source_expanded.clone();
+        let original_header = styled_source[0].text.clone();
+        styled_source[0].spans = vec![finch_ui_model::Span::styled(
+            original_header.clone(),
+            finch_ui_model::SpanStyle {
+                bold: true,
+                ..finch_ui_model::SpanStyle::default()
+            },
+        )];
+        let literal_state = viewport_tail_rendered_lines(&styled_source, literal_state_width, 1);
+        assert!(
+            !literal_state[0].text.contains("[expanded]")
+                && !literal_state[0].text.contains("[collapsed]"),
+            "an interactively projected retained header must keep its disclosure glyph instead \
+             of replacing the row with a detached literal state token; width={literal_state_width} \
+             row_id={:?} row_expanded={:?} visible={:?}",
+            literal_state[0].row_id,
+            literal_state[0].row_expanded,
+            literal_state
+        );
+        assert!(
+            literal_state[0].spans.is_empty()
+                && span_render::lower_rendered_line(&literal_state[0]) == literal_state[0].text
+                && !span_render::lower_rendered_line(&literal_state[0]).contains(&original_header),
+            "compacting a styled disclosure must clear spans tied to the original header so the \
+             paint seam emits the compact text; original={original_header:?} compact={:?} \
+             painted={:?}",
+            literal_state[0],
+            span_render::lower_rendered_line(&literal_state[0])
+        );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
         assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
@@ -11806,14 +12114,15 @@ mod tests {
 
     #[test]
     fn test_live_frame_measured_height_equals_the_rows_it_paints() {
-        // A status line wider than the terminal wraps. The frame's own row
-        // count is what erase_live_area() clears, so it must equal the rows the
-        // painted bytes actually occupy — not the number of logical lines.
+        // A draft wider than the terminal intentionally wraps. Fixed-height
+        // status chrome is width-bounded, but editable input still exercises
+        // the renderer's physical-row accounting: erase_live_area() must clear
+        // every row the painted bytes actually occupy, not just each logical
+        // frame line.
         let width = 30;
-        let status = "a".repeat(95);
-        let input = vec![String::new()];
+        let input = vec!["a".repeat(95)];
         let mut autocomplete = AutocompleteState::new();
-        let frame = plan_live_frame(&live_inputs(width, 40, &input, &status), &mut autocomplete);
+        let frame = plan_live_frame(&live_inputs(width, 40, &input, "idle"), &mut autocomplete);
 
         let buffer = frame.to_shadow_buffer(width, 40);
 

@@ -23,12 +23,14 @@ hold. If a caller needs a different shape, extend the shared type here — do no
 
 **Application-bound state arrives by injection.** [`ToolContext`](src/types.rs) names only what this
 crate can: the host's live session mode arrives as the opaque `HostModeState` port and the
-daemon-issued effect-audit authority as the `EffectAuditAuthority` port (`as_any` downcast). The
-composition root injects the concrete handles (see `src/tools/executor.rs`); carriers that fail to
-downcast must fail loud or degrade conservatively, never silently drop authority.
+daemon-issued effect-audit authority as the `EffectAuditAuthority` port (`as_any` downcast). A
+present `grant_ceiling` is likewise application-authored authority for this one tool call, not
+provider input; the composition root copies it from the owning query. The composition root injects
+the concrete handles (see `src/tools/executor.rs`); carriers that fail to downcast must fail loud or
+degrade conservatively, never silently drop authority.
 
 **Permissions are authority.** The peer hard-deny, silent-allow, and reviewed-changeset tables, the
-constitutional denials, `is_readonly_bash`, and the bash readonly refinement moved here verbatim
+dangerous-input denylist, `is_readonly_bash`, and the bash readonly refinement moved here verbatim
 from `src/tools/permissions.rs`. The pure policy tests live beside them in
 `src/permissions.rs`. The tests that exercise real registered tool implementations remain at the
 composition root (`src/tools/permissions/tests.rs`), at their original
