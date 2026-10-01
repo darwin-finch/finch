@@ -17,7 +17,8 @@ mod persist;
 
 pub use persist::{
     append_event, append_event_batch, append_journal_value, create_dir_all_durable, event_path,
-    read_events, rewrite_events, scan_readonly, sync_directory, EventJournal, JournalProjection,
+    read_events, read_events_readonly_strict, rewrite_events, scan_readonly, sync_directory,
+    EventJournal, JournalProjection,
 };
 
 pub const BRAIN_EVENT_SCHEMA_VERSION: u32 = 16;

@@ -201,55 +201,13 @@ impl BrainState {
 
     fn apply(&mut self, event: BrainEvent) {
         self.revision = self.revision.max(event.seq);
+        apply_runner_event(&mut self.runner_lease, &mut self.runner_handoff, &event);
         match &event.kind {
-            BrainEventKind::RunnerLeaseAcquired { lease } => {
-                if self
-                    .runner_handoff
-                    .as_ref()
-                    .is_some_and(|handoff| handoff.from_lease_id != lease.lease_id)
-                {
-                    self.runner_handoff = None;
-                }
-                self.runner_lease = Some(lease.clone());
-            }
-            BrainEventKind::RunnerLeaseReleased { lease_id } => {
-                if self
-                    .runner_lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.lease_id == *lease_id)
-                {
-                    self.runner_lease = None;
-                }
-                if self
-                    .runner_handoff
-                    .as_ref()
-                    .is_some_and(|handoff| handoff.from_lease_id == *lease_id)
-                {
-                    self.runner_handoff = None;
-                }
-            }
-            BrainEventKind::RunnerHandoffRequested { handoff } => {
-                self.runner_handoff = Some(handoff.clone());
-            }
-            BrainEventKind::RunnerHandoffCompleted { handoff_id, lease } => {
-                if self
-                    .runner_handoff
-                    .as_ref()
-                    .is_some_and(|handoff| handoff.handoff_id == *handoff_id)
-                {
-                    self.runner_handoff = None;
-                    self.runner_lease = Some(lease.clone());
-                }
-            }
-            BrainEventKind::RunnerHandoffCancelled { handoff_id } => {
-                if self
-                    .runner_handoff
-                    .as_ref()
-                    .is_some_and(|handoff| handoff.handoff_id == *handoff_id)
-                {
-                    self.runner_handoff = None;
-                }
-            }
+            BrainEventKind::RunnerLeaseAcquired { .. }
+            | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::RunnerHandoffRequested { .. }
+            | BrainEventKind::RunnerHandoffCompleted { .. }
+            | BrainEventKind::RunnerHandoffCancelled { .. } => {}
             BrainEventKind::ClientAttached { .. } | BrainEventKind::ClientDetached { .. } => {
                 attachment::apply_event(&mut self.attachments, &event);
             }
@@ -403,6 +361,57 @@ impl BrainState {
     }
 }
 
+fn apply_runner_event(
+    runner_lease: &mut Option<BrainRunnerLease>,
+    runner_handoff: &mut Option<BrainRunnerHandoff>,
+    event: &BrainEvent,
+) {
+    match &event.kind {
+        BrainEventKind::RunnerLeaseAcquired { lease } => {
+            if runner_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.from_lease_id != lease.lease_id)
+            {
+                *runner_handoff = None;
+            }
+            *runner_lease = Some(lease.clone());
+        }
+        BrainEventKind::RunnerLeaseReleased { lease_id } => {
+            if runner_lease
+                .as_ref()
+                .is_some_and(|lease| lease.lease_id == *lease_id)
+            {
+                *runner_lease = None;
+            }
+            if runner_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.from_lease_id == *lease_id)
+            {
+                *runner_handoff = None;
+            }
+        }
+        BrainEventKind::RunnerHandoffRequested { handoff } => {
+            *runner_handoff = Some(handoff.clone());
+        }
+        BrainEventKind::RunnerHandoffCompleted { handoff_id, lease }
+            if runner_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.handoff_id == *handoff_id) =>
+        {
+            *runner_handoff = None;
+            *runner_lease = Some(lease.clone());
+        }
+        BrainEventKind::RunnerHandoffCancelled { handoff_id }
+            if runner_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.handoff_id == *handoff_id) =>
+        {
+            *runner_handoff = None;
+        }
+        _ => {}
+    }
+}
+
 /// Opaque daemon-side authority for one runner capability. The Cap'n Proto
 /// peer never receives these fields; it can only invoke the capability that
 /// holds this grant.
@@ -490,6 +499,32 @@ impl RunPublicationGate {
 }
 
 impl BrainStore {
+    fn event_is_substantive(event: &BrainEvent) -> bool {
+        // `CommittedMemoriesReplaced` (#940) is deliberately not listed
+        // here, unlike its closest sibling `TaskListReplaced`: a task list
+        // is user-facing work product, while committed memories are a
+        // derived cache written alongside an already-substantive turn.
+        matches!(
+            event.kind,
+            BrainEventKind::Prompt { .. }
+                | BrainEventKind::SpeculativePrompt { .. }
+                | BrainEventKind::ParticipantMessage { .. }
+                | BrainEventKind::TaskListReplaced { .. }
+                | BrainEventKind::ToolCall { .. }
+                | BrainEventKind::ToolResult { .. }
+                | BrainEventKind::ApprovalRequested { .. }
+                | BrainEventKind::ApprovalDecided { .. }
+                | BrainEventKind::Program { .. }
+                | BrainEventKind::ProgramPopped { .. }
+                | BrainEventKind::Result { .. }
+                | BrainEventKind::RuntimeCommitted { .. }
+                | BrainEventKind::RunStarted { .. }
+                | BrainEventKind::RunStatusChanged { .. }
+                | BrainEventKind::ScheduleChanged { .. }
+                | BrainEventKind::ScheduleDue { .. }
+        )
+    }
+
     fn state_has_run_cancellation_reservation(state: &BrainState, run_id: RunId) -> bool {
         state.events.iter().any(|event| {
             matches!(
@@ -4106,79 +4141,56 @@ impl BrainStore {
         let has_persisted_selection = self
             .read_metadata(name)?
             .is_some_and(|metadata| !metadata.selection.is_empty());
+        // Keep the state lock from the eligibility check through removal.
+        // Otherwise a concurrent attach could recreate a live participant
+        // between the check and deletion of the provisional directory.
+        let brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let has_substantive_history = state.events.iter().any(Self::event_is_substantive);
+        // A pending reservation already represents a live participant.
+        // Removing the Brain while another transport is between `attach`
+        // and `watch` invalidates that participant's signed connection and
+        // lets an unrelated detach race erase the shared session.
+        let has_live_attachment = state
+            .attachments
+            .values()
+            .any(|attachment| attachment.connection_id.is_some());
+        if has_substantive_history
+            || has_persisted_selection
+            || has_live_attachment
+            || state.runner_lease.is_some()
         {
-            // Keep the state lock from the eligibility check through removal.
-            // Otherwise a concurrent attach could recreate a live participant
-            // between the check and deletion of the provisional directory.
-            let mut brains = self.brains.write().expect("shared brain lock poisoned");
-            let state = brains.get(name).context("Brain was removed concurrently")?;
-            // `CommittedMemoriesReplaced` (#940) is deliberately not listed
-            // here, unlike its closest sibling `TaskListReplaced`: a task
-            // list is user-facing work product a participant authored,
-            // while a committed memory set is a derived cache the query
-            // processor writes as a side effect of an ordinary turn -- and
-            // that turn already appends its own `Prompt` (or
-            // `ParticipantMessage`/`SpeculativePrompt`) event, which is
-            // already substantive on its own. A Brain can never carry a
-            // `CommittedMemoriesReplaced` event without one of those
-            // alongside it, so excluding it here does not risk losing a
-            // participant's real work.
-            let has_substantive_history = state.events.iter().any(|event| {
-                matches!(
-                    event.kind,
-                    BrainEventKind::Prompt { .. }
-                        | BrainEventKind::SpeculativePrompt { .. }
-                        | BrainEventKind::ParticipantMessage { .. }
-                        | BrainEventKind::TaskListReplaced { .. }
-                        | BrainEventKind::ToolCall { .. }
-                        | BrainEventKind::ToolResult { .. }
-                        | BrainEventKind::ApprovalRequested { .. }
-                        | BrainEventKind::ApprovalDecided { .. }
-                        | BrainEventKind::Program { .. }
-                        | BrainEventKind::ProgramPopped { .. }
-                        | BrainEventKind::Result { .. }
-                        | BrainEventKind::RuntimeCommitted { .. }
-                        | BrainEventKind::RunStarted { .. }
-                        | BrainEventKind::RunStatusChanged { .. }
-                        | BrainEventKind::ScheduleChanged { .. }
-                        | BrainEventKind::ScheduleDue { .. }
-                )
-            });
-            // A pending reservation already represents a live participant.
-            // Removing the Brain while another transport is between `attach`
-            // and `watch` invalidates that participant's signed connection and
-            // lets an unrelated detach race erase the shared session.
-            let has_live_attachment = state
-                .attachments
-                .values()
-                .any(|attachment| attachment.connection_id.is_some());
-            if has_substantive_history
-                || has_persisted_selection
-                || has_live_attachment
-                || state.runner_lease.is_some()
-            {
-                return Ok(false);
-            }
-
-            if let Some(runtime) = self
-                .runtimes
-                .read()
-                .expect("shared brain runtime lock poisoned")
-                .get(name)
-                .cloned()
-            {
-                runtime.clear_authority_sink()?;
-            }
-            if let Some(root) = &self.root {
-                let directory = root.join(name);
-                if directory.exists() {
-                    std::fs::remove_dir_all(&directory)
-                        .with_context(|| format!("remove unused Brain {}", directory.display()))?;
-                }
-            }
-            brains.remove(name);
-            self.forget_schedules_locked(name);
+            return Ok(false);
         }
+
+        self.delete_unused_brain_locked(name, brains)?;
+        Ok(true)
+    }
+
+    fn delete_unused_brain_locked(
+        &self,
+        name: &str,
+        mut brains: std::sync::RwLockWriteGuard<'_, HashMap<String, BrainState>>,
+    ) -> Result<()> {
+        if let Some(runtime) = self
+            .runtimes
+            .read()
+            .expect("shared brain runtime lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            runtime.clear_authority_sink()?;
+        }
+        if let Some(root) = &self.root {
+            let directory = root.join(name);
+            if directory.exists() {
+                std::fs::remove_dir_all(&directory)
+                    .with_context(|| format!("remove unused Brain {}", directory.display()))?;
+            }
+        }
+        brains.remove(name);
+        self.forget_schedules_locked(name);
+        drop(brains);
         self.runtimes
             .write()
             .expect("shared brain runtime lock poisoned")
@@ -4192,6 +4204,148 @@ impl BrainStore {
             .write()
             .expect("shared brain execution-lock map poisoned")
             .remove(name);
+        Ok(())
+    }
+
+    /// Minimum age, in milliseconds, a Brain with no recorded activity must
+    /// reach before [`Self::sweep_unused`] will remove it (#411).
+    ///
+    /// A Brain is minted on every launch (`names::generate`), so the store
+    /// grows monotonically and nothing else ever revisits one that never
+    /// became a real conversation. But sweeping the instant a zero-event
+    /// Brain appears would delete the one the current session is about to
+    /// type into. Twenty-four hours is chosen to comfortably outlast that
+    /// race -- including a daemon restart minutes after a Brain was minted,
+    /// where the user has not typed yet but fully intends to -- while still
+    /// reclaiming the common case (a Brain from a launch nobody returned to)
+    /// well before it accumulates with hundreds of others.
+    pub const SWEEP_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Remove every named Brain this store can prove, from durable on-disk
+    /// state alone, has held no real activity for at least `min_age_ms`.
+    /// Returns the number removed.
+    ///
+    /// Intended to run once, synchronously, during daemon startup
+    /// (`AgentServer::new`) -- before any listener accepts a connection and
+    /// so before any concurrent caller could be attaching, archiving, or
+    /// delivering a schedule against a candidate this is inspecting. That
+    /// ordering is load-bearing: startup is the only point at which the
+    /// durable inventory is known not to be changing through another server
+    /// request. The sweep itself never hydrates a candidate. A later
+    /// periodic re-sweep is deliberately not added: the set of Brains only
+    /// grows at launch, so a once-per-daemon-start pass is sufficient, and
+    /// per #380's lesson a step that finds nothing new to do must not keep
+    /// announcing that on a timer.
+    ///
+    /// The full substantive-event, persisted-provider, attachment, and
+    /// runner-lease predicate is evaluated directly from existing metadata
+    /// and journal bytes. Malformed or torn durable state fails closed. If a
+    /// caller invokes this on an already-resident store, the same state lock
+    /// also protects pending attachments and runner state that coexist only
+    /// in memory; no absent candidate is loaded to answer that check.
+    ///
+    /// 1. `metadata.json` exists and parses as valid current-version
+    ///    metadata. A directory that lacks it is the #393 half-deleted
+    ///    case: minting a fresh identity for it via `ensure_loaded` would
+    ///    be exactly the resurrection this function must not cause, so it
+    ///    is left untouched for that issue's own repair path instead.
+    /// 2. That metadata's `created_ms` is at least `min_age_ms` in the
+    ///    past.
+    ///
+    /// A candidate that fails either gate is never hydrated, repaired, or
+    /// deleted.
+    pub fn sweep_unused(&self, min_age_ms: u64) -> usize {
+        let now = unix_millis();
+        let mut removed = 0usize;
+        for name in self.list_names_unhydrated() {
+            match self.remove_unused_from_durable_state(&name, min_age_ms, now) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        brain = %name,
+                        %error,
+                        "startup sweep: could not evaluate Brain for removal"
+                    );
+                }
+            }
+        }
+        removed
+    }
+
+    fn remove_unused_from_durable_state(
+        &self,
+        name: &str,
+        min_age_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        let metadata_lock = self.metadata_lock(name);
+        let _metadata_guard = metadata_lock
+            .lock()
+            .expect("shared Brain metadata lock poisoned");
+        let Some(metadata) = self.read_metadata(name)? else {
+            return Ok(false);
+        };
+        if now_ms.saturating_sub(metadata.created_ms) < min_age_ms || !metadata.selection.is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let directory = root.join(name);
+        let events = journal::read_events_readonly_strict(&directory.join("events.jsonl"))?;
+        let mut previous_seq = 0;
+        for event in &events {
+            anyhow::ensure!(
+                event.brain_id == metadata.brain_id,
+                "Brain '{name}' event identity does not match metadata"
+            );
+            anyhow::ensure!(
+                event.seq > previous_seq,
+                "Brain '{name}' has duplicate or reordered canonical event sequence {}",
+                event.seq
+            );
+            anyhow::ensure!(
+                event.schema_version <= BRAIN_EVENT_SCHEMA_VERSION,
+                "Brain '{name}' contains unsupported event schema version {}",
+                event.schema_version
+            );
+            previous_seq = event.seq;
+        }
+        if events.iter().any(Self::event_is_substantive) {
+            return Ok(false);
+        }
+        let mut durable_attachments = HashMap::new();
+        let mut durable_runner: Option<BrainRunnerLease> = None;
+        let mut durable_handoff: Option<BrainRunnerHandoff> = None;
+        for event in &events {
+            attachment::apply_event(&mut durable_attachments, event);
+            apply_runner_event(&mut durable_runner, &mut durable_handoff, event);
+        }
+        if durable_attachments
+            .values()
+            .any(|attachment| attachment.connection_id.is_some())
+            || durable_runner.is_some()
+        {
+            return Ok(false);
+        }
+
+        let brains = self.brains.write().expect("shared brain lock poisoned");
+        if let Some(state) = brains.get(name) {
+            let has_live_attachment = state
+                .attachments
+                .values()
+                .any(|attachment| attachment.connection_id.is_some());
+            if state.events.iter().any(Self::event_is_substantive)
+                || has_live_attachment
+                || state.runner_lease.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        self.delete_unused_brain_locked(name, brains)?;
         Ok(true)
     }
 

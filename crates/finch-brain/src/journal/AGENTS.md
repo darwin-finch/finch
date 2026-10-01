@@ -21,7 +21,9 @@ payloads; do not copy delivery.
 **Invariants and lifetimes:** a checksummed batch either replays in full or not at all after a
 torn append. A receipt belongs to the first canonical event for one authorized mutation;
 retry resolution must not append a second transition. Read-only scans must not hydrate,
-create files, or repair the log. The store controls writer lifetime and authorization.
+create files, truncate, or repair the log. `read_events_readonly_strict` is the fail-closed path
+for deletion decisions: unlike best-effort listing, malformed or torn framing is an error and the
+original bytes remain untouched. The store controls writer lifetime and authorization.
 `BrainMetadata.workspace` (#1381) is `#[serde(default)]` so legacy `metadata.json` files without
 it still parse; the store, not this module, decides what a missing value falls back to and is the
 only writer of a non-`None` value, set once at first creation and never rewritten afterward.

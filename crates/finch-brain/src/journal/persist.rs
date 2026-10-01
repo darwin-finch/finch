@@ -139,6 +139,57 @@ pub fn read_events(root: Option<&Path>, name: &str) -> Result<Vec<BrainEvent>> {
     Ok(events)
 }
 
+/// Read the complete committed journal without repairing or otherwise
+/// changing it. Unlike [`scan_readonly`], malformed framing is an error:
+/// callers deciding whether durable state may be deleted must fail closed.
+pub fn read_events_readonly_strict(path: &Path) -> Result<Vec<BrainEvent>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        anyhow::bail!("torn final record in {}", path.display());
+    }
+    let mut events = Vec::new();
+    for (line_no, terminated) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line = &terminated[..terminated.len() - 1];
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<BrainJournalRecord>(line) {
+            Ok(BrainJournalRecord::EventBatch {
+                event_count,
+                payload_sha256,
+                events: batch,
+            }) => {
+                let valid_framing = match (event_count, payload_sha256) {
+                    (None, None) => true,
+                    (Some(count), Some(checksum)) => {
+                        count == batch.len()
+                            && serde_json::to_vec(&batch).is_ok_and(|payload| {
+                                hex::encode(Sha256::digest(payload)) == checksum
+                            })
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(
+                    valid_framing,
+                    "invalid event batch framing in {} line {}",
+                    path.display(),
+                    line_no + 1
+                );
+                events.extend(batch);
+            }
+            Err(_) => events.push(
+                serde_json::from_slice::<BrainEvent>(line)
+                    .with_context(|| format!("parse {} line {}", path.display(), line_no + 1))?,
+            ),
+        }
+    }
+    Ok(events)
+}
+
 pub fn append_event(root: Option<&Path>, name: &str, event: &BrainEvent) -> Result<()> {
     append_journal_value(root, name, event)
 }
