@@ -18,6 +18,10 @@ their presentation projection. Component renderers construct no SGR — pinned b
 `test_component_renderers_construct_no_sgr_bytes`; styles are palette values the engines
 lower (stage 4 of docs/TUI_DESIGN.md, #1141).
 
+The say component can also carry an optional client-local provider-reasoning disclosure at stable
+semantic path `[2]`, distinct from the program control's `[1]`. The reasoning body exists only in
+that live component snapshot; WorkUnit domain and canonical projections never receive it.
+
 **Does not own** message lifecycle or synchronization, component action dispatch, terminal
 lifecycle, `crossterm`, shadow-buffer painting, input handling, or application composition. Those
 layers depend on this capsule; this capsule does not depend back on them.

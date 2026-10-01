@@ -22,7 +22,7 @@ use ts_rs::TS;
 
 /// The manifest contract version. Bump on any shape change and update
 /// `docs/UI_MANIFEST.md` in the same commit; consumers read this first.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// One node of the serializable UI manifest: an element type (the registry
 /// key the JSX side maps to a component), a derived stable id, JSON-valued
@@ -264,6 +264,27 @@ pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
         .with_prop("elapsedMs", view.elapsed.as_millis() as u64)
         .with_prop("showProgram", view.vm.show_program);
 
+    if let Some(reasoning) = &view.reasoning {
+        let label = if reasoning.terminal {
+            format!("Provider reasoning ({} words)", reasoning.word_count)
+        } else {
+            format!("Provider reasoning ({}s)", view.elapsed.as_secs())
+        };
+        let mut disclosure = DynamicUiNode::leaf(
+            "ProviderReasoningDisclosure",
+            manifest_path_id(&view.message_id, &[2]),
+        )
+        .with_prop("label", label)
+        .with_prop("expanded", reasoning.expanded)
+        .with_prop("terminal", reasoning.terminal);
+        if reasoning.expanded {
+            disclosure = disclosure.with_child(
+                DynamicUiNode::leaf("ProviderReasoningBody", "")
+                    .with_prop("lines", reasoning.lines.clone()),
+            );
+        }
+        card = card.with_child(disclosure);
+    }
     if view.vm.status == SayTurnStatus::Running {
         card = card.with_child(program());
         if let Some(output) = output() {

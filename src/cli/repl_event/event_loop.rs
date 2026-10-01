@@ -337,6 +337,7 @@ pub struct EventLoop {
 
     /// Whether streaming is enabled
     streaming_enabled: bool,
+    display_model_reasoning: bool,
 
     /// Tool execution coordinator
     tool_coordinator: ToolExecutionCoordinator,
@@ -2104,6 +2105,7 @@ impl EventLoop {
                 status_bar: Arc::clone(&self.status_bar),
                 renderer: Arc::clone(&self.tui_renderer),
                 streaming_enabled: self.streaming_enabled,
+                display_model_reasoning: self.display_model_reasoning,
             },
             LlmSession {
                 conversation: Arc::clone(&self.conversation),
@@ -2167,6 +2169,7 @@ impl EventLoop {
             output: output_manager,
             status_bar,
             streaming_enabled,
+            display_model_reasoning,
             mention_port,
         } = ui;
         let crate::cli::repl_event::parts::ToolParts {
@@ -2340,6 +2343,7 @@ impl EventLoop {
             output_manager,
             status_bar,
             streaming_enabled,
+            display_model_reasoning,
             tool_coordinator,
             program_runtime,
             agent_scheduler,

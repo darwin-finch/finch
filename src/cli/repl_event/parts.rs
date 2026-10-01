@@ -46,6 +46,7 @@ pub struct UiParts {
     pub output: Arc<OutputManager>,
     pub status_bar: Arc<StatusBar>,
     pub streaming_enabled: bool,
+    pub display_model_reasoning: bool,
     pub mention_port: Arc<dyn crate::cli::tui::MentionPort>,
 }
 
@@ -145,6 +146,7 @@ pub struct LlmUi {
     pub status_bar: Arc<StatusBar>,
     pub renderer: Arc<Mutex<TuiRenderer>>,
     pub streaming_enabled: bool,
+    pub display_model_reasoning: bool,
 }
 
 /// Who is talking, as what, from where.

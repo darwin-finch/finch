@@ -77,12 +77,27 @@ pub struct WorkUnitViewModel {
 pub struct SayTurnView {
     pub message_id: MessageId,
     pub vm: WorkUnitViewModel,
+    /// Client-local provider reasoning. This never enters WorkUnit domain or
+    /// canonical transcript snapshots.
+    pub reasoning: Option<ProviderReasoningView>,
+    pub elapsed: std::time::Duration,
+}
+
+/// Live-only, already-sanitised provider reasoning disclosure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderReasoningView {
+    pub lines: Vec<String>,
+    pub expanded: bool,
+    pub terminal: bool,
+    pub word_count: usize,
     pub elapsed: std::time::Duration,
 }
 
 /// Semantic path of the say turn's program-disclosure control. The chrome's
 /// `[0]` retired in stage 2 and is never reused.
 pub(crate) const PROGRAM_CONTROL_PATH: &[u32] = &[1];
+/// Distinct from the established program control path.
+pub(crate) const REASONING_CONTROL_PATH: &[u32] = &[2];
 
 /// Braille spinner frames for the animated generating state; the blit tick
 /// re-snapshots every frame, so sub-second elapsed animates the indicator.
@@ -165,6 +180,35 @@ fn program_control(view: &SayTurnView) -> RowId {
         message_id: view.message_id,
         path: PROGRAM_CONTROL_PATH.to_vec(),
     }
+}
+
+/// Render a live-only provider-reasoning disclosure independently of the
+/// WorkUnit's ordinary projection, so tool/activity rows remain intact.
+pub fn provider_reasoning_lines(
+    message_id: MessageId,
+    reasoning: &ProviderReasoningView,
+) -> Vec<RenderedTranscriptLine> {
+    let target = RowId {
+        message_id,
+        path: REASONING_CONTROL_PATH.to_vec(),
+    };
+    let label = if reasoning.terminal {
+        format!("Provider reasoning ({} words)", reasoning.word_count)
+    } else {
+        format!("Provider reasoning ({}s)", reasoning.elapsed.as_secs())
+    };
+    let mut lines = vec![RenderedTranscriptLine {
+        text: format!("{} {label}", if reasoning.expanded { '▼' } else { '▶' }),
+        row_id: Some(target),
+        row_expanded: Some(reasoning.expanded),
+        role: Some(NodeRole::Activity),
+        component_owned: true,
+        ..RenderedTranscriptLine::default()
+    }];
+    if reasoning.expanded {
+        lines.extend(reasoning.lines.iter().cloned().map(body_line));
+    }
+    lines
 }
 
 /// The animated generating line: spinner frame + phase + elapsed. No source
@@ -278,11 +322,17 @@ fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 /// the completed labelled control into one stable toggle hitbox; a hidden
 /// subwidget claims nothing.
 pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
-    match say_state(&view.vm) {
+    let mut lines = view
+        .reasoning
+        .as_ref()
+        .map(|reasoning| provider_reasoning_lines(view.message_id, reasoning))
+        .unwrap_or_default();
+    lines.extend(match say_state(&view.vm) {
         SayTurnState::Generating => generating_lines(view),
         SayTurnState::Running => running_lines(view),
         SayTurnState::Completed => completed_lines(view),
-    }
+    });
+    lines
 }
 
 #[cfg(test)]
@@ -294,6 +344,7 @@ mod tests {
         SayTurnView {
             message_id: MessageId::new(),
             vm,
+            reasoning: None,
             elapsed: std::time::Duration::from_millis(2350),
         }
     }
@@ -389,6 +440,62 @@ mod tests {
             spinner_frame(std::time::Duration::from_millis(SPINNER_TICK_MS * 3)),
             spinner_frame(std::time::Duration::from_millis(SPINNER_TICK_MS * 3 + 17)),
             "frames are stable within one tick"
+        );
+    }
+
+    #[test]
+    fn test_provider_reasoning_uses_stable_distinct_path_and_terminal_label() {
+        let message_id = MessageId::new();
+        let running = ProviderReasoningView {
+            lines: vec!["safe thought".into()],
+            expanded: true,
+            terminal: false,
+            word_count: 2,
+            elapsed: std::time::Duration::from_secs(7),
+        };
+        let lines = provider_reasoning_lines(message_id, &running);
+        assert_eq!(texts(&lines), ["▼ Provider reasoning (7s)", "safe thought"]);
+        assert_eq!(
+            lines[0].row_id.as_ref().map(|id| id.path.as_slice()),
+            Some(&[2][..])
+        );
+
+        let terminal = ProviderReasoningView {
+            expanded: false,
+            terminal: true,
+            ..running
+        };
+        assert_eq!(
+            texts(&provider_reasoning_lines(message_id, &terminal)),
+            ["▶ Provider reasoning (2 words)"]
+        );
+    }
+
+    #[test]
+    fn test_provider_reasoning_keeps_successful_say_answer_and_program_projection_unchanged() {
+        let mut vm = completed_vm();
+        vm.show_program = true;
+        let baseline_view = SayTurnView {
+            message_id: MessageId::new(),
+            vm,
+            reasoning: None,
+            elapsed: std::time::Duration::from_secs(4),
+        };
+        let baseline = say_turn_lines(&baseline_view);
+        let with_reasoning = say_turn_lines(&SayTurnView {
+            reasoning: Some(ProviderReasoningView {
+                lines: vec!["private live detail".into()],
+                expanded: false,
+                terminal: true,
+                word_count: 3,
+                elapsed: std::time::Duration::from_secs(4),
+            }),
+            ..baseline_view
+        });
+        assert_eq!(
+            &with_reasoning[1..],
+            baseline.as_slice(),
+            "the reasoning disclosure may prefix, but must not alter, the successful say answer/program projection"
         );
     }
 

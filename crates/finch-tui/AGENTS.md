@@ -157,6 +157,11 @@ never hold component rows: they register in `AccordionState::component_regions` 
 only. Unmigrated rows (non-say WorkUnit presentations — the open stage-2 scope) keep the maps
 and the legacy projection path.
 
+An opted-in generic-compatible turn may prepend a live `Provider reasoning` disclosure at semantic
+path `[2]`. It starts expanded while streaming, collapses on the WorkUnit's terminal transition,
+and can be reopened through the same mouse and keyboard disclosure routing. Its sanitized body is
+component-only: canonical commit reads `complete_transcript` and never receives it.
+
 `MemoryRecalledMessage` rides the same component-owned disclosure mechanism (#1235): each
 recalled-memory row's full text is collapsed behind its identity/summary line by default and
 expands on click, addressed by semantic path `[row index]` (one toggle target per row, unlike
@@ -491,7 +496,9 @@ spinner shows its value with its ◀/▶ keys advertised on every platform
 `UiManifest { manifest_version, root: DynamicUiNode }` — the wire contract the Tauri client
 (#808) consumes. `element_type` comes from the component (`SayTurnCard`, `StaticText`,
 `Progress`, `LiveTool`, `Operation`, plus the engine vocabulary `Stack`/`Text`/`Viewport`/
-`DialogCard`/`Rule`/`Completions`/`Composer`); ids are **derived** (message uuid, or
+`DialogCard`/`Rule`/`Completions`/`Composer`); a say card may additionally contain
+`ProviderReasoningDisclosure` at `{uuid}#2` and a non-actionable `ProviderReasoningBody`;
+ids are **derived** (message uuid, or
 `{uuid}#{path}` matching the `RowId` semantic paths). A completed say card lowers answer,
 the labelled `Show program` / `Hide program` control at `{uuid}#1`, then exact source only
 while expanded; answer/source content uses the non-actionable empty id, matching terminal

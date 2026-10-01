@@ -14,12 +14,13 @@ use std::sync::Arc;
 pub use finch_ui_model::{
     AgentActivityView, AgentToolView, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, MessageId, MessageStatus, OperationRowView, OperationView, OutputVm,
-    ProgramSourceVm, ProgressView, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
-    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
-    WorkUnitView, WorkUnitViewModel,
+    ProgramSourceVm, ProgressView, ProviderReasoningView, SayTurnStatus, SayTurnView,
+    StaticTextKind, StaticTextView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
+    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
 mod concrete;
+mod reasoning;
 mod work_unit;
 
 pub use concrete::{
@@ -84,6 +85,12 @@ pub trait Message: Send + Sync {
     /// decision. `None` for rows that have not migrated to component-owned
     /// rendering; those keep the legacy projection path.
     fn component_view(&self) -> Option<ComponentView> {
+        None
+    }
+
+    /// Ephemeral sanitized provider reasoning for the live renderer. This is
+    /// deliberately separate from every canonical/domain snapshot.
+    fn provider_reasoning_view(&self) -> Option<ProviderReasoningView> {
         None
     }
 

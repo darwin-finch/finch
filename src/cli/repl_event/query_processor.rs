@@ -83,12 +83,32 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
-fn record_reasoning_activity(work_unit: &crate::cli::messages::WorkUnit, text: &str) {
+fn record_reasoning_activity(
+    work_unit: &crate::cli::messages::WorkUnit,
+    text: &str,
+    provenance: &crate::providers::EventProvenance,
+    display_reasoning: bool,
+) {
     // Provider adapters emit reasoning on a distinct stream variant. Count it
     // as live provider activity so a reasoning model does not remain stuck on
     // the pre-token "thinking" state, but do not mix private reasoning into
     // visible wire source or conversation.
     work_unit.add_tokens(text);
+    if display_reasoning && provenance.opaque_replay.is_none() && !text.trim().is_empty() {
+        work_unit.append_provider_reasoning(text);
+    }
+}
+
+fn generic_compatible_reasoning_enabled(
+    display_model_reasoning: bool,
+    generator: &dyn Generator,
+    providers: &[crate::config::ProviderEntry],
+) -> bool {
+    display_model_reasoning
+        && providers.iter().any(|entry| {
+            matches!(entry, crate::config::ProviderEntry::OpenAiCompatible { .. })
+                && entry.profile_name() == generator.name()
+        })
 }
 
 /// Strip stray Markdown inline-code backtick(s) from a provider wire response
@@ -560,6 +580,7 @@ async fn execute_wire_with_single_repair(
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     query_id: Uuid,
     tool_call_history: &ToolCallHistory,
+    reasoning_source: Option<&crate::cli::messages::WorkUnit>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -576,6 +597,9 @@ async fn execute_wire_with_single_repair(
     );
     let output_unit = output_manager.start_work_unit("VM program output");
     output_unit.set_program_output();
+    if let Some(reasoning_source) = reasoning_source {
+        reasoning_source.transfer_provider_reasoning_to(&output_unit);
+    }
     // The say card owns the turn from here (#882): the producer retains the
     // wire source in the component ViewModel so the reader can reveal it.
     output_unit.begin_say_turn(
@@ -691,6 +715,7 @@ async fn execute_wire_with_single_repair(
         let wrapped = finch_programs::wrap_prose_as_say(&source, language);
         let wrapped_unit = output_manager.start_work_unit("VM program output");
         wrapped_unit.set_program_output();
+        output_unit.transfer_provider_reasoning_to(&wrapped_unit);
         wrapped_unit.begin_say_turn(language.as_str(), &wrapped);
         return match execute_direct_wire_response(
             runtime,
@@ -868,6 +893,7 @@ async fn execute_wire_with_single_repair(
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
     repair_output_unit.set_program_output();
+    output_unit.transfer_provider_reasoning_to(&repair_output_unit);
     repair_output_unit.begin_say_turn(
         finch_programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
         &repaired_source,
@@ -1632,6 +1658,8 @@ pub(crate) async fn process_query_with_tools(
     max_verbatim: usize,
     recall_k: usize,
     streaming_enabled: bool,
+    display_model_reasoning: bool,
+    available_providers: Vec<crate::config::ProviderEntry>,
     enable_summarization: bool,
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
@@ -1854,6 +1882,11 @@ pub(crate) async fn process_query_with_tools(
         msgs
     };
     let caps = generator.capabilities();
+    let display_reasoning = generic_compatible_reasoning_enabled(
+        display_model_reasoning,
+        generator.as_ref(),
+        &available_providers,
+    );
 
     // Create the WorkUnit for this generation turn BEFORE attempting either
     // the streaming or non-streaming path below, and share it between both.
@@ -1982,8 +2015,13 @@ pub(crate) async fn process_query_with_tools(
                                 work_unit.set_response(&text);
                             }
                         }
-                        Ok(StreamChunk::ThinkingDelta { text, .. }) => {
-                            record_reasoning_activity(work_unit.as_ref(), &text);
+                        Ok(StreamChunk::ThinkingDelta { text, provenance }) => {
+                            record_reasoning_activity(
+                                work_unit.as_ref(),
+                                &text,
+                                &provenance,
+                                display_reasoning,
+                            );
                         }
                         Ok(StreamChunk::ToolCallDelta {
                             id,
@@ -2233,6 +2271,7 @@ pub(crate) async fn process_query_with_tools(
                     effect_audit,
                     query_id,
                     &tool_call_history,
+                    Some(source_unit.as_ref()),
                 )
                 .await;
                 if query_states
@@ -2495,6 +2534,7 @@ pub(crate) async fn process_query_with_tools(
                 effect_audit,
                 query_id,
                 &tool_call_history,
+                Some(source_unit.as_ref()),
             )
             .await;
             if query_states
@@ -3202,11 +3242,16 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageStatus, WorkUnit};
     use crate::cli::status_bar::StatusLineType;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, CredentialResolver, OpenAiCompatibleCapabilities,
+        OpenAiCompatibleToolChoice, ProviderCredential, ResolvedCredential, ResolvedSecret,
+    };
     use crate::generators::GeneratorCapabilities;
     use crate::tools::PermissionManager;
     use crate::tools::ToolExecutor;
     use crate::tools::ToolRegistry;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -3347,6 +3392,7 @@ mod tests {
     struct PacedStreamGenerator {
         receiver:
             std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>,
+        requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
     }
 
     impl PacedStreamGenerator {
@@ -3358,6 +3404,7 @@ mod tests {
             (
                 Arc::new(Self {
                     receiver: std::sync::Mutex::new(Some(receiver)),
+                    requests: std::sync::Mutex::new(Vec::new()),
                 }),
                 sender,
             )
@@ -3376,10 +3423,14 @@ mod tests {
 
         async fn generate_stream(
             &self,
-            _messages: Vec<crate::providers::Message>,
+            messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
         {
+            self.requests
+                .lock()
+                .expect("paced request lock poisoned")
+                .push(messages);
             Ok(self
                 .receiver
                 .lock()
@@ -3399,6 +3450,63 @@ mod tests {
 
         fn name(&self) -> &str {
             "paced-stream"
+        }
+    }
+
+    struct BoundaryCredentialResolver;
+
+    impl CredentialResolver for BoundaryCredentialResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> anyhow::Result<ResolvedCredential> {
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new("boundary-secret")?,
+            })
+        }
+    }
+
+    fn boundary_compatible_entry(endpoint: &str) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry::OpenAiCompatible {
+            name: "ciru-boundary".into(),
+            base_url: format!("{}/v1", endpoint.trim_end_matches('/')),
+            chat_path: Some("/chat/completions".into()),
+            models_path: Some("/models".into()),
+            model: "main".into(),
+            credential: CredentialBinding {
+                credential_ref: "ciru-boundary-key".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            capabilities: OpenAiCompatibleCapabilities {
+                streaming: Some(true),
+                tools: Some(true),
+                parallel_tool_calls: Some(false),
+                image_input: Some(false),
+                context_window_tokens: Some(262_144),
+                max_output_tokens: Some(65_536),
+            },
+            tool_choice: OpenAiCompatibleToolChoice::Auto,
+            strict_tool_schemas: Some(false),
+        }
+    }
+
+    fn boundary_compatible_credential(endpoint: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: "ciru-boundary-key".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiCompatible,
+            issuer: "openai-compatible".into(),
+            audience: AudienceBinding::custom(endpoint)
+                .expect("mock endpoint is a valid credential audience"),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: "test:ciru-boundary-key".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
         }
     }
 
@@ -3424,6 +3532,7 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
         colors: crate::theme::ColorScheme,
         tool_coordinator: ToolExecutionCoordinator,
+        generator: Arc<PacedStreamGenerator>,
         workspace_root: std::path::PathBuf,
         _workspace: tempfile::TempDir,
         _tempdir: tempfile::TempDir,
@@ -3438,6 +3547,16 @@ mod tests {
             query: &str,
             registry: ToolRegistry,
             tool_definitions: Vec<ToolDefinition>,
+        ) -> Self {
+            Self::spawn_with_reasoning(query, registry, tool_definitions, false, Vec::new()).await
+        }
+
+        async fn spawn_with_reasoning(
+            query: &str,
+            registry: ToolRegistry,
+            tool_definitions: Vec<ToolDefinition>,
+            display_model_reasoning: bool,
+            available_providers: Vec<crate::config::ProviderEntry>,
         ) -> Self {
             let colors = crate::theme::ColorScheme::default();
             let output = Arc::new(OutputManager::new(colors.clone()));
@@ -3532,6 +3651,8 @@ mod tests {
                 20,
                 0,
                 true,
+                display_model_reasoning,
+                available_providers,
                 false,
                 false,
                 selected,
@@ -3556,6 +3677,7 @@ mod tests {
                 task,
                 colors,
                 tool_coordinator: harness_coordinator,
+                generator,
                 workspace_root,
                 _workspace: workspace,
                 _tempdir: tempdir,
@@ -3677,8 +3799,15 @@ mod tests {
     fn reasoning_delta_advances_activity_without_exposing_reasoning() {
         let work_unit = crate::cli::messages::WorkUnit::new("Calculating");
         let colors = crate::theme::ColorScheme::default();
+        let provenance = crate::providers::EventProvenance {
+            provider: "test".into(),
+            model: "test".into(),
+            event: "reasoning".into(),
+            sequence: 1,
+            opaque_replay: None,
+        };
 
-        record_reasoning_activity(&work_unit, "private reasoning words");
+        record_reasoning_activity(&work_unit, "private reasoning words", &provenance, false);
 
         let rendered = work_unit.format(&colors);
         assert!(
@@ -3688,6 +3817,619 @@ mod tests {
         assert!(
             !rendered.contains("private reasoning words"),
             "reasoning activity leaked into visible assistant output: {rendered:?}"
+        );
+    }
+
+    fn compatible_test_provider(name: &str) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry::OpenAiCompatible {
+            name: name.into(),
+            base_url: "https://example.invalid/v1".into(),
+            chat_path: None,
+            models_path: None,
+            model: "test-model".into(),
+            credential: crate::config::CredentialBinding {
+                credential_ref: "test-credential".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: Default::default(),
+            },
+            capabilities: Default::default(),
+            tool_choice: Default::default(),
+            strict_tool_schemas: None,
+        }
+    }
+
+    fn reasoning_provenance(opaque_replay: Option<&str>) -> crate::providers::EventProvenance {
+        crate::providers::EventProvenance {
+            provider: "compatible".into(),
+            model: "test-model".into(),
+            event: "reasoning".into(),
+            sequence: 1,
+            opaque_replay: opaque_replay.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn test_reasoning_display_eligibility_requires_selected_compatible_profile() {
+        let (generator, _sender) = PacedStreamGenerator::new();
+        assert!(generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[compatible_test_provider("paced-stream")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            false,
+            generator.as_ref(),
+            &[compatible_test_provider("paced-stream")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[compatible_test_provider("some-other-profile")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[],
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_compatible_reasoning_stream_is_live_only_collapses_and_opaque_stays_hidden() {
+        let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+            "reason first",
+            ToolRegistry::new(),
+            Vec::new(),
+            true,
+            vec![compatible_test_provider("paced-stream")],
+        )
+        .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "visible safe reasoning".into(),
+                provenance: reasoning_provenance(None),
+            }))
+            .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "opaque secret".into(),
+                provenance: reasoning_provenance(Some("encrypted-replay")),
+            }))
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if harness
+                    .canonical
+                    .provider_reasoning_view()
+                    .is_some_and(|view| view.lines.join("\n").contains("visible safe reasoning"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normalized compatible reasoning never reached the live component");
+        let live = format!("{:?}", harness.canonical.provider_reasoning_view());
+        assert!(live.contains("visible safe reasoning"));
+        assert!(!live.contains("opaque secret") && !live.contains("encrypted-replay"));
+        assert_eq!(harness.canonical.content(), "");
+        assert!(!harness
+            .canonical
+            .complete_transcript(&harness.colors)
+            .contains("visible safe reasoning"));
+
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"done\")".into())))
+            .await;
+        harness.close_stream();
+        harness.task.await.expect("reasoning query task panicked");
+        let output = harness
+            .output
+            .get_messages()
+            .into_iter()
+            .find(|message| message.say_turn_view().is_some())
+            .expect("successful source must compose a say output");
+        let terminal = format!("{:?}", output.provider_reasoning_view());
+        assert!(terminal.contains("terminal: true") && terminal.contains("expanded: false"));
+        assert!(terminal.contains("visible safe reasoning"), "successful say consolidation must retain reasoning on its visible output; got {terminal}");
+        assert_eq!(harness.canonical.content(), "(say \"done\")");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_display_default_off_has_zero_live_or_canonical_leak() {
+        let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+            "reason privately",
+            ToolRegistry::new(),
+            Vec::new(),
+            false,
+            vec![compatible_test_provider("paced-stream")],
+        )
+        .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "must stay private".into(),
+                provenance: reasoning_provenance(None),
+            }))
+            .await;
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"answer\")".into())))
+            .await;
+        harness.close_stream();
+        harness.task.await.expect("default-off query task panicked");
+
+        let all_live = format!("{:?}", harness.canonical.provider_reasoning_view());
+        assert!(!all_live.contains("must stay private"));
+        assert!(!harness
+            .canonical
+            .format(&harness.colors)
+            .contains("must stay private"));
+        assert_eq!(harness.canonical.content(), "(say \"answer\")");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_display_flag_does_not_change_provider_request_bytes() {
+        async fn request_bytes(display: bool) -> Vec<u8> {
+            let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+                "same request",
+                ToolRegistry::new(),
+                Vec::new(),
+                display,
+                vec![compatible_test_provider("paced-stream")],
+            )
+            .await;
+            harness
+                .send(Ok(StreamChunk::TextDelta("(say \"same\")".into())))
+                .await;
+            harness.close_stream();
+            let generator = Arc::clone(&harness.generator);
+            harness
+                .task
+                .await
+                .expect("request-byte query task panicked");
+            let request = generator
+                .requests
+                .lock()
+                .expect("paced request lock poisoned")
+                .first()
+                .expect("paced generator received no request")
+                .clone();
+            serde_json::to_vec(&request).expect("serialize request messages")
+        }
+
+        let disabled = request_bytes(false).await;
+        let enabled = request_bytes(true).await;
+        assert_eq!(
+            enabled, disabled,
+            "local reasoning display must not change serialized provider request messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_sse_reasoning_survives_say_consolidation_to_tui_and_manifest_only(
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let private_reasoning = "check the private boundary carefully";
+        let body = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{reasoning:?}}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"(begin (say \\\"Boundary answer\\\") (file-read (path \\\"Cargo.toml\\\")) (say \\\" after approval\\\"))\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            reasoning = private_reasoning,
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer boundary-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "main",
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let entry = boundary_compatible_entry(&server.url());
+        let config = crate::config::Config::with_providers(vec![entry.clone()])
+            .with_credentials(vec![boundary_compatible_credential(&server.url())]);
+        let provider = crate::providers::create_provider_profile_from_config_with_resolver(
+            &config,
+            "ciru-boundary",
+            &BoundaryCredentialResolver,
+        )
+        .expect("the configured generic-compatible profile must resolve through the factory");
+        let selected: Arc<dyn Generator> = Arc::new(crate::generators::ClaudeGenerator::new_in(
+            Arc::new(crate::claude::ClaudeClient::with_shared_provider(provider)),
+            None,
+            None,
+        ));
+        assert_eq!(
+            selected.name(),
+            "ciru-boundary",
+            "factory selection must retain the configured profile identity used by reasoning eligibility"
+        );
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors.clone(),
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("show the boundary".into());
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let tempdir = tempfile::tempdir().expect("isolated permission pattern directory");
+        let (_workspace, workspace_root) = isolated_git_workspace();
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new()
+                .with_default_rule(crate::tools::PermissionRule::Allow)
+                .with_workspace_root(workspace_root),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+
+        let execution = process_query_with_tools(
+            query_id,
+            "show the boundary".into(),
+            event_tx,
+            Arc::clone(&selected),
+            Arc::clone(&selected),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            Arc::clone(&conversation),
+            Arc::clone(&query_states),
+            tool_coordinator,
+            runtime,
+            Arc::clone(&tui_renderer),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            Arc::clone(&status),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            "boundary-brain".into(),
+            "/test/workspace".into(),
+            4,
+            20,
+            0,
+            true,
+            true,
+            vec![entry],
+            false,
+            false,
+            Arc::clone(&selected),
+            Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "test persona".into(),
+            None,
+        );
+        tokio::pin!(execution);
+        let mut projection_events = 0usize;
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("configured compatible query completed before approval: {result:?}")
+                }
+                event = events.recv() => match event.expect("boundary query event before approval") {
+                    ReplEvent::VmEffect { projection, envelope } => {
+                        projection_events += 1;
+                        projection.project_envelope(envelope);
+                    }
+                    ReplEvent::VmApprovalNeeded { prompt, response_tx } => {
+                        assert_eq!(
+                            prompt.exact.capability,
+                            crate::vm::CapabilityKind::FileRead,
+                            "real compatible-provider wire must suspend on the expected read boundary"
+                        );
+                        let approval_messages = output.get_messages();
+                        let approval_source = approval_messages
+                            .iter()
+                            .find(|message| message.content().contains("(begin (say"))
+                            .expect("approval state must retain the submitted program source");
+                        let approval_visible = approval_messages
+                            .iter()
+                            .find(|message| message.content() == "Boundary answer")
+                            .expect("the first say must be visible while approval is pending");
+                        assert!(
+                            approval_source.provider_reasoning_view().is_none(),
+                            "suppressed source must surrender the private facet before approval"
+                        );
+                        let approval_reasoning = approval_visible
+                            .provider_reasoning_view()
+                            .expect("visible running say must own reasoning throughout approval");
+                        assert_eq!(
+                            approval_reasoning.lines,
+                            vec![private_reasoning],
+                            "approval-visible owner lost normalized provider reasoning"
+                        );
+                        assert_eq!(
+                            approval_visible.status(),
+                            MessageStatus::InProgress,
+                            "say output must still be live while the VM awaits approval"
+                        );
+
+                        let mut renderer = tui_renderer.lock().await;
+                        let bytes = renderer
+                            .redraw_full_viewport_bytes_for_test(100, 30)
+                            .expect("approval-state frame must paint through the real renderer");
+                        let mut terminal = finch_tui::TestVtOracle::new(100, 30);
+                        terminal.feed(&bytes);
+                        let reasoning_row = terminal
+                            .find_row("Provider reasoning")
+                            .unwrap_or_else(|| panic!("approval frame omitted reasoning control: {}", terminal.diagnostic()));
+                        let down = crossterm::event::MouseEvent {
+                            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                            column: 0,
+                            row: reasoning_row as u16,
+                            modifiers: crossterm::event::KeyModifiers::NONE,
+                        };
+                        let up = crossterm::event::MouseEvent {
+                            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                            ..down
+                        };
+                        renderer.handle_mouse_for_test(down);
+                        assert!(
+                            renderer.handle_mouse_for_test(up),
+                            "real mouse click must toggle the approval-state reasoning control"
+                        );
+                        let opened = renderer
+                            .draw_live_area_bytes_for_test(100, 30)
+                            .expect("mouse-opened approval frame must paint");
+                        terminal.feed(&opened);
+                        assert!(
+                            terminal.contains_visible(private_reasoning),
+                            "mouse-opened approval frame omitted reasoning body: {}",
+                            terminal.diagnostic()
+                        );
+                        for _ in 0..4 {
+                            assert!(
+                                renderer.handle_accordion_key_for_test(crossterm::event::KeyEvent::new(
+                                    crossterm::event::KeyCode::F(6),
+                                    crossterm::event::KeyModifiers::NONE,
+                                )),
+                                "F6 must reach the real accordion focus path"
+                            );
+                            renderer.handle_accordion_key_for_test(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Left,
+                                crossterm::event::KeyModifiers::NONE,
+                            ));
+                            if !approval_visible
+                                .provider_reasoning_view()
+                                .expect("approval reasoning remains attached")
+                                .expanded
+                            {
+                                break;
+                            }
+                        }
+                        assert!(
+                            !approval_visible
+                                .provider_reasoning_view()
+                                .expect("approval reasoning remains attached")
+                                .expanded,
+                            "F6/Left must collapse the real reasoning disclosure"
+                        );
+                        drop(renderer);
+                        response_tx.send(crate::vm::ApprovalChoice::AllowOnce).unwrap();
+                        break;
+                    }
+                    ReplEvent::StatsUpdate { .. } | ReplEvent::StreamingComplete { .. } => {}
+                    other => panic!("unexpected event before VM approval: {other:?}"),
+                }
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut execution)
+            .await
+            .expect("approved compatible boundary query hung");
+        drain_vm_events_as_event_loop(&mut events);
+        assert!(
+            projection_events > 0,
+            "approval must follow a real projected say effect"
+        );
+        mock.assert_async().await;
+
+        let retained = output.get_messages();
+        let source = retained
+            .iter()
+            .find(|message| message.content().contains("(say"))
+            .expect("query processor must retain the submitted program source");
+        let visible = retained
+            .iter()
+            .find(|message| message.provider_reasoning_view().is_some())
+            .expect("successful say execution must retain its visible output unit");
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|message| message.provider_reasoning_view().is_some())
+                .count(),
+            1,
+            "private reasoning must have exactly one visible owner after consolidation: {:?}",
+            retained
+                .iter()
+                .map(|message| (
+                    message.id(),
+                    message.content(),
+                    message.provider_reasoning_view().is_some()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            source.provider_reasoning_view().is_none(),
+            "successful consolidation must move the private facet off the suppressed source"
+        );
+        let terminal = visible
+            .provider_reasoning_view()
+            .expect("visible say output must retain provider reasoning after consolidation");
+        assert!(
+            terminal.terminal && !terminal.expanded,
+            "completed provider reasoning must be collapsed exactly once: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.lines,
+            vec![private_reasoning],
+            "normalized SSE reasoning must survive factory selection and consolidation unchanged"
+        );
+
+        let history_json = serde_json::to_string(&conversation.read().await.get_messages())
+            .expect("serialize retained conversation history");
+        assert!(
+            !history_json.contains(private_reasoning),
+            "private reasoning leaked into conversation history: {history_json}"
+        );
+        for message in &retained {
+            let canonical = message.complete_transcript(&colors);
+            assert!(
+                !canonical.contains(private_reasoning),
+                "private reasoning leaked into canonical transcript for {:?}: {canonical:?}",
+                message.id()
+            );
+        }
+
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors.clone());
+        let collapsed_bytes = renderer
+            .redraw_full_viewport_bytes_for_test(100, 30)
+            .expect("real TUI collapsed frame must paint");
+        let mut collapsed_terminal = finch_tui::TestVtOracle::new(100, 30);
+        collapsed_terminal.feed(&collapsed_bytes);
+        assert!(
+            collapsed_terminal.contains_visible("Provider reasoning (5 words)"),
+            "collapsed real TUI frame omitted the terminal reasoning control: {}",
+            collapsed_terminal.diagnostic()
+        );
+        assert!(
+            collapsed_terminal.contains_visible("Boundary answer")
+                && collapsed_terminal.contains_visible("after approval")
+                && !collapsed_terminal.contains_visible(private_reasoning),
+            "collapsed frame must show the unchanged answer but not the reasoning body: {}",
+            collapsed_terminal.diagnostic()
+        );
+
+        let reasoning_row = collapsed_terminal
+            .find_row("Provider reasoning")
+            .expect("collapsed screen model must locate the reasoning control");
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: reasoning_row as u16,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ..down
+        };
+        renderer.handle_mouse_for_test(down);
+        assert!(
+            renderer.handle_mouse_for_test(up),
+            "real mouse route must reopen the retained visible reasoning unit"
+        );
+        let component = visible
+            .component_view()
+            .expect("visible say output must expose its component view");
+        let manifest = finch_tui::component_ui_manifest(&component);
+        assert_eq!(
+            manifest.manifest_version, 3,
+            "reasoning nodes require the version-three manifest contract"
+        );
+        let disclosure = manifest
+            .root
+            .children
+            .iter()
+            .find(|child| child.element_type == "ProviderReasoningDisclosure")
+            .expect("manifest must include the reasoning disclosure node");
+        assert!(
+            disclosure.id.ends_with("#2")
+                && disclosure.props.get("expanded") == Some(&serde_json::json!(true)),
+            "manifest must use stable semantic path #2 and reflect reopened state: {disclosure:?}"
+        );
+        let body = disclosure
+            .children
+            .iter()
+            .find(|child| child.element_type == "ProviderReasoningBody")
+            .expect("expanded manifest must include the reasoning body");
+        assert_eq!(
+            body.props.get("lines"),
+            Some(&serde_json::json!([private_reasoning])),
+            "manifest body must carry only the sanitized live-only reasoning facet"
+        );
+
+        let reopened_bytes = renderer
+            .redraw_full_viewport_bytes_for_test(100, 30)
+            .expect("same renderer must repaint its reopened retained state");
+        collapsed_terminal.feed(&reopened_bytes);
+        assert!(
+            collapsed_terminal.contains_visible(private_reasoning)
+                && collapsed_terminal.contains_visible("Boundary answer"),
+            "same-process repaint must retain reasoning and unchanged answer: {}",
+            collapsed_terminal.diagnostic()
+        );
+        assert!(
+            !visible
+                .complete_transcript(&colors)
+                .contains(private_reasoning),
+            "reopening the live-only facet must not mutate canonical transcript bytes"
+        );
+
+        let canonical_bytes = renderer
+            .commit_complete_messages_bytes_for_test(100, 30)
+            .expect("real canonical commit path must succeed");
+        assert!(
+            !String::from_utf8_lossy(&canonical_bytes).contains(private_reasoning),
+            "canonical commit bytes leaked private reasoning: {:?}",
+            String::from_utf8_lossy(&canonical_bytes)
+        );
+
+        let fresh_output = Arc::new(OutputManager::new(colors.clone()));
+        fresh_output.disable_stdout();
+        let replayed = fresh_output.start_work_unit_with_id(visible.id(), "VM program output");
+        replayed.set_program_output();
+        replayed.begin_say_turn("lisp", &source.content());
+        replayed.set_response(visible.content());
+        replayed.set_complete();
+        assert!(
+            replayed.provider_reasoning_view().is_none(),
+            "fresh attach/restart must not reconstruct the live-only reasoning facet"
+        );
+        let mut fresh_renderer = TuiRenderer::new_headless(fresh_output, status, colors);
+        let fresh_bytes = fresh_renderer
+            .draw_live_area_bytes_for_test(100, 30)
+            .expect("fresh attach frame must paint");
+        let mut fresh_terminal = finch_tui::TestVtOracle::new(100, 30);
+        fresh_terminal.feed(&fresh_bytes);
+        assert!(
+            fresh_terminal.contains_visible("Boundary answer")
+                && !fresh_terminal.contains_visible("Provider reasoning")
+                && !fresh_terminal.contains_visible(private_reasoning),
+            "fresh attach must retain answer but omit ephemeral reasoning: {}",
+            fresh_terminal.diagnostic()
         );
     }
 
@@ -4824,6 +5566,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5262,6 +6005,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5373,6 +6117,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await;
                 let messages = output.get_messages();
@@ -5476,6 +6221,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         while event_rx.try_recv().is_ok() {}
@@ -5564,6 +6310,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5666,6 +6413,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -5732,6 +6480,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -5821,6 +6570,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5879,6 +6629,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5950,6 +6701,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5995,6 +6747,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await
             })
@@ -6095,6 +6848,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -8234,6 +8988,8 @@ mod tests {
             20,
             0,
             false,
+            false,
+            Vec::new(),
             true,
             false,
             summary_gen,
@@ -8358,6 +9114,8 @@ mod tests {
             recall_k,
             false,
             false,
+            Vec::new(),
+            false,
             false,
             no_summary_gen,
             Arc::new(std::sync::Mutex::new(
@@ -8458,6 +9216,8 @@ mod tests {
             10_000,
             recall_k,
             true,
+            false,
+            Vec::new(),
             false,
             false,
             no_summary_gen,
@@ -8772,6 +9532,8 @@ mod tests {
             // true so the streaming attempt (and its WorkUnit) actually
             // happens before `generate_stream` declines it.
             true,
+            false,
+            Vec::new(),
             false,
             false,
             Arc::clone(&generator),
