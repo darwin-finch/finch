@@ -3577,7 +3577,10 @@ impl EventLoop {
         ) {
             Ok(effective) => self
                 .output_manager
-                .write_info(effective.status_report(self.default_provider.as_deref())),
+                .write_info(effective.status_report_with_provider(
+                    self.default_provider.as_deref(),
+                    &self.available_providers[effective.provider_index],
+                )),
             Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
         }
     }

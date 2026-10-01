@@ -385,7 +385,10 @@ impl EventLoop {
         match self.effective_selection() {
             Ok(effective) => self
                 .output_manager
-                .write_info(effective.status_report(self.default_provider.as_deref())),
+                .write_info(effective.status_report_with_provider(
+                    self.default_provider.as_deref(),
+                    &self.available_providers[effective.provider_index],
+                )),
             Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
         }
         self.render_tui().await

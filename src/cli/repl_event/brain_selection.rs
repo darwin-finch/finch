@@ -82,6 +82,46 @@ impl EffectiveSelection {
         }
         lines.join("\n")
     }
+
+    /// Detailed `/status` form for the selected provider entry.
+    ///
+    /// Generic compatible entries add only their non-secret, operator-attested
+    /// capability fields. Every built-in provider keeps [`Self::status_report`]
+    /// byte-for-byte.
+    pub(crate) fn status_report_with_provider(
+        &self,
+        global_default: Option<&str>,
+        entry: &ProviderEntry,
+    ) -> String {
+        let mut report = self.status_report(global_default);
+        let ProviderEntry::OpenAiCompatible { capabilities, .. } = entry else {
+            return report;
+        };
+        let image_input = match capabilities.image_input {
+            Some(true) => "supported (operator configured)",
+            Some(false) => "unsupported (text only; operator configured)",
+            None => "not configured",
+        };
+        let lines = [
+            "dialect: generic OpenAI-compatible Chat Completions".into(),
+            configured_token_limit("context window", capabilities.context_window_tokens),
+            configured_token_limit("max output", capabilities.max_output_tokens),
+            format!("image input: {image_input}"),
+            "capacity: not configured".into(),
+        ];
+        for line in lines {
+            report.push('\n');
+            report.push_str(&line);
+        }
+        report
+    }
+}
+
+fn configured_token_limit(label: &str, tokens: Option<u32>) -> String {
+    match tokens {
+        Some(tokens) => format!("{label}: {tokens} tokens (operator configured)"),
+        None => format!("{label}: not configured"),
+    }
 }
 
 /// Inputs used to resolve one Brain's effective provider/model.

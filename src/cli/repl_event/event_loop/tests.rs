@@ -10662,3 +10662,153 @@ async fn provider_list_shows_each_local_entry_its_own_model_not_the_bare_local_t
         "the cloud entry's real model must remain unaffected by the local-descriptor fix; listing={listing:?}"
     );
 }
+
+#[tokio::test]
+async fn status_reports_generic_compatible_capabilities_without_secrets_and_preserves_builtins() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let secret_markers = [
+                "https://private-compatible.example/v1",
+                "/private/chat/completions",
+                "/private/models",
+                "private-credential-ref",
+                "PRIVATE_COMPATIBLE_API_KEY",
+                "resolved-secret-value",
+                "X-Private-Header",
+                "https://private-audience.example",
+            ];
+            let compatible = crate::config::ProviderEntry::OpenAiCompatible {
+                name: "compatible-work".into(),
+                base_url: secret_markers[0].into(),
+                chat_path: Some(secret_markers[1].into()),
+                models_path: Some(secret_markers[2].into()),
+                model: "main".into(),
+                credential: crate::config::CredentialBinding {
+                    credential_ref: secret_markers[3].into(),
+                    audience: Some(crate::config::AudienceBinding {
+                        family: crate::config::EndpointFamily::Custom,
+                        endpoint: Some(secret_markers[7].into()),
+                    }),
+                    tenant: Some(secret_markers[5].into()),
+                    project: Some(secret_markers[6].into()),
+                    account: Some(secret_markers[4].into()),
+                    required_scopes: Default::default(),
+                },
+                capabilities: crate::config::OpenAiCompatibleCapabilities {
+                    streaming: Some(true),
+                    tools: Some(true),
+                    parallel_tool_calls: Some(false),
+                    image_input: Some(false),
+                    context_window_tokens: Some(262_144),
+                    max_output_tokens: Some(32_768),
+                },
+                tool_choice: crate::config::OpenAiCompatibleToolChoice::Auto,
+                strict_tool_schemas: Some(false),
+            };
+            let mut event_loop = super::EventLoop::new_provider_switch_test_runner(
+                vec![compatible],
+                0,
+                None,
+            );
+            event_loop.output_manager.disable_stdout();
+
+            event_loop
+                .handle_user_input("/status".into())
+                .await
+                .expect("the real /status command path must project compatible diagnostics");
+
+            let messages: Vec<String> = event_loop
+                .output_manager
+                .get_messages()
+                .iter()
+                .map(|message| message.content())
+                .collect();
+            let report = messages
+                .iter()
+                .cloned()
+                .find(|message| message.starts_with("provider: compatible-work\n"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the real /status path must emit the selected profile report; messages={messages:?}"
+                    )
+                });
+            let expected = "provider: compatible-work\n\
+model: main\n\
+thinking: provider default\n\
+source: inherited global default\n\
+dialect: generic OpenAI-compatible Chat Completions\n\
+context window: 262144 tokens (operator configured)\n\
+max output: 32768 tokens (operator configured)\n\
+image input: unsupported (text only; operator configured)\n\
+capacity: not configured";
+            assert_eq!(
+                report, expected,
+                "generic compatible /status must identify the dialect and report only operator-attested, secret-free capability diagnostics"
+            );
+            assert!(
+                !report.contains("provider: openai\n") && !report.contains("provider: OpenAI\n"),
+                "a generic compatible profile must not be identified as OpenAI; report={report:?}"
+            );
+            for marker in secret_markers {
+                assert!(
+                    !report.contains(marker),
+                    "/status must not expose endpoint, path, credential, environment, header, or resolved-secret material; marker={marker:?} report={report:?}"
+                );
+            }
+
+            for (entry, expected) in [
+                (
+                    crate::config::ProviderEntry::Openai {
+                        api_key: "sk-built-in-control".into(),
+                        model: Some("gpt-5".into()),
+                        base_url: None,
+                        chat_path: None,
+                        models_path: None,
+                        name: Some("official-openai".into()),
+                        reasoning_effort: None,
+                    },
+                    "provider: official-openai\nmodel: gpt-5\nthinking: provider default\nsource: inherited global default",
+                ),
+                (
+                    crate::config::ProviderEntry::Claude {
+                        api_key: "sk-ant-built-in-control".into(),
+                        model: Some("claude-sonnet-5".into()),
+                        base_url: None,
+                        chat_path: None,
+                        models_path: None,
+                        name: Some("official-claude".into()),
+                    },
+                    "provider: official-claude\nmodel: claude-sonnet-5\nthinking: provider default\nsource: inherited global default",
+                ),
+            ] {
+                let mut control = super::EventLoop::new_provider_switch_test_runner(
+                    vec![entry],
+                    0,
+                    None,
+                );
+                control.output_manager.disable_stdout();
+                control
+                    .handle_user_input("/status".into())
+                    .await
+                    .expect("built-in provider /status control must remain available");
+                let messages: Vec<String> = control
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .map(|message| message.content())
+                    .collect();
+                let report = messages
+                    .iter()
+                    .cloned()
+                    .find(|message| message.starts_with("provider: "))
+                    .unwrap_or_else(|| {
+                        panic!("built-in /status must emit its existing report; messages={messages:?}")
+                    });
+                assert_eq!(
+                    report, expected,
+                    "generic-compatible diagnostics must not alter built-in provider status output"
+                );
+            }
+        })
+        .await;
+}
