@@ -997,10 +997,10 @@ async fn main() -> Result<()> {
             None
         }
     };
-    // `Command::Query` is dispatched before the REPL setup below, so preserve
-    // this global flag explicitly rather than accidentally dropping it on the
-    // one-shot path.
-    let cloud_only = args.cloud_only;
+    // `Command::Query` and piped input are dispatched before the REPL setup
+    // below, so preserve the global direct-provider decision explicitly rather
+    // than accidentally dropping `--direct` on either one-shot path.
+    let bypass_daemon = args.direct || args.cloud_only;
 
     // Dispatch based on command
     match args.command {
@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
             query,
             show_program,
         }) => {
-            return run_query(&query, cloud_only, show_program).await;
+            return run_query(&query, bypass_daemon, show_program).await;
         }
         Some(Command::Worker { bind, info }) => {
             return run_worker(bind, info).await;
@@ -1114,7 +1114,7 @@ async fn main() -> Result<()> {
         }
 
         // Run query via daemon
-        return run_query(input.trim(), cloud_only, false).await;
+        return run_query(input.trim(), bypass_daemon, false).await;
     }
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
@@ -2518,7 +2518,7 @@ fn is_clearly_forth(s: &str) -> bool {
 }
 
 /// Run a single query with full tool support (agentic mode)
-async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<()> {
+async fn run_query(query: &str, bypass_daemon: bool, show_program: bool) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
 
@@ -2553,10 +2553,10 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Build tool executor (same tools as the REPL)
     let (executor, tool_definitions, program_runtime) = build_query_tool_executor(&config).await?;
 
-    // A one-shot cloud-only query must not first attempt the daemon. Besides
-    // defeating the flag, that startup attempt can consume the whole caller
-    // timeout and makes direct-provider smoke tests look hung.
-    if cloud_only {
+    // An explicitly direct one-shot query must not first attempt the daemon.
+    // Besides defeating the flag, that startup attempt can consume the whole
+    // caller timeout and makes direct-provider smoke tests look hung.
+    if bypass_daemon {
         return run_query_cloud_only(
             query,
             &config,
