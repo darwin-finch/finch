@@ -66,12 +66,23 @@ fn openai_bindings(
     .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-fn decode_openai_tool_name(bindings: &ToolBindingTable, wire_name: &str) -> Result<String> {
-    Ok(bindings
+fn decode_openai_tool_name(
+    bindings: &ToolBindingTable,
+    wire_name: &str,
+    redact_wire_identity: bool,
+) -> Result<String> {
+    let binding = bindings
         .decode_wire_call(wire_name, None)
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .semantic
-        .clone())
+        .map_err(|error| {
+            if redact_wire_identity {
+                anyhow::anyhow!(
+                "OpenAI-compatible response called a tool that was not advertised in this request"
+            )
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?;
+    Ok(binding.semantic.clone())
 }
 
 fn encode_openai_tool_name(bindings: &ToolBindingTable, semantic: &str) -> Result<String> {
@@ -347,7 +358,7 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
 async fn read_api_error(
     response: reqwest::Response,
     status: reqwest::StatusCode,
-    rule: TransportRule,
+    redact_body: bool,
 ) -> String {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -359,10 +370,7 @@ async fn read_api_error(
         }
         body.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
     }
-    if matches!(
-        rule,
-        TransportRule::CanonicalGpt56ChatCompletions | TransportRule::MetaModelApiChatCompletions
-    ) {
+    if redact_body {
         // Upstream error bodies can reflect prompts or tool arguments. They are
         // deliberately consumed with a bound but never surfaced or logged.
         return friendly_api_error(status, "response body redacted");
@@ -468,6 +476,213 @@ fn validate_canonical_response_shape(value: &serde_json::Value, rule: TransportR
     Ok(())
 }
 
+fn validate_configured_response_types(value: &serde_json::Value) -> Result<()> {
+    let root = value
+        .as_object()
+        .context("OpenAI-compatible response was not a JSON object")?;
+    require_string(root, "id", "response")?;
+    require_string(root, "object", "response")?;
+    require_string(root, "model", "response")?;
+    optional_unsigned(root, "created", "response")?;
+    optional_string_or_null(root, "service_tier", "response")?;
+    optional_string_or_null(root, "system_fingerprint", "response")?;
+    validate_usage_object(root.get("usage"), "response usage")?;
+    let choices = root
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .context("OpenAI-compatible response omitted a valid choices array")?;
+    for choice in choices {
+        let choice = choice
+            .as_object()
+            .context("OpenAI-compatible response choice was not an object")?;
+        require_unsigned(choice, "index", "response choice")?;
+        require_string_or_null(choice, "finish_reason", "response choice")?;
+        if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("OpenAI-compatible response contained unsupported log probabilities");
+        }
+        let message = choice
+            .get("message")
+            .and_then(serde_json::Value::as_object)
+            .context("OpenAI-compatible response choice omitted a valid message")?;
+        require_string(message, "role", "response message")?;
+        require_string_or_null(message, "content", "response message")?;
+        if message.get("refusal").is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("OpenAI-compatible response contained an unsupported refusal item");
+        }
+        if message
+            .get("annotations")
+            .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+        {
+            anyhow::bail!("OpenAI-compatible response contained unsupported annotations");
+        }
+    }
+    Ok(())
+}
+
+fn validate_configured_chunk_types(value: &serde_json::Value) -> Result<()> {
+    let root = value
+        .as_object()
+        .context("OpenAI-compatible stream event was not a JSON object")?;
+    require_string(root, "id", "stream event")?;
+    require_string(root, "object", "stream event")?;
+    require_string(root, "model", "stream event")?;
+    optional_unsigned(root, "created", "stream event")?;
+    optional_string_or_null(root, "service_tier", "stream event")?;
+    optional_string_or_null(root, "system_fingerprint", "stream event")?;
+    validate_usage_object(root.get("usage"), "stream usage")?;
+    let choices = root
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .context("OpenAI-compatible stream event omitted a valid choices array")?;
+    for choice in choices {
+        let choice = choice
+            .as_object()
+            .context("OpenAI-compatible stream choice was not an object")?;
+        require_unsigned(choice, "index", "stream choice")?;
+        require_string_or_null(choice, "finish_reason", "stream choice")?;
+        if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("OpenAI-compatible stream contained unsupported log probabilities");
+        }
+        let delta = choice
+            .get("delta")
+            .and_then(serde_json::Value::as_object)
+            .context("OpenAI-compatible stream choice omitted a valid delta object")?;
+        optional_string_or_null(delta, "role", "stream delta")?;
+        optional_string_or_null(delta, "content", "stream delta")?;
+        if delta
+            .get("tool_calls")
+            .is_some_and(|value| value.as_array().is_none())
+        {
+            anyhow::bail!("OpenAI-compatible stream tool_calls was not an array");
+        }
+        if let Some(tool_calls) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for tool_call in tool_calls {
+                let tool_call = tool_call
+                    .as_object()
+                    .context("OpenAI-compatible stream tool call was not an object")?;
+                require_unsigned(tool_call, "index", "stream tool call")?;
+                optional_string_or_null(tool_call, "id", "stream tool call")?;
+                optional_string_or_null(tool_call, "type", "stream tool call")?;
+                let function = tool_call.get("function");
+                if function.is_none()
+                    && tool_call.get("id").is_none()
+                    && tool_call.get("type").is_none()
+                {
+                    anyhow::bail!("OpenAI-compatible stream returned an empty tool-call delta");
+                }
+                if let Some(function) = function {
+                    let function = function
+                        .as_object()
+                        .context("OpenAI-compatible stream function delta was not an object")?;
+                    optional_string_or_null(function, "name", "stream function delta")?;
+                    optional_string_or_null(function, "arguments", "stream function delta")?;
+                    if function.is_empty() {
+                        anyhow::bail!(
+                            "OpenAI-compatible stream returned an empty function-call delta"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    if object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        anyhow::bail!("OpenAI-compatible {context} omitted a valid {field} field");
+    }
+    Ok(())
+}
+
+fn require_string_or_null(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(value) = object.get(field) else {
+        anyhow::bail!("OpenAI-compatible {context} omitted the {field} field");
+    };
+    if !value.is_null() && !value.is_string() {
+        anyhow::bail!("OpenAI-compatible {context} had an invalid {field} field");
+    }
+    Ok(())
+}
+
+fn optional_string_or_null(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    if object
+        .get(field)
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        anyhow::bail!("OpenAI-compatible {context} had an invalid {field} field");
+    }
+    Ok(())
+}
+
+fn require_unsigned(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    if object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        anyhow::bail!("OpenAI-compatible {context} omitted a valid {field} field");
+    }
+    Ok(())
+}
+
+fn optional_unsigned(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    if object
+        .get(field)
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        anyhow::bail!("OpenAI-compatible {context} had an invalid {field} field");
+    }
+    Ok(())
+}
+
+fn validate_usage_object(value: Option<&serde_json::Value>, context: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let usage = value
+        .as_object()
+        .with_context(|| format!("OpenAI-compatible {context} was not an object"))?;
+    reject_unknown_keys(
+        usage,
+        &["prompt_tokens", "completion_tokens", "total_tokens"],
+        context,
+    )?;
+    require_unsigned(usage, "prompt_tokens", context)?;
+    require_unsigned(usage, "completion_tokens", context)?;
+    require_unsigned(usage, "total_tokens", context)
+}
+
 fn validate_canonical_actual_model(model: &str) -> Result<()> {
     if model.trim().is_empty() {
         anyhow::bail!("OpenAI response omitted the actual model");
@@ -489,6 +704,7 @@ struct CanonicalStreamState {
     tool_delta_emitted: Vec<bool>,
     sequence: u64,
     bindings: Arc<ToolBindingTable>,
+    redact_wire_identities: bool,
 }
 
 fn reject_unknown_keys(
@@ -590,6 +806,9 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     let value: serde_json::Value =
         serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
     validate_canonical_chunk_shape(&value, state.rule)?;
+    if state.rule == TransportRule::CompatibleChatCompletions {
+        validate_configured_chunk_types(&value)?;
+    }
     let has_meta_reasoning_field = state.rule == TransportRule::MetaModelApiChatCompletions
         && value
             .pointer("/choices/0/delta")
@@ -673,6 +892,18 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         && !has_meta_reasoning_field
     {
         anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
+    }
+    if state.rule == TransportRule::CompatibleChatCompletions
+        && choice.finish_reason.is_none()
+        && choice.delta.role.as_deref().is_none_or(str::is_empty)
+        && choice.delta.content.as_deref().is_none_or(str::is_empty)
+        && choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+    {
+        anyhow::bail!("OpenAI-compatible stream returned a sparse non-terminal delta");
     }
     if let Some(reasoning) = choice
         .delta
@@ -770,7 +1001,11 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                 let name = if call_name.is_empty() {
                     None
                 } else {
-                    Some(decode_openai_tool_name(&state.bindings, &call_name)?)
+                    Some(decode_openai_tool_name(
+                        &state.bindings,
+                        &call_name,
+                        state.redact_wire_identities,
+                    )?)
                 };
                 state.sequence += 1;
                 let sequence = state.sequence;
@@ -809,7 +1044,11 @@ fn mark_canonical_done(state: &mut CanonicalStreamState) -> Result<()> {
     if state.terminal_reason.is_none() {
         anyhow::bail!("OpenAI stream ended before terminal status");
     }
-    if !state.usage_seen {
+    if matches!(
+        state.rule,
+        TransportRule::CanonicalGpt56ChatCompletions | TransportRule::MetaModelApiChatCompletions
+    ) && !state.usage_seen
+    {
         anyhow::bail!("OpenAI stream ended without its requested usage chunk");
     }
     state.done = true;
@@ -820,7 +1059,12 @@ async fn publish_canonical_completion(
     state: &CanonicalStreamState,
     tx: &mpsc::Sender<Result<StreamChunk>>,
 ) -> Result<()> {
-    let tool_blocks = finalize_tool_calls(&state.tool_calls, true, &state.bindings)?;
+    let tool_blocks = finalize_tool_calls(
+        &state.tool_calls,
+        true,
+        &state.bindings,
+        state.redact_wire_identities,
+    )?;
     if !state.accumulated_text.is_empty() {
         tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
             text: state.accumulated_text.clone(),
@@ -868,11 +1112,13 @@ fn spawn_canonical_stream_parser(
     rule: TransportRule,
     provider: String,
     bindings: Arc<ToolBindingTable>,
+    redact_wire_identities: bool,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut event_data: Option<String> = None;
         let mut total = 0usize;
         let mut state = CanonicalStreamState {
             rule,
@@ -887,6 +1133,7 @@ fn spawn_canonical_stream_parser(
             tool_delta_emitted: Vec::new(),
             sequence: 0,
             bindings,
+            redact_wire_identities,
         };
         loop {
             let next = tokio::select! {
@@ -895,7 +1142,7 @@ fn spawn_canonical_stream_parser(
                 next = stream.next() => next,
             };
             let Some(next) = next else {
-                if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                if event_data.is_some() || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
                     let message = if state.done {
                         "OpenAI stream sent data after its terminal marker"
                     } else {
@@ -945,6 +1192,9 @@ fn spawn_canonical_stream_parser(
                 return;
             }
             while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                if tx.is_closed() {
+                    return;
+                }
                 let line = buffer.drain(..=pos).collect::<Vec<_>>();
                 if line.len() > MAX_SSE_LINE_BYTES {
                     let _ = tx
@@ -964,6 +1214,31 @@ fn spawn_canonical_stream_parser(
                     }
                 };
                 if line.is_empty() {
+                    let Some(data) = event_data.take() else {
+                        continue;
+                    };
+                    if data == "[DONE]" {
+                        if let Err(error) = mark_canonical_done(&mut state) {
+                            if !tx.is_closed() {
+                                let _ = tx.send(Err(error)).await;
+                            }
+                            return;
+                        }
+                    } else {
+                        match canonical_stream_data(&mut state, &data) {
+                            Ok(chunks) => {
+                                for chunk in chunks {
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                        }
+                    }
                     if sse_line_prefix_exceeds_limit(&buffer) {
                         let _ = tx
                             .send(Err(anyhow::anyhow!(
@@ -994,35 +1269,18 @@ fn spawn_canonical_stream_parser(
                     return;
                 };
                 let data = data.strip_prefix(' ').unwrap_or(data);
-                if data == "[DONE]" {
-                    if let Err(error) = mark_canonical_done(&mut state) {
-                        if !tx.is_closed() {
-                            let _ = tx.send(Err(error)).await;
-                        }
-                        return;
-                    }
-                    if sse_line_prefix_exceeds_limit(&buffer) {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
-                                "OpenAI SSE line exceeded the 1 MiB limit"
-                            )))
-                            .await;
-                        return;
-                    }
-                    continue;
+                let event = event_data.get_or_insert_with(String::new);
+                if !event.is_empty() {
+                    event.push('\n');
                 }
-                match canonical_stream_data(&mut state, data) {
-                    Ok(chunks) => {
-                        for chunk in chunks {
-                            if tx.send(Ok(chunk)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
+                event.push_str(data);
+                if event.len() > MAX_SSE_LINE_BYTES {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI SSE event exceeded the 1 MiB limit"
+                        )))
+                        .await;
+                    return;
                 }
                 if sse_line_prefix_exceeds_limit(&buffer) {
                     let _ = tx
@@ -1076,6 +1334,7 @@ fn finalize_tool_calls(
     acc: &[(String, String, String)],
     strict: bool,
     bindings: &ToolBindingTable,
+    redact_wire_identities: bool,
 ) -> Result<Vec<ContentBlock>> {
     let mut blocks = Vec::new();
     for (id, name, args_str) in acc
@@ -1098,7 +1357,7 @@ fn finalize_tool_calls(
             }
             Ok(_) | Err(_) => continue,
         };
-        let name = decode_openai_tool_name(bindings, name)?;
+        let name = decode_openai_tool_name(bindings, name, redact_wire_identities)?;
         blocks.push(ContentBlock::ToolUse {
             id: id.clone(),
             name,
@@ -1492,6 +1751,21 @@ impl OpenAIProvider {
         TransportRule::CompatibleChatCompletions
     }
 
+    fn uses_strict_response_contract(&self, rule: TransportRule) -> bool {
+        matches!(
+            rule,
+            TransportRule::CanonicalGpt56ChatCompletions
+                | TransportRule::MetaModelApiChatCompletions
+        ) || matches!(&self.profile, ProviderProfile::Configured(_))
+    }
+
+    fn configured_terminal_error(&self, error: anyhow::Error) -> anyhow::Error {
+        if matches!(&self.profile, ProviderProfile::Configured(_)) {
+            return anyhow::Error::new(NonRetriableError(format!("{error:#}")));
+        }
+        error
+    }
+
     /// Convert a Finch request according to the explicitly selected wire rule.
     fn to_openai_request(
         &self,
@@ -1825,11 +2099,8 @@ impl OpenAIProvider {
         rule: TransportRule,
         bindings: &ToolBindingTable,
     ) -> Result<ProviderResponse> {
-        if matches!(
-            rule,
-            TransportRule::CanonicalGpt56ChatCompletions
-                | TransportRule::MetaModelApiChatCompletions
-        ) {
+        let strict_response = self.uses_strict_response_contract(rule);
+        if strict_response {
             if response.object.as_deref() != Some("chat.completion") {
                 anyhow::bail!("OpenAI returned an unknown response object");
             }
@@ -1861,62 +2132,41 @@ impl OpenAIProvider {
             let mut call_ids = std::collections::HashSet::new();
             for tool_call in tool_calls {
                 if tool_call.tool_type == "function" {
-                    let input = match rule {
-                        TransportRule::CanonicalGpt56ChatCompletions
-                        | TransportRule::MetaModelApiChatCompletions => {
-                            if tool_call.id.is_empty()
-                                || tool_call.function.name.is_empty()
-                                || !call_ids.insert(tool_call.id.clone())
-                            {
-                                anyhow::bail!(
-                                    "OpenAI returned an invalid or duplicate function call ID/name"
-                                );
-                            }
-                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
-                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
-                            }
-                            let input: serde_json::Value =
-                                serde_json::from_str(&tool_call.function.arguments)
-                                    .context("OpenAI returned malformed JSON function arguments")?;
-                            if !input.is_object() {
-                                anyhow::bail!("OpenAI function arguments were not a JSON object");
-                            }
-                            input
-                        }
-                        TransportRule::CompatibleChatCompletions => {
-                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
-                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
-                            }
-                            let input: serde_json::Value =
-                                serde_json::from_str(&tool_call.function.arguments)
-                                    .context("OpenAI returned malformed JSON function arguments")?;
-                            if !input.is_object() {
-                                anyhow::bail!("OpenAI function arguments were not a JSON object");
-                            }
-                            input
-                        }
-                    };
-                    let name = decode_openai_tool_name(bindings, &tool_call.function.name)?;
+                    if strict_response
+                        && (tool_call.id.is_empty()
+                            || tool_call.function.name.is_empty()
+                            || !call_ids.insert(tool_call.id.clone()))
+                    {
+                        anyhow::bail!(
+                            "OpenAI returned an invalid or duplicate function call ID/name"
+                        );
+                    }
+                    if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                        anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                    }
+                    let input: serde_json::Value =
+                        serde_json::from_str(&tool_call.function.arguments)
+                            .context("OpenAI returned malformed JSON function arguments")?;
+                    if !input.is_object() {
+                        anyhow::bail!("OpenAI function arguments were not a JSON object");
+                    }
+                    let name = decode_openai_tool_name(
+                        bindings,
+                        &tool_call.function.name,
+                        matches!(&self.profile, ProviderProfile::Configured(_)),
+                    )?;
                     content.push(ContentBlock::ToolUse {
                         id: tool_call.id,
                         name,
                         input,
                     });
-                } else if matches!(
-                    rule,
-                    TransportRule::CanonicalGpt56ChatCompletions
-                        | TransportRule::MetaModelApiChatCompletions
-                ) {
+                } else if strict_response {
                     anyhow::bail!("OpenAI returned an unknown tool-call type");
                 }
             }
         }
 
-        if matches!(
-            rule,
-            TransportRule::CanonicalGpt56ChatCompletions
-                | TransportRule::MetaModelApiChatCompletions
-        ) {
+        if strict_response {
             let reason = choice
                 .finish_reason
                 .as_deref()
@@ -1978,12 +2228,14 @@ impl OpenAIProvider {
             .json(&openai_request)
             .send()
             .await
-            .context("Failed to send request to OpenAI API")?;
+            .context("Failed to send request to OpenAI API")
+            .map_err(|error| self.configured_terminal_error(error))?;
 
         let status = response.status();
 
         if !status.is_success() {
-            let msg = read_api_error(response, status, rule).await;
+            let msg =
+                read_api_error(response, status, self.uses_strict_response_contract(rule)).await;
             if status.is_client_error()
                 && !(rule == TransportRule::MetaModelApiChatCompletions
                     && status == reqwest::StatusCode::TOO_MANY_REQUESTS)
@@ -1993,27 +2245,28 @@ impl OpenAIProvider {
             anyhow::bail!("{}", msg);
         }
 
-        let openai_response: OpenAIResponse = match rule {
-            TransportRule::CanonicalGpt56ChatCompletions
-            | TransportRule::MetaModelApiChatCompletions => {
+        let strict_response = self.uses_strict_response_contract(rule);
+        let parsed: Result<OpenAIResponse> = async {
+            if strict_response {
                 let body = read_bounded_response_body(response).await?;
                 let value: serde_json::Value =
                     serde_json::from_slice(&body).context("Failed to parse OpenAI API response")?;
                 validate_canonical_response_shape(&value, rule)?;
-                serde_json::from_value(value)
-                    .context("OpenAI response did not match the documented schema")?
+                if matches!(&self.profile, ProviderProfile::Configured(_)) {
+                    validate_configured_response_types(&value)?;
+                }
+                return serde_json::from_value(value)
+                    .context("OpenAI response did not match the documented schema");
             }
-            TransportRule::CompatibleChatCompletions => response
+            response
                 .json()
                 .await
-                .context("Failed to parse OpenAI API response")?,
-        };
+                .context("Failed to parse OpenAI API response")
+        }
+        .await;
+        let openai_response = parsed.map_err(|error| self.configured_terminal_error(error))?;
 
-        if matches!(
-            rule,
-            TransportRule::CanonicalGpt56ChatCompletions
-                | TransportRule::MetaModelApiChatCompletions
-        ) {
+        if strict_response {
             validate_canonical_actual_model(&openai_response.model)?;
         }
 
@@ -2024,6 +2277,7 @@ impl OpenAIProvider {
         );
 
         self.parse_response(openai_response, rule, bindings)
+            .map_err(|error| self.configured_terminal_error(error))
     }
 
     /// Send a message with streaming response (no retry)
@@ -2060,11 +2314,13 @@ impl OpenAIProvider {
             .json(&openai_request)
             .send()
             .await
-            .context("Failed to send streaming request to OpenAI API")?;
+            .context("Failed to send streaming request to OpenAI API")
+            .map_err(|error| self.configured_terminal_error(error))?;
 
         let status = response.status();
         if !status.is_success() {
-            let msg = read_api_error(response, status, rule).await;
+            let msg =
+                read_api_error(response, status, self.uses_strict_response_contract(rule)).await;
             if status.is_client_error()
                 && !(rule == TransportRule::MetaModelApiChatCompletions
                     && status == reqwest::StatusCode::TOO_MANY_REQUESTS)
@@ -2074,24 +2330,28 @@ impl OpenAIProvider {
             anyhow::bail!("{}", msg);
         }
 
-        if matches!(
-            rule,
-            TransportRule::CanonicalGpt56ChatCompletions
-                | TransportRule::MetaModelApiChatCompletions
-        ) {
+        if self.uses_strict_response_contract(rule) {
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
-            if !content_type.starts_with("text/event-stream") {
-                anyhow::bail!("OpenAI streaming response was not text/event-stream");
+            let media_type = content_type
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or_default();
+            if !media_type.eq_ignore_ascii_case("text/event-stream") {
+                return Err(self.configured_terminal_error(anyhow::anyhow!(
+                    "OpenAI streaming response was not text/event-stream"
+                )));
             }
             return Ok(spawn_canonical_stream_parser(
                 response,
                 rule,
                 self.provider_name.clone(),
                 Arc::new(bindings.clone()),
+                matches!(&self.profile, ProviderProfile::Configured(_)),
             ));
         }
 
@@ -2154,6 +2414,7 @@ impl OpenAIProvider {
                                         &tool_call_acc,
                                         false,
                                         &stream_bindings,
+                                        false,
                                     ) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
@@ -2294,6 +2555,7 @@ impl OpenAIProvider {
                                                     match decode_openai_tool_name(
                                                         &stream_bindings,
                                                         &name,
+                                                        false,
                                                     ) {
                                                         Ok(name) => Some(name),
                                                         Err(error) => {
@@ -2973,6 +3235,7 @@ mod tests {
             tool_delta_emitted: Vec::new(),
             sequence: 0,
             bindings: Arc::new(test_tool_bindings(&["read", "bash", "glob", "grep"])),
+            redact_wire_identities: false,
         }
     }
 
@@ -5655,6 +5918,509 @@ mod tests {
         mock.assert_async().await;
     }
 
+    fn configured_test_provider(base_url: String) -> OpenAIProvider {
+        OpenAIProvider::new_configured_compatible(
+            "configured-sentinel-secret".into(),
+            base_url,
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "configured-test".into(),
+            ModelCapabilities::configured_openai_compatible(
+                "configured-test",
+                "main",
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(262_144),
+                Some(65_536),
+            ),
+            true,
+            Some(false),
+        )
+        .expect("configured-compatible test provider must construct")
+    }
+
+    async fn configured_stream_outcome(
+        body: impl Into<Vec<u8>>,
+        content_type: &str,
+    ) -> (Vec<StreamChunk>, Vec<String>) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", content_type)
+            .with_body(body.into())
+            .create_async()
+            .await;
+        let result = configured_test_provider(server.url())
+            .send_message_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await;
+        let mut chunks = Vec::new();
+        let mut errors = Vec::new();
+        match result {
+            Ok(mut receiver) => {
+                while let Some(item) = receiver.recv().await {
+                    match item {
+                        Ok(chunk) => chunks.push(chunk),
+                        Err(error) => errors.push(format!("{error:#}")),
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+        (chunks, errors)
+    }
+
+    fn configured_terminal_stream() -> String {
+        concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_requires_exact_sse_media_type_and_one_done_after_terminal() {
+        let (chunks, errors) = configured_stream_outcome(
+            configured_terminal_stream(),
+            "text/event-stream; charset=utf-8",
+        )
+        .await;
+        assert!(
+            errors.is_empty(),
+            "valid configured stream failed: {errors:?}"
+        );
+        assert!(
+            chunks.iter().any(|chunk| matches!(
+                chunk,
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) if text == "ok"
+            )),
+            "valid configured stream omitted its completed text: {chunks:?}"
+        );
+
+        for content_type in ["application/json", "text/event-streamish", ""] {
+            let (chunks, errors) =
+                configured_stream_outcome(configured_terminal_stream(), content_type).await;
+            assert!(
+                chunks.is_empty(),
+                "wrong content type leaked chunks: {chunks:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "wrong content type must produce one terminal error: type={content_type:?}, errors={errors:?}"
+            );
+        }
+
+        let terminal = configured_terminal_stream();
+        let cases = [
+            ("missing DONE", terminal.replace("data: [DONE]\n\n", "")),
+            ("duplicate DONE", format!("{terminal}data: [DONE]\n\n")),
+            (
+                "late data",
+                format!(
+                    "{terminal}data: {{\"id\":\"late\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[]}}\n\n"
+                ),
+            ),
+            (
+                "DONE before terminal",
+                "data: [DONE]\n\n".to_string(),
+            ),
+            (
+                "mid-frame EOF",
+                "data: {\"id\":\"chat-1\"".to_string(),
+            ),
+            (
+                "DONE missing its blank event terminator",
+                terminal
+                    .strip_suffix('\n')
+                    .expect("terminal fixture ends in a blank SSE delimiter")
+                    .to_string(),
+            ),
+            (
+                "two data lines in one SSE event",
+                concat!(
+                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n",
+                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_string(),
+            ),
+        ];
+        for (case, body) in cases {
+            let (chunks, errors) = configured_stream_outcome(body, "text/event-stream").await;
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+                "{case} produced a successful completion: {chunks:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "{case} must produce exactly one terminal error: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_tool_binding_diagnostics_never_reflect_the_credential() {
+        let secret = "configured-sentinel-secret";
+        let request = ProviderRequest::new(vec![crate::Message::user("hello")]).with_tools(vec![
+            crate::ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                input_schema: crate::ToolInputSchema::simple(vec![]),
+            },
+        ]);
+        let nonstream_body = serde_json::json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "model": "main",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": secret, "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let mut nonstream_server = mockito::Server::new_async().await;
+        nonstream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&nonstream_body).unwrap())
+            .create_async()
+            .await;
+        let error = configured_test_provider(nonstream_server.url())
+            .send_message(&request)
+            .await
+            .expect_err("an unadvertised reflected tool name must fail closed");
+        let displayed = format!("{error:#}");
+        assert!(
+            !displayed.contains(secret),
+            "configured nonstream tool-binding diagnostic leaked the credential: {displayed}"
+        );
+
+        let stream_body = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            secret
+        );
+        let mut stream_server = mockito::Server::new_async().await;
+        stream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .create_async()
+            .await;
+        let mut receiver = configured_test_provider(stream_server.url())
+            .send_message_stream(&request)
+            .await
+            .expect("the response-body failure must surface through the stream");
+        let mut errors = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            if let Err(error) = item {
+                errors.push(format!("{error:#}"));
+            }
+        }
+        assert_eq!(
+            errors.len(),
+            1,
+            "configured reflected tool name must emit exactly one terminal error: {errors:?}"
+        );
+        assert!(
+            !errors[0].contains(secret),
+            "configured streaming tool-binding diagnostic leaked the credential: {}",
+            errors[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_rejects_malformed_unknown_wrong_and_sparse_stream_events() {
+        let events = [
+            ("malformed JSON", "not-json".to_string()),
+            (
+                "unknown field",
+                r#"{"id":"chat-1","object":"chat.completion.chunk","model":"main","unknown":true,"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#.to_string(),
+            ),
+            (
+                "wrong typed field",
+                r#"{"id":"chat-1","object":"chat.completion.chunk","model":"main","choices":[{"index":0,"delta":{"content":7},"finish_reason":null}]}"#.to_string(),
+            ),
+            (
+                "empty delta",
+                r#"{"id":"chat-1","object":"chat.completion.chunk","model":"main","choices":[{"index":0,"delta":{},"finish_reason":null}]}"#.to_string(),
+            ),
+            (
+                "sparse content",
+                r#"{"id":"chat-1","object":"chat.completion.chunk","model":"main","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}"#.to_string(),
+            ),
+            (
+                "generic reasoning leak",
+                r#"{"id":"chat-1","object":"chat.completion.chunk","model":"main","choices":[{"index":0,"delta":{"reasoning_content":"private"},"finish_reason":null}]}"#.to_string(),
+            ),
+        ];
+        for (case, event) in events {
+            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let (chunks, errors) = configured_stream_outcome(body, "text/event-stream").await;
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+                "{case} produced a successful completion: {chunks:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "{case} must produce exactly one terminal error: {errors:?}"
+            );
+            assert!(
+                !errors[0].contains("private"),
+                "{case} reflected private response content: {}",
+                errors[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_bounds_stream_events_aggregate_and_tool_arguments() {
+        let oversized_line = format!("data: {}\n\n", "x".repeat(MAX_SSE_LINE_BYTES));
+        let aggregate = format!(":{}\n", "x".repeat(MAX_SSE_LINE_BYTES - 2)).repeat(5);
+        let first_args = "x".repeat(MAX_TOOL_ARGUMENT_BYTES / 2 + 1);
+        let second_args = "y".repeat(MAX_TOOL_ARGUMENT_BYTES / 2 + 1);
+        let oversized_args = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n"
+            ),
+            first_args, second_args
+        );
+        for (case, body, expected) in [
+            ("event", oversized_line, "1 MiB"),
+            ("aggregate", aggregate, "4 MiB"),
+            ("tool arguments", oversized_args, "function arguments"),
+        ] {
+            let (chunks, errors) = configured_stream_outcome(body, "text/event-stream").await;
+            assert_eq!(
+                errors.len(),
+                1,
+                "oversized {case} must produce exactly one error: chunks={chunks:?}, errors={errors:?}"
+            );
+            assert!(
+                errors[0].contains(expected),
+                "oversized {case} reported the wrong bounded diagnostic: {errors:?}"
+            );
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+                "oversized {case} produced a completion: {chunks:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_bounds_nonstream_and_redacts_error_bodies() {
+        let mut oversized_server = mockito::Server::new_async().await;
+        oversized_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(vec![b'x'; MAX_RESPONSE_BYTES + 1])
+            .create_async()
+            .await;
+        let error = configured_test_provider(oversized_server.url())
+            .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .expect_err("oversized configured response must fail");
+        assert!(
+            format!("{error:#}").contains("32 MiB"),
+            "oversized configured response had the wrong error: {error:#}"
+        );
+
+        let secret = "configured-sentinel-secret";
+        let mut error_server = mockito::Server::new_async().await;
+        error_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"error":{{"message":"Authorization: Bearer {secret} {}"}}}}"#,
+                "x".repeat(MAX_ERROR_BODY_BYTES + 1)
+            ))
+            .create_async()
+            .await;
+        let error = configured_test_provider(error_server.url())
+            .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .expect_err("configured provider error must fail");
+        let displayed = format!("{error:#}");
+        assert!(displayed.contains("response body redacted"), "{displayed}");
+        assert!(
+            !displayed.contains(secret),
+            "secret leaked in error: {displayed}"
+        );
+        assert!(
+            displayed.len() < 1024,
+            "bounded configured error grew unexpectedly: {} bytes",
+            displayed.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_nonstream_rejects_malformed_unknown_wrong_and_terminal_fields() {
+        let cases = vec![
+            ("malformed JSON", b"not-json".to_vec()),
+            (
+                "unknown field",
+                br#"{"id":"chat-1","object":"chat.completion","model":"main","unknown":true,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#.to_vec(),
+            ),
+            (
+                "wrong typed field",
+                br#"{"id":"chat-1","object":"chat.completion","created":"yesterday","model":"main","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#.to_vec(),
+            ),
+            (
+                "generic reasoning leak",
+                br#"{"id":"chat-1","object":"chat.completion","model":"main","choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"private"},"finish_reason":"stop"}]}"#.to_vec(),
+            ),
+            (
+                "missing terminal status",
+                br#"{"id":"chat-1","object":"chat.completion","model":"main","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":null}]}"#.to_vec(),
+            ),
+            (
+                "unknown terminal status",
+                br#"{"id":"chat-1","object":"chat.completion","model":"main","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"mystery"}]}"#.to_vec(),
+            ),
+            (
+                "oversized tool arguments",
+                serde_json::to_vec(&serde_json::json!({
+                    "id": "chat-1",
+                    "object": "chat.completion",
+                    "model": "main",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }))
+                .unwrap(),
+            ),
+        ];
+        for (case, body) in cases {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            let error = configured_test_provider(server.url())
+                .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+                .await
+                .expect_err("invalid configured-compatible response must fail");
+            let displayed = format!("{error:#}");
+            assert!(
+                !displayed.contains("private"),
+                "{case} reflected private provider content: {displayed}"
+            );
+            assert!(
+                displayed.len() < 2048,
+                "{case} produced an unexpectedly large diagnostic: {} bytes",
+                displayed.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_receiver_drop_cancellation_and_timeout_release_transport() {
+        let (url, closed) = stalling_http_server(true).await;
+        let receiver = configured_test_provider(url)
+            .send_message_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .expect("configured stream must return after response headers");
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("receiver drop did not release the configured upstream transport")
+            .expect("receiver-drop server did not report transport closure");
+
+        let (url, mut accepted, mut closed) = retrying_stalling_http_server(1).await;
+        let provider = configured_test_provider(url);
+        let task = tokio::spawn(async move {
+            provider
+                .send_message_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+                .await
+        });
+        assert_eq!(
+            recv_without_advancing_time(&mut accepted, "configured cancellation accept").await,
+            0
+        );
+        task.abort();
+        assert_eq!(
+            recv_without_advancing_time(&mut closed, "configured cancellation close").await,
+            0,
+            "cancelling configured dispatch did not release its only upstream attempt"
+        );
+
+        let (url, closed) = stalling_http_server(true).await;
+        let mut provider = configured_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("short-timeout configured client must construct");
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .expect("configured timeout stream must return after response headers");
+        let first = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("configured post-header timeout hung")
+            .expect("configured timeout stream ended without its terminal error")
+            .expect_err("configured timeout must not be a successful chunk");
+        assert!(
+            format!("{first:#}")
+                .to_ascii_lowercase()
+                .contains("timed out"),
+            "configured timeout had the wrong terminal diagnostic: {first:#}"
+        );
+        assert!(
+            receiver.recv().await.is_none(),
+            "configured timeout emitted more than one terminal outcome"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("configured timeout did not release the upstream transport")
+            .expect("configured timeout server did not report transport closure");
+    }
+
     #[tokio::test]
     async fn compatible_stream_reports_reasoning_activity_without_treating_it_as_output() {
         let mut server = mockito::Server::new_async().await;
@@ -6707,6 +7473,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert_eq!(blocks.len(), 1);
@@ -6730,6 +7497,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap_err();
         assert!(error
@@ -6744,6 +7512,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert!(blocks.is_empty());
@@ -6791,6 +7560,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert_eq!(blocks.len(), 1);
