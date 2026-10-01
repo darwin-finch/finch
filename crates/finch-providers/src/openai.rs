@@ -2324,7 +2324,7 @@ impl OpenAIProvider {
                         "https://dev.meta.ai/docs/protocols/chat-completions",
                     ),
                     1_048_576,
-                    None,
+                    Some(131_072),
                 ),
                 ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
                     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
@@ -3314,6 +3314,87 @@ mod tests {
             );
         }
         no_http.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn meta_model_api_output_limit_rejects_oversized_request_before_http() {
+        let mut server = mockito::Server::new_async().await;
+        let accepted = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "max_completion_tokens": 131_072
+            })))
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": "meta-output-limit",
+                    "object": "chat.completion",
+                    "model": "muse-spark-1.3",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let rejected = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "max_completion_tokens": 131_073
+            })))
+            .expect(0)
+            .with_status(400)
+            .create_async()
+            .await;
+        let provider = meta_test_provider(server.url());
+        assert_eq!(
+            provider
+                .capabilities("muse-spark-1.3")
+                .output_token_limit
+                .max_tokens,
+            Some(131_072),
+            "Muse Spark must advertise Meta's exact documented output-token maximum"
+        );
+
+        let response = provider
+            .clone()
+            .send_message(
+                &ProviderRequest::new(vec![crate::Message::user("hello")])
+                    .with_model("muse-spark-1.3")
+                    .with_max_tokens(131_072),
+            )
+            .await
+            .expect("Meta's documented 131072-token output maximum must be accepted");
+        assert_eq!(
+            response.model, "muse-spark-1.3",
+            "the accepted boundary request must preserve Muse Spark model identity"
+        );
+        assert_eq!(
+            response.provider, "meta_model_api",
+            "the accepted boundary request must preserve direct Meta provider identity"
+        );
+
+        let error = provider
+            .send_message(
+                &ProviderRequest::new(vec![crate::Message::user("hello")])
+                    .with_model("muse-spark-1.3")
+                    .with_max_tokens(131_073),
+            )
+            .await
+            .expect_err("an output request above Meta's maximum must fail before HTTP")
+            .to_string();
+        assert_eq!(
+            error,
+            "Provider 'meta_model_api' model 'muse-spark-1.3' supports at most 131072 output tokens, but 131073 were requested",
+            "the oversized request must be rejected by capability validation before HTTP"
+        );
+        accepted.assert_async().await;
+        rejected.assert_async().await;
     }
 
     #[tokio::test]
