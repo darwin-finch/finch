@@ -83,6 +83,14 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
+fn record_reasoning_activity(work_unit: &crate::cli::messages::WorkUnit, text: &str) {
+    // Provider adapters emit reasoning on a distinct stream variant. Count it
+    // as live provider activity so a reasoning model does not remain stuck on
+    // the pre-token "thinking" state, but do not mix private reasoning into
+    // visible wire source or conversation.
+    work_unit.add_tokens(text);
+}
+
 /// Strip stray Markdown inline-code backtick(s) from a provider wire response
 /// before it reaches either language detection or the compiler.
 ///
@@ -1966,10 +1974,8 @@ pub(crate) async fn process_query_with_tools(
                                 work_unit.set_response(&text);
                             }
                         }
-                        Ok(StreamChunk::ThinkingDelta { .. }) => {
-                            // Reasoning text is labelled by ReasoningKind at the
-                            // generation layer; this loop does not parse wire
-                            // formats to display it.
+                        Ok(StreamChunk::ThinkingDelta { text, .. }) => {
+                            record_reasoning_activity(work_unit.as_ref(), &text);
                         }
                         Ok(StreamChunk::ToolCallDelta {
                             id,
@@ -3649,6 +3655,24 @@ mod tests {
             "completed named-Brain program emitted no output completion"
         );
         assert_eq!(completed_response.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn reasoning_delta_advances_activity_without_exposing_reasoning() {
+        let work_unit = crate::cli::messages::WorkUnit::new("Calculating");
+        let colors = crate::theme::ColorScheme::default();
+
+        record_reasoning_activity(&work_unit, "private reasoning words");
+
+        let rendered = work_unit.format(&colors);
+        assert!(
+            rendered.contains("tokens"),
+            "reasoning delta left the work unit in its pre-token state: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("private reasoning words"),
+            "reasoning activity leaked into visible assistant output: {rendered:?}"
+        );
     }
 
     #[tokio::test]

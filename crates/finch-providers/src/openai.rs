@@ -2038,6 +2038,45 @@ impl OpenAIProvider {
                                         actual_model = stream_chunk.model.clone();
                                     }
                                     if let Some(choice) = stream_chunk.choices.into_iter().next() {
+                                        if let Some(reason) = choice.finish_reason.as_deref() {
+                                            let error = match reason {
+                                                "stop" | "tool_calls" | "function_call" => None,
+                                                "length" => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream reached its output-token limit"
+                                                )),
+                                                "content_filter" => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream was stopped by content filtering"
+                                                )),
+                                                _ => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream returned unknown finish reason '{reason}'"
+                                                )),
+                                            };
+                                            if let Some(error) = error {
+                                                let _ = tx.send(Err(error)).await;
+                                                done = true;
+                                                break;
+                                            }
+                                        }
+                                        if let Some(reasoning) = choice.delta.reasoning_content {
+                                            sequence += 1;
+                                            if tx
+                                                .send(Ok(StreamChunk::ThinkingDelta {
+                                                    text: reasoning,
+                                                    provenance: EventProvenance {
+                                                        provider: provider_name.clone(),
+                                                        model: actual_model.clone(),
+                                                        event: "reasoning".to_string(),
+                                                        sequence,
+                                                        opaque_replay: None,
+                                                    },
+                                                }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                done = true;
+                                                break;
+                                            }
+                                        }
                                         if let Some(content) = choice.delta.content {
                                             accumulated_text.push_str(&content);
                                             // Send delta immediately
@@ -2652,6 +2691,9 @@ struct OpenAIStreamChoice {
 struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
+    /// Reasoning text used by xAI and other compatible endpoints. This is
+    /// activity/reasoning, never assistant output.
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }
 
@@ -4657,6 +4699,112 @@ mod tests {
         assert_eq!(
             provider.capabilities("other").tools.support,
             CapabilitySupport::Unknown
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_reports_reasoning_activity_without_treating_it_as_output() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"checking\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .dispatch_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .unwrap();
+        let mut reasoning = Vec::new();
+        let mut text = String::new();
+        let mut completed = String::new();
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ThinkingDelta { text, provenance } => {
+                    reasoning.push((text, provenance.event));
+                }
+                StreamChunk::TextDelta(delta) => text.push_str(&delta),
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    completed.push_str(&text);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reasoning,
+            vec![("checking".to_string(), "reasoning".to_string())],
+            "generic compatible reasoning_content must remain a distinct thinking event"
+        );
+        assert_eq!(text, "OK", "reasoning text leaked into assistant output");
+        assert_eq!(
+            completed, "OK",
+            "completed assistant output must exclude reasoning_content"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_surfaces_output_limit_instead_of_empty_success() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .dispatch_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .unwrap();
+        let mut error = None;
+        let mut completed = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Err(item_error) => error = Some(item_error.to_string()),
+                Ok(StreamChunk::ContentBlockComplete(_)) => completed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            error.as_deref(),
+            Some("OpenAI-compatible stream reached its output-token limit"),
+            "a reasoning-only truncated stream must report its real terminal cause"
+        );
+        assert!(
+            !completed,
+            "a truncated compatible stream must not publish a completed output block"
         );
         mock.assert_async().await;
     }
