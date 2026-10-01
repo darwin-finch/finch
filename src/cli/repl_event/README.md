@@ -6,7 +6,9 @@ event loop and its per-query state, and the handoff between tool results and the
 turn. It does not own provider transports, durable Brain storage, or terminal layout.
 The provider-visible history and ordered staging of tool results belong to
 [`finch-conversation`](../../../crates/finch-conversation/README.md); this module decides when
-to commit a round, generate a summary, and admit a continuation.
+to commit a round, generate a summary, and admit a continuation. `EventLoop` and its `LlmLoop`
+worker share the session's committed-summary cache so a conversation reset invalidates both the
+raw history and the derived provider prefix before another request is assembled.
 
 Two callers illustrate the boundary:
 

@@ -292,6 +292,11 @@ pub struct EventLoop {
     /// Shared conversation history
     conversation: Arc<RwLock<ConversationHistory>>,
 
+    /// Committed summary of the shared conversation. `LlmLoop` assembles
+    /// requests from this handle; conversation-clearing commands invalidate
+    /// it while holding the conversation write boundary.
+    summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
+
     /// Persona used for request-local provider system instructions.
     active_persona: Arc<RwLock<crate::config::Persona>>,
 
@@ -2107,6 +2112,7 @@ impl EventLoop {
             },
             LlmSession {
                 conversation: Arc::clone(&self.conversation),
+                summary_cache: Arc::clone(&self.summary_cache),
                 active_persona: Arc::clone(&self.active_persona),
                 mode: Arc::clone(&self.mode),
                 query_states: Arc::clone(&self.query_states),
@@ -2202,6 +2208,9 @@ impl EventLoop {
         todo_journal_receiver.spawn();
         memory_commitment_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
 
         let agent_events = agent_scheduler.subscribe();
         let agent_event_tx = event_tx.clone();
@@ -2319,6 +2328,7 @@ impl EventLoop {
             event_tx,
             input_rx,
             conversation,
+            summary_cache,
             active_persona,
             query_states: Arc::new(QueryStateManager::new()),
             model_selection: ModelSelection::from_handle(

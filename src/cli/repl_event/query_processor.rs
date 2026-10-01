@@ -1805,18 +1805,32 @@ pub(crate) async fn process_query_with_tools(
     // Get conversation context, optionally injecting relevant memories
     let mut memory_recall = finch_memory::Recall::none();
     let messages = {
-        let all_msgs = conversation.read().await.get_messages();
+        // Capture the summary-cache generation while the conversation read
+        // guard is still held. `/clear` takes the write guard before it
+        // invalidates the cache, so this snapshot and its cache generation
+        // always describe the same side of that reset boundary.
+        let (all_msgs, compactor) = {
+            let conversation = conversation.read().await;
+            let all_msgs = conversation.get_messages();
+            let compactor =
+                if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim {
+                    Some(
+                        crate::cli::conversation_compactor::ConversationCompactor::new(
+                            summary_gen,
+                            summary_cache,
+                        ),
+                    )
+                } else {
+                    None
+                };
+            (all_msgs, compactor)
+        };
         // When summarization is enabled and messages have been dropped by the
         // sliding window, inject the committed summary of those messages as a
         // prefix so the LLM retains awareness of earlier turns. The summary
         // is keyed on a committed range, so its bytes stay stable across
         // turns and the request prefix can be cached.
-        let mut msgs = if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim
-        {
-            let compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
-                summary_gen,
-                summary_cache,
-            );
+        let mut msgs = if let Some(compactor) = compactor {
             assemble_window_with_summary(
                 &compactor,
                 all_msgs,
@@ -3134,6 +3148,7 @@ pub(crate) async fn assemble_window_with_summary(
                 }
             }
         }
+        SummaryPlan::Invalidated => None,
     };
     let window = apply_sliding_window(history, max_verbatim);
     match summary {

@@ -17,7 +17,13 @@ impl EventLoop {
                         return Ok(());
                     }
                     Command::Clear => {
-                        self.conversation.write().await.clear();
+                        let mut conversation = self.conversation.write().await;
+                        conversation.clear();
+                        self.summary_cache
+                            .lock()
+                            .expect("summary cache lock poisoned")
+                            .invalidate();
+                        drop(conversation);
                         self.output_manager
                             .write_info("Conversation history cleared. Starting fresh.");
                         self.render_tui().await?;

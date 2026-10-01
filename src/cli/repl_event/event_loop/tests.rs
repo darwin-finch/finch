@@ -7326,12 +7326,215 @@ async fn assert_clear_command_resets_provider_context(command: &str) {
     );
 }
 
+struct SummaryRequestRecorder {
+    requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    request_ready: tokio::sync::Notify,
+}
+
+impl SummaryRequestRecorder {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            request_ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn request_containing_user_text(&self, expected: &str) -> Vec<crate::providers::Message> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = self
+                    .requests
+                    .lock()
+                    .expect("summary request recorder lock poisoned")
+                    .iter()
+                    .find(|request| {
+                        request.iter().any(|message| {
+                            message.role == "user" && message.text_content() == expected
+                        })
+                    })
+                    .cloned()
+                {
+                    return request;
+                }
+                self.request_ready.notified().await;
+            }
+        })
+        .await
+        .expect("the real LlmLoop must reach the generator request boundary")
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for SummaryRequestRecorder {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let is_summary_request = messages.iter().any(|message| {
+            message
+                .text_content()
+                .starts_with("Summarise the following conversation history concisely")
+        });
+        self.requests
+            .lock()
+            .expect("summary request recorder lock poisoned")
+            .push(messages);
+        self.request_ready.notify_waiters();
+        let text = if is_summary_request {
+            "fresh post-clear summary"
+        } else {
+            "(say \"fresh response\")"
+        };
+        Ok(crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "summary-request-recorder".to_string(),
+                model: "summary-request-recorder".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(4),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "summary-request-recorder"
+    }
+}
+
+fn summary_reuse_fixture(prefix: &str) -> Vec<crate::providers::Message> {
+    use crate::providers::Message;
+    vec![
+        Message::user(format!("{prefix} user zero")),
+        Message::assistant(format!("{prefix} assistant one")),
+        Message::user(format!("{prefix} user two")),
+        Message::assistant(format!("{prefix} assistant three")),
+        Message::user(format!("{prefix} user four")),
+        Message::assistant("shared boundary message"),
+    ]
+}
+
+async fn assert_clear_command_invalidates_committed_summary(command: &str) {
+    const STALE_SUMMARY: &str = "STALE SUMMARY FROM CLEARED CONVERSATION";
+    const FRESH_QUESTION: &str = "fresh question after summary reset";
+
+    let recorder = Arc::new(SummaryRequestRecorder::new());
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let patterns = tempfile::tempdir()
+        .expect("isolated summary-reset tool state")
+        .path()
+        .join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .expect("construct inert summary-reset tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.max_verbatim_messages = 4;
+    event_loop.enable_summarization = true;
+
+    let mut old_history = summary_reuse_fixture("old");
+    old_history.push(crate::providers::Message::user("old trailing message"));
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in old_history.iter().cloned() {
+            conversation.add_message(message);
+        }
+    }
+    let boundary = crate::cli::conversation_compactor::ConversationCompactor::boundary_fingerprint(
+        &old_history,
+        5,
+    );
+    crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    )
+    .commit_summary(5, boundary, STALE_SUMMARY.to_string());
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the clear alias must dispatch before the worker starts");
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in summary_reuse_fixture("new") {
+            conversation.add_message(message);
+        }
+    }
+
+    event_loop.start_llm_worker();
+    event_loop
+        .handle_user_input(FRESH_QUESTION.to_string())
+        .await
+        .expect("the post-clear question must dispatch through the real LlmLoop");
+    let provider_request = recorder.request_containing_user_text(FRESH_QUESTION).await;
+    let rendered_request = provider_request
+        .iter()
+        .map(crate::providers::Message::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered_request.contains(STALE_SUMMARY),
+        "{command} must invalidate committed summary bytes before a same-boundary history regrows; provider_request={provider_request:?}"
+    );
+    assert!(
+        rendered_request.contains("fresh post-clear summary"),
+        "the actual generator request must carry a newly assembled post-clear summary, proving the test traversed request assembly; provider_request={provider_request:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_clear_and_reset_commands_remove_committed_and_staged_provider_context() {
     tokio::task::LocalSet::new()
         .run_until(async {
             for command in ["/clear", "/reset"] {
                 assert_clear_command_resets_provider_context(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_commands_invalidate_summary_before_actual_generator_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_command_invalidates_committed_summary(command).await;
             }
         })
         .await;
@@ -7365,6 +7568,17 @@ async fn test_unrelated_help_command_preserves_provider_context_and_staged_round
                     )
                     .expect("the fixture must stage the provider-invisible tool round")
             };
+            let retained_messages = event_loop.conversation.read().await.get_messages();
+            let boundary =
+                crate::cli::conversation_compactor::ConversationCompactor::boundary_fingerprint(
+                    &retained_messages,
+                    1,
+                );
+            crate::cli::conversation_compactor::ConversationCompactor::new(
+                Arc::new(NeverCompletes),
+                Arc::clone(&event_loop.summary_cache),
+            )
+            .commit_summary(1, boundary, "retained summary bytes".to_string());
 
             event_loop
                 .handle_user_input("/help".to_string())
@@ -7391,6 +7605,17 @@ async fn test_unrelated_help_command_preserves_provider_context_and_staged_round
                     .expect("the unrelated command must preserve the staged round"),
                 ToolRoundProgress::Complete,
                 "the staged round must remain usable after an unrelated command"
+            );
+            let compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+                Arc::new(NeverCompletes),
+                Arc::clone(&event_loop.summary_cache),
+            );
+            assert_eq!(
+                compactor.plan_summary(&conversation.get_messages(), 1),
+                crate::cli::conversation_compactor::SummaryPlan::Reuse(
+                    "retained summary bytes".to_string()
+                ),
+                "an unrelated slash command must preserve the committed summary cache"
             );
         })
         .await;
