@@ -44,8 +44,11 @@ triggering training. Existing legacy training queues and adapters are left
 untouched.
 
 **Configured `type` values:** `claude`, `openai`, `grok`, `gemini`, `mistral`, `groq`, `ollama`,
-`remote_daemon`, and `local`. The legacy `chatgpt_subscription` value still deserializes only to
-produce migration guidance and is rejected before provider construction.
+`openai_compatible`, `remote_daemon`, and `local`. The old standalone
+`type = "chatgpt_subscription"` shape still deserializes only to produce
+migration guidance and is rejected before provider construction. Current
+ChatGPT subscription support is configured as `type = "credentialed"` with
+`provider = "chatgpt_subscription"`.
 
 **Backwards-compatible:** The removed legacy `[[teachers]]` format still loads (one private migration shim); saves write `[[providers]]` only.
 
@@ -105,6 +108,59 @@ issuer, audience, and account metadata, move the secret to the referenced
 store (for example an environment variable), then replace the old provider
 entry with `type = "credentialed"`. Ambiguous legacy named records fail with an
 actionable `finch setup` migration error.
+
+### Generic OpenAI-compatible endpoints
+
+A generic endpoint is an explicitly named profile, not an alias for OpenAI.
+Its model capabilities are operator assertions: omitted values remain unknown
+and therefore fail closed when a request needs them. Secrets stay in the named
+credential store.
+
+```toml
+[[credentials]]
+name = "ciru-key"
+kind = "api_key"
+provider = "openai_compatible"
+issuer = "openai-compatible"
+secret_ref = "env:CIRU_API_KEY"
+scopes = []
+
+[credentials.audience]
+family = "custom"
+endpoint = "https://dunamis.ciru.ai"
+
+[credentials.lifecycle]
+state = "active"
+refreshable = false
+
+[[providers]]
+type = "openai_compatible"
+name = "ciru"
+base_url = "https://dunamis.ciru.ai/v1"
+chat_path = "/chat/completions"
+models_path = "/models"
+model = "main"
+tool_choice = "auto"
+strict_tool_schemas = false
+
+[providers.credential]
+credential_ref = "ciru-key"
+required_scopes = []
+
+[providers.capabilities]
+streaming = true
+tools = true
+parallel_tool_calls = false
+image_input = false
+context_window_tokens = 262144
+max_output_tokens = 32768
+```
+
+The credential audience binds the secret to the normalized endpoint origin;
+cross-origin chat or model paths are rejected. `tool_choice = "auto"` and
+`strict_tool_schemas = false` are sent only when tools are present. The
+streaming path consumes OpenAI Chat Completions SSE and converts native tool
+call deltas through Finch's normal tool-binding validation.
 
 ## Post-edit diagnostics — `[diagnostics]` (issue #757)
 

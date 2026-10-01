@@ -1066,6 +1066,8 @@ pub struct OpenAIProvider {
     /// How this instance's model capabilities are attested. See
     /// [`ProviderProfile`].
     profile: ProviderProfile,
+    compatible_tool_choice_auto: bool,
+    compatible_strict_tool_schemas: Option<bool>,
 }
 
 /// Strategy this provider instance uses to answer `capabilities()` /
@@ -1104,6 +1106,9 @@ enum ProviderProfile {
     /// specific, with no attestation path at all, so capabilities are
     /// always `Unknown`.
     RemoteDaemon,
+    /// Operator-attested capabilities for one exact generic connection and
+    /// model. These never inherit a first-party provider identity.
+    Configured(ModelCapabilities),
 }
 
 /// One model's live capability attestation, fetched from Ollama's own
@@ -1308,7 +1313,40 @@ impl OpenAIProvider {
             canonical_openai_endpoint,
             auth_header: AuthHeader::Bearer,
             profile: ProviderProfile::Static,
+            compatible_tool_choice_auto: false,
+            compatible_strict_tool_schemas: None,
         })
+    }
+
+    /// Create a generic OpenAI Chat Completions provider whose capabilities
+    /// and request compatibility fields come from the exact named profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured_compatible(
+        api_key: String,
+        base_url: String,
+        chat_path: impl AsRef<str>,
+        models_path: impl AsRef<str>,
+        model: String,
+        provider_name: String,
+        capabilities: ModelCapabilities,
+        tool_choice_auto: bool,
+        strict_tool_schemas: Option<bool>,
+    ) -> Result<Self> {
+        if capabilities.provider != provider_name || capabilities.model != model {
+            anyhow::bail!("Configured compatible capability identity did not match provider/model");
+        }
+        let mut provider = Self::new(
+            api_key,
+            base_url,
+            chat_path.as_ref(),
+            models_path.as_ref(),
+            model,
+            provider_name,
+        )?;
+        provider.profile = ProviderProfile::Configured(capabilities);
+        provider.compatible_tool_choice_auto = tool_choice_auto;
+        provider.compatible_strict_tool_schemas = strict_tool_schemas;
+        Ok(provider)
     }
 
     /// OpenAI-compatible transport that sends the secret as a named header
@@ -1603,6 +1641,7 @@ impl OpenAIProvider {
                             name: bound.wire.name.clone(),
                             description: bound.description.clone(),
                             parameters: bound.wire_schema.clone(),
+                            strict: self.compatible_strict_tool_schemas,
                         },
                     })
                     .collect(),
@@ -1621,6 +1660,8 @@ impl OpenAIProvider {
             temperature: request.temperature,
             reasoning_effort: self.reasoning_effort.map(ReasoningEffort::as_str),
             tools,
+            tool_choice: (self.compatible_tool_choice_auto && !bindings.is_empty())
+                .then_some("auto"),
             stream: request.stream,
             stream_options: (request.stream
                 && rule == TransportRule::CanonicalGpt56ChatCompletions)
@@ -2320,6 +2361,13 @@ impl ProviderBackend for OpenAIProvider {
                 capabilities,
             } => self.ollama_model_capabilities(capability_endpoint, capabilities, model),
             ProviderProfile::RemoteDaemon => ModelCapabilities::unknown(self.name(), model),
+            ProviderProfile::Configured(capabilities) => {
+                if capabilities.model == model {
+                    capabilities.clone()
+                } else {
+                    ModelCapabilities::unknown(self.name(), model)
+                }
+            }
         }
     }
 
@@ -2339,6 +2387,10 @@ impl ProviderBackend for OpenAIProvider {
             } => (capability_endpoint.as_str(), capabilities),
             ProviderProfile::RemoteDaemon => {
                 // No attestation path at all (issue #925 scope was Ollama-only).
+                return;
+            }
+            ProviderProfile::Configured(_) => {
+                // Configuration is the explicit attestation boundary.
                 return;
             }
         };
@@ -2423,6 +2475,8 @@ struct OpenAIRequest {
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2515,6 +2569,8 @@ struct OpenAIFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4520,6 +4576,88 @@ mod tests {
             .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
             .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_streams_native_tool_calls_with_declared_wire_options() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_read\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer endpoint-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "main",
+                "stream": true,
+                "max_tokens": 32768,
+                "tool_choice": "auto",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "strict": false
+                    }
+                }]
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let capabilities = ModelCapabilities::configured_openai_compatible(
+            "ciru",
+            "main",
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(262_144),
+            Some(65_536),
+        );
+        let provider = OpenAIProvider::new_configured_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+            capabilities,
+            true,
+            Some(false),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![crate::Message::user("read the file")])
+            .with_max_tokens(32_768)
+            .with_tools(vec![crate::ToolDefinition {
+                name: "read".into(),
+                description: "read file".into(),
+                input_schema: crate::ToolInputSchema::simple(vec![("path", "path")]),
+            }]);
+        let mut rx = provider.dispatch_stream(&request).await.unwrap();
+        let mut completed = None;
+        while let Some(item) = rx.recv().await {
+            if let StreamChunk::ToolCallComplete { name, input, .. } = item.unwrap() {
+                completed = Some((name, input));
+            }
+        }
+        assert_eq!(
+            completed,
+            Some(("read".into(), serde_json::json!({"path": "README.md"})))
+        );
+        assert_eq!(provider.name(), "ciru");
+        assert_eq!(
+            provider.capabilities("main").tools.provenance,
+            CapabilityProvenance::Configuration
+        );
+        assert_eq!(
+            provider.capabilities("other").tools.support,
+            CapabilitySupport::Unknown
+        );
         mock.assert_async().await;
     }
 
