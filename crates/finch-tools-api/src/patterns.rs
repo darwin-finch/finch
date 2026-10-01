@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::permissions::{bash_command_is_constitutionally_denied, resolve_canonical_path};
+use crate::permissions::{bash_command_is_denylisted, resolve_canonical_path};
 use crate::signature::ToolSignature;
 
 /// Type of pattern matching to use
@@ -145,7 +145,7 @@ impl ToolPattern {
     /// options remain undecided). This is still a strict narrowing versus
     /// today's `bash:*`-shaped default: the resulting pattern only matches
     /// the observed program + subcommand + flag skeleton, never an
-    /// unrelated command, and the existing constitutional-denylist and
+    /// unrelated command, and the existing dangerous-input denylist and
     /// never-widen gates in [`ToolPattern::matches`] still apply to every
     /// match attempt regardless of pattern type.
     pub fn structured_from_bash_command(command: &str, description: String) -> Option<Self> {
@@ -543,14 +543,14 @@ impl PersistentPatternStore {
 /// A pattern must not admit anything the one-shot path would Deny or would
 /// AskUser solely because the path escaped the workspace.
 fn pattern_may_admit(signature: &ToolSignature) -> bool {
-    if signature.constitutionally_denied {
+    if signature.denylisted {
         return false;
     }
     if signature.path.is_some() && !signature.path_in_workspace {
         return false;
     }
     if let Some(command) = signature.full_command() {
-        if bash_command_is_constitutionally_denied(&command) {
+        if bash_command_is_denylisted(&command) {
             return false;
         }
     }
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_does_not_admit_constitutionally_denied_bash() {
+    fn test_pattern_does_not_admit_denylisted_bash() {
         let pattern = ToolPattern::new(
             "*".to_string(),
             "bash".to_string(),
@@ -1492,12 +1492,12 @@ mod tests {
             command: Some("rm".to_string()),
             args: Some("-rf /".to_string()),
             directory: Some("/project".to_string()),
-            constitutionally_denied: true,
+            denylisted: true,
             ..Default::default()
         };
         assert!(
             !pattern.matches(&denied),
-            "invariant: a pattern must not admit a constitutionally Denied bash command"
+            "invariant: a pattern must not admit a denylisted bash command"
         );
     }
 
@@ -1667,10 +1667,10 @@ mod tests {
     }
 
     #[test]
-    fn test_structured_from_bash_command_never_admits_a_constitutionally_denied_match() {
+    fn test_structured_from_bash_command_never_admits_a_denylisted_match() {
         // Even a Structured pattern goes through the same never-widen gate
-        // as Wildcard: `pattern_may_admit` still refuses a constitutionally
-        // Denied bash command at match time, regardless of pattern type.
+        // as Wildcard: `pattern_may_admit` still refuses a denylisted bash
+        // command at match time, regardless of pattern type.
         let pattern = ToolPattern::structured_from_bash_command(
             "gh issue create --repo owner/repo --title x --body y",
             "test".to_string(),
@@ -1681,13 +1681,12 @@ mod tests {
             context_key: "irrelevant".to_string(),
             command: Some("gh".to_string()),
             args: Some("issue create --repo owner/repo --title x --body y".to_string()),
-            constitutionally_denied: true,
+            denylisted: true,
             ..Default::default()
         };
         assert!(
             !pattern.matches(&denied_sig),
-            "invariant: Structured patterns must not admit a constitutionally \
-             Denied command either"
+            "invariant: Structured patterns must not admit a denylisted command either"
         );
     }
 }

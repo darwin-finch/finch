@@ -141,7 +141,7 @@ provenance, cache format, and stale-result semantics remain owned by that capsul
 the optional application-specific local disambiguation port stay here; they must not enter
 `source_index` or depend on MemTree.
 
-**Permissions are authority.** Peer and constitutional rules — defined in the
+**Permissions are authority.** Peer rules and the dangerous-input denylist — defined in the
 `finch-tools-api` crate, re-exported here — are invariants, not defaults to relax. Facade changes
 must not alter allowlist behavior: `is_readonly_bash()` still rejects shell operators, peers still
 cannot restart or spawn, and write/edit/patch still surface as AskUser. See the root [Security invariant](../../CLAUDE.md#security). The peer
@@ -213,7 +213,7 @@ sandbox/`is_readonly_bash`-fragment options remain undecided). It is still a
 strict narrowing versus today's default — the pattern only matches the
 observed program + subcommand + flag skeleton, never an unrelated command —
 and every match, Structured or Wildcard, still passes through
-`pattern_may_admit`'s constitutional-denylist and never-widen gates.
+`pattern_may_admit`'s dangerous-input denylist and never-widen gates.
 `test_structured_from_bash_command_captures_flag_skeleton`,
 `test_structured_from_bash_command_falls_back_on_bare_positional_args`, and
 `test_structured_from_bash_command_short_flag_never_absorbs_a_value` in

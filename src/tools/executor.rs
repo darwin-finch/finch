@@ -4,7 +4,7 @@
 
 use crate::cli::ReplModeState;
 use crate::tools::permissions::{
-    bash_command_is_constitutionally_denied, path_argument_for_tool, raw_path_escapes_workspace,
+    bash_command_is_denylisted, path_argument_for_tool, raw_path_escapes_workspace,
     resolve_workspace_root, PermissionCheck, PermissionManager,
 };
 use crate::tools::types::{EffectAuditAuthority, ToolResult, ToolUse};
@@ -110,7 +110,7 @@ impl ToolConfirmationCache {
 
     /// Check if a signature is approved, returning the approval source
     pub fn is_approved(&mut self, sig: &ToolSignature) -> ApprovalSource {
-        if sig.constitutionally_denied {
+        if sig.denylisted {
             return ApprovalSource::NotApproved;
         }
 
@@ -704,7 +704,7 @@ fn signature(
     directory: Option<String>,
     path: Option<String>,
     path_in_workspace: bool,
-    constitutionally_denied: bool,
+    denylisted: bool,
 ) -> ToolSignature {
     ToolSignature {
         tool_name: tool_name.into(),
@@ -714,7 +714,7 @@ fn signature(
         directory,
         path,
         path_in_workspace,
-        constitutionally_denied,
+        denylisted,
     }
 }
 
@@ -753,7 +753,7 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
                 directory,
                 None,
                 true,
-                bash_command_is_constitutionally_denied(command),
+                bash_command_is_denylisted(command),
             )
         }
         "read" => signature(
@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_constitutional_bash_is_not_pattern_admissible() {
+    fn test_denylisted_bash_is_not_pattern_admissible() {
         let (workspace, root) = isolated_workspace();
         let mut executor = create_test_executor(true, false);
         executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
@@ -1804,14 +1804,11 @@ mod tests {
         ));
         let denied = ToolUse::new("bash".to_string(), json!({"command": "rm -rf /"}));
         let sig = generate_tool_signature(&denied, &root);
-        assert!(
-            sig.constitutionally_denied,
-            "invariant: rm -rf is constitutionally denied"
-        );
+        assert!(sig.denylisted, "invariant: rm -rf is denylisted");
         assert_eq!(
             executor.is_approved(&sig),
             ApprovalSource::NotApproved,
-            "invariant: a pattern must not admit a constitutionally Denied bash command; \
+            "invariant: a pattern must not admit a denylisted bash command; \
              got {:?}",
             executor.is_approved(&sig)
         );

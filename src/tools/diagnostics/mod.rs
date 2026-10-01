@@ -8,7 +8,7 @@
 //
 // Authority: the declared command is evaluated through the *existing bash
 // approval path* — `PermissionManager::check_tool_use("bash", …)` — so
-// constitutional denials, patterns, and peer asymmetry apply unchanged, and
+// built-in denylist rules, patterns, and peer asymmetry apply unchanged, and
 // its worst-case authority is bash's own ExternalWrite. No new authority
 // declaration and no new registered tool exist for this feature.
 //
@@ -32,7 +32,7 @@ enum CheckVerdict {
     /// Not executed: the bash path asks the user (peer role, or an owner
     /// session whose bash policy has not allowed this command).
     Skipped(String),
-    /// Never executed: the bash path denied (tool disabled, constitutional
+    /// Never executed: the bash path denied (tool disabled, denylisted
     /// constraint, or configured deny).
     Denied(String),
 }
@@ -124,7 +124,7 @@ impl DiagnosticsService {
     }
 
     /// The verdict the *existing bash approval path* returns for the declared
-    /// command. Constitutional denials, patterns, and peer asymmetry all come
+    /// command. Built-in denylist rules, patterns, and peer asymmetry all come
     /// from that single path; nothing here widens it.
     fn verdict_for(command: &str, permissions: &PermissionManager) -> CheckVerdict {
         let input = serde_json::json!({ "command": command });
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_constitutionally_denied_check_command_is_never_executed() {
+    async fn test_denylisted_check_command_is_never_executed() {
         let dir = tempfile::tempdir().expect("fixture dir");
         let script = write_script(dir.path(), "check.sh", "touch marker; echo ran\n");
         let marker = dir.path().join("marker");
@@ -744,11 +744,11 @@ mod tests {
 
         assert!(
             annotation.contains("refused:"),
-            "a constitutionally denied declaration must read as a refusal:\n{annotation}"
+            "a denylisted declaration must read as a refusal:\n{annotation}"
         );
         assert!(
             !marker.exists(),
-            "a constitutionally denied command must never execute, even though \
+            "a denylisted command must never execute, even though \
              the user declared it"
         );
     }

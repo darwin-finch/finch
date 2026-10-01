@@ -48,14 +48,13 @@ pub(super) fn config_from_setup_result(result: &SetupResult) -> crate::config::C
 pub(super) fn config_from_setup_result_with_paths(
     result: &SetupResult,
     metrics_dir: std::path::PathBuf,
-    constitution_path: Option<std::path::PathBuf>,
 ) -> crate::config::Config {
     use crate::config::Config;
 
     let providers = result.providers.clone();
     apply_setup_result_to_config(
         result,
-        Config::with_providers_and_paths(providers, metrics_dir, constitution_path)
+        Config::with_providers_and_paths(providers, metrics_dir)
             .with_credentials(result.credentials.clone()),
     )
 }

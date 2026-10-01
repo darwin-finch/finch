@@ -5543,7 +5543,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
 /// The persistent variant is routed by the caller (`tool_execution.rs`) through
 /// `approve_pattern_persistent` + `save_patterns()`, the same disk-backed store
 /// the pattern-matching security gates (workspace containment, never-widen,
-/// constitutional denylist) check at match time. File-mutating tools arrive
+/// dangerous-input denylist) check at match time. File-mutating tools arrive
 /// with the "Edit in $EDITOR" index already shifted out by the call sites.
 ///
 /// The minted pattern itself comes from [`approval_pattern_for_dialog`]: for

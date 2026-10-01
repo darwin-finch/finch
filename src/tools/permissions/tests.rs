@@ -359,7 +359,7 @@ fn session_local_tools_skip_host_effect_confirmation_at_approval_boundary() {
                 PermissionCheck::Deny(_)
             ),
             "invariant: PermissionManager must not Deny '{name}'; \
-                 constitutional constraints still apply to bash/read/web_fetch \
+                 the dangerous-input denylist still applies to bash/read/web_fetch \
                  only (got {:?})",
             owner.check_tool_use(name, &serde_json::json!({}))
         );
@@ -386,6 +386,6 @@ fn session_local_tools_skip_host_effect_confirmation_at_approval_boundary() {
             owner.check_tool_use("bash", &serde_json::json!({"command": "rm -rf /"})),
             PermissionCheck::Deny(_)
         ),
-        "invariant: constitutional constraints still deny dangerous bash"
+        "invariant: the dangerous-input denylist still denies dangerous bash"
     );
 }
