@@ -1750,7 +1750,11 @@ fn test_device_code_overlay_claims_a_card_with_chrome_inside_it() {
 fn test_known_models_for_returns_list_for_all_providers() {
     for (id, _, default_model, _) in CLOUD_PROVIDERS {
         let models = known_models_for(id);
-        assert!(!models.is_empty(), "provider '{}' has no known models", id);
+        assert!(
+            *id == "openai-compatible" || !models.is_empty(),
+            "provider '{}' has no known models",
+            id
+        );
         // Discovery-capable providers intentionally start blank so the
         // wizard cannot silently select a stale compile-time identifier.
         assert!(
@@ -1759,6 +1763,552 @@ fn test_known_models_for_returns_list_for_all_providers() {
             id,
             default_model,
             models
+        );
+    }
+}
+
+#[test]
+fn generic_openai_compatible_is_visible_and_opens_its_dedicated_editor() {
+    let compatible_idx = CLOUD_PROVIDERS
+        .iter()
+        .position(|(id, ..)| *id == "openai-compatible")
+        .expect("generic compatible provider must be present in the setup registry");
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: compatible_idx,
+    });
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureCompatibleConnection {
+                editing_idx: None,
+                ..
+            })
+        ),
+        "selecting Generic OpenAI-compatible must open its endpoint/credential editor; step={:?}",
+        get_step(&state)
+    );
+    let rendered = render_wizard_text_at(&state, 120, 35);
+    assert!(
+        rendered.contains("Generic OpenAI-compatible")
+            || rendered.contains("Compatible Connection")
+    );
+    assert!(rendered.contains("Protocol compatibility does not attest"));
+    assert!(!rendered.contains("sk-live"));
+}
+
+fn compatible_test_profile(name: &str, credential_ref: &str, base_url: &str) -> ProviderEntry {
+    ProviderEntry::OpenAiCompatible {
+        name: name.into(),
+        base_url: base_url.into(),
+        chat_path: Some("/chat/completions".into()),
+        models_path: Some("/models".into()),
+        model: "main".into(),
+        credential: crate::config::CredentialBinding {
+            credential_ref: credential_ref.into(),
+            audience: None,
+            tenant: None,
+            project: None,
+            account: None,
+            required_scopes: Default::default(),
+        },
+        capabilities: Default::default(),
+        tool_choice: Default::default(),
+        strict_tool_schemas: None,
+    }
+}
+
+fn compatible_test_credential(
+    name: &str,
+    secret_env: &str,
+    base_url: &str,
+) -> crate::config::ProviderCredential {
+    crate::config::ProviderCredential {
+        name: name.into(),
+        kind: crate::config::CredentialKind::ApiKey,
+        provider: crate::config::CredentialProvider::OpenaiCompatible,
+        issuer: "openai-compatible".into(),
+        audience: crate::config::required_audience(
+            crate::config::CredentialProvider::OpenaiCompatible,
+            Some(base_url),
+        )
+        .unwrap(),
+        tenant: None,
+        project: None,
+        account: None,
+        scopes: Default::default(),
+        secret_ref: format!("env:{secret_env}"),
+        lifecycle: Default::default(),
+        revocation: Default::default(),
+    }
+}
+
+#[test]
+fn compatible_wizard_apply_reload_and_factory_resolution_preserve_attested_profile() {
+    struct FixtureResolver;
+    impl crate::config::CredentialResolver for FixtureResolver {
+        fn resolve(
+            &self,
+            credential: &crate::config::ProviderCredential,
+        ) -> Result<crate::config::ResolvedCredential> {
+            Ok(crate::config::ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: crate::config::ResolvedSecret::new("fixture-secret")?,
+            })
+        }
+    }
+
+    let mut state = state_with_step(AddProviderStep::ConfigureCompatibleConnection {
+        draft: OpenAiCompatibleDraft {
+            name: "ciru".into(),
+            base_url: "https://dunamis.ciru.ai/v1".into(),
+            chat_path: "/chat/completions".into(),
+            models_path: "/models".into(),
+            model: "main".into(),
+            credential_ref: "ciru-key".into(),
+            secret_env: "CIRU_API_KEY".into(),
+            credential_kind: crate::config::CredentialKind::Bearer,
+            streaming: Some(true),
+            tools: Some(true),
+            parallel_tool_calls: Some(false),
+            image_input: Some(false),
+            context_window_tokens: "262144".into(),
+            max_output_tokens: "32768".into(),
+            tool_choice: crate::config::OpenAiCompatibleToolChoice::Auto,
+            strict_tool_schemas: Some(false),
+            original_profile: None,
+            original_credential: None,
+        },
+        focused_field: 0,
+        editing_idx: None,
+    });
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+    ));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(get_step(&state).is_none());
+
+    let result = build_setup_result(&state).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let metrics_dir = directory.path().join("metrics");
+    let config = config_from_setup_result_with_paths(&result, metrics_dir.clone());
+    config.save_to(&config_path).unwrap();
+    let serialized = std::fs::read_to_string(&config_path).unwrap();
+    assert!(serialized.contains("secret_ref = \"env:CIRU_API_KEY\""));
+    assert!(!serialized.contains("fixture-secret"));
+
+    let loaded = crate::config::load_config_from_path_with_paths(&config_path, metrics_dir)
+        .expect("wizard output must reload through the production config loader");
+    let ProviderEntry::OpenAiCompatible {
+        name,
+        model,
+        capabilities,
+        tool_choice,
+        strict_tool_schemas,
+        ..
+    } = &loaded.providers[0]
+    else {
+        panic!(
+            "wizard must persist a generic compatible provider: {:?}",
+            loaded.providers
+        );
+    };
+    assert_eq!(name, "ciru");
+    assert_eq!(model, "main");
+    assert_eq!(capabilities.streaming, Some(true));
+    assert_eq!(capabilities.tools, Some(true));
+    assert_eq!(capabilities.context_window_tokens, Some(262_144));
+    assert_eq!(capabilities.max_output_tokens, Some(32_768));
+    assert_eq!(
+        *tool_choice,
+        crate::config::OpenAiCompatibleToolChoice::Auto
+    );
+    assert_eq!(*strict_tool_schemas, Some(false));
+
+    let provider = crate::providers::create_provider_profile_from_config_with_resolver(
+        &loaded,
+        "ciru",
+        &FixtureResolver,
+    )
+    .expect("wizard profile must resolve through the production provider factory");
+    assert_eq!(provider.name(), "ciru");
+    assert!(provider.supports_streaming());
+    assert!(provider.supports_tools());
+    let resolved_capabilities = provider.capabilities("main");
+    assert_eq!(
+        resolved_capabilities.streaming.provenance,
+        crate::providers::CapabilityProvenance::Configuration
+    );
+    assert_eq!(
+        resolved_capabilities.tools.provenance,
+        crate::providers::CapabilityProvenance::Configuration
+    );
+    assert_eq!(
+        resolved_capabilities.context_window.provenance,
+        crate::providers::CapabilityProvenance::Configuration
+    );
+    assert_eq!(
+        resolved_capabilities.output_token_limit.provenance,
+        crate::providers::CapabilityProvenance::Configuration
+    );
+
+    let mut reopened = WizardState::new(Some(&loaded));
+    let Some(ModelConfig::Remote { persisted, .. }) = get_primary(&reopened) else {
+        panic!("reopened wizard must retain the compatible provider row");
+    };
+    assert!(matches!(
+        persisted,
+        Some(ProviderEntry::OpenAiCompatible { .. })
+    ));
+    handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+    let Some(AddProviderStep::ConfigureCompatibleConnection { draft, .. }) = get_step(&reopened)
+    else {
+        panic!("editing a compatible row must reopen its dedicated editor");
+    };
+    assert_eq!(draft.base_url, "https://dunamis.ciru.ai/v1");
+    assert_eq!(draft.secret_env, "CIRU_API_KEY");
+    assert_eq!(draft.streaming, Some(true));
+    assert_eq!(draft.strict_tool_schemas, Some(false));
+    handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+    let reopened_result = build_setup_result(&reopened).unwrap();
+    assert_eq!(reopened_result.providers, loaded.providers);
+    assert_eq!(reopened_result.credentials, loaded.credentials());
+}
+
+#[test]
+fn compatible_wizard_no_change_edit_preserves_restricted_credential_metadata() {
+    let base_url = "https://compatible.example/v1";
+    let mut profile = compatible_test_profile("restricted", "restricted-key", base_url);
+    let mut credential = compatible_test_credential("restricted-key", "RESTRICTED_KEY", base_url);
+    let audience = credential.audience.clone();
+    let scopes: std::collections::BTreeSet<String> =
+        ["models.read".to_string(), "tools.invoke".to_string()]
+            .into_iter()
+            .collect();
+    if let ProviderEntry::OpenAiCompatible {
+        credential: binding,
+        ..
+    } = &mut profile
+    {
+        binding.audience = Some(audience);
+        binding.tenant = Some("tenant-a".into());
+        binding.project = Some("project-a".into());
+        binding.account = Some("account-a".into());
+        binding.required_scopes = scopes.clone();
+    }
+    credential.tenant = Some("tenant-a".into());
+    credential.project = Some("project-a".into());
+    credential.account = Some("account-a".into());
+    credential.scopes = scopes;
+    credential.lifecycle = crate::config::CredentialLifecycle::Active {
+        expires_at: Some("2099-01-01T00:00:00Z".parse().unwrap()),
+        refreshable: true,
+    };
+    let config = crate::config::Config::with_providers(vec![profile.clone()])
+        .with_credentials(vec![credential.clone()]);
+    config.validate().unwrap();
+    let mut state = WizardState::new(Some(&config));
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    let result = build_setup_result(&state).unwrap();
+    assert_eq!(
+        result.providers,
+        vec![profile.clone()],
+        "a no-change wizard edit must preserve every profile-side credential constraint"
+    );
+    assert_eq!(
+        result.credentials,
+        vec![credential.clone()],
+        "a no-change wizard edit must preserve account, scopes, lifecycle, and revocation state"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let metrics_dir = directory.path().join("metrics");
+    config_from_setup_result_with_paths(&result, metrics_dir.clone())
+        .save_to(&config_path)
+        .unwrap();
+    let reloaded = crate::config::load_config_from_path_with_paths(&config_path, metrics_dir)
+        .expect("restricted compatible metadata must survive production save and reload");
+    assert_eq!(reloaded.providers, vec![profile]);
+    assert_eq!(reloaded.credentials(), &[credential]);
+}
+
+#[test]
+fn compatible_wizard_rejects_contradictory_tool_attestations_without_committing() {
+    let draft = OpenAiCompatibleDraft {
+        name: "hostile".into(),
+        base_url: "https://compatible.example/v1".into(),
+        model: "main".into(),
+        credential_ref: "hostile-key".into(),
+        secret_env: "HOSTILE_KEY".into(),
+        tools: Some(false),
+        tool_choice: crate::config::OpenAiCompatibleToolChoice::Auto,
+        ..OpenAiCompatibleDraft::default()
+    };
+    let mut state = state_with_step(AddProviderStep::ConfigureCompatibleCapabilities {
+        draft,
+        focused_field: 0,
+        editing_idx: None,
+    });
+    state.current_section = WizardSection::Models;
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+    ));
+    let rendered = render_wizard_text_at(&state, 120, 35);
+    assert!(
+        rendered.contains("tools unsupported") || rendered.contains("tool request fields"),
+        "the wizard must explain the contradictory tool contract; rendered:\n{rendered}"
+    );
+}
+
+#[test]
+fn compatible_wizard_does_not_replace_a_same_named_foreign_credential() {
+    let draft = OpenAiCompatibleDraft {
+        name: "ciru".into(),
+        base_url: "https://dunamis.ciru.ai/v1".into(),
+        model: "main".into(),
+        credential_ref: "shared-key".into(),
+        secret_env: "CIRU_API_KEY".into(),
+        ..OpenAiCompatibleDraft::default()
+    };
+    let mut state = state_with_step(AddProviderStep::ConfigureCompatibleCapabilities {
+        draft,
+        focused_field: 0,
+        editing_idx: None,
+    });
+    state.current_section = WizardSection::Models;
+    state.credentials = vec![crate::config::ProviderCredential {
+        name: "shared-key".into(),
+        kind: crate::config::CredentialKind::ApiKey,
+        provider: crate::config::CredentialProvider::OpenaiPlatform,
+        issuer: "openai-platform".into(),
+        audience: crate::config::AudienceBinding::standard(
+            crate::config::EndpointFamily::OpenaiPlatform,
+        ),
+        tenant: None,
+        project: None,
+        account: None,
+        scopes: Default::default(),
+        secret_ref: "env:OPENAI_API_KEY".into(),
+        lifecycle: Default::default(),
+        revocation: Default::default(),
+    }];
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+    ));
+    assert_eq!(
+        state.credentials[0].provider,
+        crate::config::CredentialProvider::OpenaiPlatform,
+        "a compatible-provider save must not replace a credential owned by another provider namespace"
+    );
+    let rendered = render_wizard_text_at(&state, 120, 35);
+    assert!(
+        rendered.contains("already in use by provider namespace 'openai_platform'"),
+        "the wizard must identify the credential collision and its owning namespace; rendered:\n{rendered}"
+    );
+}
+
+#[test]
+fn compatible_wizard_rejects_an_occupied_same_namespace_credential_name() {
+    let mut state = state_with_step(AddProviderStep::ConfigureCompatibleCapabilities {
+        draft: OpenAiCompatibleDraft {
+            name: "new-profile".into(),
+            base_url: "https://compatible.example/v1".into(),
+            model: "main".into(),
+            credential_ref: "occupied-key".into(),
+            secret_env: "NEW_SECRET".into(),
+            ..OpenAiCompatibleDraft::default()
+        },
+        focused_field: 0,
+        editing_idx: None,
+    });
+    state.current_section = WizardSection::Models;
+    let occupied = compatible_test_credential(
+        "occupied-key",
+        "EXISTING_SECRET",
+        "https://compatible.example/v1",
+    );
+    state.credentials = vec![occupied.clone()];
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+    ));
+    assert_eq!(state.credentials, vec![occupied]);
+    let rendered = render_wizard_text_at(&state, 120, 35);
+    assert!(
+        rendered.contains("already in use by provider namespace 'openai_compatible'"),
+        "same-namespace name occupancy must be treated as an ownership collision; rendered:\n{rendered}"
+    );
+}
+
+#[test]
+fn compatible_wizard_rejects_mutating_a_credential_shared_by_two_profiles() {
+    let base_url = "https://compatible.example/v1";
+    let credential = compatible_test_credential("shared-key", "SHARED_SECRET", base_url);
+    let config = crate::config::Config::with_providers(vec![
+        compatible_test_profile("primary-compatible", "shared-key", base_url),
+        compatible_test_profile("tool-compatible", "shared-key", base_url),
+    ])
+    .with_credentials(vec![credential.clone()]);
+    config.validate().unwrap();
+    let mut state = WizardState::new(Some(&config));
+    state.current_section = WizardSection::Models;
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let Some(AddProviderStep::ConfigureCompatibleConnection { draft, .. }) = state
+        .sections
+        .get_mut(&WizardSection::Models)
+        .and_then(|section| {
+            if let SectionState::Models {
+                adding_provider, ..
+            } = section
+            {
+                adding_provider.as_mut()
+            } else {
+                None
+            }
+        })
+    else {
+        panic!("editing a compatible profile must open the connection editor");
+    };
+    draft.secret_env = "REPLACEMENT_SECRET".into();
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+    ));
+    assert_eq!(
+        state.credentials,
+        vec![credential],
+        "editing one profile must not replace a credential still referenced by another profile"
+    );
+    let rendered = render_wizard_text_at(&state, 120, 35);
+    assert!(
+        rendered.contains("shared by 2 compatible profiles"),
+        "the shared-dependent rejection must explain how to proceed; rendered:\n{rendered}"
+    );
+}
+
+#[test]
+fn compatible_connection_editor_rejects_invalid_endpoint_and_environment_inputs() {
+    let cases = [
+        (
+            "scheme",
+            "ftp://compatible.example/v1",
+            "/chat/completions",
+            "COMPATIBLE_KEY",
+            "endpoint",
+        ),
+        (
+            "cross-origin path",
+            "https://compatible.example/v1",
+            "https://attacker.example/chat/completions",
+            "COMPATIBLE_KEY",
+            "endpoint",
+        ),
+        (
+            "environment name",
+            "https://compatible.example/v1",
+            "/chat/completions",
+            "not-a-valid-env-name",
+            "requires",
+        ),
+    ];
+    for (case, base_url, chat_path, secret_env, diagnostic) in cases {
+        let mut state = state_with_step(AddProviderStep::ConfigureCompatibleConnection {
+            draft: OpenAiCompatibleDraft {
+                name: "compatible".into(),
+                base_url: base_url.into(),
+                chat_path: chat_path.into(),
+                model: "main".into(),
+                credential_ref: "compatible-key".into(),
+                secret_env: secret_env.into(),
+                ..OpenAiCompatibleDraft::default()
+            },
+            focused_field: 0,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::ConfigureCompatibleConnection { .. })
+            ),
+            "invalid {case} must remain in the connection editor; step={:?}",
+            get_step(&state)
+        );
+        let rendered = render_wizard_text_at(&state, 120, 35);
+        assert!(
+            rendered.to_ascii_lowercase().contains(diagnostic),
+            "invalid {case} must produce an actionable diagnostic; rendered:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn compatible_capability_editor_rejects_invalid_token_limits() {
+    let cases = [
+        ("zero", "0", "", "positive"),
+        ("overflow", "4294967296", "", "whole number"),
+        ("output above context", "10", "11", "context"),
+    ];
+    for (case, context_tokens, output_tokens, diagnostic) in cases {
+        let mut state = state_with_step(AddProviderStep::ConfigureCompatibleCapabilities {
+            draft: OpenAiCompatibleDraft {
+                name: "compatible".into(),
+                base_url: "https://compatible.example/v1".into(),
+                model: "main".into(),
+                credential_ref: "compatible-key".into(),
+                secret_env: "COMPATIBLE_KEY".into(),
+                context_window_tokens: context_tokens.into(),
+                max_output_tokens: output_tokens.into(),
+                ..OpenAiCompatibleDraft::default()
+            },
+            focused_field: 0,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::ConfigureCompatibleCapabilities { .. })
+            ),
+            "invalid {case} token limits must remain in the capability editor; step={:?}",
+            get_step(&state)
+        );
+        let rendered = render_wizard_text_at(&state, 120, 35);
+        assert!(
+            rendered.to_ascii_lowercase().contains(diagnostic),
+            "invalid {case} token limits must produce an actionable diagnostic; rendered:\n{rendered}"
         );
     }
 }
@@ -5056,11 +5606,37 @@ fn test_provider_editor_identity_table_matches_catalog() {
 
     let mapped: std::collections::BTreeSet<_> =
         cases.into_iter().map(|(_, editor)| editor).collect();
-    let registered: std::collections::BTreeSet<_> =
-        CLOUD_PROVIDERS.iter().map(|(editor, ..)| *editor).collect();
+    let registered: std::collections::BTreeSet<_> = CLOUD_PROVIDERS
+        .iter()
+        .map(|(editor, ..)| *editor)
+        .filter(|editor| *editor != "openai-compatible")
+        .collect();
     assert_eq!(
         mapped, registered,
         "every registered cloud editor must have exactly one credentialed-provider identity mapping"
+    );
+    let compatible = ProviderEntry::OpenAiCompatible {
+        name: "compatible".into(),
+        base_url: "https://compatible.example/v1".into(),
+        chat_path: Some("/chat/completions".into()),
+        models_path: Some("/models".into()),
+        model: "main".into(),
+        credential: crate::config::CredentialBinding {
+            credential_ref: "compatible-key".into(),
+            audience: None,
+            tenant: None,
+            project: None,
+            account: None,
+            required_scopes: Default::default(),
+        },
+        capabilities: Default::default(),
+        tool_choice: Default::default(),
+        strict_tool_schemas: None,
+    };
+    assert_eq!(
+        registered_editor_id(&compatible),
+        Some("openai-compatible"),
+        "generic compatible profiles use their dedicated editor rather than a built-in credentialed-provider mapping"
     );
 }
 

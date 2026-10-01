@@ -22,6 +22,18 @@ pub(super) enum AddProviderStep {
         focused_field: usize,       // 0=Provider, 1=Name, 2=Model, 3=APIKey when present
         editing_idx: Option<usize>, // 0=primary, n=tool model index + 1
     },
+    /// Generic OpenAI-compatible connection identity and credential binding.
+    ConfigureCompatibleConnection {
+        draft: OpenAiCompatibleDraft,
+        focused_field: usize,
+        editing_idx: Option<usize>,
+    },
+    /// Explicit, operator-attested capabilities for a compatible connection.
+    ConfigureCompatibleCapabilities {
+        draft: OpenAiCompatibleDraft,
+        focused_field: usize,
+        editing_idx: Option<usize>,
+    },
     // Local model path — single dialog (backend, family, size, device on one screen)
     ConfigureLocal {
         inference_provider: InferenceProvider,
@@ -56,6 +68,55 @@ pub(super) enum AddProviderStep {
         outcome: DeviceAuthOutcome,
         cancel: tokio_util::sync::CancellationToken,
     },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OpenAiCompatibleDraft {
+    pub(super) name: String,
+    pub(super) base_url: String,
+    pub(super) chat_path: String,
+    pub(super) models_path: String,
+    pub(super) model: String,
+    pub(super) credential_ref: String,
+    pub(super) secret_env: String,
+    pub(super) credential_kind: crate::config::CredentialKind,
+    pub(super) streaming: Option<bool>,
+    pub(super) tools: Option<bool>,
+    pub(super) parallel_tool_calls: Option<bool>,
+    pub(super) image_input: Option<bool>,
+    pub(super) context_window_tokens: String,
+    pub(super) max_output_tokens: String,
+    pub(super) tool_choice: crate::config::OpenAiCompatibleToolChoice,
+    pub(super) strict_tool_schemas: Option<bool>,
+    /// Exact persisted records retained so a no-change edit cannot weaken
+    /// account, scope, audience, lifecycle, or revocation constraints.
+    pub(super) original_profile: Option<ProviderEntry>,
+    pub(super) original_credential: Option<crate::config::ProviderCredential>,
+}
+
+impl Default for OpenAiCompatibleDraft {
+    fn default() -> Self {
+        Self {
+            name: "compatible".into(),
+            base_url: String::new(),
+            chat_path: "/chat/completions".into(),
+            models_path: "/models".into(),
+            model: String::new(),
+            credential_ref: "compatible-key".into(),
+            secret_env: String::new(),
+            credential_kind: crate::config::CredentialKind::ApiKey,
+            streaming: None,
+            tools: None,
+            parallel_tool_calls: None,
+            image_input: None,
+            context_window_tokens: String::new(),
+            max_output_tokens: String::new(),
+            tool_choice: crate::config::OpenAiCompatibleToolChoice::Omit,
+            strict_tool_schemas: None,
+            original_profile: None,
+            original_credential: None,
+        }
+    }
 }
 
 /// Secret-free device sign-in details shown by the add-time dialog (#424).
@@ -99,6 +160,12 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     ),
     ("openai", "OpenAI API", "", "get key at platform.openai.com"),
     (
+        "openai-compatible",
+        "Generic OpenAI-compatible",
+        "",
+        "custom endpoint; capabilities must be explicitly attested",
+    ),
+    (
         "gemini",
         "Gemini (Google)",
         "gemini-2.5-flash",
@@ -137,6 +204,7 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
             ..
         }
         | ProviderEntry::Openai { .. } => Some("openai"),
+        ProviderEntry::OpenAiCompatible { .. } => Some("openai-compatible"),
         ProviderEntry::Credentialed {
             provider: crate::config::CredentialProvider::ChatgptSubscription,
             ..
@@ -184,7 +252,7 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
 pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
     !matches!(
         provider.to_ascii_lowercase().as_str(),
-        "chatgpt" | "grok-sub" | "ollama" | "finch"
+        "chatgpt" | "grok-sub" | "openai-compatible" | "ollama" | "finch"
     )
 }
 
@@ -518,6 +586,14 @@ impl ModelConfig {
 /// Convert a persisted provider profile into the wizard's editable model form.
 pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
+        ProviderEntry::OpenAiCompatible { name, model, .. } => Some(ModelConfig::Remote {
+            provider: "openai-compatible".to_string(),
+            name: name.clone(),
+            api_key: String::new(),
+            model: model.clone(),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
         ProviderEntry::Credentialed {
             provider: credential_provider,
             model,
@@ -724,6 +800,26 @@ pub(super) fn provider_entry_from_remote_model(
             models_path: models_path.clone(),
             name,
             reasoning_effort: *reasoning_effort,
+        },
+        Some(ProviderEntry::OpenAiCompatible {
+            base_url,
+            chat_path,
+            models_path,
+            credential,
+            capabilities,
+            tool_choice,
+            strict_tool_schemas,
+            ..
+        }) => ProviderEntry::OpenAiCompatible {
+            name: name.clone().unwrap_or_default(),
+            base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
+            model: model.unwrap_or_default(),
+            credential: credential.clone(),
+            capabilities: capabilities.clone(),
+            tool_choice: *tool_choice,
+            strict_tool_schemas: *strict_tool_schemas,
         },
         Some(ProviderEntry::Grok {
             base_url,
