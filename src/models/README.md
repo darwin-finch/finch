@@ -23,8 +23,9 @@ only the suffix; divergent, equal, or shortened prompts automatically fall back 
 This cache is in memory and lasts only for the daemon lifetime.
 
 Memory embeddings are outside this local chat-provider slice. The frontend memory selector,
-defaults, and automatic model download remain independently owned. Its current ONNX dependency
-does not make ONNX a daemon chat provider.
+defaults, and automatic model download remain independently owned. That path loads its fixed
+managed bge-small-en-v1.5 Q8_0 GGUF through llama.cpp and uses the hashed-n-gram fallback while
+the artifact is unavailable; the user-selected chat GGUF does not select the memory embedder.
 
 Two callers show the boundary:
 
