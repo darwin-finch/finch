@@ -1343,6 +1343,10 @@ impl OpenAIProvider {
             model,
             provider_name,
         )?;
+        // A configured compatible profile owns its wire contract explicitly.
+        // Its user-selected name and endpoint must not opt it into Finch's
+        // first-party OpenAI transport rules.
+        provider.canonical_openai_endpoint = false;
         provider.profile = ProviderProfile::Configured(capabilities);
         provider.compatible_tool_choice_auto = tool_choice_auto;
         provider.compatible_strict_tool_schemas = strict_tool_schemas;
@@ -3119,6 +3123,32 @@ mod tests {
         assert_eq!(
             custom.transport_rule("gpt-5.6-sol"),
             TransportRule::CompatibleChatCompletions
+        );
+        let configured = OpenAIProvider::new_configured_compatible(
+            "key".into(),
+            "https://api.openai.com".into(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-5.6-sol".into(),
+            "openai".into(),
+            ModelCapabilities::configured_openai_compatible(
+                "openai",
+                "gpt-5.6-sol",
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(128_000),
+                Some(8_192),
+            ),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.transport_rule("gpt-5.6-sol"),
+            TransportRule::CompatibleChatCompletions,
+            "a generic configured profile must not inherit first-party transport identity from its display name and endpoint"
         );
         assert_eq!(
             canonical.capabilities("gpt-5.6-sol").wire_protocol.protocol,
