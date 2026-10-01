@@ -18,8 +18,10 @@ When the live TUI blits, `crates/finch-tui/src/view_model.rs` asks the message t
 calls `project_work_unit`; migrated messages answer the generalized `component_view` accessor
 instead, and the renderer hands that snapshot to `component_lines` together with a
 `ComponentStylePalette` built from the user's `ColorScheme` (stage 4). The renderer then builds its
-widget tree and claims frame rectangles using this crate's presentation vocabulary. Disclosure
-and focus remain renderer state; terminal painting stays in the TUI.
+widget tree and claims frame rectangles using this crate's presentation vocabulary.
+Component-owned toggle state stays in the message ViewModel while focus remains renderer state;
+terminal painting stays in the TUI. A completed say turn projects exactly one actionable content
+surface — output or exact source — under one stable identity.
 
 Stage 4 (#1141): component lines carry **styled spans** (`span.rs` — `Span`,
 `SpanStyle`, `SpanColor`) alongside their plain `text`; the spans concatenate

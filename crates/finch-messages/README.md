@@ -20,8 +20,9 @@ Two callers illustrate the boundary:
    `OperationMessage` (#1120), and `MemoryRecalledMessage` — answer the generalized
    `component_view` accessor instead, so the renderer never matches on the message type. Ordinary
    un-migrated messages supply formatted
-   lines. The renderer owns disclosure and painting, while the message's complete transcript
-   remains the canonical text for scrollback and copying.
+   lines. Migrated components own their toggle state, the renderer owns focus and painting, and
+   the message's complete transcript remains the canonical text for scrollback and copying. A
+   completed say turn swaps output and exact source in place under one stable action identity.
 
 The presentation snapshot vocabulary and pure projection live in
 [`finch-ui-model`](../finch-ui-model/AGENTS.md); this crate re-exports

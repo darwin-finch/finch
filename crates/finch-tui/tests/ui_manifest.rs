@@ -84,11 +84,11 @@ fn test_manifest_round_trips_serde() {
     );
 }
 
-/// The card id comes from the message uuid. Only the labelled program control
-/// carries semantic path `#1`; answer and source content are not action
-/// targets, matching terminal routing.
+/// The card id comes from the message uuid. The displayed output itself
+/// carries semantic path `#1`, matching terminal routing without a separate
+/// visible control node.
 #[test]
-fn test_say_card_labelled_control_is_the_only_action_target() {
+fn test_say_card_output_is_the_only_action_target() {
     let card = finch_tui::say_card_manifest(&say_view(false));
     assert_eq!(
         (card.element_type.as_str(), card.id.as_str()),
@@ -96,19 +96,10 @@ fn test_say_card_labelled_control_is_the_only_action_target() {
         "the card element type and message-uuid id are pinned; got {card:?}"
     );
     let output = &card.children[0];
-    let control = &card.children[1];
     assert_eq!(
         (output.element_type.as_str(), output.id.as_str()),
-        ("Output", ""),
-        "the answer is content, not an action target; got {output:?}"
-    );
-    assert_eq!(
-        (control.element_type.as_str(), control.id.as_str()),
-        (
-            "ProgramDisclosureControl",
-            format!("{GOLDEN_MESSAGE_ID}#1").as_str()
-        ),
-        "the explicit labelled control alone carries semantic path 1; got {control:?}"
+        ("Output", format!("{GOLDEN_MESSAGE_ID}#1").as_str()),
+        "the displayed answer itself carries semantic path 1; got {output:?}"
     );
     assert_eq!(
         output.props["lines"],
@@ -116,47 +107,43 @@ fn test_say_card_labelled_control_is_the_only_action_target() {
         "the answer child carries the VM output; output={output:?}"
     );
     assert_eq!(
-        (&control.props["label"], &control.props["expanded"]),
-        (
-            &serde_json::json!("Show program"),
-            &serde_json::json!(false)
-        ),
-        "the closed control exposes matching visible and structured state; control={control:?}"
+        output.props["actionLabel"],
+        serde_json::json!("Show program"),
+        "the actionable output exposes a truthful non-visible semantic label; output={output:?}"
     );
     assert_eq!(
         card.children.len(),
-        2,
-        "closed completed cards do not expose source content; card={card:?}"
+        1,
+        "closed completed cards contain only the displayed output target; card={card:?}"
     );
 }
 
 #[test]
-fn test_say_card_open_manifest_preserves_answer_and_adds_exact_source_beneath_control() {
+fn test_say_card_program_manifest_replaces_output_under_the_same_identity() {
     let card = finch_tui::say_card_manifest(&say_view(true));
     assert_eq!(
         card.children
             .iter()
             .map(|child| child.element_type.as_str())
             .collect::<Vec<_>>(),
-        vec!["Output", "ProgramDisclosureControl", "ProgramSource"],
-        "the open DOM order mirrors the terminal: answer, control, exact source"
+        vec!["ProgramSource"],
+        "the program state contains exact source only, with no answer or control sibling"
     );
-    let output = &card.children[0];
-    let control = &card.children[1];
-    let program = &card.children[2];
+    let program = &card.children[0];
     assert_eq!(
-        (&control.props["label"], &control.props["expanded"]),
-        (&serde_json::json!("Hide program"), &serde_json::json!(true)),
-        "the open control exposes its inverse label and expanded state; control={control:?}"
+        program.id,
+        format!("{GOLDEN_MESSAGE_ID}#1"),
+        "source replaces output under the same stable semantic identity"
+    );
+    assert_eq!(
+        program.props["actionLabel"],
+        serde_json::json!("Show output"),
+        "the displayed source exposes the truthful inverse action"
     );
     assert_eq!(
         program.props["lines"],
         serde_json::json!([r#"(say "Hi, Shammah!")"#]),
         "the exact VM source is additive beneath the control; program={program:?}"
-    );
-    assert!(
-        output.id.is_empty() && program.id.is_empty(),
-        "answer and source content remain non-actionable; output={output:?} program={program:?}"
     );
 }
 /// The committed TS types exist and carry the wire types (they regenerate on
@@ -192,7 +179,7 @@ fn test_committed_ts_types_carry_the_wire_types() {
     ))
     .expect("the barrel file is committed");
     assert!(
-        barrel.contains("FINCH_UI_MANIFEST_VERSION = 2"),
+        barrel.contains("FINCH_UI_MANIFEST_VERSION = 3"),
         "the barrel pins the contract version; got:\n{barrel}"
     );
 }

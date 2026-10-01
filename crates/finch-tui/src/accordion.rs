@@ -75,6 +75,14 @@ impl AccordionState {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn visible_order_count(&self, row: &RowId) -> usize {
+        self.visible_order
+            .iter()
+            .filter(|candidate| *candidate == row)
+            .count()
+    }
+
     pub fn is_expanded(&self, row: &TranscriptNode) -> bool {
         self.expanded
             .get(&row.id)
@@ -223,7 +231,9 @@ impl AccordionState {
         for rect in claimed {
             let top = rect.region.top as usize + row_offset;
             let rows = rect.region.bottom as usize - rect.region.top as usize + 1;
-            self.visible_order.push(rect.region.row_id.clone());
+            if !self.visible_order.contains(&rect.region.row_id) {
+                self.visible_order.push(rect.region.row_id.clone());
+            }
             if rect.component_owned {
                 // Migrated say-turn rows: no open-set entry, component routing
                 // instead (#882).
@@ -256,7 +266,9 @@ impl AccordionState {
         for line in lines {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
             if let Some(row_id) = &line.row_id {
-                self.visible_order.push(row_id.clone());
+                if !self.visible_order.contains(row_id) {
+                    self.visible_order.push(row_id.clone());
+                }
                 let region = TranscriptHitRegion {
                     row_id: row_id.clone(),
                     top: y as u16,
