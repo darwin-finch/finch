@@ -25,7 +25,9 @@ crates must not import daemon lifecycle or log policy.
 
 ## Invariants
 
-- Isolated Brain tests disable daemon discovery, reuse, and auto-spawn.
+- Isolated Brain tests disable daemon discovery, reuse, and auto-spawn except for the
+  authenticated supervised acquisition fixture. That fixture accepts only sealed supervisor
+  authority and keeps its explicit child in the supervisor-owned process group.
 - Detached children are the only processes that take over stdout/stderr via
   `DETACHED_DAEMON_ENV`.
 - The persistent log is size-bounded, owner-only, and never follows a symlink.

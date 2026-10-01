@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -14,6 +14,21 @@ use super::lifecycle::DaemonLifecycle;
 use crate::errors;
 
 use crate::config::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
+
+const SUPERVISED_ACQUISITION_ENV: &str = "FINCH_TEST_SUPERVISED_DAEMON_ACQUISITION";
+const SUPERVISED_BOUND_ADDRESS_ENV: &str = "FINCH_TEST_BOUND_ADDR_FILE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonLaunchMode {
+    Detached,
+    SupervisedTest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialProbeMode {
+    ReuseCompatible,
+    ColdSupervisedTest,
+}
 
 /// Ensure daemon is running, spawning if necessary
 ///
@@ -63,12 +78,17 @@ impl LocalDaemonAcquisition {
 
     /// Reuse a compatible daemon or launch the supplied Finch executable once.
     pub async fn acquire(&self) -> Result<()> {
-        ensure_daemon_access_allowed()?;
+        let launch_mode = daemon_launch_mode()?;
+        let probe_mode = match launch_mode {
+            DaemonLaunchMode::Detached => InitialProbeMode::ReuseCompatible,
+            DaemonLaunchMode::SupervisedTest => InitialProbeMode::ColdSupervisedTest,
+        };
         connect_or_spawn(
             &self.bind_address,
             &self.executable,
+            probe_mode,
             DaemonLifecycle::new,
-            spawn_daemon_from,
+            move |executable, bind| spawn_daemon_from(executable, bind, launch_mode),
         )
         .await
     }
@@ -84,17 +104,20 @@ impl LocalDaemonAcquisition {
     }
 }
 
-fn ensure_daemon_access_allowed() -> Result<()> {
+fn daemon_launch_mode() -> Result<DaemonLaunchMode> {
     let supervisor_marker = std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
         || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some()
         || std::env::var_os("FINCH_BRAIN_TEST_PROOF_BACKUP_FD").is_some();
     let no_auto_spawn = std::env::var("FINCH_BRAIN_TEST_NO_AUTO_SPAWN").as_deref() == Ok("1");
     if !supervisor_marker && !no_auto_spawn {
-        return Ok(());
+        return Ok(DaemonLaunchMode::Detached);
     }
     if supervisor_marker {
         crate::brain::isolated_test_proof()
             .context("invalid Brain test supervisor authority at daemon lifecycle gate")?;
+        if std::env::var(SUPERVISED_ACQUISITION_ENV).as_deref() == Ok("1") {
+            return Ok(DaemonLaunchMode::SupervisedTest);
+        }
     }
     anyhow::bail!(
         "daemon discovery, reuse, and auto-spawn are disabled by the Brain test supervisor"
@@ -112,24 +135,32 @@ pub(crate) const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// file instead of the developer's real one. #364, "Instrument and reduce
 /// Finch interactive TUI time-to-ready", is about what this function's phases
 /// say happened, so a test has to be able to run *this function*.
-async fn connect_or_spawn<F, S>(bind: &str, executable: &Path, lifecycle: F, spawn: S) -> Result<()>
+async fn connect_or_spawn<F, S>(
+    bind: &str,
+    executable: &Path,
+    initial_probe_mode: InitialProbeMode,
+    lifecycle: F,
+    spawn: S,
+) -> Result<()>
 where
     F: FnOnce() -> Result<DaemonLifecycle>,
     S: FnOnce(&Path, &str) -> Result<()>,
 {
     let base_url = format!("http://{}", bind);
 
-    // Quick health check first. HTTP 200 is not compatibility: a leftover
-    // daemon from another protocol generation must not be reused.
-    match probe_daemon_health(&base_url).await {
-        HealthProbe::Compatible => {
-            debug!("Daemon already running and healthy");
-            return Ok(());
+    if initial_probe_mode == InitialProbeMode::ReuseCompatible {
+        // Quick health check first. HTTP 200 is not compatibility: a leftover
+        // daemon from another protocol generation must not be reused.
+        match probe_daemon_health(&base_url).await {
+            HealthProbe::Compatible => {
+                debug!("Daemon already running and healthy");
+                return Ok(());
+            }
+            HealthProbe::Incompatible(mismatch) => {
+                return Err(mismatch.into_error());
+            }
+            HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
         }
-        HealthProbe::Incompatible(mismatch) => {
-            return Err(mismatch.into_error());
-        }
-        HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
     }
 
     // Serialize cold acquisition independently from the daemon's own
@@ -139,15 +170,17 @@ where
     // daemon while this caller waited.
     let lifecycle = lifecycle()?;
     let acquisition_lock = acquire_spawn_lock(&lifecycle).await?;
-    match probe_daemon_health(&base_url).await {
-        HealthProbe::Compatible => {
-            debug!("Daemon became healthy while waiting for acquisition lock");
-            return Ok(());
+    if initial_probe_mode == InitialProbeMode::ReuseCompatible {
+        match probe_daemon_health(&base_url).await {
+            HealthProbe::Compatible => {
+                debug!("Daemon became healthy while waiting for acquisition lock");
+                return Ok(());
+            }
+            HealthProbe::Incompatible(mismatch) => {
+                return Err(mismatch.into_error());
+            }
+            HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
         }
-        HealthProbe::Incompatible(mismatch) => {
-            return Err(mismatch.into_error());
-        }
-        HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
     }
 
     // Check PID file
@@ -317,13 +350,17 @@ fn repair_frontend_log_permissions(log_file: &std::fs::File, log_path: &std::pat
 /// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
-    ensure_daemon_access_allowed()?;
+    let launch_mode = daemon_launch_mode()?;
     let exe_path =
         std::env::current_exe().context("Failed to determine current executable path")?;
-    spawn_daemon_from(&exe_path, bind_address)
+    spawn_daemon_from(&exe_path, bind_address, launch_mode)
 }
 
-fn spawn_daemon_from(exe_path: &Path, bind_address: &str) -> Result<()> {
+fn spawn_daemon_from(
+    exe_path: &Path,
+    bind_address: &str,
+    launch_mode: DaemonLaunchMode,
+) -> Result<()> {
     let log_path = crate::daemon::daemon_log_path()?;
     let log_file = open_frontend_log(&log_path)?;
 
@@ -357,34 +394,40 @@ fn spawn_daemon_from(exe_path: &Path, bind_address: &str) -> Result<()> {
         //
         // The call runs in the pre-exec window, where only async-signal-safe
         // functions are legal; the new-session call is one. It must stay in
-        // the parent spawn path, which `ensure_daemon_access_allowed()` denies
-        // under test isolation. A daemon that started its own session from
-        // inside `run_daemon` would escape the test supervisor's process group
-        // and could not be reaped. See scripts/test_brain_isolation.sh.
+        // the parent spawn path. Under test isolation the authenticated,
+        // explicit acquisition fixture skips this call so its child remains
+        // in the supervisor's process group. A daemon that started its own
+        // session from inside `run_daemon` would escape that process group and
+        // could not be reaped. See scripts/test_brain_isolation.sh.
         //
         // Note: the escape-API allowlist in that script matches the bare
         // token, so the call below is the only place it may appear here.
         //
         // SAFETY: the closure calls one async-signal-safe libc function and
         // allocates nothing.
-        unsafe {
-            command.pre_exec(|| {
-                if nix::libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        if launch_mode == DaemonLaunchMode::Detached {
+            unsafe {
+                command.pre_exec(|| {
+                    if nix::libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            // Marks the child as the detached daemon. `run_daemon` binds its own
+            // stdout/stderr only when this is set, so the documented foreground
+            // modes (`finch daemon` in a terminal, `finch worker`, and the shipped
+            // systemd unit) keep writing to the terminal or the journal.
+            command.env(crate::daemon::DETACHED_DAEMON_ENV, "1");
         }
 
-        // Marks the child as the detached daemon. `run_daemon` binds its own
-        // stdout/stderr only when this is set, so the documented foreground
-        // modes (`finch daemon` in a terminal, `finch worker`, and the shipped
-        // systemd unit) keep writing to the terminal or the journal.
-        command.env(crate::daemon::DETACHED_DAEMON_ENV, "1");
-
-        command
+        let mut child = command
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
+        if launch_mode == DaemonLaunchMode::SupervisedTest {
+            wait_for_supervised_bind_publication(&mut child)?;
+        }
     }
 
     #[cfg(target_family = "windows")]
@@ -410,6 +453,28 @@ fn spawn_daemon_from(exe_path: &Path, bind_address: &str) -> Result<()> {
 
     debug!(log = %log_path.display(), "Daemon subprocess spawned, logs at {}", log_path.display());
     Ok(())
+}
+
+fn wait_for_supervised_bind_publication(child: &mut Child) -> Result<()> {
+    let address_file = std::env::var_os(SUPERVISED_BOUND_ADDRESS_ENV)
+        .map(PathBuf::from)
+        .context("supervised daemon acquisition requires a bound-address publication file")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if address_file.is_file() {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("inspect supervised daemon child")?
+        {
+            bail!("supervised daemon exited before publishing its address: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("supervised daemon did not publish its address within 60 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// The unconditional wait between a failed first probe and the one retry.
@@ -887,6 +952,7 @@ mod tests {
         connect_or_spawn(
             &bind,
             &supplied,
+            InitialProbeMode::ReuseCompatible,
             || Ok(DaemonLifecycle::with_pid_file(pid_file)),
             |executable, launched_bind| {
                 launches.fetch_add(1, Ordering::SeqCst);
@@ -923,6 +989,7 @@ mod tests {
         connect_or_spawn(
             url.trim_start_matches("http://"),
             &executable,
+            InitialProbeMode::ReuseCompatible,
             || anyhow::bail!("warm compatibility must not construct lifecycle state"),
             |_, _| anyhow::bail!("warm compatibility must not launch a process"),
         )
@@ -952,6 +1019,7 @@ mod tests {
                 connect_or_spawn(
                     &bind,
                     &supplied,
+                    InitialProbeMode::ReuseCompatible,
                     || Ok(DaemonLifecycle::with_pid_file(pid_file)),
                     |_, _| {
                         launches.fetch_add(1, Ordering::SeqCst);
@@ -1116,6 +1184,7 @@ mod tests {
         let error = connect_or_spawn(
             &dead_address,
             &executable,
+            InitialProbeMode::ReuseCompatible,
             || Ok(DaemonLifecycle::with_pid_file(pid_file.clone())),
             |_, _| anyhow::bail!("live PID branch must not spawn"),
         )
@@ -1218,6 +1287,7 @@ mod tests {
         let omitted_error = connect_or_spawn(
             omitted_url.trim_start_matches("http://"),
             &executable,
+            InitialProbeMode::ReuseCompatible,
             || anyhow::bail!("omitted generation must fail before lifecycle construction"),
             |_, _| anyhow::bail!("omitted generation must fail before spawn"),
         )
@@ -1236,6 +1306,7 @@ mod tests {
         let error = connect_or_spawn(
             old_url.trim_start_matches("http://"),
             &executable,
+            InitialProbeMode::ReuseCompatible,
             || anyhow::bail!("leftover daemon must not reach PID-file construction"),
             |_, _| anyhow::bail!("leftover daemon must not reach spawn"),
         )
@@ -1278,7 +1349,7 @@ mod tests {
         if std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_none() {
             return;
         }
-        let error = ensure_daemon_access_allowed().unwrap_err();
+        let error = daemon_launch_mode().unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1293,6 +1364,6 @@ mod tests {
         if std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_none() {
             return;
         }
-        assert!(ensure_daemon_access_allowed().is_err());
+        assert!(daemon_launch_mode().is_err());
     }
 }

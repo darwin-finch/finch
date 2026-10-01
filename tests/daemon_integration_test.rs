@@ -1,17 +1,46 @@
 //! Isolated integration tests for the Finch daemon binary.
 
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+fn daemon_test_serial() -> Arc<tokio::sync::Mutex<()>> {
+    static SERIAL: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    SERIAL
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+struct RestoredEnvVar {
+    name: &'static str,
+    original: Option<OsString>,
+}
+
+impl RestoredEnvVar {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let original = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, original }
+    }
+}
+
+impl Drop for RestoredEnvVar {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
 
 struct TestDaemon {
     _child: OwnedChild,
     _serial: tokio::sync::OwnedMutexGuard<()>,
     home_path: PathBuf,
-    address: String,
-    ipc_socket: PathBuf,
 }
 
 struct OwnedChild(Child);
@@ -25,13 +54,7 @@ impl Drop for OwnedChild {
 
 impl TestDaemon {
     async fn start(api_key: &str) -> Result<Self> {
-        static SERIAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
-            std::sync::OnceLock::new();
-        let serial = SERIAL
-            .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await;
+        let serial = daemon_test_serial().lock_owned().await;
         let proof = finch::brain::isolated_test_proof()
             .context("daemon integration tests require supervisor authority")?;
         let brain_address = proof.brain_address().to_owned();
@@ -192,8 +215,6 @@ impl TestDaemon {
             _child: child,
             _serial: serial,
             home_path: home,
-            address,
-            ipc_socket,
         })
     }
 }
@@ -609,18 +630,108 @@ fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
 #[tokio::test]
 #[ignore = "spawns the built daemon binary"]
 async fn test_daemon_spawn_and_health() -> Result<()> {
-    let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
-    let response = request_health(&daemon.address, Duration::from_secs(2))?;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let _serial = daemon_test_serial().lock_owned().await;
+    let proof = finch::brain::isolated_test_proof()
+        .context("daemon integration tests require supervisor authority")?;
+    let brain_address = proof.brain_address().to_owned();
+    let address = proof.daemon_address().to_owned();
+    let ipc_socket = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+        .map(PathBuf::from)
+        .context("daemon integration test requires its sealed IPC socket path")?;
+    require_bounded_unix_socket_path(&ipc_socket)?;
+    let brain_password = proof.brain_password()?;
+    let home = proof.home;
+    let finch_dir = home.join(".finch");
+    std::fs::create_dir_all(finch_dir.join("brains"))?;
+    write_config(
+        &home,
+        &address,
+        "sk-ant-isolated-health-test",
+        &brain_password,
+    )?;
+
+    let supplied_executable = PathBuf::from(env!("CARGO_BIN_EXE_finch"))
+        .canonicalize()
+        .context("canonicalize the caller-supplied Finch executable")?;
+    let test_executable = std::env::current_exe()
+        .context("resolve the daemon integration test executable")?
+        .canonicalize()
+        .context("canonicalize the daemon integration test executable")?;
+    anyhow::ensure!(
+        supplied_executable != test_executable,
+        "the controlled Finch executable must differ from the integration test executable; \
+         supplied={}, current={}",
+        supplied_executable.display(),
+        test_executable.display()
+    );
+
+    let address_file = finch_dir.join(format!("bound-{}.addr", uuid::Uuid::new_v4().simple()));
+    let _address_file_env = RestoredEnvVar::set("FINCH_TEST_BOUND_ADDR_FILE", &address_file);
+    let _supervised_acquisition_env =
+        RestoredEnvVar::set("FINCH_TEST_SUPERVISED_DAEMON_ACQUISITION", "1");
+    let acquisition = finch::daemon::LocalDaemonAcquisition::new(&supplied_executable, &address)?;
+    if let Err(error) = acquisition.acquire().await {
+        let socket_root = std::env::var("FINCH_TEST_SOCKET_ROOT").unwrap_or_default();
+        let daemon_log = redact_daemon_diagnostic(
+            bounded_path_diagnostic(&finch_dir.join("daemon.log")),
+            &home,
+            &socket_root,
+            &brain_address,
+            &address,
+            &brain_password,
+            "sk-ant-isolated-health-test",
+        );
+        anyhow::bail!(
+            "acquire daemon through the caller-supplied Finch executable: {error:#}; \
+             bounded daemon log={daemon_log:?}"
+        );
+    }
+
+    let published_address = std::fs::read_to_string(&address_file)
+        .context("the acquired daemon did not publish its supervised address")?;
+    anyhow::ensure!(
+        published_address.trim() == address,
+        "the acquired daemon published an address outside supervisor authority: expected \
+         {address}, got {published_address:?}"
+    );
+    let pid_text = std::fs::read_to_string(finch_dir.join("daemon.pid"))
+        .context("the acquired daemon did not publish its PID")?;
+    let pid = Pid::from_u32(
+        pid_text
+            .trim()
+            .parse()
+            .context("the acquired daemon published a non-numeric PID")?,
+    );
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let spawned_executable = system
+        .process(pid)
+        .and_then(|process| process.exe())
+        .context("the acquired daemon PID was not a live process with a visible executable")?
+        .canonicalize()
+        .context("canonicalize the acquired daemon executable")?;
+    assert_eq!(
+        spawned_executable, supplied_executable,
+        "public acquisition must spawn the exact executable supplied by its caller, not the \
+         current test executable or a PATH-resolved binary"
+    );
+
+    let response = request_health(&address, Duration::from_secs(2))?;
     assert_eq!(
         response["status"], "healthy",
         "the supervised daemon's HTTP health boundary must be reachable; response={response}"
     );
     assert!(
-        daemon.ipc_socket.exists(),
+        ipc_socket.exists(),
         "the supervised daemon must publish its sealed IPC socket at {}",
-        daemon.ipc_socket.display()
+        ipc_socket.display()
     );
-    let ipc_socket = daemon.ipc_socket.clone();
     tokio::task::LocalSet::new()
         .run_until(async move {
             finch::client::IpcClient::connect_path(ipc_socket)
@@ -629,7 +740,7 @@ async fn test_daemon_spawn_and_health() -> Result<()> {
         })
         .await?;
     assert!(
-        !daemon.home_path.join(".finch/daemon.sock").exists(),
+        !home.join(".finch/daemon.sock").exists(),
         "the isolated daemon must not create the ordinary user socket"
     );
     Ok(())

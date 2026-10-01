@@ -29,8 +29,10 @@ arguments, for example:
 The Rust supervisor creates and owns one OS process group, retains its leader
 until group termination, escalates TERM to KILL within a bound, proves the
 group quiescent, and only then reaps and removes HOME. Launchers never signal
-PIDs. Isolated commands reject daemon discovery, reuse, and auto-spawn. Test
-code is trusted not to enable job control or call `setsid`, `setpgid`, or
+PIDs. Isolated commands reject daemon discovery, reuse, and auto-spawn. The daemon acquisition
+smoke has one authenticated exception: it calls the public acquisition API with the exact built
+Finch path and keeps that child in the supervisor-owned process group. Test code is trusted not to
+enable job control or call `setsid`, `setpgid`, or
 `CommandExt::process_group`. The isolation self-test mechanically scans the
 supervised launchers and daemon integration paths for those escape APIs.
 Deliberately hostile same-UID code that evades that source contract is outside
@@ -71,15 +73,16 @@ Run the isolation harness's own regression checks with:
 - Loopback networking
 - A live teacher credential only for the ignored query smoke
 
-The tests spawn `env!("CARGO_BIN_EXE_finch")`
-(`tests/daemon_integration_test.rs`), so `cargo test` builds the binary it
-needs; no separate `cargo build --release` is required.
+The tests use `env!("CARGO_BIN_EXE_finch")` (`tests/daemon_integration_test.rs`), so `cargo test`
+builds the binary it needs; no separate `cargo build --release` is required. The spawn-and-health
+smoke passes that absolute path through `LocalDaemonAcquisition` and verifies the resulting
+process identity plus compatible HTTP and IPC handshakes.
 
 Each test daemon uses the supervisor's disposable HOME, per-suite Unix socket,
-inherited port-zero listener, and sealed random Brain password. Its RAII guard
-stops and reaps only the direct child on ordinary returns; the process-group
-supervisor remains authoritative for signal and failure teardown. The tests
-never discover, probe, or reuse an ambient daemon.
+inherited port-zero listener, and sealed random Brain password. Direct-spawn
+tests use an RAII guard on ordinary returns; the public-acquisition smoke leaves
+its child to the process-group supervisor, which remains authoritative for signal
+and failure teardown. The tests never discover, probe, or reuse an ambient daemon.
 
 Ignored remote Brain smokes consume the supervisor's inherited port-zero
 listeners and sealed random credential; they never accept a caller-supplied
@@ -110,8 +113,8 @@ Finch child PID and never sends a signal by process name.
 
 ### Daemon Tests (`daemon_integration_test.rs`)
 
-1. **`test_daemon_spawn_and_health`** - Verifies the supervised daemon starts and its compatible
-   HTTP and IPC endpoints both accept a client handshake
+1. **`test_daemon_spawn_and_health`** - Verifies public acquisition spawns the exact supplied
+   Finch executable and its compatible HTTP and IPC endpoints both accept a client handshake
 2. **`test_daemon_query`** - Tests full query flow through daemon
 3. **`test_daemon_config_parsing`** - Validates isolated endpoint configuration
 
