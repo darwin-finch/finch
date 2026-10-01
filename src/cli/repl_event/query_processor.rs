@@ -2267,6 +2267,7 @@ pub(crate) async fn process_query_with_tools(
                     &tool_call_history,
                 )
                 .await;
+                source_unit.transfer_provider_reasoning_to(&wire_execution.output_unit);
                 if query_states
                     .get_metadata(query_id)
                     .await
@@ -2529,6 +2530,7 @@ pub(crate) async fn process_query_with_tools(
                 &tool_call_history,
             )
             .await;
+            source_unit.transfer_provider_reasoning_to(&wire_execution.output_unit);
             if query_states
                 .get_metadata(query_id)
                 .await
@@ -3234,12 +3236,18 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageStatus, WorkUnit};
     use crate::cli::status_bar::StatusLineType;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, CredentialResolver, OpenAiCompatibleCapabilities,
+        OpenAiCompatibleToolChoice, ProviderCredential, ResolvedCredential, ResolvedSecret,
+    };
     use crate::generators::GeneratorCapabilities;
     use crate::tools::PermissionManager;
     use crate::tools::ToolExecutor;
     use crate::tools::ToolRegistry;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use vte::{Params, Parser, Perform};
 
     #[test]
     fn inject_recall_prefix_inserts_before_the_current_question_not_after() {
@@ -3437,6 +3445,102 @@ mod tests {
 
         fn name(&self) -> &str {
             "paced-stream"
+        }
+    }
+
+    struct BoundaryCredentialResolver;
+
+    impl CredentialResolver for BoundaryCredentialResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> anyhow::Result<ResolvedCredential> {
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new("boundary-secret")?,
+            })
+        }
+    }
+
+    /// Deliberately small real-VT parser used by the cross-crate boundary
+    /// regression below. Escape/control sequences are interpreted by `vte`;
+    /// assertions only inspect glyphs that the terminal would print.
+    #[derive(Default)]
+    struct VtOracle {
+        visible: String,
+    }
+
+    impl VtOracle {
+        fn parse(bytes: &[u8]) -> Self {
+            let mut oracle = Self::default();
+            Parser::new().advance(&mut oracle, bytes);
+            oracle
+        }
+
+        fn contains(&self, text: &str) -> bool {
+            self.visible.contains(text)
+        }
+    }
+
+    impl Perform for VtOracle {
+        fn print(&mut self, character: char) {
+            self.visible.push(character);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            if matches!(byte, b'\n' | b'\r') {
+                self.visible.push('\n');
+            }
+        }
+
+        fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
+        fn put(&mut self, _: u8) {}
+        fn unhook(&mut self) {}
+        fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
+        fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
+        fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {}
+    }
+
+    fn boundary_compatible_entry(endpoint: &str) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry::OpenAiCompatible {
+            name: "ciru-boundary".into(),
+            base_url: format!("{}/v1", endpoint.trim_end_matches('/')),
+            chat_path: Some("/chat/completions".into()),
+            models_path: Some("/models".into()),
+            model: "main".into(),
+            credential: CredentialBinding {
+                credential_ref: "ciru-boundary-key".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            capabilities: OpenAiCompatibleCapabilities {
+                streaming: Some(true),
+                tools: Some(true),
+                parallel_tool_calls: Some(false),
+                image_input: Some(false),
+                context_window_tokens: Some(262_144),
+                max_output_tokens: Some(65_536),
+            },
+            tool_choice: OpenAiCompatibleToolChoice::Auto,
+            strict_tool_schemas: Some(false),
+        }
+    }
+
+    fn boundary_compatible_credential(endpoint: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: "ciru-boundary-key".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiCompatible,
+            issuer: "openai-compatible".into(),
+            audience: AudienceBinding::custom(endpoint)
+                .expect("mock endpoint is a valid credential audience"),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: "test:ciru-boundary-key".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
         }
     }
 
@@ -3857,8 +3961,15 @@ mod tests {
             .await;
         harness.close_stream();
         harness.task.await.expect("reasoning query task panicked");
-        let terminal = format!("{:?}", harness.canonical.provider_reasoning_view());
+        let output = harness
+            .output
+            .get_messages()
+            .into_iter()
+            .find(|message| message.say_turn_view().is_some())
+            .expect("successful source must compose a say output");
+        let terminal = format!("{:?}", output.provider_reasoning_view());
         assert!(terminal.contains("terminal: true") && terminal.contains("expanded: false"));
+        assert!(terminal.contains("visible safe reasoning"), "successful say consolidation must retain reasoning on its visible output; got {terminal}");
         assert_eq!(harness.canonical.content(), "(say \"done\")");
     }
 
@@ -3928,6 +4039,253 @@ mod tests {
         assert_eq!(
             enabled, disabled,
             "local reasoning display must not change serialized provider request messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_sse_reasoning_survives_say_consolidation_to_tui_and_manifest_only(
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let private_reasoning = "check the private boundary carefully";
+        let body = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{reasoning:?}}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"(say \\\"Boundary answer\\\")\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            reasoning = private_reasoning,
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer boundary-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "main",
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let entry = boundary_compatible_entry(&server.url());
+        let config = crate::config::Config::with_providers(vec![entry.clone()])
+            .with_credentials(vec![boundary_compatible_credential(&server.url())]);
+        let provider = crate::providers::create_provider_profile_from_config_with_resolver(
+            &config,
+            "ciru-boundary",
+            &BoundaryCredentialResolver,
+        )
+        .expect("the configured generic-compatible profile must resolve through the factory");
+        let selected: Arc<dyn Generator> = Arc::new(crate::generators::ClaudeGenerator::new_in(
+            Arc::new(crate::claude::ClaudeClient::with_shared_provider(provider)),
+            None,
+            None,
+        ));
+        assert_eq!(
+            selected.name(),
+            "ciru-boundary",
+            "factory selection must retain the configured profile identity used by reasoning eligibility"
+        );
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors.clone(),
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("show the boundary".into());
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let tempdir = tempfile::tempdir().expect("isolated permission pattern directory");
+        let (_workspace, workspace_root) = isolated_git_workspace();
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new()
+                .with_default_rule(crate::tools::PermissionRule::Allow)
+                .with_workspace_root(workspace_root),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process_query_with_tools(
+                query_id,
+                "show the boundary".into(),
+                event_tx,
+                Arc::clone(&selected),
+                Arc::clone(&selected),
+                Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+                Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+                Arc::new(Vec::new()),
+                Arc::clone(&conversation),
+                Arc::clone(&query_states),
+                tool_coordinator,
+                runtime,
+                tui_renderer,
+                Arc::new(RwLock::new(ReplMode::Normal)),
+                Arc::clone(&output),
+                Arc::clone(&status),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+                "boundary-brain".into(),
+                "/test/workspace".into(),
+                4,
+                20,
+                0,
+                true,
+                true,
+                vec![entry],
+                false,
+                false,
+                Arc::clone(&selected),
+                Arc::new(std::sync::Mutex::new(
+                    crate::cli::conversation_compactor::SummaryCache::new(),
+                )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                "test persona".into(),
+                None,
+            ),
+        )
+        .await
+        .expect("configured compatible boundary query hung");
+        drain_vm_events_as_event_loop(&mut events);
+        mock.assert_async().await;
+
+        let retained = output.get_messages();
+        let source = retained
+            .iter()
+            .find(|message| message.content().contains("(say"))
+            .expect("query processor must retain the submitted program source");
+        let visible = retained
+            .iter()
+            .find(|message| message.content() == "Boundary answer")
+            .expect("successful say execution must retain its visible output unit");
+        assert!(
+            source.provider_reasoning_view().is_none(),
+            "successful consolidation must move the private facet off the suppressed source"
+        );
+        let terminal = visible
+            .provider_reasoning_view()
+            .expect("visible say output must retain provider reasoning after consolidation");
+        assert!(
+            terminal.terminal && !terminal.expanded,
+            "completed provider reasoning must be collapsed exactly once: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.lines,
+            vec![private_reasoning],
+            "normalized SSE reasoning must survive factory selection and consolidation unchanged"
+        );
+
+        let history_json = serde_json::to_string(&conversation.read().await.get_messages())
+            .expect("serialize retained conversation history");
+        assert!(
+            !history_json.contains(private_reasoning),
+            "private reasoning leaked into conversation history: {history_json}"
+        );
+        for message in &retained {
+            let canonical = message.complete_transcript(&colors);
+            assert!(
+                !canonical.contains(private_reasoning),
+                "private reasoning leaked into canonical transcript for {:?}: {canonical:?}",
+                message.id()
+            );
+        }
+
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors.clone());
+        let collapsed_bytes = renderer
+            .draw_live_area_bytes_for_test(100, 30)
+            .expect("real TUI collapsed frame must paint");
+        let collapsed_terminal = VtOracle::parse(&collapsed_bytes);
+        assert!(
+            collapsed_terminal.contains("Provider reasoning (5 words)"),
+            "collapsed real TUI frame omitted the terminal reasoning control: {:?}",
+            collapsed_terminal.visible
+        );
+        assert!(
+            collapsed_terminal.contains("Boundary answer")
+                && !collapsed_terminal.contains(private_reasoning),
+            "collapsed frame must show the answer but not the reasoning body: {:?}",
+            collapsed_terminal.visible
+        );
+
+        let action = visible
+            .transcript_action(&[2])
+            .expect("stable semantic reasoning path #2 must resolve after consolidation");
+        assert!(
+            visible.handle_transcript_action(&action),
+            "reasoning disclosure action must reopen the retained visible unit"
+        );
+        let component = visible
+            .component_view()
+            .expect("visible say output must expose its component view");
+        let manifest = finch_tui::component_ui_manifest(&component);
+        assert_eq!(
+            manifest.manifest_version, 3,
+            "reasoning nodes require the version-three manifest contract"
+        );
+        let disclosure = manifest
+            .root
+            .children
+            .iter()
+            .find(|child| child.element_type == "ProviderReasoningDisclosure")
+            .expect("manifest must include the reasoning disclosure node");
+        assert!(
+            disclosure.id.ends_with("#2")
+                && disclosure.props.get("expanded") == Some(&serde_json::json!(true)),
+            "manifest must use stable semantic path #2 and reflect reopened state: {disclosure:?}"
+        );
+        let body = disclosure
+            .children
+            .iter()
+            .find(|child| child.element_type == "ProviderReasoningBody")
+            .expect("expanded manifest must include the reasoning body");
+        assert_eq!(
+            body.props.get("lines"),
+            Some(&serde_json::json!([private_reasoning])),
+            "manifest body must carry only the sanitized live-only reasoning facet"
+        );
+
+        let mut reopened_renderer = TuiRenderer::new_headless(output, status, colors.clone());
+        let reopened_bytes = reopened_renderer
+            .draw_live_area_bytes_for_test(100, 30)
+            .expect("real TUI reopened frame must paint");
+        let reopened_terminal = VtOracle::parse(&reopened_bytes);
+        assert!(
+            reopened_terminal.contains(private_reasoning)
+                && reopened_terminal.contains("Boundary answer"),
+            "reopened real TUI frame must show both private reasoning and unchanged answer: {:?}",
+            reopened_terminal.visible
+        );
+        assert!(
+            !visible
+                .complete_transcript(&colors)
+                .contains(private_reasoning),
+            "reopening the live-only facet must not mutate canonical transcript bytes"
         );
     }
 

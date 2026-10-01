@@ -463,6 +463,29 @@ impl WorkUnit {
         state.sanitizer.push(text);
     }
 
+    /// Move the private reasoning facet onto the WorkUnit that will remain
+    /// visible after a successful source/output consolidation. No response,
+    /// program, history, or canonical field is copied.
+    pub fn transfer_provider_reasoning_to(&self, target: &WorkUnit) {
+        if std::ptr::eq(self, target) {
+            return;
+        }
+        let reasoning = self
+            .inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .provider_reasoning
+            .take();
+        let Some(reasoning) = reasoning else {
+            return;
+        };
+        target
+            .inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .provider_reasoning = Some(reasoning);
+    }
+
     fn provider_reasoning_snapshot(&self) -> Option<ProviderReasoningView> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner.provider_reasoning.as_ref().and_then(|state| {
@@ -3263,5 +3286,36 @@ mod tests {
         assert!(!fresh
             .complete_transcript(&colors())
             .contains("process-local secret"));
+    }
+
+    #[test]
+    fn test_provider_reasoning_transfer_moves_only_the_private_terminal_facet() {
+        let source = WorkUnit::new("Calculating");
+        source.set_program_source("lisp");
+        source.set_response("(say \"answer\")");
+        source.append_provider_reasoning("private reasoning");
+        source.set_complete();
+
+        let visible = WorkUnit::new("VM program output");
+        visible.set_program_output();
+        visible.begin_say_turn("lisp", "(say \"answer\")");
+        source.transfer_provider_reasoning_to(&visible);
+
+        assert!(source.provider_reasoning_view().is_none());
+        let transferred = visible
+            .say_turn_view()
+            .expect("visible say turn")
+            .reasoning
+            .expect("transferred private reasoning");
+        assert!(transferred.terminal && !transferred.expanded);
+        assert_eq!(transferred.lines, ["private reasoning"]);
+        assert_eq!(source.content(), "(say \"answer\")");
+        assert_eq!(visible.content(), "");
+        assert!(
+            !visible
+                .complete_transcript(&colors())
+                .contains("private reasoning"),
+            "transfer must not populate the target's canonical transcript"
+        );
     }
 }

@@ -22,7 +22,7 @@ use ts_rs::TS;
 
 /// The manifest contract version. Bump on any shape change and update
 /// `docs/UI_MANIFEST.md` in the same commit; consumers read this first.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// One node of the serializable UI manifest: an element type (the registry
 /// key the JSX side maps to a component), a derived stable id, JSON-valued

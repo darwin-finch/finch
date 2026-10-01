@@ -34,7 +34,7 @@ A third consumer is the future GUI client (#808): the engine lowers the same wid
 component snapshots to the versioned DOM manifest (`dom_manifest.rs`; contract in
 [docs/UI_MANIFEST.md](../../docs/UI_MANIFEST.md), generated TS types committed under
 `bindings/dom/`). Components never write HTML; the golden JSON test pins the say card's wire
-shape.
+shape, including an opted-in provider-reasoning disclosure at semantic path `#2`.
 
 The [agent contract](AGENTS.md) states dependency and rendering invariants. [`src/lib.rs`](src/lib.rs)
 is the callable facade; [ARCHITECTURE.md](ARCHITECTURE.md) explains the paint pipeline. Completion

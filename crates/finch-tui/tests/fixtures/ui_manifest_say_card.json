@@ -1,5 +1,5 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "root": {
     "element_type": "SayTurnCard",
     "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -9,6 +9,27 @@
       "status": "completed"
     },
     "children": [
+      {
+        "element_type": "ProviderReasoningDisclosure",
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7#2",
+        "props": {
+          "expanded": true,
+          "label": "Provider reasoning (3 words)",
+          "terminal": true
+        },
+        "children": [
+          {
+            "element_type": "ProviderReasoningBody",
+            "id": "",
+            "props": {
+              "lines": [
+                "checked the constraints"
+              ]
+            },
+            "children": []
+          }
+        ]
+      },
       {
         "element_type": "Output",
         "id": "",

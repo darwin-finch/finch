@@ -2163,6 +2163,22 @@ impl TuiRenderer {
         self.draw_live_area_to(&mut io::stdout())
     }
 
+    /// Capture the real live-frame byte stream at a deterministic terminal size.
+    ///
+    /// This exists only for cross-crate production-boundary tests. It keeps
+    /// those tests on the same layout, hit-region, and paint path as the live
+    /// terminal without writing escape sequences to the test runner's stdout.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn draw_live_area_bytes_for_test(
+        &mut self,
+        term_width: usize,
+        term_height: usize,
+    ) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.draw_live_area_to_at(&mut bytes, term_width, term_height, None)?;
+        Ok(bytes)
+    }
+
     /// Paint the live area to `out`. Tests capture the attention bell here.
     fn draw_live_area_to(&mut self, out: &mut impl Write) -> Result<()> {
         let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));

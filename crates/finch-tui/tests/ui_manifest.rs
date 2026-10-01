@@ -5,8 +5,8 @@
 
 use finch_tui::{component_ui_manifest, UiManifest, MANIFEST_VERSION};
 use finch_ui_model::{
-    ComponentView, MessageId, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView,
-    WorkUnitViewModel,
+    ComponentView, MessageId, OutputVm, ProgramSourceVm, ProviderReasoningView, SayTurnStatus,
+    SayTurnView, WorkUnitViewModel,
 };
 
 /// The fixed identity the golden pins. Never change this value without
@@ -33,8 +33,21 @@ fn say_view(show_program: bool) -> SayTurnView {
     }
 }
 
+fn reasoning_say_view(show_program: bool, expanded: bool) -> SayTurnView {
+    SayTurnView {
+        reasoning: Some(ProviderReasoningView {
+            lines: vec!["checked the constraints".to_string()],
+            expanded,
+            terminal: true,
+            word_count: 3,
+            elapsed: std::time::Duration::from_millis(2350),
+        }),
+        ..say_view(show_program)
+    }
+}
+
 fn golden_json() -> String {
-    let manifest = component_ui_manifest(&ComponentView::Say(say_view(false)));
+    let manifest = component_ui_manifest(&ComponentView::Say(reasoning_say_view(false, true)));
     serde_json::to_string_pretty(&manifest).expect("the manifest serializes")
 }
 
@@ -82,6 +95,23 @@ fn test_manifest_round_trips_serde() {
     assert_eq!(
         parsed.manifest_version, MANIFEST_VERSION,
         "the envelope carries the contract version"
+    );
+}
+
+#[test]
+fn test_reasoning_enabled_manifest_round_trips_with_stable_semantic_id() {
+    let manifest = component_ui_manifest(&ComponentView::Say(reasoning_say_view(false, true)));
+    let serialized = serde_json::to_string(&manifest).expect("serialize reasoning manifest");
+    let parsed: UiManifest = serde_json::from_str(&serialized).expect("parse reasoning manifest");
+    assert_eq!(parsed, manifest, "reasoning manifest must round-trip");
+    assert_eq!(
+        parsed.root.children[0].id,
+        format!("{GOLDEN_MESSAGE_ID}#2"),
+        "provider reasoning must retain semantic path #2 on the DOM wire"
+    );
+    assert_eq!(
+        parsed.manifest_version, 3,
+        "reasoning nodes change the wire shape and therefore require manifest v3"
     );
 }
 
@@ -193,7 +223,7 @@ fn test_committed_ts_types_carry_the_wire_types() {
     ))
     .expect("the barrel file is committed");
     assert!(
-        barrel.contains("FINCH_UI_MANIFEST_VERSION = 2"),
+        barrel.contains("FINCH_UI_MANIFEST_VERSION = 3"),
         "the barrel pins the contract version; got:\n{barrel}"
     );
 }

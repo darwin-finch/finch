@@ -1,4 +1,4 @@
-# UI manifest — the DOM wire contract (version 2)
+# UI manifest — the DOM wire contract (version 3)
 
 Status: current (stage 4 of [TUI_DESIGN.md](TUI_DESIGN.md), #1141 part 2). The
 manifest is the serialization boundary between Finch's widget engine and a
@@ -14,13 +14,14 @@ The wire payload is one JSON object; a consumer reads `manifest_version`
 first and rejects (or versions) everything else:
 
 ```json
-{ "manifest_version": 2, "root": { …DynamicUiNode… } }
+{ "manifest_version": 3, "root": { …DynamicUiNode… } }
 ```
 
 | Version | When | Notes |
 |---|---|---|
 | 1 | 2026-09 | initial contract |
 | 2 | 2026-10 | Say turns expose one labelled `#1` program-disclosure control; answer and source content are non-actionable |
+| 3 | 2026-10 | Opted-in compatible-provider reasoning adds a `#2` disclosure and an optional non-actionable body to the same say card |
 
 Any shape change bumps the version and updates this document and the TS
 artifacts in the same commit.
@@ -56,11 +57,13 @@ A rendered line's spans lower to `ManifestSpan[]`:
 `{ "Rgb": [r, g, b] }`. Absent optional fields are omitted; a plain span
 serializes as `{"text": "…"}`.
 
-## Element types and props (contract v2)
+## Element types and props (contract v3)
 
 | element_type | props | children |
 |---|---|---|
-| `SayTurnCard` | `status` (`running`/`completed`), `elapsedMs`, `showProgram` | Running: non-actionable `ProgramSource`, then optional non-actionable `Output`. Completed: optional non-actionable `Output`, `ProgramDisclosureControl` (`#1`), then non-actionable `ProgramSource` only while expanded. |
+| `SayTurnCard` | `status` (`running`/`completed`), `elapsedMs`, `showProgram` | Optional `ProviderReasoningDisclosure` (`#2`) first. Running: non-actionable `ProgramSource`, then optional non-actionable `Output`. Completed: optional non-actionable `Output`, `ProgramDisclosureControl` (`#1`), then non-actionable `ProgramSource` only while expanded. |
+| `ProviderReasoningDisclosure` | `label`, `expanded`, `terminal` | Optional non-actionable `ProviderReasoningBody` while expanded. |
+| `ProviderReasoningBody` | `lines` | — |
 | `ProgramDisclosureControl` | `label` (`Show program`/`Hide program`), `expanded` | — |
 | `ProgramSource` | `language`, `lines` | — |
 | `Output` | `lines` | — |
@@ -94,17 +97,17 @@ by id. Transport is #808's scope; this document pins only the payload shape.
   with `FINCH_UPDATE_UI_MANIFEST_GOLDEN=1` and commit the diff with this
   document's version bump).
 
-## JSON schema (v2)
+## JSON schema (v3)
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://finch.dev/schemas/ui-manifest-v2.json",
+  "$id": "https://finch.dev/schemas/ui-manifest-v3.json",
   "title": "Finch UI manifest",
   "type": "object",
   "required": ["manifest_version", "root"],
   "properties": {
-    "manifest_version": { "const": 2 },
+    "manifest_version": { "const": 3 },
     "root": { "$ref": "#/$defs/node" }
   },
   "$defs": {

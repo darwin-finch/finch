@@ -78,12 +78,12 @@ impl ReasoningSanitizer {
                 }
             }
             EscapeState::Osc => match ch {
-                '\u{7}' => self.state = EscapeState::Ground,
+                '\u{7}' | '\u{9c}' => self.state = EscapeState::Ground,
                 '\u{1b}' => self.state = EscapeState::OscEscape,
                 _ => {}
             },
             EscapeState::OscEscape => {
-                self.state = if ch == '\\' {
+                self.state = if ch == '\\' || ch == '\u{9c}' {
                     EscapeState::Ground
                 } else if ch == '\u{1b}' {
                     EscapeState::OscEscape
@@ -134,6 +134,26 @@ impl ReasoningSanitizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reasoning_sanitizer_c1_st_preserves_safe_text_at_every_delta_boundary() {
+        for input in [
+            "before\u{009d}0;title\u{009c}after",
+            "before\u{1b}]0;title\u{1b}\u{009c}after",
+        ] {
+            for split in input
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain([input.len()])
+            {
+                let mut sanitizer = ReasoningSanitizer::default();
+                sanitizer.push(&input[..split]);
+                sanitizer.push(&input[split..]);
+                assert_eq!(sanitizer.lines(), vec!["beforeafter"],
+                    "OSC C1 ST must terminate across deltas and preserve subsequent safe text; input={input:?}, split={split}");
+            }
+        }
+    }
 
     #[test]
     fn test_reasoning_sanitizer_hides_split_controls_and_expands_tabs() {
