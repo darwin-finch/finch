@@ -19,6 +19,9 @@ pub enum MessageStatus {
 pub enum WorkUnitPresentation {
     #[default]
     Assistant,
+    /// A durable Interactive Brain run projected as the semantic assistant
+    /// turn it represents, without exposing its internal RunId as chrome.
+    Interactive,
     Activity {
         title: String,
     },
@@ -175,6 +178,16 @@ pub fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
             )
         }
         WorkUnitPresentation::Assistant => {
+            let (body, raw_body) = assistant_body(&head.response_text);
+            (
+                NodeRole::Response,
+                assistant_prose_label(&view.verb, head),
+                body,
+                raw_body,
+                true,
+            )
+        }
+        WorkUnitPresentation::Interactive => {
             let (body, raw_body) = assistant_body(&head.response_text);
             (
                 NodeRole::Response,

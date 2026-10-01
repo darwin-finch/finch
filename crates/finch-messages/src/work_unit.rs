@@ -309,6 +309,14 @@ impl WorkUnit {
         reset_program_output_role(&mut inner);
     }
 
+    /// Present a durable named-Brain Interactive run as one semantic turn.
+    /// Run identity remains orchestration data and is not transcript chrome.
+    pub fn set_interactive_presentation(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::Interactive;
+        reset_program_output_role(&mut inner);
+    }
+
     /// Render retained rows as internal lifecycle activity rather than model
     /// tool calls.
     pub fn set_activity_presentation(&self, title: impl Into<String>) {
@@ -1036,7 +1044,7 @@ impl Message for WorkUnit {
                 };
 
                 let mut out = match &inner.presentation {
-                    WorkUnitPresentation::Assistant => {
+                    WorkUnitPresentation::Assistant | WorkUnitPresentation::Interactive => {
                         if inner.response_text.is_empty() {
                             let title = if inner.rows.is_empty() {
                                 String::new()
@@ -1312,9 +1320,9 @@ fn message_band_for_inner(inner: &WorkUnitInner) -> MessageBand {
     match &inner.presentation {
         WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
         WorkUnitPresentation::ProgramOutput { .. } => program_output_band(inner),
-        WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
-            MessageBand::Assistant
-        }
+        WorkUnitPresentation::Assistant
+        | WorkUnitPresentation::Interactive
+        | WorkUnitPresentation::Activity { .. } => MessageBand::Assistant,
     }
 }
 
@@ -1398,6 +1406,10 @@ fn format_work_unit_header(inner: &WorkUnitInner) -> String {
             format!("⏺ Tools ({})", inner.rows.len())
         }
         WorkUnitPresentation::Assistant => format!("⏺ {}", inner.response_text),
+        WorkUnitPresentation::Interactive if !inner.response_text.is_empty() => {
+            format!("⏺ {}", inner.response_text)
+        }
+        WorkUnitPresentation::Interactive => "⏺ Assistant turn".to_string(),
         WorkUnitPresentation::Activity { title } => format!("⏺ {title}"),
         WorkUnitPresentation::ProgramSource { language } => {
             if inner.response_text.is_empty() {

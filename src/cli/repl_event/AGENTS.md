@@ -88,6 +88,14 @@ already carries a card (a later snapshot must not reset `show_program` or duplic
 Snapshot branch also skips the run-unaffiliated Program source unit for programs a replayed card
 already covers, so one turn never wears two representations.
 
+**Interactive named-Brain runs project semantic turns, not lifecycle UUIDs (#422).** A remote or
+replayed `Interactive` run retains its `RunId` in orchestration state, but its transcript unit is
+an `Interactive` WorkUnit: program and tool/approval rows remain inspectable, successful `Result`
+bytes are the assistant body, and the terminal run status settles the unit. Failed and cancelled
+turns carry their actionable diagnostic once on that unit. Speculative/background runs retain the
+explicit run-labelled activity projection. Brain-context recaps attribute a correlated successful
+Interactive result to `assistant`, never to the journal sender `daemon`.
+
 **Locally executed runs never wear the legacy run group (#978).** When this frontend holds the
 home runner lease, runs it initiated are executed by its own callback paths and rendered through
 the same local units every other local path uses, so daemon lifecycle events for those runs never
