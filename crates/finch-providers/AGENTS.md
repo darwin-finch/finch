@@ -93,6 +93,16 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   provider/model provenance and no opaque replay. Schema-valid `null` and empty streamed values are
   ignored as no-ops. Reasoning never enters assistant-visible completed content, and canonical
   OpenAI does not accept the Meta-only field.
+- **Configured generic OpenAI-compatible responses are strict, bounded, and secret-safe.** Their
+  request bytes and operator-attested capability contract remain separate from first-party OpenAI,
+  while response handling requires the documented SSE media type, one valid terminal choice and
+  one `[DONE]`, rejects malformed/unknown/wrong-typed/sparse/truncated/late events, and never treats
+  `reasoning_content` as generic output. Limits are 1 MiB per SSE line/event, 4 MiB per stream,
+  1 MiB accumulated arguments per tool call, 32 MiB per non-stream success, and 64 KiB consumed
+  from a non-success body. Compatible error diagnostics redact response bodies, and receiver drop,
+  cancellation, timeout, parse failure, or disconnect releases the upstream transport with no
+  successful completion or late post-terminal mutation. Canonical OpenAI and direct Meta retain
+  their own dialect rules; legacy compatible constructors retain their historical parser.
 - Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
   OpenAI and Claude also emit native `ToolCallDelta` / `ToolCallComplete`.
   Generation-layer translation of `ContentBlockComplete(ToolUse)` into
