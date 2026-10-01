@@ -66,12 +66,23 @@ fn openai_bindings(
     .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-fn decode_openai_tool_name(bindings: &ToolBindingTable, wire_name: &str) -> Result<String> {
-    Ok(bindings
+fn decode_openai_tool_name(
+    bindings: &ToolBindingTable,
+    wire_name: &str,
+    redact_wire_identity: bool,
+) -> Result<String> {
+    let binding = bindings
         .decode_wire_call(wire_name, None)
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .semantic
-        .clone())
+        .map_err(|error| {
+            if redact_wire_identity {
+                anyhow::anyhow!(
+                "OpenAI-compatible response called a tool that was not advertised in this request"
+            )
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?;
+    Ok(binding.semantic.clone())
 }
 
 fn encode_openai_tool_name(bindings: &ToolBindingTable, semantic: &str) -> Result<String> {
@@ -693,6 +704,7 @@ struct CanonicalStreamState {
     tool_delta_emitted: Vec<bool>,
     sequence: u64,
     bindings: Arc<ToolBindingTable>,
+    redact_wire_identities: bool,
 }
 
 fn reject_unknown_keys(
@@ -989,7 +1001,11 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                 let name = if call_name.is_empty() {
                     None
                 } else {
-                    Some(decode_openai_tool_name(&state.bindings, &call_name)?)
+                    Some(decode_openai_tool_name(
+                        &state.bindings,
+                        &call_name,
+                        state.redact_wire_identities,
+                    )?)
                 };
                 state.sequence += 1;
                 let sequence = state.sequence;
@@ -1043,7 +1059,12 @@ async fn publish_canonical_completion(
     state: &CanonicalStreamState,
     tx: &mpsc::Sender<Result<StreamChunk>>,
 ) -> Result<()> {
-    let tool_blocks = finalize_tool_calls(&state.tool_calls, true, &state.bindings)?;
+    let tool_blocks = finalize_tool_calls(
+        &state.tool_calls,
+        true,
+        &state.bindings,
+        state.redact_wire_identities,
+    )?;
     if !state.accumulated_text.is_empty() {
         tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
             text: state.accumulated_text.clone(),
@@ -1091,11 +1112,13 @@ fn spawn_canonical_stream_parser(
     rule: TransportRule,
     provider: String,
     bindings: Arc<ToolBindingTable>,
+    redact_wire_identities: bool,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut event_data: Option<String> = None;
         let mut total = 0usize;
         let mut state = CanonicalStreamState {
             rule,
@@ -1110,6 +1133,7 @@ fn spawn_canonical_stream_parser(
             tool_delta_emitted: Vec::new(),
             sequence: 0,
             bindings,
+            redact_wire_identities,
         };
         loop {
             let next = tokio::select! {
@@ -1118,7 +1142,7 @@ fn spawn_canonical_stream_parser(
                 next = stream.next() => next,
             };
             let Some(next) = next else {
-                if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                if event_data.is_some() || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
                     let message = if state.done {
                         "OpenAI stream sent data after its terminal marker"
                     } else {
@@ -1190,6 +1214,31 @@ fn spawn_canonical_stream_parser(
                     }
                 };
                 if line.is_empty() {
+                    let Some(data) = event_data.take() else {
+                        continue;
+                    };
+                    if data == "[DONE]" {
+                        if let Err(error) = mark_canonical_done(&mut state) {
+                            if !tx.is_closed() {
+                                let _ = tx.send(Err(error)).await;
+                            }
+                            return;
+                        }
+                    } else {
+                        match canonical_stream_data(&mut state, &data) {
+                            Ok(chunks) => {
+                                for chunk in chunks {
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                        }
+                    }
                     if sse_line_prefix_exceeds_limit(&buffer) {
                         let _ = tx
                             .send(Err(anyhow::anyhow!(
@@ -1220,35 +1269,18 @@ fn spawn_canonical_stream_parser(
                     return;
                 };
                 let data = data.strip_prefix(' ').unwrap_or(data);
-                if data == "[DONE]" {
-                    if let Err(error) = mark_canonical_done(&mut state) {
-                        if !tx.is_closed() {
-                            let _ = tx.send(Err(error)).await;
-                        }
-                        return;
-                    }
-                    if sse_line_prefix_exceeds_limit(&buffer) {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
-                                "OpenAI SSE line exceeded the 1 MiB limit"
-                            )))
-                            .await;
-                        return;
-                    }
-                    continue;
+                let event = event_data.get_or_insert_with(String::new);
+                if !event.is_empty() {
+                    event.push('\n');
                 }
-                match canonical_stream_data(&mut state, data) {
-                    Ok(chunks) => {
-                        for chunk in chunks {
-                            if tx.send(Ok(chunk)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
+                event.push_str(data);
+                if event.len() > MAX_SSE_LINE_BYTES {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI SSE event exceeded the 1 MiB limit"
+                        )))
+                        .await;
+                    return;
                 }
                 if sse_line_prefix_exceeds_limit(&buffer) {
                     let _ = tx
@@ -1302,6 +1334,7 @@ fn finalize_tool_calls(
     acc: &[(String, String, String)],
     strict: bool,
     bindings: &ToolBindingTable,
+    redact_wire_identities: bool,
 ) -> Result<Vec<ContentBlock>> {
     let mut blocks = Vec::new();
     for (id, name, args_str) in acc
@@ -1324,7 +1357,7 @@ fn finalize_tool_calls(
             }
             Ok(_) | Err(_) => continue,
         };
-        let name = decode_openai_tool_name(bindings, name)?;
+        let name = decode_openai_tool_name(bindings, name, redact_wire_identities)?;
         blocks.push(ContentBlock::ToolUse {
             id: id.clone(),
             name,
@@ -2117,7 +2150,11 @@ impl OpenAIProvider {
                     if !input.is_object() {
                         anyhow::bail!("OpenAI function arguments were not a JSON object");
                     }
-                    let name = decode_openai_tool_name(bindings, &tool_call.function.name)?;
+                    let name = decode_openai_tool_name(
+                        bindings,
+                        &tool_call.function.name,
+                        matches!(&self.profile, ProviderProfile::Configured(_)),
+                    )?;
                     content.push(ContentBlock::ToolUse {
                         id: tool_call.id,
                         name,
@@ -2314,6 +2351,7 @@ impl OpenAIProvider {
                 rule,
                 self.provider_name.clone(),
                 Arc::new(bindings.clone()),
+                matches!(&self.profile, ProviderProfile::Configured(_)),
             ));
         }
 
@@ -2376,6 +2414,7 @@ impl OpenAIProvider {
                                         &tool_call_acc,
                                         false,
                                         &stream_bindings,
+                                        false,
                                     ) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
@@ -2516,6 +2555,7 @@ impl OpenAIProvider {
                                                     match decode_openai_tool_name(
                                                         &stream_bindings,
                                                         &name,
+                                                        false,
                                                     ) {
                                                         Ok(name) => Some(name),
                                                         Err(error) => {
@@ -3195,6 +3235,7 @@ mod tests {
             tool_delta_emitted: Vec::new(),
             sequence: 0,
             bindings: Arc::new(test_tool_bindings(&["read", "bash", "glob", "grep"])),
+            redact_wire_identities: false,
         }
     }
 
@@ -5993,6 +6034,22 @@ mod tests {
                 "mid-frame EOF",
                 "data: {\"id\":\"chat-1\"".to_string(),
             ),
+            (
+                "DONE missing its blank event terminator",
+                terminal
+                    .strip_suffix('\n')
+                    .expect("terminal fixture ends in a blank SSE delimiter")
+                    .to_string(),
+            ),
+            (
+                "two data lines in one SSE event",
+                concat!(
+                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n",
+                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_string(),
+            ),
         ];
         for (case, body) in cases {
             let (chunks, errors) = configured_stream_outcome(body, "text/event-stream").await;
@@ -6008,6 +6065,90 @@ mod tests {
                 "{case} must produce exactly one terminal error: {errors:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_tool_binding_diagnostics_never_reflect_the_credential() {
+        let secret = "configured-sentinel-secret";
+        let request = ProviderRequest::new(vec![crate::Message::user("hello")]).with_tools(vec![
+            crate::ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                input_schema: crate::ToolInputSchema::simple(vec![]),
+            },
+        ]);
+        let nonstream_body = serde_json::json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "model": "main",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": secret, "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let mut nonstream_server = mockito::Server::new_async().await;
+        nonstream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&nonstream_body).unwrap())
+            .create_async()
+            .await;
+        let error = configured_test_provider(nonstream_server.url())
+            .send_message(&request)
+            .await
+            .expect_err("an unadvertised reflected tool name must fail closed");
+        let displayed = format!("{error:#}");
+        assert!(
+            !displayed.contains(secret),
+            "configured nonstream tool-binding diagnostic leaked the credential: {displayed}"
+        );
+
+        let stream_body = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            secret
+        );
+        let mut stream_server = mockito::Server::new_async().await;
+        stream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .create_async()
+            .await;
+        let mut receiver = configured_test_provider(stream_server.url())
+            .send_message_stream(&request)
+            .await
+            .expect("the response-body failure must surface through the stream");
+        let mut errors = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            if let Err(error) = item {
+                errors.push(format!("{error:#}"));
+            }
+        }
+        assert_eq!(
+            errors.len(),
+            1,
+            "configured reflected tool name must emit exactly one terminal error: {errors:?}"
+        );
+        assert!(
+            !errors[0].contains(secret),
+            "configured streaming tool-binding diagnostic leaked the credential: {}",
+            errors[0]
+        );
     }
 
     #[tokio::test]
@@ -7332,6 +7473,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert_eq!(blocks.len(), 1);
@@ -7355,6 +7497,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap_err();
         assert!(error
@@ -7369,6 +7512,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert!(blocks.is_empty());
@@ -7416,6 +7560,7 @@ mod tests {
             &acc,
             true,
             &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+            false,
         )
         .unwrap();
         assert_eq!(blocks.len(), 1);

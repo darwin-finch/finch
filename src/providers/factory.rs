@@ -1019,6 +1019,7 @@ mod tests {
     };
     use crate::models::{InferenceProvider, ModelFamily, ModelSize};
     use crate::providers::{ContentBlock, Message};
+    use finch_providers::{ToolDefinition, ToolInputSchema};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1380,6 +1381,28 @@ mod tests {
         (graph.default_provider(), calls)
     }
 
+    async fn configured_factory_stream_outcome(
+        endpoint: &str,
+        request: &ProviderRequest,
+    ) -> (Vec<StreamChunk>, Vec<String>) {
+        let (provider, _) = configured_compatible_provider_at(endpoint);
+        let result = provider.send_message_stream(request).await;
+        let mut chunks = Vec::new();
+        let mut errors = Vec::new();
+        match result {
+            Ok(mut receiver) => {
+                while let Some(item) = receiver.recv().await {
+                    match item {
+                        Ok(chunk) => chunks.push(chunk),
+                        Err(error) => errors.push(format!("{error:#}")),
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+        (chunks, errors)
+    }
+
     async fn factory_stalling_server(
         send_sse_headers: bool,
     ) -> (
@@ -1676,9 +1699,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_configured_compatible_factory_rejects_adversarial_sse_framing_and_bounds() {
+        const MIB: usize = 1024 * 1024;
+        let terminal = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let oversized_tool_arguments = "x".repeat(MIB + 1);
+        let cases = vec![
+            (
+                "wrong content type",
+                "application/json",
+                terminal.to_string(),
+            ),
+            (
+                "missing DONE",
+                "text/event-stream",
+                terminal.replace("data: [DONE]\n\n", ""),
+            ),
+            (
+                "duplicate DONE",
+                "text/event-stream",
+                format!("{terminal}data: [DONE]\n\n"),
+            ),
+            (
+                "late SSE data",
+                "text/event-stream",
+                format!(
+                    "{terminal}data: {{\"id\":\"late\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[]}}\n\n"
+                ),
+            ),
+            (
+                "DONE without blank terminator",
+                "text/event-stream",
+                terminal
+                    .strip_suffix('\n')
+                    .expect("terminal fixture ends with a blank delimiter")
+                    .to_string(),
+            ),
+            (
+                "oversized SSE line",
+                "text/event-stream",
+                format!("data: {}\n\n", "x".repeat(MIB)),
+            ),
+            (
+                "oversized SSE aggregate",
+                "text/event-stream",
+                format!(":{}\n", "x".repeat(MIB - 2)).repeat(5),
+            ),
+            (
+                "oversized tool arguments",
+                "text/event-stream",
+                format!(
+                    concat!(
+                        "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read\",\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                        "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                    oversized_tool_arguments
+                ),
+            ),
+        ];
+
+        for (case, content_type, body) in cases {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", content_type)
+                .with_body(body)
+                .create_async()
+                .await;
+            let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![
+                ToolDefinition {
+                    name: "read".into(),
+                    description: "read".into(),
+                    input_schema: ToolInputSchema::simple(vec![]),
+                },
+            ]);
+            let (chunks, errors) = configured_factory_stream_outcome(&server.url(), &request).await;
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+                "factory-boundary {case} published a successful completion: {chunks:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "factory-boundary {case} must emit exactly one terminal error: chunks={chunks:?}, errors={errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_bounds_nonstream_success_body() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(vec![b'x'; 32 * 1024 * 1024 + 1])
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&server.url());
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect_err("factory-built provider must reject an oversized success body");
+        assert!(
+            format!("{error:#}").contains("32 MiB"),
+            "factory-built provider reported the wrong oversized-success diagnostic: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_configured_compatible_factory_redacts_reflected_credentials_and_releases_on_drop()
     {
         let secret = "factory-boundary-sentinel-secret";
+        let request =
+            ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                input_schema: ToolInputSchema::simple(vec![]),
+            }]);
+        let reflected_nonstream = serde_json::json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "model": "main",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": secret, "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let mut reflected_nonstream_server = mockito::Server::new_async().await;
+        reflected_nonstream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&reflected_nonstream).unwrap())
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&reflected_nonstream_server.url());
+        let error = provider
+            .send_message(&request)
+            .await
+            .expect_err("factory-built provider must reject an unadvertised reflected tool name");
+        assert!(
+            !format!("{error:#}").contains(secret),
+            "factory nonstream schema diagnostic leaked the resolved credential: {error:#}"
+        );
+
+        let reflected_stream = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            secret
+        );
+        let mut reflected_stream_server = mockito::Server::new_async().await;
+        reflected_stream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(reflected_stream)
+            .create_async()
+            .await;
+        let (chunks, errors) =
+            configured_factory_stream_outcome(&reflected_stream_server.url(), &request).await;
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+            "factory streaming schema failure published a completion: {chunks:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "factory streaming schema failure must emit exactly one error: {errors:?}"
+        );
+        assert!(
+            !errors[0].contains(secret),
+            "factory streaming schema diagnostic leaked the resolved credential: {}",
+            errors[0]
+        );
+
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/v1/chat/completions")
@@ -1748,6 +1964,39 @@ mod tests {
                 .is_cancelled(),
             "cancelled factory dispatch produced a late non-cancellation outcome"
         );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_post_header_timeout_is_one_terminal_error() {
+        let (endpoint, accepted, closed) = factory_stalling_server(true).await;
+        let (provider, _) = configured_compatible_provider_at(&endpoint);
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("factory-built stream must return after SSE headers");
+        accepted
+            .await
+            .expect("factory timeout fixture did not accept the request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let error = receiver
+            .recv()
+            .await
+            .expect("factory timeout stream ended without its terminal error")
+            .expect_err("factory timeout must not emit a successful chunk");
+        assert!(
+            format!("{error:#}")
+                .to_ascii_lowercase()
+                .contains("timed out"),
+            "factory timeout reported the wrong terminal diagnostic: {error:#}"
+        );
+        assert!(
+            receiver.recv().await.is_none(),
+            "factory timeout emitted more than one terminal outcome"
+        );
+        closed
+            .await
+            .expect("factory timeout did not release the upstream transport");
     }
 
     #[tokio::test]
