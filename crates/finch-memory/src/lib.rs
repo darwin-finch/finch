@@ -3078,6 +3078,71 @@ mod tests {
         }
     }
 
+    fn alternate_existing_path_spelling(
+        path: &std::path::Path,
+    ) -> Result<(Option<tempfile::TempDir>, PathBuf)> {
+        if let Ok(suffix) = path.strip_prefix("/private/var") {
+            return Ok((None, std::path::Path::new("/var").join(suffix)));
+        }
+        if path.starts_with("/var") {
+            return Ok((None, std::fs::canonicalize(path)?));
+        }
+        let parent = path
+            .parent()
+            .context("the temporary database path must have a parent")?;
+        let file_name = path
+            .file_name()
+            .context("the temporary database path must have a file name")?;
+        let detour = tempfile::tempdir_in(parent)?;
+        let alternate = detour.path().join("..").join(file_name);
+        Ok((Some(detour), alternate))
+    }
+
+    struct RoutingPausePathFixture {
+        _detour: Option<tempfile::TempDir>,
+        registered_spelling: PathBuf,
+        sqlite_observed_spelling: PathBuf,
+        registered_key: PathBuf,
+        sqlite_observed_key: PathBuf,
+    }
+
+    fn routing_pause_path_fixture(path: &std::path::Path) -> Result<RoutingPausePathFixture> {
+        let (detour, registered_spelling) = alternate_existing_path_spelling(path)?;
+        let conn = Connection::open(path)?;
+        let sqlite_observed_spelling = conn
+            .path()
+            .map(PathBuf::from)
+            .context("SQLite must report the path of the real file-backed test database")?;
+        let registered_key = std::fs::canonicalize(&registered_spelling)?;
+        let sqlite_observed_key = std::fs::canonicalize(&sqlite_observed_spelling)?;
+        assert_ne!(
+            registered_spelling,
+            sqlite_observed_spelling,
+            "the pause regression must register a spelling different from SQLite's observed path: \
+             registered_spelling={}, sqlite_observed_spelling={}",
+            registered_spelling.display(),
+            sqlite_observed_spelling.display(),
+        );
+        assert_eq!(
+            registered_key,
+            sqlite_observed_key,
+            "the pause regression's different spellings must identify the same existing database: \
+             registered_spelling={}, sqlite_observed_spelling={}, registered_key={}, \
+             sqlite_observed_key={}",
+            registered_spelling.display(),
+            sqlite_observed_spelling.display(),
+            registered_key.display(),
+            sqlite_observed_key.display(),
+        );
+        Ok(RoutingPausePathFixture {
+            _detour: detour,
+            registered_spelling,
+            sqlite_observed_spelling,
+            registered_key,
+            sqlite_observed_key,
+        })
+    }
+
     /// Count writes to `routing_nodes` made by one closure.
     ///
     /// A trigger rather than `Connection::total_changes`, because the store
@@ -7741,6 +7806,35 @@ mod tests {
             }),
         )?);
 
+        let (first_hydration, second_hydration) =
+            tokio::join!(first.ensure_hydrated(), second.ensure_hydrated());
+        first_hydration.context("the first writer must finish startup hydration")?;
+        second_hydration.context("the second writer must finish startup hydration")?;
+        let (first_recovery, second_recovery) = tokio::join!(
+            first.recover_pending_projections(),
+            second.recover_pending_projections()
+        );
+        let first_repaired = first_recovery.context("the first startup recovery must succeed")?;
+        let second_repaired =
+            second_recovery.context("the second startup recovery must succeed")?;
+
+        assert!(
+            matches!(first.hydration_status(), HydrationStatus::Ready { .. })
+                && matches!(second.hydration_status(), HydrationStatus::Ready { .. })
+                && !first.needs_projection_sweep.load(Ordering::SeqCst)
+                && !second.needs_projection_sweep.load(Ordering::SeqCst)
+                && first_repaired == 0
+                && second_repaired == 0,
+            "both independently opened writers must finish startup recovery before the embedding \
+             barrier can expose their own insert outcomes: first_status={:?}, \
+             first_sweep_owed={}, first_repaired={first_repaired}, second_status={:?}, \
+             second_sweep_owed={}, second_repaired={second_repaired}",
+            first.hydration_status(),
+            first.needs_projection_sweep.load(Ordering::SeqCst),
+            second.hydration_status(),
+            second.needs_projection_sweep.load(Ordering::SeqCst),
+        );
+
         let write_first = {
             let memory = Arc::clone(&first);
             tokio::spawn(async move {
@@ -7778,13 +7872,13 @@ mod tests {
             })
         };
         let (first_result, second_result) = tokio::join!(write_first, write_second);
+        let first_outcome = first_result.context("the first writer task must join")??;
+        let second_outcome = second_result.context("the second writer task must join")??;
         assert!(
-            first_result??,
-            "the first distinct Brain turn must be inserted"
-        );
-        assert!(
-            second_result??,
-            "the second distinct Brain turn must be inserted"
+            first_outcome && second_outcome,
+            "each distinct Brain writer must perform its own insert after both startup sweeps are \
+             discharged: first_outcome={first_outcome}, second_outcome={second_outcome}, \
+             first_repaired={first_repaired}, second_repaired={second_repaired}"
         );
 
         let conn = Connection::open(temp.path())?;
@@ -8083,8 +8177,9 @@ mod tests {
                 Some("writer"),
             )
             .await?;
+        let pause_paths = routing_pause_path_fixture(temp.path())?;
         let (_registration, pause) =
-            routing_memory::register_routing_load_pause(temp.path().to_path_buf());
+            routing_memory::register_routing_load_pause(pause_paths.registered_spelling.clone());
         let refresh = {
             let reader = Arc::clone(&reader);
             tokio::spawn(async move { reader.stats().await })
@@ -8095,7 +8190,16 @@ mod tests {
         };
         assert!(
             reached,
-            "the refresh must reach the deterministic boundary between routing rows and memory metadata"
+            "the refresh must reach the deterministic boundary between routing rows and memory \
+             metadata for two spellings of the same existing database: registered_spelling={}, \
+             sqlite_observed_spelling={}, registered_key={}, sqlite_observed_key={}, \
+             hydration={:?}, tree_load_count={}",
+            pause_paths.registered_spelling.display(),
+            pause_paths.sqlite_observed_spelling.display(),
+            pause_paths.registered_key.display(),
+            pause_paths.sqlite_observed_key.display(),
+            reader.hydration_status(),
+            reader.tree_load_count.load(Ordering::SeqCst),
         );
 
         writer
@@ -8291,8 +8395,9 @@ mod tests {
             )
             .await?;
 
+        let pause_paths = routing_pause_path_fixture(temp.path())?;
         let (_registration, pause) =
-            routing_memory::register_routing_load_pause(temp.path().to_path_buf());
+            routing_memory::register_routing_load_pause(pause_paths.registered_spelling.clone());
         let reader = MemorySystem::new(config)?;
         let reached = {
             let pause = Arc::clone(&pause);
@@ -8300,7 +8405,15 @@ mod tests {
         };
         assert!(
             reached,
-            "background hydration must reach its read snapshot pause"
+            "background hydration must reach its read snapshot pause for two spellings of the \
+             same existing database: registered_spelling={}, sqlite_observed_spelling={}, \
+             registered_key={}, sqlite_observed_key={}, hydration={:?}, tree_load_count={}",
+            pause_paths.registered_spelling.display(),
+            pause_paths.sqlite_observed_spelling.display(),
+            pause_paths.registered_key.display(),
+            pause_paths.sqlite_observed_key.display(),
+            reader.hydration_status(),
+            reader.tree_load_count.load(Ordering::SeqCst),
         );
         assert!(
             matches!(reader.hydration_status(), HydrationStatus::Loading { .. }),
