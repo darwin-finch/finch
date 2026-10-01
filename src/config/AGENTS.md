@@ -24,6 +24,9 @@ signature catalog.
 **Credentials are secrets.** Resolvers return values that must never reach logs, prompts, metrics,
 or error text; see the redaction rules in the root instructions before touching
 `credential.rs`.
+The `meta_model_api` credential provider is fixed to the `api.meta.ai` audience;
+configuration must not allow a custom-origin override or reinterpret it as a
+generic OpenAI-compatible credential.
 
 **Startup writes nothing; saves are atomic.** Ordinary start and attach perform no configuration
 save — notice bookkeeping lives in `notice_state.toml`, and the legacy `notice_suppress_until` is

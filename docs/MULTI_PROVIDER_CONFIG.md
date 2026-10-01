@@ -69,6 +69,14 @@ model = "gpt-4o"              # optional — default: gpt-4o
 
 Get an API key: https://platform.openai.com/
 
+### Muse Spark (direct Meta Model API)
+
+Muse Spark uses a named, origin-bound credential rather than an inline key.
+The current standard profile, exact TOML, supported wire behavior, and the
+distinction from OpenCode Zen and Muse Code are documented in
+[`META_MODEL_API.md`](META_MODEL_API.md). The setup wizard does not configure
+this profile.
+
 ### Grok (xAI)
 
 ```toml
@@ -192,6 +200,7 @@ The file is rewritten to the new format the next time config is saved (e.g. afte
 |----------|-----------|--------------|-------|
 | Claude   | ✅        | ✅           | Primary; best tool use quality |
 | OpenAI   | ✅        | ✅           | GPT-4o default |
+| Meta Model API | ✅  | ✅ (parallel) | Muse Spark 1.3; direct hosted API only |
 | Grok     | ✅        | ✅           | Fast; good for code |
 | Gemini   | ✅        | ✅           | Free tier available |
 | Mistral  | ✅        | ✅           | EU-hosted option |

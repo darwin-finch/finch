@@ -174,6 +174,11 @@ compatibility boundary, not an OpenAI-supported third-party integration. Legacy 
 `chatgpt_subscription` configuration is rejected with migration guidance; subscription
 authentication must not be inferred from OpenAI API-key support.
 
+Muse Spark 1.3 can be configured through the direct, origin-bound Meta Model
+API profile with a named `MODEL_API_KEY`; see
+[docs/META_MODEL_API.md](docs/META_MODEL_API.md). This is not OpenCode Zen or
+the Muse Code harness, and it does not claim local Muse Spark weights.
+
 A hand-written `type = "claude_cli_backend"` entry drives the official `claude`
 CLI as a subscription subprocess instead of metered API billing. It is never
 offered by the setup wizard, it disables the CLI's own tools so Finch's

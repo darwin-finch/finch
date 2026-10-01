@@ -1,7 +1,8 @@
 # Finch provider transports
 
 This crate owns provider-neutral request and stream contracts plus the concrete Claude,
-OpenAI-compatible, Gemini, ChatGPT, Grok, and Claude-subscription transports, provider capability
+OpenAI-compatible (including direct Meta Model API for Muse Spark), Gemini, ChatGPT, Grok, and
+Claude-subscription transports, provider capability
 and model-catalog logic, credential ports, and OAuth state machines. It validates
 provider-specific wire behavior without importing Finch application configuration. The root
 application maps `Config` onto these contracts and decides which provider profile to run;
@@ -32,6 +33,13 @@ Claude requests explicitly enable Anthropic's automatic moving-prefix cache; Ope
 ChatGPT use their service-managed implicit caches. Finch still sends complete request context to
 remote stateless APIs, because a cache hit is a provider optimization rather than stored
 conversation authority.
+
+The direct Meta Model API dialect accepts Muse Spark's documented `reasoning_content` response
+field without treating it as assistant output. Streaming reasoning crosses the provider boundary
+only as bounded `StreamChunk::ThinkingDelta` activity with Meta provider/model provenance;
+schema-valid `null` and empty streamed values are ignored, and buffered reasoning is validated and
+discarded. It is never appended to `ProviderResponse` content, tool arguments, or opaque replay
+material. Canonical OpenAI parsing remains strict and does not inherit Meta-only response fields.
 
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth

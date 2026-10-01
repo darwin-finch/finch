@@ -11,6 +11,8 @@ These documents are intended to describe the current `main` branch:
 - [Project overview and source quick start](../README.md)
 - [Contributing and attribution](../CONTRIBUTING.md)
 - [MCP client guide](MCP_USER_GUIDE.md)
+- [Muse Spark through direct Meta Model API](META_MODEL_API.md) — dated hosted-provider contract;
+  distinguishes Meta API, OpenCode Zen, Muse Code, and unavailable Muse Spark weights
 - [macOS GUI automation permissions](MACOS_GUI_AUTOMATION.md)
 - [Automatic-training and LoRA status](AUTOMATIC_TRAINING.md) — deferred because training and
   adapter loading depend on unsupported runtime and ML-toolchain requirements

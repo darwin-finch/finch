@@ -17,6 +17,11 @@ name for display. The REPL owns model/profile selection; this module owns the Co
 construction step. The duplicate graph construction is a measured startup cost, not a
 separate provider contract.
 
+The direct Meta Model API profile maps a named `meta_model_api` credential to
+the fixed Meta origin and Muse Spark identity. It is deliberately distinct
+from generic OpenAI-compatible endpoints, OpenCode Zen, and the Muse Code
+harness.
+
 Read [AGENTS.md](AGENTS.md) for dependency rules, [mod.rs](mod.rs) for flat exports, and
 root-package rustdoc for callable methods. For transport or catalog changes, use the
 [`finch-providers` capsule](../../crates/finch-providers/README.md).

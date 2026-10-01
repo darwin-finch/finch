@@ -36,6 +36,9 @@ types. The Claude HTTP client in `src/claude` must not re-export that trio.
 the crate. This facade only maps application configuration onto crate constructors.
 SuperGrok subscription construction is `GrokSubscriptionProvider::production`; it is
 not an OpenAI-compatible xAI Console API-key profile.
+Direct Meta Model API construction is `OpenAIProvider::new_meta_model_api` behind
+the distinct `CredentialProvider::MetaModelApi` mapping; endpoint overrides are
+rejected before secret resolution.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- providers::`; crate
 tests via `./scripts/test_brains.sh cargo test -p finch-providers --lib`; also
