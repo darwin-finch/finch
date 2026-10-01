@@ -17,6 +17,10 @@ credential bindings and maps them onto `finch-providers` implementations. This m
 persisted application vocabulary and secret-bearing resolver contracts; the provider factory
 owns profile selection, and the extracted crate owns validated transport dispatch.
 
+`provider = "meta_model_api"` is the named, fixed-origin vocabulary for the
+direct Meta Model API; it is not an alias for arbitrary OpenAI-compatible
+services.
+
 Read [AGENTS.md](AGENTS.md) for secret, lifetime, and testing rules,
 [mod.rs](mod.rs) for the flat facade, and root-package rustdoc for methods. The on-disk shape
 and migration limits live in [CONFIGURATION.md](CONFIGURATION.md).
