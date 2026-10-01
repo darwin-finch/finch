@@ -31,6 +31,7 @@ pub enum CredentialKind {
 pub enum CredentialProvider {
     Anthropic,
     OpenaiPlatform,
+    OpenaiCompatible,
     ChatgptSubscription,
     ClaudeSubscription,
     Xai,
@@ -47,6 +48,7 @@ impl CredentialProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenaiPlatform => "openai_platform",
+            Self::OpenaiCompatible => "openai_compatible",
             Self::ChatgptSubscription => "chatgpt_subscription",
             Self::ClaudeSubscription => "claude_subscription",
             Self::Xai => "xai",
@@ -334,6 +336,17 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             family: EndpointFamily::OpenaiPlatform,
             standard_origin: "https://api.openai.com",
         },
+        CredentialProvider::OpenaiCompatible => ProviderAuthDescriptor {
+            provider,
+            issuer: "openai-compatible",
+            kinds: &[CredentialKind::ApiKey, CredentialKind::Bearer],
+            family: EndpointFamily::Custom,
+            // Generic compatible credentials are always bound to the explicit
+            // profile endpoint. This sentinel is never used as an origin; the
+            // special cases in `required_audience` and
+            // `validate_authenticated_endpoints` require one from the caller.
+            standard_origin: "",
+        },
         CredentialProvider::ChatgptSubscription => ProviderAuthDescriptor {
             provider,
             issuer: "openai-chatgpt",
@@ -448,6 +461,11 @@ pub fn required_audience(
     endpoint: Option<&str>,
 ) -> Result<AudienceBinding> {
     let expected = descriptor(provider);
+    if provider == CredentialProvider::OpenaiCompatible {
+        let endpoint = endpoint
+            .context("generic OpenAI-compatible credentials require an explicit endpoint origin")?;
+        return AudienceBinding::custom(endpoint);
+    }
     let endpoint = endpoint.unwrap_or(expected.standard_origin);
     let actual = normalize_origin(endpoint)?;
     if actual == normalize_origin(expected.standard_origin)? {
@@ -463,6 +481,9 @@ pub fn validate_authenticated_endpoints(
     overrides: &[Option<&str>],
 ) -> Result<()> {
     let expected = descriptor(provider);
+    if provider == CredentialProvider::OpenaiCompatible && base_url.is_none() {
+        bail!("generic OpenAI-compatible profiles require an explicit base URL");
+    }
     let base_origin = normalize_origin(base_url.unwrap_or(expected.standard_origin))?;
     for endpoint in overrides.iter().flatten() {
         if *endpoint != endpoint.trim() || endpoint.contains('\\') || endpoint.starts_with("//") {
@@ -640,7 +661,11 @@ mod tests {
             kind,
             provider,
             issuer: descriptor.issuer.into(),
-            audience: AudienceBinding::standard(descriptor.family),
+            audience: if provider == CredentialProvider::OpenaiCompatible {
+                AudienceBinding::custom("https://compatible.example").unwrap()
+            } else {
+                AudienceBinding::standard(descriptor.family)
+            },
             tenant: None,
             project: None,
             account: Some("account-1".into()),
@@ -667,6 +692,7 @@ mod tests {
         let providers = [
             CredentialProvider::Anthropic,
             CredentialProvider::OpenaiPlatform,
+            CredentialProvider::OpenaiCompatible,
             CredentialProvider::ChatgptSubscription,
             CredentialProvider::ClaudeSubscription,
             CredentialProvider::Xai,
@@ -690,20 +716,40 @@ mod tests {
             for kind in kinds {
                 let value = credential(provider, kind);
                 assert_eq!(
-                    validate_binding(provider, None, &binding(), &value, Utc::now()).is_ok(),
+                    validate_binding(
+                        provider,
+                        (provider == CredentialProvider::OpenaiCompatible)
+                            .then_some("https://compatible.example/v1"),
+                        &binding(),
+                        &value,
+                        Utc::now()
+                    )
+                    .is_ok(),
                     descriptor(provider).kinds.contains(&kind),
                     "provider={provider:?} kind={kind:?}"
                 );
             }
             let mut wrong = credential(provider, descriptor(provider).kinds[0]);
-            wrong.audience = AudienceBinding::standard(
-                if descriptor(provider).family == EndpointFamily::AnthropicApi {
-                    EndpointFamily::OpenaiPlatform
-                } else {
-                    EndpointFamily::AnthropicApi
-                },
-            );
-            assert!(validate_binding(provider, None, &binding(), &wrong, Utc::now()).is_err());
+            wrong.audience = if provider == CredentialProvider::OpenaiCompatible {
+                AudienceBinding::standard(EndpointFamily::AnthropicApi)
+            } else {
+                AudienceBinding::standard(
+                    if descriptor(provider).family == EndpointFamily::AnthropicApi {
+                        EndpointFamily::OpenaiPlatform
+                    } else {
+                        EndpointFamily::AnthropicApi
+                    },
+                )
+            };
+            assert!(validate_binding(
+                provider,
+                (provider == CredentialProvider::OpenaiCompatible)
+                    .then_some("https://compatible.example/v1"),
+                &binding(),
+                &wrong,
+                Utc::now()
+            )
+            .is_err());
         }
     }
 

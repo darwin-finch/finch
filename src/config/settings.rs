@@ -3,7 +3,7 @@
 use super::backend::BackendConfig;
 use super::diagnostics::DiagnosticsConfig;
 use super::provider::ProviderEntry;
-use super::ProviderCredential;
+use super::{CredentialProvider, ProviderCredential};
 use crate::theme::ColorScheme;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -328,8 +328,8 @@ pub struct LicenseConfig {
 impl ProviderEntry {
     /// The `(provider-name, api-key)` projection used by startup validation.
     /// Returns `None` for variants outside the simple API-key cloud set
-    /// (`Credentialed`, `LegacyChatgptSubscription`, `Ollama`, `RemoteDaemon`,
-    /// `Local`).
+    /// (`Credentialed`, `OpenAiCompatible`, `LegacyChatgptSubscription`,
+    /// `Ollama`, `RemoteDaemon`, `Local`).
     ///
     /// This is validation input only — configuration I/O is `[[providers]]`.
     pub(crate) fn simple_cloud_key(&self) -> Option<(&'static str, &str)> {
@@ -342,6 +342,7 @@ impl ProviderEntry {
             Self::Groq { api_key, .. } => Some(("groq", api_key)),
             Self::Openrouter { api_key, .. } => Some(("openrouter", api_key)),
             Self::Credentialed { .. }
+            | Self::OpenAiCompatible { .. }
             | Self::LegacyChatgptSubscription { .. }
             | Self::ClaudeCliBackend { .. }
             | Self::Ollama { .. }
@@ -540,26 +541,36 @@ impl Config {
                     binding.credential_ref
                 )
             })?;
-            if let ProviderEntry::Credentialed {
-                provider: credential_provider,
-                base_url,
-                chat_path,
-                models_path,
-                ..
-            } = provider
-            {
-                super::validate_authenticated_endpoints(
+            match provider {
+                ProviderEntry::Credentialed {
+                    provider: credential_provider,
+                    base_url,
+                    chat_path,
+                    models_path,
+                    ..
+                } => super::validate_authenticated_endpoints(
                     *credential_provider,
                     base_url.as_deref(),
                     &[chat_path.as_deref(), models_path.as_deref()],
-                )
-                .with_context(|| {
-                    format!(
-                        "provider profile '{}' has unsafe endpoint override",
-                        provider.profile_name()
-                    )
-                })?;
+                ),
+                ProviderEntry::OpenAiCompatible {
+                    base_url,
+                    chat_path,
+                    models_path,
+                    ..
+                } => super::validate_authenticated_endpoints(
+                    CredentialProvider::OpenaiCompatible,
+                    Some(base_url),
+                    &[chat_path.as_deref(), models_path.as_deref()],
+                ),
+                _ => Ok(()),
             }
+            .with_context(|| {
+                format!(
+                    "provider profile '{}' has unsafe endpoint override",
+                    provider.profile_name()
+                )
+            })?;
             super::validate_binding(
                 provider
                     .credential_provider()
@@ -576,6 +587,54 @@ impl Config {
                     binding.credential_ref
                 )
             })?;
+        }
+
+        for provider in &self.providers {
+            let ProviderEntry::OpenAiCompatible {
+                name,
+                base_url,
+                model,
+                capabilities,
+                tool_choice,
+                strict_tool_schemas,
+                ..
+            } = provider
+            else {
+                continue;
+            };
+            if name.trim().is_empty() || model.trim().is_empty() || base_url.trim().is_empty() {
+                anyhow::bail!(
+                    "generic OpenAI-compatible profiles require non-empty name, base_url, and model"
+                );
+            }
+            if capabilities.context_window_tokens == Some(0)
+                || capabilities.max_output_tokens == Some(0)
+            {
+                anyhow::bail!(
+                    "provider profile '{}' capability token limits must be positive",
+                    name
+                );
+            }
+            if let (Some(context), Some(output)) = (
+                capabilities.context_window_tokens,
+                capabilities.max_output_tokens,
+            ) {
+                if output > context {
+                    anyhow::bail!(
+                        "provider profile '{}' max_output_tokens cannot exceed context_window_tokens",
+                        name
+                    );
+                }
+            }
+            if capabilities.tools == Some(false)
+                && (!matches!(tool_choice, super::OpenAiCompatibleToolChoice::Omit)
+                    || strict_tool_schemas.is_some())
+            {
+                anyhow::bail!(
+                    "provider profile '{}' configures tool request fields while declaring tools unsupported",
+                    name
+                );
+            }
         }
 
         // Allow empty cloud providers — the app can start and will show an error

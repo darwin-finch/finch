@@ -191,6 +191,9 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
         ProviderEntry::Credentialed { .. } => {
             bail!("Named credential profiles must be created from the complete Config graph so their references can be validated; use create_provider_from_config")
         }
+        ProviderEntry::OpenAiCompatible { .. } => {
+            bail!("Generic OpenAI-compatible profiles must be created from the complete Config graph so their named credential can be validated; use create_provider_from_config")
+        }
         ProviderEntry::LegacyChatgptSubscription { .. } => {
             bail!(LEGACY_CHATGPT_MIGRATION_ERROR)
         }
@@ -372,6 +375,42 @@ fn create_provider_from_resolved_entry(
     entry: &ProviderEntry,
     resolved: &ResolvedCredential,
 ) -> Result<Box<dyn LlmProvider>> {
+    if let ProviderEntry::OpenAiCompatible {
+        name,
+        base_url,
+        chat_path,
+        models_path,
+        model,
+        capabilities,
+        tool_choice,
+        strict_tool_schemas,
+        ..
+    } = entry
+    {
+        let attested = super::ModelCapabilities::configured_openai_compatible(
+            name.clone(),
+            model.clone(),
+            capabilities.streaming,
+            capabilities.tools,
+            capabilities.parallel_tool_calls,
+            capabilities.image_input,
+            capabilities
+                .context_window_tokens
+                .map(|value| value as usize),
+            capabilities.max_output_tokens.map(|value| value as usize),
+        );
+        return Ok(Box::new(OpenAIProvider::new_configured_compatible(
+            resolved.secret.expose().to_string(),
+            base_url.clone(),
+            chat_path.as_deref().unwrap_or("/chat/completions"),
+            models_path.as_deref().unwrap_or("/models"),
+            model.clone(),
+            name.clone(),
+            attested,
+            matches!(tool_choice, crate::config::OpenAiCompatibleToolChoice::Auto),
+            *strict_tool_schemas,
+        )?));
+    }
     let ProviderEntry::Credentialed {
         provider,
         model,
@@ -448,6 +487,9 @@ fn create_provider_from_resolved_entry(
         ),
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
+        ),
+        CredentialProvider::OpenaiCompatible => bail!(
+            "generic OpenAI-compatible credentials require an openai_compatible profile"
         ),
     }
 }
@@ -953,7 +995,8 @@ mod tests {
     use crate::config::ProviderEntry;
     use crate::config::{
         AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
-        CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ResolvedSecret,
+        CredentialProvider, EndpointFamily, ExecutionTarget, OpenAiCompatibleCapabilities,
+        OpenAiCompatibleToolChoice, ProviderCredential, ResolvedSecret,
     };
     use crate::models::{InferenceProvider, ModelFamily, ModelSize};
     use std::collections::BTreeSet;
@@ -1130,6 +1173,55 @@ mod tests {
         credential
     }
 
+    fn generic_openai_compatible(
+        name: &str,
+        credential_ref: &str,
+        endpoint: &str,
+    ) -> ProviderEntry {
+        ProviderEntry::OpenAiCompatible {
+            name: name.into(),
+            base_url: format!("{}/v1", endpoint.trim_end_matches('/')),
+            chat_path: Some("/chat/completions".into()),
+            models_path: Some("/models".into()),
+            model: "main".into(),
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            capabilities: OpenAiCompatibleCapabilities {
+                streaming: Some(true),
+                tools: Some(true),
+                parallel_tool_calls: Some(false),
+                image_input: Some(false),
+                context_window_tokens: Some(262_144),
+                max_output_tokens: Some(65_536),
+            },
+            tool_choice: OpenAiCompatibleToolChoice::Auto,
+            strict_tool_schemas: Some(false),
+        }
+    }
+
+    fn generic_openai_compatible_credential(name: &str, endpoint: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiCompatible,
+            issuer: "openai-compatible".into(),
+            audience: AudienceBinding::custom(endpoint).unwrap(),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Single-entry construction tests
     // -----------------------------------------------------------------------
@@ -1241,6 +1333,53 @@ mod tests {
         assert_eq!(graph.profiles()[1].profile_name(), "reasoning");
         let default = graph.default_provider();
         assert!(Arc::ptr_eq(&default, graph.profiles()[0].provider()));
+    }
+
+    #[test]
+    fn test_generic_openai_compatible_profile_builds_from_endpoint_bound_credential() {
+        let endpoint = "https://compatible.example";
+        let config = Config::with_providers(vec![generic_openai_compatible(
+            "ciru", "ciru-key", endpoint,
+        )])
+        .with_credentials(vec![generic_openai_compatible_credential(
+            "ciru-key", endpoint,
+        )]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+
+        let graph = create_provider_graph_from_config_with_resolver(&config, &resolver).unwrap();
+        let provider = graph.default_provider();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "ciru");
+        assert_eq!(provider.name(), "ciru");
+        assert_eq!(provider.default_model(), "main");
+        let capabilities = provider.capabilities("main");
+        assert!(capabilities.streaming.is_supported());
+        assert!(capabilities.tools.is_supported());
+        assert_eq!(capabilities.context_window.max_tokens, Some(262_144));
+        assert_eq!(capabilities.output_token_limit.max_tokens, Some(65_536));
+    }
+
+    #[test]
+    fn test_generic_openai_compatible_rejects_cross_origin_path_before_resolution() {
+        let endpoint = "https://compatible.example";
+        let mut profile = generic_openai_compatible("ciru", "ciru-key", endpoint);
+        if let ProviderEntry::OpenAiCompatible { chat_path, .. } = &mut profile {
+            *chat_path = Some("https://attacker.example/v1/chat/completions".into());
+        }
+        let config = Config::with_providers(vec![profile]).with_credentials(vec![
+            generic_openai_compatible_credential("ciru-key", endpoint),
+        ]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .err()
+            .expect("cross-origin authenticated path must fail closed");
+        assert!(format!("{error:#}").contains("unsafe endpoint override"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

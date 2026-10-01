@@ -34,6 +34,38 @@ fn default_model_size() -> ModelSize {
     ModelSize::Medium
 }
 
+/// Operator-attested capabilities for one generic OpenAI-compatible model.
+///
+/// `None` remains unknown and therefore fails closed when a request depends on
+/// it. The protocol name alone is never treated as evidence of model support.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiCompatibleCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Tool-choice request field used by a generic compatible endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatibleToolChoice {
+    /// Do not send a `tool_choice` field.
+    #[default]
+    Omit,
+    /// Send `tool_choice: "auto"` whenever tools are advertised.
+    Auto,
+}
+
 /// A single provider entry — either a cloud API or a local inference backend.
 ///
 /// Serializes with a `type` tag, e.g.:
@@ -69,8 +101,10 @@ pub enum ProviderEntry {
         reasoning_effort: Option<ReasoningEffort>,
     },
     #[serde(rename = "chatgpt_subscription")]
-    /// Legacy Codex app-server profile retained only so old configuration can
-    /// be diagnosed without silently treating a subscription as a Platform key.
+    /// Old standalone Codex app-server profile retained only so that config
+    /// shape can be diagnosed without silently treating a subscription as a
+    /// Platform key. Current subscription support uses `Credentialed` with
+    /// `CredentialProvider::ChatgptSubscription`.
     LegacyChatgptSubscription {
         #[serde(default)]
         credential_ref: String,
@@ -133,6 +167,30 @@ pub enum ProviderEntry {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<ReasoningEffort>,
+    },
+    /// A named, endpoint-bound OpenAI Chat Completions profile.
+    ///
+    /// This is deliberately distinct from `Openai`: it makes no claim that
+    /// the service is OpenAI and only exposes capabilities explicitly
+    /// attested in this exact profile.
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible {
+        name: String,
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
+        model: String,
+        credential: CredentialBinding,
+        #[serde(default)]
+        capabilities: OpenAiCompatibleCapabilities,
+        #[serde(default)]
+        tool_choice: OpenAiCompatibleToolChoice,
+        /// Whether to include the OpenAI `strict` member on function schemas.
+        /// `Some(false)` is required by endpoints such as Ciru/Dunamis.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict_tool_schemas: Option<bool>,
     },
     Grok {
         api_key: String,
@@ -288,6 +346,7 @@ impl ProviderEntry {
     /// falling back to the configured model, then to a provider-specific label.
     pub fn profile_name(&self) -> String {
         let explicit_name = match self {
+            Self::OpenAiCompatible { name, .. } => Some(name.as_str()),
             Self::Credentialed { name, .. }
             | Self::LegacyChatgptSubscription { name, .. }
             | Self::Claude { name, .. }
@@ -400,6 +459,7 @@ impl ProviderEntry {
                 name.as_deref().unwrap_or("Claude CLI (subscription)")
             }
             Self::Openai { name, .. } => name.as_deref().unwrap_or("OpenAI"),
+            Self::OpenAiCompatible { name, .. } => name,
             Self::Grok { name, .. } => name.as_deref().unwrap_or("Grok"),
             Self::Gemini { name, .. } => name.as_deref().unwrap_or("Gemini"),
             Self::Mistral { name, .. } => name.as_deref().unwrap_or("Mistral"),
@@ -418,6 +478,7 @@ impl ProviderEntry {
             Self::LegacyChatgptSubscription { .. } => "chatgpt_subscription",
             Self::Claude { .. } => "claude",
             Self::Openai { .. } => "openai",
+            Self::OpenAiCompatible { .. } => "openai_compatible",
             Self::ClaudeCliBackend { .. } => "claude_cli",
             Self::Grok { .. } => "grok",
             Self::Gemini { .. } => "gemini",
@@ -446,6 +507,7 @@ impl ProviderEntry {
             Self::Groq { api_key, .. } => Some(api_key.as_str()),
             Self::Openrouter { api_key, .. } => Some(api_key.as_str()),
             Self::Credentialed { .. }
+            | Self::OpenAiCompatible { .. }
             | Self::LegacyChatgptSubscription { .. }
             | Self::ClaudeCliBackend { .. }
             | Self::Ollama { .. }
@@ -462,6 +524,7 @@ impl ProviderEntry {
             Self::Claude { model, .. } => model.as_deref(),
             Self::ClaudeCliBackend { model, .. } => model.as_deref(),
             Self::Openai { model, .. } => model.as_deref(),
+            Self::OpenAiCompatible { model, .. } => Some(model.as_str()),
             Self::Grok { model, .. } => model.as_deref(),
             Self::Gemini { model, .. } => model.as_deref(),
             Self::Mistral { model, .. } => model.as_deref(),
@@ -504,6 +567,11 @@ impl ProviderEntry {
             | Self::Groq { model, .. }
             | Self::Openrouter { model, .. }
             | Self::ClaudeCliBackend { model, .. } => *model = overlay,
+            Self::OpenAiCompatible { model, .. } => {
+                if let Some(value) = overlay {
+                    *model = value;
+                }
+            }
             Self::Ollama { model, .. } => {
                 if let Some(value) = overlay {
                     *model = value;
@@ -532,7 +600,9 @@ impl ProviderEntry {
     /// Named provider credential binding, if this is a credentialed profile.
     pub fn credential_binding(&self) -> Option<&CredentialBinding> {
         match self {
-            Self::Credentialed { credential, .. } => Some(credential),
+            Self::Credentialed { credential, .. } | Self::OpenAiCompatible { credential, .. } => {
+                Some(credential)
+            }
             _ => None,
         }
     }
@@ -541,6 +611,7 @@ impl ProviderEntry {
     pub fn credential_provider(&self) -> Option<CredentialProvider> {
         match self {
             Self::Credentialed { provider, .. } => Some(*provider),
+            Self::OpenAiCompatible { .. } => Some(CredentialProvider::OpenaiCompatible),
             _ => None,
         }
     }
@@ -549,6 +620,7 @@ impl ProviderEntry {
     pub fn credential_base_url(&self) -> Option<&str> {
         match self {
             Self::Credentialed { base_url, .. } => base_url.as_deref(),
+            Self::OpenAiCompatible { base_url, .. } => Some(base_url.as_str()),
             _ => None,
         }
     }
@@ -627,6 +699,43 @@ mod tests {
         let debug = format!("{entry:?}");
         assert!(!debug.contains(secret));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn generic_openai_compatible_profile_round_trips_without_inline_secret() {
+        let entry = ProviderEntry::OpenAiCompatible {
+            name: "ciru-dunamis".into(),
+            base_url: "https://dunamis.ciru.ai/v1".into(),
+            chat_path: Some("/chat/completions".into()),
+            models_path: Some("/models".into()),
+            model: "main".into(),
+            credential: CredentialBinding {
+                credential_ref: "ciru-dunamis".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: Default::default(),
+            },
+            capabilities: OpenAiCompatibleCapabilities {
+                streaming: Some(true),
+                tools: Some(true),
+                parallel_tool_calls: Some(false),
+                image_input: Some(false),
+                context_window_tokens: Some(262_144),
+                max_output_tokens: Some(65_536),
+            },
+            tool_choice: OpenAiCompatibleToolChoice::Auto,
+            strict_tool_schemas: Some(false),
+        };
+
+        let encoded = toml::to_string(&entry).unwrap();
+        let decoded: ProviderEntry = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.provider_type(), "openai_compatible");
+        assert_eq!(decoded.profile_name(), "ciru-dunamis");
+        assert!(!encoded.contains("api_key"));
+        assert!(!format!("{decoded:?}").contains("dunaapi"));
     }
 
     #[test]

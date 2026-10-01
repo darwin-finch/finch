@@ -68,6 +68,22 @@ impl ModelFeature {
         }
     }
 
+    /// Construct an operator-attested feature for an exact configured
+    /// provider/model profile. An omitted assertion remains unknown.
+    pub fn configuration(support: Option<bool>) -> Self {
+        match support {
+            Some(true) => Self {
+                support: CapabilitySupport::Supported,
+                provenance: CapabilityProvenance::Configuration,
+            },
+            Some(false) => Self {
+                support: CapabilitySupport::Unsupported,
+                provenance: CapabilityProvenance::Configuration,
+            },
+            None => Self::unknown(),
+        }
+    }
+
     /// Return true only for explicit support, never for unknown status.
     pub fn is_supported(&self) -> bool {
         self.support == CapabilitySupport::Supported
@@ -318,6 +334,55 @@ impl ModelCapabilities {
                 OutputTokenLimitCapability::unknown()
             },
             wire_protocol: WireProtocolCapability::unknown(),
+        }
+    }
+
+    /// Build capabilities from explicit configuration for one generic
+    /// OpenAI-compatible connection and model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configured_openai_compatible(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        streaming: Option<bool>,
+        tools: Option<bool>,
+        parallel_tool_calls: Option<bool>,
+        image_input: Option<bool>,
+        context_window_tokens: Option<usize>,
+        max_output_tokens: Option<usize>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            streaming: ModelFeature::configuration(streaming),
+            tools: ModelFeature::configuration(tools),
+            parallel_tool_calls: ModelFeature::configuration(parallel_tool_calls),
+            structured_output: ModelFeature::unknown(),
+            image_input: ModelFeature::configuration(image_input),
+            audio_input: ModelFeature::unknown(),
+            usage_reporting: ModelFeature::unknown(),
+            continuation: ModelFeature::unknown(),
+            reasoning: ReasoningCapability::unknown(),
+            context_window: ContextWindowCapability {
+                max_tokens: context_window_tokens,
+                max_messages: None,
+                provenance: if context_window_tokens.is_some() {
+                    CapabilityProvenance::Configuration
+                } else {
+                    CapabilityProvenance::Unknown
+                },
+            },
+            output_token_limit: OutputTokenLimitCapability {
+                max_tokens: max_output_tokens,
+                provenance: if max_output_tokens.is_some() {
+                    CapabilityProvenance::Configuration
+                } else {
+                    CapabilityProvenance::Unknown
+                },
+            },
+            wire_protocol: WireProtocolCapability {
+                protocol: Some(WireProtocol::OpenAiChatCompletions),
+                provenance: CapabilityProvenance::Configuration,
+            },
         }
     }
 

@@ -1066,6 +1066,8 @@ pub struct OpenAIProvider {
     /// How this instance's model capabilities are attested. See
     /// [`ProviderProfile`].
     profile: ProviderProfile,
+    compatible_tool_choice_auto: bool,
+    compatible_strict_tool_schemas: Option<bool>,
 }
 
 /// Strategy this provider instance uses to answer `capabilities()` /
@@ -1104,6 +1106,9 @@ enum ProviderProfile {
     /// specific, with no attestation path at all, so capabilities are
     /// always `Unknown`.
     RemoteDaemon,
+    /// Operator-attested capabilities for one exact generic connection and
+    /// model. These never inherit a first-party provider identity.
+    Configured(ModelCapabilities),
 }
 
 /// One model's live capability attestation, fetched from Ollama's own
@@ -1308,7 +1313,44 @@ impl OpenAIProvider {
             canonical_openai_endpoint,
             auth_header: AuthHeader::Bearer,
             profile: ProviderProfile::Static,
+            compatible_tool_choice_auto: false,
+            compatible_strict_tool_schemas: None,
         })
+    }
+
+    /// Create a generic OpenAI Chat Completions provider whose capabilities
+    /// and request compatibility fields come from the exact named profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured_compatible(
+        api_key: String,
+        base_url: String,
+        chat_path: impl AsRef<str>,
+        models_path: impl AsRef<str>,
+        model: String,
+        provider_name: String,
+        capabilities: ModelCapabilities,
+        tool_choice_auto: bool,
+        strict_tool_schemas: Option<bool>,
+    ) -> Result<Self> {
+        if capabilities.provider != provider_name || capabilities.model != model {
+            anyhow::bail!("Configured compatible capability identity did not match provider/model");
+        }
+        let mut provider = Self::new(
+            api_key,
+            base_url,
+            chat_path.as_ref(),
+            models_path.as_ref(),
+            model,
+            provider_name,
+        )?;
+        // A configured compatible profile owns its wire contract explicitly.
+        // Its user-selected name and endpoint must not opt it into Finch's
+        // first-party OpenAI transport rules.
+        provider.canonical_openai_endpoint = false;
+        provider.profile = ProviderProfile::Configured(capabilities);
+        provider.compatible_tool_choice_auto = tool_choice_auto;
+        provider.compatible_strict_tool_schemas = strict_tool_schemas;
+        Ok(provider)
     }
 
     /// OpenAI-compatible transport that sends the secret as a named header
@@ -1603,6 +1645,7 @@ impl OpenAIProvider {
                             name: bound.wire.name.clone(),
                             description: bound.description.clone(),
                             parameters: bound.wire_schema.clone(),
+                            strict: self.compatible_strict_tool_schemas,
                         },
                     })
                     .collect(),
@@ -1621,6 +1664,8 @@ impl OpenAIProvider {
             temperature: request.temperature,
             reasoning_effort: self.reasoning_effort.map(ReasoningEffort::as_str),
             tools,
+            tool_choice: (self.compatible_tool_choice_auto && !bindings.is_empty())
+                .then_some("auto"),
             stream: request.stream,
             stream_options: (request.stream
                 && rule == TransportRule::CanonicalGpt56ChatCompletions)
@@ -1997,6 +2042,45 @@ impl OpenAIProvider {
                                         actual_model = stream_chunk.model.clone();
                                     }
                                     if let Some(choice) = stream_chunk.choices.into_iter().next() {
+                                        if let Some(reason) = choice.finish_reason.as_deref() {
+                                            let error = match reason {
+                                                "stop" | "tool_calls" | "function_call" => None,
+                                                "length" => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream reached its output-token limit"
+                                                )),
+                                                "content_filter" => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream was stopped by content filtering"
+                                                )),
+                                                _ => Some(anyhow::anyhow!(
+                                                    "OpenAI-compatible stream returned unknown finish reason '{reason}'"
+                                                )),
+                                            };
+                                            if let Some(error) = error {
+                                                let _ = tx.send(Err(error)).await;
+                                                done = true;
+                                                break;
+                                            }
+                                        }
+                                        if let Some(reasoning) = choice.delta.reasoning_content {
+                                            sequence += 1;
+                                            if tx
+                                                .send(Ok(StreamChunk::ThinkingDelta {
+                                                    text: reasoning,
+                                                    provenance: EventProvenance {
+                                                        provider: provider_name.clone(),
+                                                        model: actual_model.clone(),
+                                                        event: "reasoning".to_string(),
+                                                        sequence,
+                                                        opaque_replay: None,
+                                                    },
+                                                }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                done = true;
+                                                break;
+                                            }
+                                        }
                                         if let Some(content) = choice.delta.content {
                                             accumulated_text.push_str(&content);
                                             // Send delta immediately
@@ -2320,6 +2404,13 @@ impl ProviderBackend for OpenAIProvider {
                 capabilities,
             } => self.ollama_model_capabilities(capability_endpoint, capabilities, model),
             ProviderProfile::RemoteDaemon => ModelCapabilities::unknown(self.name(), model),
+            ProviderProfile::Configured(capabilities) => {
+                if capabilities.model == model {
+                    capabilities.clone()
+                } else {
+                    ModelCapabilities::unknown(self.name(), model)
+                }
+            }
         }
     }
 
@@ -2339,6 +2430,10 @@ impl ProviderBackend for OpenAIProvider {
             } => (capability_endpoint.as_str(), capabilities),
             ProviderProfile::RemoteDaemon => {
                 // No attestation path at all (issue #925 scope was Ollama-only).
+                return;
+            }
+            ProviderProfile::Configured(_) => {
+                // Configuration is the explicit attestation boundary.
                 return;
             }
         };
@@ -2423,6 +2518,8 @@ struct OpenAIRequest {
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2515,6 +2612,8 @@ struct OpenAIFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2596,6 +2695,9 @@ struct OpenAIStreamChoice {
 struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
+    /// Reasoning text used by xAI and other compatible endpoints. This is
+    /// activity/reasoning, never assistant output.
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }
 
@@ -3021,6 +3123,32 @@ mod tests {
         assert_eq!(
             custom.transport_rule("gpt-5.6-sol"),
             TransportRule::CompatibleChatCompletions
+        );
+        let configured = OpenAIProvider::new_configured_compatible(
+            "key".into(),
+            "https://api.openai.com".into(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-5.6-sol".into(),
+            "openai".into(),
+            ModelCapabilities::configured_openai_compatible(
+                "openai",
+                "gpt-5.6-sol",
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(128_000),
+                Some(8_192),
+            ),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.transport_rule("gpt-5.6-sol"),
+            TransportRule::CompatibleChatCompletions,
+            "a generic configured profile must not inherit first-party transport identity from its display name and endpoint"
         );
         assert_eq!(
             canonical.capabilities("gpt-5.6-sol").wire_protocol.protocol,
@@ -4520,6 +4648,194 @@ mod tests {
             .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
             .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn configured_compatible_streams_native_tool_calls_with_declared_wire_options() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_read\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer endpoint-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "main",
+                "stream": true,
+                "max_tokens": 32768,
+                "tool_choice": "auto",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "strict": false
+                    }
+                }]
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let capabilities = ModelCapabilities::configured_openai_compatible(
+            "ciru",
+            "main",
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(262_144),
+            Some(65_536),
+        );
+        let provider = OpenAIProvider::new_configured_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+            capabilities,
+            true,
+            Some(false),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![crate::Message::user("read the file")])
+            .with_max_tokens(32_768)
+            .with_tools(vec![crate::ToolDefinition {
+                name: "read".into(),
+                description: "read file".into(),
+                input_schema: crate::ToolInputSchema::simple(vec![("path", "path")]),
+            }]);
+        let mut rx = provider.dispatch_stream(&request).await.unwrap();
+        let mut completed = None;
+        while let Some(item) = rx.recv().await {
+            if let StreamChunk::ToolCallComplete { name, input, .. } = item.unwrap() {
+                completed = Some((name, input));
+            }
+        }
+        assert_eq!(
+            completed,
+            Some(("read".into(), serde_json::json!({"path": "README.md"})))
+        );
+        assert_eq!(provider.name(), "ciru");
+        assert_eq!(
+            provider.capabilities("main").tools.provenance,
+            CapabilityProvenance::Configuration
+        );
+        assert_eq!(
+            provider.capabilities("other").tools.support,
+            CapabilitySupport::Unknown
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_reports_reasoning_activity_without_treating_it_as_output() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"checking\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .dispatch_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .unwrap();
+        let mut reasoning = Vec::new();
+        let mut text = String::new();
+        let mut completed = String::new();
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ThinkingDelta { text, provenance } => {
+                    reasoning.push((text, provenance.event));
+                }
+                StreamChunk::TextDelta(delta) => text.push_str(&delta),
+                StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                    completed.push_str(&text);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reasoning,
+            vec![("checking".to_string(), "reasoning".to_string())],
+            "generic compatible reasoning_content must remain a distinct thinking event"
+        );
+        assert_eq!(text, "OK", "reasoning text leaked into assistant output");
+        assert_eq!(
+            completed, "OK",
+            "completed assistant output must exclude reasoning_content"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_surfaces_output_limit_instead_of_empty_success() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "endpoint-secret".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "main".into(),
+            "ciru".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .dispatch_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
+            .unwrap();
+        let mut error = None;
+        let mut completed = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Err(item_error) => error = Some(item_error.to_string()),
+                Ok(StreamChunk::ContentBlockComplete(_)) => completed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            error.as_deref(),
+            Some("OpenAI-compatible stream reached its output-token limit"),
+            "a reasoning-only truncated stream must report its real terminal cause"
+        );
+        assert!(
+            !completed,
+            "a truncated compatible stream must not publish a completed output block"
+        );
         mock.assert_async().await;
     }
 
