@@ -246,6 +246,7 @@ impl ToolExecutionCoordinator {
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) {
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
@@ -424,6 +425,7 @@ impl ToolExecutionCoordinator {
                 &tool_use,
                 live_output,
                 effect_audit,
+                grant_ceiling,
             )
             .await;
         });
@@ -437,6 +439,7 @@ impl ToolExecutionCoordinator {
         round_token: ToolRoundToken,
         calls: Vec<(ToolUse, Arc<WorkUnit>, usize)>,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) {
         if calls.len() <= 1 {
             if let Some((tool_use, work_unit, row_idx)) = calls.into_iter().next() {
@@ -447,6 +450,7 @@ impl ToolExecutionCoordinator {
                     work_unit,
                     row_idx,
                     effect_audit,
+                    grant_ceiling,
                 );
             }
             return;
@@ -586,6 +590,7 @@ impl ToolExecutionCoordinator {
                     &tool_use,
                     live_output,
                     effect_audit.clone(),
+                    grant_ceiling.clone(),
                 )
                 .await;
             }
@@ -626,17 +631,19 @@ async fn execute_admitted_tool(
     tool_use: &ToolUse,
     live_output: LiveOutput,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    grant_ceiling: Option<crate::vm::EffectSet>,
 ) {
     tool_executor.lock().await.poset = poset.clone();
     let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
     let executor = tool_executor.lock().await;
-    let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+    let execute = executor.execute_tool_with_grant_ceiling::<fn() -> anyhow::Result<()>>(
         tool_use,
         None,
         Some(Arc::clone(repl_mode)),
         Some(Arc::clone(plan_content)),
         Some(live_output),
         effect_audit,
+        grant_ceiling,
     );
     let result = match timeout_duration {
         Some(timeout) => tokio::time::timeout(timeout, execute).await,
@@ -813,7 +820,15 @@ mod tests {
             .expect("stage the write probe round");
         let work_unit = coordinator.output_manager.start_work_unit("write");
         let row_idx = work_unit.add_row("write(src/lib.rs)");
-        coordinator.spawn_tool_execution(query_id, round_token, tool_use, work_unit, row_idx, None);
+        coordinator.spawn_tool_execution(
+            query_id,
+            round_token,
+            tool_use,
+            work_unit,
+            row_idx,
+            None,
+            None,
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
             .await
             .expect("write probe must emit an event")
@@ -988,6 +1003,7 @@ mod tests {
                 tool_use,
                 work_unit,
                 row_idx,
+                None,
                 None,
             );
 

@@ -8362,6 +8362,7 @@ async fn named_brain_say_complete_does_not_leave_run_status_running() {
                             environment_generation: 1,
                         },
                         approval_connection_id: None,
+                        grant_ceiling: crate::vm::TypedRuntime::intrinsic_grants(),
                         approval_tx: None,
                         effect_audit: None,
                         response_tx,

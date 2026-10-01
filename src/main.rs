@@ -882,6 +882,7 @@ mod script_tests {
             live_output: None,
             host_mode_state: None,
             effect_audit: None,
+            grant_ceiling: None,
             skip_interactive_review: false,
         };
         let before = runtime.revision();

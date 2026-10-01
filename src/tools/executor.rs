@@ -433,8 +433,6 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool use
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
@@ -443,6 +441,34 @@ impl ToolExecutor {
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) -> Result<ToolResult>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        self.execute_tool_with_grant_ceiling(
+            tool_use,
+            save_models_fn,
+            repl_mode,
+            plan_content,
+            live_output,
+            effect_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Execute a tool use under an application-authored VM grant ceiling.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit, grant_ceiling), fields(tool = %tool_use.name, id = %tool_use.id))]
+    pub async fn execute_tool_with_grant_ceiling<F>(
+        &self,
+        tool_use: &ToolUse,
+        save_models_fn: Option<F>,
+        repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
+        plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
+        live_output: Option<crate::tools::types::LiveOutput>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -546,6 +572,7 @@ impl ToolExecutor {
             }),
             effect_audit: effect_audit
                 .map(|authority| Arc::new(authority) as Arc<dyn EffectAuditAuthority>),
+            grant_ceiling,
             // The coordinator already showed the dialog, applied edit:*, or
             // AutoAccept. execute() must not open $EDITOR again.
             skip_interactive_review: true,

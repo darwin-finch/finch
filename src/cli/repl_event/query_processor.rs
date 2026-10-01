@@ -211,6 +211,7 @@ async fn execute_direct_wire_response(
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     source: String,
+    grant_ceiling: Option<crate::vm::EffectSet>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
@@ -230,7 +231,7 @@ async fn execute_direct_wire_response(
         });
     });
     let outcome = runtime
-        .submit_tool_program(submission, None, Some(sink), true, effect_audit)
+        .submit_provider_wire_program(submission, sink, grant_ceiling, effect_audit)
         .await?;
     let execution_id = outcome.execution_id;
     let mut resumed = Box::pin(resume_interactive_boundaries(runtime, event_tx, outcome));
@@ -555,6 +556,7 @@ async fn execute_wire_with_single_repair(
     messages: &[crate::providers::Message],
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
+    grant_ceiling: Option<crate::vm::EffectSet>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     query_id: Uuid,
     tool_call_history: &ToolCallHistory,
@@ -587,6 +589,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel.clone(),
         source.clone(),
+        grant_ceiling.clone(),
         effect_audit.clone(),
     )
     .await;
@@ -696,6 +699,7 @@ async fn execute_wire_with_single_repair(
             event_tx.clone(),
             cancel,
             wrapped.clone(),
+            grant_ceiling,
             effect_audit,
         )
         .await
@@ -875,6 +879,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel,
         repaired_source.clone(),
+        grant_ceiling,
         effect_audit,
     )
     .await
@@ -1307,10 +1312,11 @@ pub(super) async fn dispatch_tool_uses(
         query_id,
         tool_uses: tool_uses.clone(),
     });
-    let effect_audit = query_states
-        .get_metadata(query_id)
-        .await
-        .and_then(|metadata| metadata.effect_audit);
+    let query_metadata = query_states.get_metadata(query_id).await;
+    let effect_audit = query_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.effect_audit.clone());
+    let grant_ceiling = query_metadata.and_then(|metadata| metadata.grant_ceiling);
     // Snapshot the mode instead of holding the `RwLockReadGuard` across this
     // loop (#26): `handle_present_plan`, called below for an approved
     // `present_plan` in the same batch, does `mode.write().await` on this
@@ -1451,6 +1457,7 @@ pub(super) async fn dispatch_tool_uses(
                 round_token,
                 calls,
                 effect_audit.clone(),
+                grant_ceiling.clone(),
             );
         } else {
             for (tool_use, row_idx) in group {
@@ -1461,6 +1468,7 @@ pub(super) async fn dispatch_tool_uses(
                     Arc::clone(work_unit),
                     row_idx,
                     effect_audit.clone(),
+                    grant_ceiling.clone(),
                 );
             }
         }
@@ -2208,6 +2216,9 @@ pub(crate) async fn process_query_with_tools(
                     .as_ref()
                     .map(|metadata| metadata.cancellation_token.clone())
                     .unwrap_or_default();
+                let grant_ceiling = query_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.grant_ceiling.clone());
                 let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
@@ -2218,6 +2229,7 @@ pub(crate) async fn process_query_with_tools(
                     &messages,
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
+                    grant_ceiling,
                     effect_audit,
                     query_id,
                     &tool_call_history,
@@ -2466,6 +2478,9 @@ pub(crate) async fn process_query_with_tools(
                 .as_ref()
                 .map(|metadata| metadata.cancellation_token.clone())
                 .unwrap_or_default();
+            let grant_ceiling = query_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.grant_ceiling.clone());
             let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
@@ -2476,6 +2491,7 @@ pub(crate) async fn process_query_with_tools(
                 &messages,
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
+                grant_ceiling,
                 effect_audit,
                 query_id,
                 &tool_call_history,
@@ -4805,6 +4821,7 @@ mod tests {
             source,
             Some(&metrics),
             None,
+            None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
         )
@@ -4903,6 +4920,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4953,6 +4971,7 @@ mod tests {
             event_tx,
             cancel.clone(),
             "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
+            None,
             None,
         );
         let cancel_after_prefix = async {
@@ -5008,6 +5027,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             "s\" blocked.txt\" task-output-path s\" secret\" bytes task-output-file-write"
                 .to_string(),
+            None,
             Some(effect_audit),
         )
         .await
@@ -5019,6 +5039,83 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.contains("direct wire audit rejected")));
         assert!(!task_output.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn named_brain_intrinsic_ceiling_allows_say_wire() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let outcome = execute_direct_wire_response(
+            &runtime,
+            output,
+            work_unit,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "(say \"bounded\")".to_string(),
+            Some(crate::vm::TypedRuntime::intrinsic_grants()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "daemon-issued intrinsic ceiling rejected a named-Brain say wire program: diagnostics={:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(outcome.output, "bounded");
+        assert!(
+            matches!(event_rx.try_recv(), Ok(ReplEvent::VmEffect { .. })),
+            "completed intrinsic say did not cross the real VM effect projection boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_owner_wire_without_ceiling_reuses_explicit_grant() {
+        let task_output = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::ProgramRuntime::new();
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Write,
+                crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+            ))
+            .unwrap();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        let outcome = execute_direct_wire_response(
+            &runtime,
+            output,
+            work_unit,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "s\" owner.txt\" task-output-path s\" allowed\" bytes task-output-file-write"
+                .to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            crate::runtime::ExecutionStatus::Completed,
+            "local-owner provider wire lost its reusable explicit FileWrite grant: diagnostics={:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            std::fs::read(task_output.path().join("owner.txt")).unwrap(),
+            b"allowed",
+            "local-owner provider wire completed without writing the granted target bytes"
+        );
     }
 
     #[tokio::test]
@@ -5035,6 +5132,7 @@ mod tests {
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             "(file-read (path \"Cargo.toml\"))".to_string(),
+            None,
             None,
         );
         tokio::pin!(execution);
@@ -5161,6 +5259,7 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
         )
@@ -5271,6 +5370,7 @@ mod tests {
                     source,
                     None,
                     None,
+                    None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
                 )
@@ -5373,6 +5473,7 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
         )
@@ -5459,6 +5560,7 @@ mod tests {
             &[crate::providers::Message::user("reply")],
             source.clone(),
             Some(&metrics),
+            None,
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
@@ -5561,6 +5663,7 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            None,
             query_id,
             &tool_call_history,
         )
@@ -5625,6 +5728,7 @@ mod tests {
             )],
             source.clone(),
             Some(&metrics),
+            None,
             None,
             query_id,
             &tool_call_history,
@@ -5714,6 +5818,7 @@ mod tests {
             "(say \"Hello\")".to_string(),
             None,
             None,
+            None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
         )
@@ -5769,6 +5874,7 @@ mod tests {
             generator.clone(),
             &[crate::providers::Message::user("reply")],
             source,
+            None,
             None,
             None,
             Uuid::new_v4(),
@@ -5841,6 +5947,7 @@ mod tests {
             source.clone(),
             None,
             None,
+            None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
         )
@@ -5883,6 +5990,7 @@ mod tests {
                     generator,
                     &[crate::providers::Message::user("reply")],
                     source,
+                    None,
                     None,
                     None,
                     Uuid::new_v4(),
@@ -5982,6 +6090,7 @@ mod tests {
             generator.clone(),
             &[crate::providers::Message::user("reply")],
             source.clone(),
+            None,
             None,
             None,
             Uuid::new_v4(),

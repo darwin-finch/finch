@@ -3046,6 +3046,7 @@ impl ProgramRuntime {
         caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         defer_program_effects: bool,
+        grant_ceiling: Option<EffectSet>,
         effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         let deferred_host_effects = if defer_program_effects && caller.is_none() {
@@ -3058,7 +3059,29 @@ impl ProgramRuntime {
             caller,
             effect_sink,
             deferred_host_effects,
+            grant_ceiling,
+            effect_audit,
+        )
+        .await
+    }
+
+    /// Execute provider text decoded as VM wire with an application-owned
+    /// authority ceiling. A named-Brain caller supplies `Some` from its daemon
+    /// request; a local owner query supplies `None` and retains ordinary grant
+    /// reuse. The ceiling is captured with any suspended continuation.
+    pub async fn submit_provider_wire_program(
+        &self,
+        submission: ProgramSubmission,
+        effect_sink: TypedEffectSink,
+        grant_ceiling: Option<EffectSet>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
             None,
+            Some(effect_sink),
+            DeferredHostEffects::ProgramInvocations,
+            grant_ceiling,
             effect_audit,
         )
         .await

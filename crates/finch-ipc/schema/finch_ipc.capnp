@@ -971,6 +971,9 @@ struct BrainTurnRequest {
   approvalAudience @4 :BrainApprovalAudience;
   control          @5 :BrainTurnControl;
   runId            @6 :Text;
+  # Application-authored maximum authority for every VM program produced by
+  # this provider turn. The provider never supplies or widens this list.
+  grantCeiling     @7 :List(CapabilityRequirement);
 }
 
 enum BrainAttachmentRole {
