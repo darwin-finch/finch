@@ -1416,6 +1416,7 @@ fn transcript_disclosure_hitboxes(
             },
             row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
             component_owned: viewport_content[index].component_owned,
+            single_focus_target: viewport_content[index].single_focus_target,
         })
         .collect()
 }
@@ -9122,6 +9123,25 @@ mod tests {
             Arc::new(StatusBar::new()),
             colors.clone(),
         );
+        fn component_point(
+            renderer: &TuiRenderer,
+            target: &view_model::RowId,
+            width: u16,
+            height: u16,
+        ) -> (u16, u16) {
+            for row in 0..height {
+                for column in 0..width {
+                    if renderer.accordion.component_region_at(column, row).as_ref() == Some(target)
+                    {
+                        return (column, row);
+                    }
+                }
+            }
+            panic!(
+                "the painted frame must expose the stable component target; target={target:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+        }
 
         let output = Arc::new(WorkUnit::new("VM program output"));
         output.set_program_output();
@@ -9150,22 +9170,37 @@ mod tests {
             "no separate visible show/hide control row may remain; lines={closed:?}"
         );
 
+        let mut paint_bytes = Vec::new();
         renderer
-            .accordion
-            .rebuild_retained_hit_regions(&closed, 0, 80);
-        let output_row = closed
-            .iter()
-            .position(|line| line.text == "assistant answer")
-            .expect("answer row");
-        let click = crossterm::event::MouseEvent {
+            .draw_live_area_to_at(&mut paint_bytes, 80, 24, None)
+            .expect("the production live-frame paint must register output hit regions");
+        let (output_column, output_row) = component_point(&renderer, &target, 80, 24);
+        let press = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row: output_row as u16,
+            column: output_column,
+            row: output_row,
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         assert!(
-            renderer.handle_accordion_mouse(click),
-            "clicking the displayed output must route through the real component action path"
+            !renderer.handle_mouse_to(press, &mut Vec::new()),
+            "the real mouse path must defer disclosure until a matching Up"
+        );
+        assert!(
+            !output.say_turn_view().expect("say VM").vm.show_program,
+            "Down alone must not swap the displayed output"
+        );
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..press
+                },
+                &mut Vec::new(),
+            ),
+            "a matching Down -> Up on the displayed output must route through the production \
+             click gesture and component action path"
         );
 
         let open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
@@ -9189,24 +9224,75 @@ mod tests {
         );
 
         renderer
-            .accordion
-            .rebuild_retained_hit_regions(&open, 0, 80);
+            .handle_resize(64, 20)
+            .expect("the production resize path must accept the source-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the source state");
         assert_eq!(
             renderer.accordion.visible_order_count(&target),
             1,
-            "multiline source is one keyboard target, not duplicate focus stops; {}",
+            "multiline source remains one keyboard target after resize/repaint; {}",
             renderer.accordion.diagnostic_state()
         );
-        let second_source_row = open
-            .iter()
-            .position(|line| line.text == "# exact second line")
-            .expect("second source line");
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_press = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(!renderer.handle_mouse_to(source_press, &mut Vec::new()));
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: source_column.saturating_add(1),
+            ..source_press
+        };
+        assert!(renderer.handle_mouse_to(drag, &mut Vec::new()));
         assert!(
-            renderer.handle_accordion_mouse(crossterm::event::MouseEvent {
-                row: second_source_row as u16,
-                ..click
-            }),
-            "clicking any displayed program line must swap back to output"
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..drag
+                },
+                &mut Vec::new(),
+            ),
+            "a drag that begins on source content must finish as selection"
+        );
+        assert!(
+            output.say_turn_view().expect("say VM").vm.show_program,
+            "a real drag must not also activate the source toggle"
+        );
+
+        // This press clears the finalized selection through a synchronous
+        // full repaint. The production Down -> Up gesture must survive that
+        // repaint and still swap source back to output.
+        // `redraw_full_viewport()` reads the real terminal size in production;
+        // this headless test instead pins the same 64x20 geometry it simulated
+        // above so the repaint cannot move content under the recorded press.
+        renderer.pending_viewport_size = Some((64, 20));
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(renderer.handle_mouse_to(source_click, &mut Vec::new()));
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..source_click
+                },
+                &mut Vec::new(),
+            ),
+            "clicking displayed source through the real gesture path swaps back to output"
         );
         let mouse_closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
         assert!(mouse_closed.iter().any(|line| {
@@ -9214,8 +9300,21 @@ mod tests {
         }));
 
         renderer
-            .accordion
-            .rebuild_retained_hit_regions(&mouse_closed, 0, 80);
+            .handle_resize(80, 24)
+            .expect("the production resize path must accept the output-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the output state");
+        let output_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
+                .accordion
+                .component_region_at(output_point.0, output_point.1)
+                .as_ref(),
+            Some(&target),
+            "output repaint must retain the same action identity"
+        );
         assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
         assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
         assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
@@ -9242,6 +9341,71 @@ mod tests {
             output.complete_transcript(&colors),
             canonical_before,
             "presentation toggles must not mutate canonical transcript bytes"
+        );
+
+        let mut canonical_bytes = Vec::new();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("the swapped turn must commit to native history");
+        let committed = String::from_utf8(canonical_bytes.clone()).expect("canonical UTF-8");
+        for expected in ["Program output", "assistant answer"] {
+            assert_eq!(
+                committed.matches(expected).count(),
+                1,
+                "native history keeps each canonical line exactly once; \
+                 expected={expected:?} committed={committed:?}"
+            );
+        }
+        assert!(
+            exact_source
+                .lines()
+                .all(|source| !committed.contains(source)),
+            "the interactive source projection must not replace or duplicate the canonical \
+             output record in native history; committed={committed:?}"
+        );
+        let committed_len = canonical_bytes.len();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("a repeated native-history pass remains idempotent");
+        assert_eq!(
+            canonical_bytes.len(),
+            committed_len,
+            "the completed turn must not append duplicate native-history bytes"
+        );
+
+        renderer.pending_viewport_size = Some((80, 24));
+        renderer.viewport_invalidated = true;
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("post-commit reconstruction must repaint the retained say target");
+        let retained_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
+                .accordion
+                .component_region_at(retained_point.0, retained_point.1)
+                .as_ref(),
+            Some(&target),
+            "native-history reconstruction retains the same in-place action identity"
+        );
+        assert_eq!(
+            output.complete_transcript(&colors),
+            canonical_before,
+            "native-history reconstruction must not mutate canonical source/output bytes"
         );
     }
 

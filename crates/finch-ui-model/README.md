@@ -21,7 +21,8 @@ instead, and the renderer hands that snapshot to `component_lines` together with
 widget tree and claims frame rectangles using this crate's presentation vocabulary.
 Component-owned toggle state stays in the message ViewModel while focus remains renderer state;
 terminal painting stays in the TUI. A completed say turn projects exactly one actionable content
-surface — output or exact source — under one stable identity.
+surface — output or exact source — under one stable identity. Its lines opt into one semantic
+keyboard focus target while retaining per-line mouse hit regions; unrelated multiline rows do not.
 
 Stage 4 (#1141): component lines carry **styled spans** (`span.rs` — `Span`,
 `SpanStyle`, `SpanColor`) alongside their plain `text`; the spans concatenate

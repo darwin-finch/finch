@@ -136,6 +136,7 @@ fn body_line(text: String) -> RenderedTranscriptLine {
         role: Some(NodeRole::Output),
         body_of: None,
         component_owned: false,
+        single_focus_target: false,
     }
 }
 
@@ -156,6 +157,7 @@ fn toggle_content_line(
         role: Some(role),
         body_of: None,
         component_owned: true,
+        single_focus_target: true,
     }
 }
 

@@ -84,6 +84,24 @@ fn test_manifest_round_trips_serde() {
     );
 }
 
+/// The human-facing canonical envelope example must move with the manifest
+/// version. A stale example sends external consumers toward the wrong wire
+/// contract even when the serializer and generated bindings are correct.
+#[test]
+fn test_manifest_documentation_example_uses_the_current_version() {
+    let documentation = include_str!("../../../docs/UI_MANIFEST.md");
+    let current_version = format!(r#""manifest_version": {MANIFEST_VERSION}"#);
+    assert!(
+        documentation.contains(&current_version),
+        "the canonical UI manifest documentation must show the current envelope version; \
+         expected {current_version:?} in docs/UI_MANIFEST.md"
+    );
+    assert!(
+        !documentation.contains(r#""manifest_version": 2"#),
+        "the canonical UI manifest documentation must not retain the superseded v2 envelope"
+    );
+}
+
 /// The card id comes from the message uuid. The displayed output itself
 /// carries semantic path `#1`, matching terminal routing without a separate
 /// visible control node.

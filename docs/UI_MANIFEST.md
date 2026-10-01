@@ -14,7 +14,7 @@ The wire payload is one JSON object; a consumer reads `manifest_version`
 first and rejects (or versions) everything else:
 
 ```json
-{ "manifest_version": 2, "root": { …DynamicUiNode… } }
+{ "manifest_version": 3, "root": { …DynamicUiNode… } }
 ```
 
 | Version | When | Notes |

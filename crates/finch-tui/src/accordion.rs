@@ -36,6 +36,9 @@ pub struct ClaimedDisclosureRect {
     /// ViewModel, so the rect registers for component routing instead of the
     /// RowId-keyed open-set maps.
     pub component_owned: bool,
+    /// Repeated physical lines share one keyboard focus stop while retaining
+    /// independent mouse hit regions.
+    pub single_focus_target: bool,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +176,7 @@ impl AccordionState {
             role: Some(row.role),
             body_of: None,
             component_owned: false,
+            single_focus_target: false,
         });
         if !expanded {
             return;
@@ -194,6 +198,7 @@ impl AccordionState {
                 role: Some(row.role),
                 body_of: expandable.then(|| row.id.clone()),
                 component_owned: false,
+                single_focus_target: false,
             });
         }
         for child in &row.children {
@@ -231,7 +236,7 @@ impl AccordionState {
         for rect in claimed {
             let top = rect.region.top as usize + row_offset;
             let rows = rect.region.bottom as usize - rect.region.top as usize + 1;
-            if !self.visible_order.contains(&rect.region.row_id) {
+            if !rect.single_focus_target || !self.visible_order.contains(&rect.region.row_id) {
                 self.visible_order.push(rect.region.row_id.clone());
             }
             if rect.component_owned {
@@ -266,7 +271,7 @@ impl AccordionState {
         for line in lines {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
             if let Some(row_id) = &line.row_id {
-                if !self.visible_order.contains(row_id) {
+                if !line.single_focus_target || !self.visible_order.contains(row_id) {
                     self.visible_order.push(row_id.clone());
                 }
                 let region = TranscriptHitRegion {
@@ -405,6 +410,112 @@ mod tests {
 
     fn colors() -> ColorScheme {
         ColorScheme::default()
+    }
+
+    #[test]
+    fn test_focus_consolidation_is_opt_in_and_does_not_change_unrelated_rows() {
+        let message_id = finch_ui_model::MessageId::new();
+        let shared = RowId {
+            message_id,
+            path: vec![7],
+        };
+        let line = |text: &str, component_owned, single_focus_target| RenderedTranscriptLine {
+            text: text.to_string(),
+            row_id: Some(shared.clone()),
+            row_expanded: Some(true),
+            component_owned,
+            single_focus_target,
+            ..RenderedTranscriptLine::default()
+        };
+
+        let mut legacy = AccordionState::default();
+        legacy.rebuild_retained_hit_regions(
+            &[
+                line("legacy header", false, false),
+                line("legacy body", false, false),
+            ],
+            0,
+            80,
+        );
+        assert_eq!(
+            legacy.visible_order_count(&shared),
+            2,
+            "legacy multiline rows retain their pre-swap per-line focus registration; {}",
+            legacy.diagnostic_state()
+        );
+
+        let mut memory = AccordionState::default();
+        memory.rebuild_retained_hit_regions(
+            &[
+                line("memory summary", true, false),
+                line("memory body", true, false),
+            ],
+            0,
+            80,
+        );
+        assert_eq!(
+            memory.visible_order_count(&shared),
+            2,
+            "other component-owned multiline rows retain their prior focus order; {}",
+            memory.diagnostic_state()
+        );
+
+        let mut say = AccordionState::default();
+        say.rebuild_retained_hit_regions(
+            &[
+                line("say source one", true, true),
+                line("say source two", true, true),
+            ],
+            0,
+            80,
+        );
+        assert_eq!(
+            say.visible_order_count(&shared),
+            1,
+            "only the explicitly grouped say content becomes one keyboard target; {}",
+            say.diagnostic_state()
+        );
+        assert_eq!(
+            say.component_regions.len(),
+            2,
+            "focus consolidation must retain a mouse hit region for every content line; {}",
+            say.diagnostic_state()
+        );
+
+        let claimed = |top, single_focus_target| ClaimedDisclosureRect {
+            region: TranscriptHitRegion {
+                row_id: shared.clone(),
+                top,
+                bottom: top,
+                left: 0,
+                right: 79,
+            },
+            row_expanded: true,
+            component_owned: true,
+            single_focus_target,
+        };
+        let mut live_memory = AccordionState::default();
+        live_memory.adopt_claimed_hitboxes(&[claimed(0, false), claimed(1, false)], 0, 80);
+        assert_eq!(
+            live_memory.visible_order_count(&shared),
+            2,
+            "live non-say component rows retain per-line keyboard traversal; {}",
+            live_memory.diagnostic_state()
+        );
+        let mut live_say = AccordionState::default();
+        live_say.adopt_claimed_hitboxes(&[claimed(0, true), claimed(1, true)], 0, 80);
+        assert_eq!(
+            live_say.visible_order_count(&shared),
+            1,
+            "live say content opts into one stable keyboard target; {}",
+            live_say.diagnostic_state()
+        );
+        assert_eq!(
+            live_say.component_regions.len(),
+            2,
+            "live focus consolidation retains both mouse hit regions; {}",
+            live_say.diagnostic_state()
+        );
     }
 
     /// Project a WorkUnit message into ViewModel widget props.

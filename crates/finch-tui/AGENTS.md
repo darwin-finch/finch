@@ -144,7 +144,10 @@ arrow + the `[0]` hitbox) is deleted; the displayed output owns semantic path `[
 F6/Enter activation swaps that same stable target to exact source. Activating the source swaps
 back to output, so answer and source never coexist. The opaque action routes to the message's
 `handle_transcript_action`, toggles `show_program` under the message's lock, and the next frame
-re-renders from the mutated ViewModel. The legacy source-group row does not render beside the card: `TuiRenderer::projected_lines`
+re-renders from the mutated ViewModel. Its multiline content explicitly opts into one keyboard
+focus stop while retaining one mouse hit region per displayed line; this consolidation is not a
+global `RowId` policy, so legacy accordions and other component-owned multiline rows keep their
+existing focus order. The legacy source-group row does not render beside the card: `TuiRenderer::projected_lines`
 pairs each say-VM unit with the adjacent completed Program-source unit whose response text is
 byte-identical to the turn's program (`say_turn_consolidated_source_ids`) and suppresses that
 row from the viewport only — byte identity holds by construction in every producer path and a
