@@ -1438,7 +1438,7 @@ fn attached_typed_program_turn_spools_its_canonical_record_into_native_scrollbac
 }
 
 #[test]
-fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program() {
+fn completed_say_preserves_answer_behind_labelled_program_disclosure() {
     const SAY_TEXT: &str = "attach-say-882";
     const SOURCE_LINE: &str = "(say \"attach-say-882\")";
 
@@ -1454,14 +1454,13 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
         "the completed say rendered its prose on the live screen",
     );
     session.wait_for(
-        "(ran ",
+        "Show program",
         ECHO_DEADLINE,
-        "the completed say card carries its `(ran Ns)` elapsed annotation",
+        "the completed say card exposes its labelled disclosure control",
     );
 
-    // The completed state on the live screen: prose + `(ran Ns)`, and NOTHING
-    // else — no Program source row, no Brain run row, no UUID, no result row,
-    // no card chrome (the stage-1 transition duplication is dead).
+    // The completed closed state on the live screen: prose plus the labelled
+    // elapsed control, and no source or legacy duplicate rows.
     let screen = session
         .wait_for_screen_pred(
             |screen| screen.matches(SAY_TEXT).count() >= 1,
@@ -1476,6 +1475,16 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
         screen.lines().any(|line| line.contains("(ran ")),
         "INVARIANT: the completed say carries its `(ran Ns)` elapsed annotation \
          (docs/TUI_DESIGN.md, stage-2 verbatim target).\nlive screen:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line.contains("Show program")),
+        "INVARIANT: a completed say names its closed disclosure action.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains(SOURCE_LINE),
+        "INVARIANT: exact source stays hidden in the closed state.\n\
+         live screen:\n{screen}"
     );
     assert!(
         !screen.contains("Program source"),
@@ -1515,10 +1524,9 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
     );
 
     // Drive the toggle through the real input path: one write is F6 (focus the
-    // next semantic row, `\x1b[17~`) followed by Enter (toggle it). The
-    // completed output region is the hit target, so within a couple of
-    // iterations the prose swaps to the program source, observable as a second
-    // rendered occurrence of the exact source line on the live screen.
+    // next semantic row, `\x1b[17~`) followed by Enter (activate it). The
+    // labelled control is the only hit target; the answer stays visible while
+    // exact source is added beneath it.
     let before = session.screen_text().matches(SOURCE_LINE).count();
     let mut toggled = None;
     for _ in 0..4 {
@@ -1526,7 +1534,11 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
         if let Some(screen) = session.wait_for_screen_pred(
             |screen| {
                 let after = screen.matches(SOURCE_LINE).count();
-                after > before && screen.contains("(ran ")
+                after > before
+                    && screen.contains("Hide program")
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(SAY_TEXT) && !line.contains(SOURCE_LINE))
             },
             Duration::from_secs(5),
         ) {
@@ -1537,35 +1549,89 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
     let screen = toggled.unwrap_or_else(|| {
         panic!(
             "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
-             say card's show_program through the component ViewModel and swap the \
-             completed prose to the program source.\nbefore: {before} occurrence(s) of \
+             say card's show_program through the component ViewModel and reveal exact \
+             source without replacing the answer.\nbefore: {before} occurrence(s) of \
              {SOURCE_LINE:?}.\nlive screen:\n{}",
             session.screen_text()
         )
     });
-    let say_lines: Vec<&str> = screen
-        .lines()
-        .filter(|line| line.contains(SAY_TEXT))
-        .collect();
-    assert_eq!(
-        say_lines.len(),
-        1,
-        "INVARIANT: the completed output swapped to the program source — the prose line \
-         is gone and exactly the source line carries the say bytes.\nlive screen:\n{screen}"
-    );
+    let lines = screen.lines().collect::<Vec<_>>();
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains(SAY_TEXT) && !line.contains(SOURCE_LINE))
+        .expect("the answer remains visible after opening program disclosure");
+    let control_row = lines
+        .iter()
+        .position(|line| line.contains("Hide program"))
+        .expect("the open disclosure carries the inverse label");
+    let source_row = lines
+        .iter()
+        .position(|line| line.contains(SOURCE_LINE))
+        .expect("the exact source is visible while disclosure is open");
     assert!(
-        say_lines[0].contains("(say"),
-        "INVARIANT: the visible say bytes are the program source form; line={:?}",
-        say_lines[0]
+        answer_row < control_row && control_row < source_row,
+        "INVARIANT: open say disclosure orders persistent answer, inverse control, then \
+         exact source; rows=({answer_row}, {control_row}, {source_row}).\n\
+         live screen:\n{screen}"
     );
     assert!(
         screen.lines().any(|line| line.contains("(ran ")),
-        "INVARIANT: the `(ran Ns)` annotation stays through the swap.\nlive screen:\n{screen}"
+        "INVARIANT: the `(ran Ns)` annotation stays through disclosure.\nlive screen:\n{screen}"
+    );
+
+    // Directional keys use the same structured disclosure state: Left closes,
+    // Right opens. This also proves the second activation is the inverse and
+    // that focus remains on the control while source rows come and go.
+    session.send_raw(b"\x1b[D");
+    let closed = session
+        .wait_for_screen_pred(
+            |screen| {
+                screen.contains("Show program")
+                    && screen.contains(SAY_TEXT)
+                    && !screen.contains(SOURCE_LINE)
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "INVARIANT: Left on the focused open control must hide source, restore the \
+                 Show program label, and preserve the answer.\nlive screen:\n{}",
+                session.screen_text()
+            )
+        });
+    assert!(
+        closed.lines().any(|line| line.contains("(ran ")),
+        "elapsed remains visible after inverse toggle; live screen:\n{closed}"
+    );
+
+    session.send_raw(b"\x1b[C");
+    let reopened = session
+        .wait_for_screen_pred(
+            |screen| {
+                screen.contains("Hide program")
+                    && screen.contains(SOURCE_LINE)
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(SAY_TEXT) && !line.contains(SOURCE_LINE))
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "INVARIANT: Right on the focused closed control must match Enter: persistent \
+                 answer plus exact source beneath Hide program.\nlive screen:\n{}",
+                session.screen_text()
+            )
+        });
+    assert_eq!(
+        reopened.matches(SOURCE_LINE).count(),
+        before + 1,
+        "directional reopen adds exactly one source representation; live screen:\n{reopened}"
     );
 
     // Esc clears keyboard focus (the accordion's documented key), so the
     // following Enter submits the command instead of toggling the still
-    // focused output region. The Esc byte goes out raw — a trailing newline
+    // focused disclosure control. The Esc byte goes out raw — a trailing newline
     // would arrive as Alt+Enter.
     session.send_raw(b"\x1b");
     std::thread::sleep(Duration::from_millis(300));
@@ -1725,7 +1791,11 @@ fn test_reconnected_completed_say_renders_the_component_card() {
         if let Some(screen) = second.wait_for_screen_pred(
             |screen| {
                 let after = screen.matches(SOURCE_LINE).count();
-                after > before && screen.contains("(ran ")
+                after > before
+                    && screen.contains("Hide program")
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(SAY_TEXT) && !line.contains(SOURCE_LINE))
             },
             Duration::from_secs(5),
         ) {
@@ -1736,8 +1806,8 @@ fn test_reconnected_completed_say_renders_the_component_card() {
     let screen = toggled.unwrap_or_else(|| {
         panic!(
             "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
-             replayed say card's show_program through the component ViewModel and swap \
-             the prose to the program source.\nbefore: {before} occurrence(s) of \
+             replayed say card's show_program through the component ViewModel and reveal \
+             source without replacing prose.\nbefore: {before} occurrence(s) of \
              {SOURCE_LINE:?}.\nlive screen:\n{}",
             second.screen_text()
         )
@@ -1883,8 +1953,8 @@ fn daemon_runner_say_turn_renders_component_card_only() {
     );
 
     // The card's toggle still works through the real input path: F6 focuses
-    // the next semantic row and Enter activates it, swapping the completed
-    // prose to the program source (exactly one new source-line occurrence).
+    // the next semantic row and Enter activates it, preserving completed
+    // prose while adding exactly one source-line occurrence.
     let before = first.screen_text().matches(SOURCE_LINE).count();
     let mut toggled = None;
     for _ in 0..4 {
@@ -1892,7 +1962,11 @@ fn daemon_runner_say_turn_renders_component_card_only() {
         if let Some(screen) = first.wait_for_screen_pred(
             |screen| {
                 let after = screen.matches(SOURCE_LINE).count();
-                after > before && screen.contains("(ran ")
+                after > before
+                    && screen.contains("Hide program")
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(SAY_TEXT) && !line.contains(SOURCE_LINE))
             },
             Duration::from_secs(5),
         ) {
@@ -1903,8 +1977,8 @@ fn daemon_runner_say_turn_renders_component_card_only() {
     let screen = toggled.unwrap_or_else(|| {
         panic!(
             "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
-             delegated say card's show_program and swap the completed prose to the \
-             program source.\nbefore: {before} occurrence(s) of {SOURCE_LINE:?}.\n\
+             delegated say card's show_program, preserve completed prose, and add exact \
+             source.\nbefore: {before} occurrence(s) of {SOURCE_LINE:?}.\n\
              live screen:\n{}",
             first.screen_text()
         )

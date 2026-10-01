@@ -439,11 +439,10 @@ impl WorkUnit {
         })
     }
 
-    /// The component-defined action a click on the turn's output region at
-    /// `path` produces (stage 2, docs/TUI_DESIGN.md): the completed output is
-    /// the toggle hit target — semantic path `[1]`, new since the stage-1
-    /// chrome's `[0]` retired with it. Rows without a ViewModel produce
-    /// nothing.
+    /// The component-defined action a click on the turn's labelled program
+    /// control at `path` produces. The control keeps semantic path `[1]`,
+    /// established when the stage-1 chrome's `[0]` retired. Answer and source
+    /// rows are not targets. Rows without a ViewModel produce nothing.
     pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner.say_vm.as_ref()?;
@@ -455,8 +454,9 @@ impl WorkUnit {
     }
 
     /// Route a component action to the say component's handle: toggles
-    /// `show_program` under the message's lock. False for foreign actions or
-    /// unmigrated rows.
+    /// `show_program` under the message's lock. The projection keeps the
+    /// answer visible and adds/removes source beneath it. False for foreign
+    /// actions or unmigrated rows.
     pub fn handle_say_turn_action(&self, action: &ComponentAction) -> bool {
         if action.downcast_ref::<ToggleProgram>().is_none() {
             return false;
@@ -2523,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn say_turn_action_targets_the_output_region_and_toggles_show_program() {
+    fn say_turn_action_targets_the_labelled_control_and_toggles_show_program() {
         let output = WorkUnit::new("VM program output");
         output.set_program_output();
         output.begin_say_turn("lisp", "(say \"hello\")");
@@ -2534,7 +2534,7 @@ mod tests {
         );
         let action = output
             .say_turn_action(&[1])
-            .expect("the output region is the toggle target");
+            .expect("the labelled program control is the toggle target");
         assert!(
             output.handle_say_turn_action(&action),
             "the component handle accepts its own action payload"

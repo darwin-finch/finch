@@ -3,7 +3,7 @@
 //! manifest round-trips serde, and the committed TS types match what the
 //! structs generate.
 
-use finch_tui::{component_ui_manifest, manifest_path_id, UiManifest, MANIFEST_VERSION};
+use finch_tui::{component_ui_manifest, UiManifest, MANIFEST_VERSION};
 use finch_ui_model::{
     ComponentView, MessageId, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView,
     WorkUnitViewModel,
@@ -14,7 +14,7 @@ use finch_ui_model::{
 /// — the wire contract moves with it.
 const GOLDEN_MESSAGE_ID: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
 
-fn golden_say_view() -> SayTurnView {
+fn say_view(show_program: bool) -> SayTurnView {
     SayTurnView {
         message_id: MessageId::from_uuid(uuid::Uuid::parse_str(GOLDEN_MESSAGE_ID).unwrap()),
         vm: WorkUnitViewModel {
@@ -26,14 +26,14 @@ fn golden_say_view() -> SayTurnView {
             output: Some(OutputVm {
                 lines: vec!["Hi, Shammah! What would you like to work on?".to_string()],
             }),
-            show_program: false,
+            show_program,
         },
         elapsed: std::time::Duration::from_millis(2350),
     }
 }
 
 fn golden_json() -> String {
-    let manifest = component_ui_manifest(&ComponentView::Say(golden_say_view()));
+    let manifest = component_ui_manifest(&ComponentView::Say(say_view(false)));
     serde_json::to_string_pretty(&manifest).expect("the manifest serializes")
 }
 
@@ -71,7 +71,7 @@ fn test_say_card_manifest_json_matches_the_committed_snapshot() {
 /// engine emits, and the parsed value equals the produced one.
 #[test]
 fn test_manifest_round_trips_serde() {
-    let manifest = component_ui_manifest(&ComponentView::Say(golden_say_view()));
+    let manifest = component_ui_manifest(&ComponentView::Say(say_view(false)));
     let serialized = serde_json::to_string(&manifest).expect("serialize");
     let parsed: UiManifest = serde_json::from_str(&serialized).expect("parse");
     assert_eq!(
@@ -84,39 +84,79 @@ fn test_manifest_round_trips_serde() {
     );
 }
 
-/// The ids come from derived identity: the card id is the message uuid, and
-/// the program/output children carry the semantic paths `#0`/`#1` — the
-/// output path is the toggle hit target's path, never a minted uuid.
+/// The card id comes from the message uuid. Only the labelled program control
+/// carries semantic path `#1`; answer and source content are not action
+/// targets, matching terminal routing.
 #[test]
-fn test_say_card_ids_are_derived_from_the_message_and_semantic_paths() {
-    let card = finch_tui::say_card_manifest(&golden_say_view());
+fn test_say_card_labelled_control_is_the_only_action_target() {
+    let card = finch_tui::say_card_manifest(&say_view(false));
     assert_eq!(
         (card.element_type.as_str(), card.id.as_str()),
         ("SayTurnCard", GOLDEN_MESSAGE_ID),
         "the card element type and message-uuid id are pinned; got {card:?}"
     );
-    let program = &card.children[0];
-    let output = &card.children[1];
-    assert_eq!(
-        (program.element_type.as_str(), program.id.as_str()),
-        ("ProgramSource", format!("{GOLDEN_MESSAGE_ID}#0").as_str()),
-        "the program child carries semantic path 0; got {program:?}"
-    );
+    let output = &card.children[0];
+    let control = &card.children[1];
     assert_eq!(
         (output.element_type.as_str(), output.id.as_str()),
-        ("Output", format!("{GOLDEN_MESSAGE_ID}#1").as_str()),
-        "the output child carries the toggle hit target's path 1; got {output:?}"
+        ("Output", ""),
+        "the answer is content, not an action target; got {output:?}"
     );
     assert_eq!(
+        (control.element_type.as_str(), control.id.as_str()),
         (
-            program.props["language"].clone(),
-            output.props["lines"].clone()
+            "ProgramDisclosureControl",
+            format!("{GOLDEN_MESSAGE_ID}#1").as_str()
         ),
+        "the explicit labelled control alone carries semantic path 1; got {control:?}"
+    );
+    assert_eq!(
+        output.props["lines"],
+        serde_json::json!(["Hi, Shammah! What would you like to work on?"]),
+        "the answer child carries the VM output; output={output:?}"
+    );
+    assert_eq!(
+        (&control.props["label"], &control.props["expanded"]),
         (
-            serde_json::json!("Co-Forth"),
-            serde_json::json!(["Hi, Shammah! What would you like to work on?"])
+            &serde_json::json!("Show program"),
+            &serde_json::json!(false)
         ),
-        "the children carry the VM data as JSON props; program={program:?} output={output:?}"
+        "the closed control exposes matching visible and structured state; control={control:?}"
+    );
+    assert_eq!(
+        card.children.len(),
+        2,
+        "closed completed cards do not expose source content; card={card:?}"
+    );
+}
+
+#[test]
+fn test_say_card_open_manifest_preserves_answer_and_adds_exact_source_beneath_control() {
+    let card = finch_tui::say_card_manifest(&say_view(true));
+    assert_eq!(
+        card.children
+            .iter()
+            .map(|child| child.element_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Output", "ProgramDisclosureControl", "ProgramSource"],
+        "the open DOM order mirrors the terminal: answer, control, exact source"
+    );
+    let output = &card.children[0];
+    let control = &card.children[1];
+    let program = &card.children[2];
+    assert_eq!(
+        (&control.props["label"], &control.props["expanded"]),
+        (&serde_json::json!("Hide program"), &serde_json::json!(true)),
+        "the open control exposes its inverse label and expanded state; control={control:?}"
+    );
+    assert_eq!(
+        program.props["lines"],
+        serde_json::json!([r#"(say "Hi, Shammah!")"#]),
+        "the exact VM source is additive beneath the control; program={program:?}"
+    );
+    assert!(
+        output.id.is_empty() && program.id.is_empty(),
+        "answer and source content remain non-actionable; output={output:?} program={program:?}"
     );
 }
 /// The committed TS types exist and carry the wire types (they regenerate on
@@ -152,7 +192,7 @@ fn test_committed_ts_types_carry_the_wire_types() {
     ))
     .expect("the barrel file is committed");
     assert!(
-        barrel.contains("FINCH_UI_MANIFEST_VERSION = 1"),
+        barrel.contains("FINCH_UI_MANIFEST_VERSION = 2"),
         "the barrel pins the contract version; got:\n{barrel}"
     );
 }
