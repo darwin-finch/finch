@@ -534,18 +534,30 @@ fn claims_tool_grounded_fact(text: &str) -> bool {
 /// Whether the response opens with a completed filesystem mutation claim.
 ///
 /// This is intentionally grammar-shaped rather than a bag of mutation words:
-/// the completed verb must lead the response (optionally after a first-person
-/// subject), and its direct target must look like a path or explicitly name a
-/// file/directory. That catches terse success reports such as `Created
-/// pagoda.html` while keeping prospective instructions, requests, plans,
-/// refusals, examples, and ordinary creative claims such as `I wrote a poem`
-/// out of the policy.
+/// the completed verb must lead the response or immediately follow a bounded
+/// standalone acknowledgement (optionally after a first-person subject), and
+/// its direct target must look like a path or explicitly name a file/directory.
+/// That catches terse success reports such as `Done.\nCreated pagoda.html`
+/// while keeping prospective instructions, requests, plans, refusals,
+/// examples, and ordinary creative claims such as `I wrote a poem` out of the
+/// policy.
 fn claims_completed_filesystem_mutation(text: &str) -> bool {
-    let first_line = text.lines().find(|line| !line.trim().is_empty());
-    let Some(mut claim) = first_line.map(str::trim) else {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(first_line) = lines.next() else {
         return false;
     };
+    if claims_completed_filesystem_mutation_line(first_line) {
+        return true;
+    }
+    if !matches!(first_line, "done." | "done!") {
+        return false;
+    }
+    lines
+        .next()
+        .is_some_and(claims_completed_filesystem_mutation_line)
+}
 
+fn claims_completed_filesystem_mutation_line(mut claim: &str) -> bool {
     claim = claim.strip_prefix("successfully ").unwrap_or(claim);
     for subject in ["i've ", "i have ", "i ", "we've ", "we have ", "we "] {
         if let Some(rest) = claim.strip_prefix(subject) {
@@ -596,7 +608,7 @@ fn starts_with_filesystem_target(text: &str) -> bool {
     }
     if ["file", "directory", "folder"]
         .iter()
-        .any(|noun| starts_with_word(target, noun))
+        .any(|noun| starts_with_filesystem_noun(target, noun))
     {
         return true;
     }
@@ -608,6 +620,11 @@ fn starts_with_filesystem_target(text: &str) -> bool {
         .trim_matches(['`', '\'', '"', ',', ';', ':', '!', '?', ')', ']', '}'])
         .trim_end_matches('.');
     looks_like_filesystem_path(token)
+}
+
+fn starts_with_filesystem_noun(text: &str, noun: &str) -> bool {
+    text.strip_prefix(noun)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 fn starts_with_word(text: &str, word: &str) -> bool {
@@ -5767,6 +5784,9 @@ mod tests {
             "I wrote a poem about a pagoda.",
             "I wrote a story called pagoda.html.",
             "`Created pagoda.html` is an example of a completion message.",
+            "Done.\n`Created pagoda.html` is an example of a completion message.",
+            "Done.\nFor example: Created pagoda.html with a basic website.",
+            "Done.\nI will create pagoda.html next.",
         ] {
             assert!(
                 !claims_tool_grounded_fact(prose),
@@ -5774,6 +5794,26 @@ mod tests {
                  mislabeled merely for containing a mutation verb: {prose:?}"
             );
         }
+    }
+
+    #[test]
+    fn completed_filesystem_mutation_claim_after_done_line_is_detected() {
+        let claim = "Done.\nCreated pagoda.html with a basic website.";
+        assert!(
+            claims_tool_grounded_fact(claim),
+            "a standalone completion acknowledgement must not hide the filesystem mutation \
+             assertion on the following line: {claim:?}"
+        );
+    }
+
+    #[test]
+    fn hyphenated_file_adjective_is_not_a_filesystem_target() {
+        let prose = "I wrote file-based documentation for this design.";
+        assert!(
+            !claims_tool_grounded_fact(prose),
+            "a hyphenated adjective beginning with `file` is ordinary prose, not an explicit \
+             filesystem target: {prose:?}"
+        );
     }
 
     #[tokio::test]
@@ -5943,7 +5983,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_raw_prose_file_creation_claim_is_caveated_without_creating_the_file() {
         let mut harness = StreamingQueryHarness::spawn("create pagoda.html").await;
-        let claim = "Created pagoda.html with a basic website.";
+        let claim = "Done.\nCreated pagoda.html with a basic website.";
         let claimed_path = harness.workspace_path("pagoda.html");
 
         harness
