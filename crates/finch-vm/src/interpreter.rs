@@ -261,27 +261,6 @@ impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
-pub struct DenyCapabilities;
-
-impl CapabilityHandler for DenyCapabilities {
-    fn request(
-        &mut self,
-        requirement: &CapabilityRequirement,
-        _arguments: Vec<TypedValue>,
-        origin: &SourceOrigin,
-    ) -> Result<Vec<TypedValue>, VmDiagnostic> {
-        let mut diagnostic = VmDiagnostic::error(
-            "E-CAP-002",
-            DiagnosticPhase::Authorization,
-            format!("capability {:?} was not granted", requirement.capability),
-            Some(origin.clone()),
-        );
-        diagnostic.capability = Some(requirement.clone());
-        Err(diagnostic)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct InterpreterConfig {
     pub fuel: u64,
@@ -510,8 +489,7 @@ pub(crate) enum VmStep {
 
 /// The handler-free execution core used by the runtime event-loop trampoline.
 /// It advances pure instructions synchronously and yields at output and host
-/// capability boundaries. `Interpreter::execute` remains a synchronous
-/// adapter for existing callers while the runtime migrates to this interface.
+/// capability boundaries.
 pub(crate) struct VmTrampoline<'a> {
     module: &'a VerifiedModule,
     fuel: u64,
@@ -1544,144 +1522,6 @@ impl<'a> VmTrampoline<'a> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
-pub struct Interpreter<'a, H> {
-    module: &'a VerifiedModule,
-    handler: H,
-    config: InterpreterConfig,
-}
-
-#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
-impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
-    pub fn new(module: &'a VerifiedModule, handler: H, config: InterpreterConfig) -> Self {
-        Self {
-            module,
-            handler,
-            config,
-        }
-    }
-
-    /// Execute transactionally against an owned stack. The caller's stack is
-    /// changed only after the entry function returns successfully.
-    pub fn execute(&mut self, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnostic> {
-        let trampoline = VmTrampoline::new(self.module, &self.config);
-        let continuation = trampoline.start(stack.clone())?;
-        let mut step = trampoline.run(continuation);
-        loop {
-            step = match step {
-                VmStep::Yielded {
-                    value: TypedValue::Unit,
-                    continuation,
-                } => trampoline.run(continuation),
-                VmStep::Yielded { value, .. } => {
-                    return Err(VmDiagnostic::error(
-                        "E-YIELD-002",
-                        DiagnosticPhase::Interpretation,
-                        format!(
-                            "synchronous execution cannot discard yielded {}",
-                            value.value_type()
-                        ),
-                        Some(SourceOrigin::generated("yield")),
-                    ));
-                }
-                VmStep::Emit {
-                    effect,
-                    continuation,
-                } => {
-                    let requirement = CapabilityRequirement {
-                        capability: CapabilityKind::SessionEmit,
-                        selector: ResourceSelector::None,
-                    };
-                    let requested = EffectSet::from_requirement(requirement.clone());
-                    if !self.config.grants.grants(&requested) {
-                        let mut diagnostic = VmDiagnostic::error(
-                            "E-CAP-002",
-                            DiagnosticPhase::Authorization,
-                            "session.emit is outside this execution's grants",
-                            Some(effect.origin.clone()),
-                        );
-                        diagnostic.capability = Some(requirement);
-                        return Err(diagnostic);
-                    }
-                    // The continuation already contains the unit produced by
-                    // the UI operation; this host projection is intentionally
-                    // ignored by the synchronous compatibility adapter.
-                    self.handler.side_effect(&effect)?;
-                    trampoline.run(continuation)
-                }
-                VmStep::Await {
-                    effect,
-                    output,
-                    continuation,
-                } => {
-                    self.handler.observe_awaited_effect(&effect)?;
-                    let HostSideEffect::Request { arguments } = effect.event else {
-                        return Err(VmDiagnostic::error(
-                            "E-HOST-002",
-                            DiagnosticPhase::HostCall,
-                            "VM await boundary did not carry a host request",
-                            Some(effect.origin),
-                        ));
-                    };
-                    let requirement = effect.requirement;
-                    let origin = effect.origin;
-                    let requested = EffectSet::from_requirement(requirement.clone());
-                    if !self.config.grants.grants(&requested) {
-                        let mut diagnostic = VmDiagnostic::error(
-                            "E-CAP-002",
-                            DiagnosticPhase::Authorization,
-                            format!(
-                                "capability {:?} is outside this execution's grants",
-                                requirement.capability
-                            ),
-                            Some(origin),
-                        );
-                        diagnostic.capability = Some(requirement);
-                        return Err(diagnostic);
-                    }
-                    let values = self.handler.request(&requirement, arguments, &origin)?;
-                    validate_host_result(&output, &values, &origin)?;
-                    trampoline.resume(continuation, values)
-                }
-                VmStep::SpawnFiber { origin, .. }
-                | VmStep::NextFiber { origin, .. }
-                | VmStep::JoinFiber { origin, .. }
-                | VmStep::CancelFiber { origin, .. } => {
-                    return Err(VmDiagnostic::error(
-                        "E-FIBER-032",
-                        DiagnosticPhase::HostCall,
-                        "producer fibers require the typed runtime event loop",
-                        Some(origin),
-                    ));
-                }
-                VmStep::SpawnCpuFiber { origin, .. } => {
-                    return Err(VmDiagnostic::error(
-                        "E-FIBER-006",
-                        DiagnosticPhase::HostCall,
-                        "CPU fibers require the typed runtime event loop",
-                        Some(origin),
-                    ));
-                }
-                VmStep::PollCpuFiber { origin, .. }
-                | VmStep::JoinCpuFiber { origin, .. }
-                | VmStep::CancelCpuFiber { origin, .. } => {
-                    return Err(VmDiagnostic::error(
-                        "E-FIBER-018",
-                        DiagnosticPhase::HostCall,
-                        "CPU task operations require the typed runtime event loop",
-                        Some(origin),
-                    ));
-                }
-                VmStep::Complete { stack: pending } => {
-                    *stack = pending;
-                    return Ok(());
-                }
-                VmStep::Failed(diagnostic) => return Err(diagnostic),
-            };
-        }
-    }
-}
-
 /// Instantiate a selector template in a declared capability requirement against the arguments
 /// of a call. Public because the program runtime service instantiates a core word's declared
 /// requirement to compare it with the one actually requested.
@@ -2464,8 +2304,7 @@ fn runtime_underflow(origin: &SourceOrigin, trace: Vec<String>) -> VmDiagnostic 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core_vocabulary, Verifier};
-    use crate::{BasicBlock, Function, LocatedInstruction, Module, StackRow, StackSignature, Type};
+    use crate::{core_vocabulary, Type};
     use std::collections::BTreeMap;
 
     #[derive(Default)]
@@ -2580,33 +2419,6 @@ mod tests {
         assert_eq!(handler.requests, 0, "no rejection may fall through to use");
     }
 
-    fn arithmetic_module(instructions: Vec<Instruction>) -> VerifiedModule {
-        let function = Function {
-            name: "main".into(),
-            documentation: None,
-            signature: StackSignature::pure(
-                StackRow::closed(Vec::new()),
-                StackRow::closed(vec![Type::Int]),
-            ),
-            locals: Vec::new(),
-            captures: Vec::new(),
-            entry: 0,
-            blocks: BTreeMap::from([(
-                0,
-                BasicBlock {
-                    id: 0,
-                    instructions: instructions
-                        .into_iter()
-                        .map(|instruction| LocatedInstruction::generated(instruction, "test"))
-                        .collect(),
-                },
-            )]),
-        };
-        Verifier::new(&core_vocabulary())
-            .verify(Module::single(function))
-            .unwrap()
-    }
-
     #[test]
     fn option_and_result_words_preserve_typed_values() {
         let mut stack = vec![TypedValue::Int(7)];
@@ -2652,45 +2464,49 @@ mod tests {
 
     #[test]
     fn executes_verified_arithmetic_transactionally() {
-        let module = arithmetic_module(vec![
-            Instruction::Constant {
-                value: TypedValue::Int(3),
-            },
-            Instruction::Constant {
-                value: TypedValue::Int(4),
-            },
-            Instruction::Call {
-                function: "+".into(),
-            },
-            Instruction::Return,
-        ]);
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(7)]);
+        let module = finch_language::compile_forth(
+            "arithmetic.forth",
+            "3 4 +",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut runtime = crate::TypedRuntime::new();
+        let execution = runtime.execute(&module, 100_000);
+        assert_eq!(
+            execution.status,
+            crate::TypedExecutionStatus::Completed,
+            "production runtime must complete verified arithmetic: diagnostics={:?}",
+            execution.diagnostics
+        );
+        assert_eq!(runtime.stack(), [TypedValue::Int(7)]);
     }
 
     #[test]
     fn runtime_failure_rolls_back_stack() {
-        let module = arithmetic_module(vec![
-            Instruction::Constant {
-                value: TypedValue::Int(1),
-            },
-            Instruction::Constant {
-                value: TypedValue::Int(0),
-            },
-            Instruction::Call {
-                function: "/".into(),
-            },
-            Instruction::Return,
-        ]);
-        let mut stack = vec![TypedValue::String("existing".into())];
-        let error = Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap_err();
-        assert_eq!(error.code, "E-NUM-001");
-        assert_eq!(stack, vec![TypedValue::String("existing".into())]);
+        let module = finch_language::compile_forth(
+            "division.forth",
+            "1 0 /",
+            vec![Type::String],
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut runtime = crate::TypedRuntime::from_checkpoint(crate::TypedRuntimeCheckpoint {
+            version: crate::VM_TYPE_SYSTEM_VERSION,
+            stack: vec![TypedValue::String("existing".into())],
+            functions: BTreeMap::new(),
+            producer_fibers: BTreeMap::new(),
+        })
+        .unwrap();
+        let execution = runtime.execute(&module, 100_000);
+        assert_eq!(
+            execution.status,
+            crate::TypedExecutionStatus::Failed,
+            "production runtime must report arithmetic failure: diagnostics={:?}",
+            execution.diagnostics
+        );
+        assert_eq!(execution.diagnostics[0].code, "E-NUM-001");
+        assert_eq!(runtime.stack(), [TypedValue::String("existing".into())]);
     }
 
     #[test]
