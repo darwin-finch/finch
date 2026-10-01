@@ -434,9 +434,13 @@ did). The card's lines are the pinned output of `TuiRenderer::dialog_lines` — 
 `pin_dialog_controls` discipline that keeps Yes/No/Submit inside the card while the
 preview body scrolls inside it (#435) — re-rendered to, and padded to exactly, the
 height the sizing pass claimed, so both claiming passes see the same box and the erase
-estimator (`live_geometry`) plans the identical frame ("one planner, two consumers").
-Wheels and clicks over the conversation stay gated while a dialog owns focus. Overlay
-placement (a z-layer above the conversation, #713/#793) is the same widget under a
+estimator (`live_geometry`) plans the identical frame ("one planner, two consumers"). The
+same pinned-line plan records semantic body and fixed-control claims for mouse dispatch:
+while an approval is open, a wheel over the transcript scrolls only the conversation, a
+wheel over the proposed-write body scrolls only that body, and a wheel over the fixed card
+rows is consumed without changing selection. Mouse capture stays held. Clicks remain gated
+while the dialog owns focus. Overlay placement (a z-layer above the conversation, #713/#793)
+is the same widget under a
 different parent; it is not a second renderer and must blit through the shadow buffer.
 
 After submit the renderer freezes the settled card into the conversation:

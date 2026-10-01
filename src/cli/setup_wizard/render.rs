@@ -1538,6 +1538,135 @@ pub(super) fn add_provider_card(
                 Some(wizard_line(controls, Color::Yellow)),
             )
         }
+        AddProviderStep::ConfigureCompatibleConnection {
+            draft,
+            focused_field,
+            editing_idx,
+        } => {
+            let kind = match draft.credential_kind {
+                crate::config::CredentialKind::Bearer => "Bearer token",
+                _ => "API key",
+            };
+            let body = vec![
+                wizard_line(
+                    "Protocol compatibility does not attest model capabilities.",
+                    Color::Yellow,
+                ),
+                remote_form_row("Profile", &draft.name, *focused_field == 0, true),
+                remote_form_row("Base URL", &draft.base_url, *focused_field == 1, true),
+                remote_form_row("Chat path", &draft.chat_path, *focused_field == 2, true),
+                remote_form_row("Models path", &draft.models_path, *focused_field == 3, true),
+                remote_form_row("Model", &draft.model, *focused_field == 4, true),
+                remote_form_row(
+                    "Credential",
+                    &draft.credential_ref,
+                    *focused_field == 5,
+                    true,
+                ),
+                remote_form_row("Secret env", &draft.secret_env, *focused_field == 6, true),
+                remote_form_row("Auth", kind, *focused_field == 7, false),
+                wizard_line(
+                    "Only env:VARIABLE is saved; Finch never stores or displays the secret.",
+                    Color::DarkGray,
+                ),
+            ];
+            WizardCard::new(
+                if editing_idx.is_some() {
+                    "Edit Compatible Connection (1/2)"
+                } else {
+                    "Add Compatible Connection (1/2)"
+                },
+                body,
+                Some(wizard_line(
+                    "↑↓ navigate · type to edit · ←→ auth · Enter capabilities · Esc back",
+                    Color::Yellow,
+                )),
+            )
+        }
+        AddProviderStep::ConfigureCompatibleCapabilities {
+            draft,
+            focused_field,
+            editing_idx,
+        } => {
+            let attestation = |value: Option<bool>| match value {
+                Some(true) => "supported",
+                Some(false) => "unsupported",
+                None => "unknown",
+            };
+            let tool_choice = match draft.tool_choice {
+                crate::config::OpenAiCompatibleToolChoice::Omit => "omit",
+                crate::config::OpenAiCompatibleToolChoice::Auto => "auto",
+            };
+            let body = vec![
+                wizard_line(
+                    "Declare only capabilities verified for this exact endpoint and model.",
+                    Color::Yellow,
+                ),
+                remote_form_row(
+                    "Streaming",
+                    attestation(draft.streaming),
+                    *focused_field == 0,
+                    false,
+                ),
+                remote_form_row(
+                    "Tools",
+                    attestation(draft.tools),
+                    *focused_field == 1,
+                    false,
+                ),
+                remote_form_row(
+                    "Parallel tools",
+                    attestation(draft.parallel_tool_calls),
+                    *focused_field == 2,
+                    false,
+                ),
+                remote_form_row(
+                    "Image input",
+                    attestation(draft.image_input),
+                    *focused_field == 3,
+                    false,
+                ),
+                remote_form_row(
+                    "Context tokens",
+                    if draft.context_window_tokens.is_empty() {
+                        "unknown"
+                    } else {
+                        &draft.context_window_tokens
+                    },
+                    *focused_field == 4,
+                    true,
+                ),
+                remote_form_row(
+                    "Max output",
+                    if draft.max_output_tokens.is_empty() {
+                        "unknown"
+                    } else {
+                        &draft.max_output_tokens
+                    },
+                    *focused_field == 5,
+                    true,
+                ),
+                remote_form_row("Tool choice", tool_choice, *focused_field == 6, false),
+                remote_form_row(
+                    "Strict schemas",
+                    attestation(draft.strict_tool_schemas),
+                    *focused_field == 7,
+                    false,
+                ),
+            ];
+            WizardCard::new(
+                if editing_idx.is_some() {
+                    "Edit Compatible Capabilities (2/2)"
+                } else {
+                    "Add Compatible Capabilities (2/2)"
+                },
+                body,
+                Some(wizard_line(
+                    "↑↓ navigate · ←→ change/attest · type token limits · Enter saves · Esc back",
+                    Color::Yellow,
+                )),
+            )
+        }
         // ── single-screen local model form ───────────────────────────────────
         AddProviderStep::ConfigureLocal {
             inference_provider: _,
