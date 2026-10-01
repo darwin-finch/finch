@@ -10705,6 +10705,7 @@ async fn status_reports_generic_compatible_capabilities_without_secrets_and_pres
                 tool_choice: crate::config::OpenAiCompatibleToolChoice::Auto,
                 strict_tool_schemas: Some(false),
             };
+            let overlay_compatible = compatible.clone();
             let mut event_loop = super::EventLoop::new_provider_switch_test_runner(
                 vec![compatible],
                 0,
@@ -10753,6 +10754,63 @@ capacity: not configured";
                 assert!(
                     !report.contains(marker),
                     "/status must not expose endpoint, path, credential, environment, header, or resolved-secret material; marker={marker:?} report={report:?}"
+                );
+            }
+
+            let mut overlay = super::EventLoop::new_provider_switch_test_runner(
+                vec![overlay_compatible],
+                0,
+                None,
+            );
+            overlay.output_manager.disable_stdout();
+            overlay.cli_model = Some("alternate".into());
+            overlay
+                .handle_user_input("/status".into())
+                .await
+                .expect("the real /status command path must handle a one-shot model overlay");
+            let overlay_messages: Vec<String> = overlay
+                .output_manager
+                .get_messages()
+                .iter()
+                .map(|message| message.content())
+                .collect();
+            let overlay_report = overlay_messages
+                .iter()
+                .find(|message| message.starts_with("provider: compatible-work\n"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the real /status path must emit the overlaid profile report; messages={overlay_messages:?}"
+                    )
+                });
+            let expected_overlay = "provider: compatible-work\n\
+model: alternate\n\
+thinking: provider default\n\
+source: CLI --model (this invocation only)\n\
+dialect: generic OpenAI-compatible Chat Completions\n\
+capabilities: not attested for model overlay 'alternate' (configured model: main)\n\
+context window: not attested for selected model\n\
+max output: not attested for selected model\n\
+image input: not attested for selected model\n\
+capacity: not configured";
+            assert_eq!(
+                overlay_report, expected_overlay,
+                "a model overlay must clearly withhold capability values attested only for the configured compatible model"
+            );
+            for configured_model_claim in [
+                "262144",
+                "32768",
+                "text only; operator configured",
+                "supported (operator configured)",
+            ] {
+                assert!(
+                    !overlay_report.contains(configured_model_claim),
+                    "an overlaid model must not inherit the configured model's capability claim; claim={configured_model_claim:?} report={overlay_report:?}"
+                );
+            }
+            for marker in secret_markers {
+                assert!(
+                    !overlay_report.contains(marker),
+                    "the overlay provenance diagnostic must remain secret-free; marker={marker:?} report={overlay_report:?}"
                 );
             }
 

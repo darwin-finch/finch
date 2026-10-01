@@ -94,21 +94,40 @@ impl EffectiveSelection {
         entry: &ProviderEntry,
     ) -> String {
         let mut report = self.status_report(global_default);
-        let ProviderEntry::OpenAiCompatible { capabilities, .. } = entry else {
+        let ProviderEntry::OpenAiCompatible {
+            model: configured_model,
+            capabilities,
+            ..
+        } = entry
+        else {
             return report;
         };
-        let image_input = match capabilities.image_input {
-            Some(true) => "supported (operator configured)",
-            Some(false) => "unsupported (text only; operator configured)",
-            None => "not configured",
+        let lines = if self.model.as_deref() != Some(configured_model.as_str()) {
+            let selected_model = self.model.as_deref().unwrap_or("provider default");
+            vec![
+                "dialect: generic OpenAI-compatible Chat Completions".into(),
+                format!(
+                    "capabilities: not attested for model overlay '{selected_model}' (configured model: {configured_model})"
+                ),
+                "context window: not attested for selected model".into(),
+                "max output: not attested for selected model".into(),
+                "image input: not attested for selected model".into(),
+                "capacity: not configured".into(),
+            ]
+        } else {
+            let image_input = match capabilities.image_input {
+                Some(true) => "supported (operator configured)",
+                Some(false) => "unsupported (text only; operator configured)",
+                None => "not configured",
+            };
+            vec![
+                "dialect: generic OpenAI-compatible Chat Completions".into(),
+                configured_token_limit("context window", capabilities.context_window_tokens),
+                configured_token_limit("max output", capabilities.max_output_tokens),
+                format!("image input: {image_input}"),
+                "capacity: not configured".into(),
+            ]
         };
-        let lines = [
-            "dialect: generic OpenAI-compatible Chat Completions".into(),
-            configured_token_limit("context window", capabilities.context_window_tokens),
-            configured_token_limit("max output", capabilities.max_output_tokens),
-            format!("image input: {image_input}"),
-            "capacity: not configured".into(),
-        ];
         for line in lines {
             report.push('\n');
             report.push_str(&line);
