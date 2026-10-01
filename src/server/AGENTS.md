@@ -32,10 +32,13 @@ the server and supervised IPC tests, not just a helper unit test.
 
 **Schedule-delivery diagnostics report transitions, not retry cadence.** The process-ephemeral
 failure registry in `schedule_delivery::FailureEpisodes` is keyed by exact indexed `BrainId` plus
-display name. The first failed attempt emits one actionable WARN with the full cause chain;
+display name and fenced by the schedule set's process-local lifecycle epoch, so cancel-last plus
+same-identity recreation cannot form an ABA. The first failed attempt emits one actionable WARN with the full cause chain;
 unchanged retries are silent; the first real success emits one INFO and clears the episode.
 Archive, unused removal, external absence, and schedule retirement silently reconcile the entry,
-and a completion that crossed one of those boundaries cannot reinsert it. Restart deliberately
+and a completion that crossed one of those boundaries cannot reinsert it. A successful one-shot
+captures its completion observation while the execution lane is still held, so its natural final
+retirement does not hide the real recovery. Restart deliberately
 starts empty, so the first real post-restart failure may warn again but never invents recovery.
 
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and

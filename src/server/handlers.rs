@@ -961,6 +961,13 @@ pub(crate) async fn resume_queued_named_brain_runs_in_lane(
     Ok(resumed)
 }
 
+/// Result plus the schedule lifecycle observed before releasing its execution lane.
+#[derive(Debug)]
+pub(crate) struct ScheduleDeliveryAttempt {
+    pub(crate) delivered: usize,
+    pub(crate) completion: Option<(crate::brain::BrainId, u64, bool)>,
+}
+
 /// Advance one Brain's durable schedules and, when its environment runner is
 /// live, execute the newly queued ProgramRuns through that exact runner.
 pub(crate) async fn deliver_due_named_brain_schedules(
@@ -968,14 +975,17 @@ pub(crate) async fn deliver_due_named_brain_schedules(
     runners: crate::server::BrainRunnerBroker,
     name: String,
     now_ms: u64,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<ScheduleDeliveryAttempt> {
     use crate::brain::BrainRunStatus;
 
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
     let queued = store.queue_due_schedules(&name, now_ms)?;
     if queued.is_empty() || !named_brain_runner_is_ready(&store, &runners, &name)? {
-        return Ok(queued.len());
+        return Ok(ScheduleDeliveryAttempt {
+            delivered: queued.len(),
+            completion: store.schedule_lifecycle_observation(&name),
+        });
     }
 
     let mut dispatched = 0;
@@ -992,7 +1002,10 @@ pub(crate) async fn deliver_due_named_brain_schedules(
         dispatch_named_brain_run(&store, &runners, &name, &running).await?;
         dispatched += 1;
     }
-    Ok(dispatched)
+    Ok(ScheduleDeliveryAttempt {
+        delivered: dispatched,
+        completion: store.schedule_lifecycle_observation(&name),
+    })
 }
 
 fn commit_named_brain_approval_decision(

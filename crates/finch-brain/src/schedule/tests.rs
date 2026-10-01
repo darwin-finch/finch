@@ -79,3 +79,38 @@ fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
     );
     assert_eq!(index.active_identity("alpha"), None);
 }
+
+#[test]
+fn test_schedule_index_generation_fences_cancel_last_then_recreate_aba() {
+    let mut index = ScheduleIndex::default();
+    let brain_id = BrainId(uuid::Uuid::from_u128(30));
+    let active = sample_schedule(1, 10, Some(1_000), true);
+    index.upsert("same", brain_id, &active);
+    let first = index.active_observation("same").unwrap();
+
+    let inactive = sample_schedule(1, 10, Some(1_000), false);
+    index.upsert("same", brain_id, &inactive);
+    assert_eq!(index.active_observation("same"), None);
+    let retired = index.lifecycle_observation("same").unwrap();
+    assert!(
+        retired.1 > first.1,
+        "retirement must advance the lifecycle epoch"
+    );
+
+    let replacement = sample_schedule(2, 20, Some(1_000), true);
+    index.upsert("same", brain_id, &replacement);
+    let recreated = index.active_observation("same").unwrap();
+    assert_eq!(recreated.0, brain_id);
+    assert!(
+        recreated.1 > retired.1,
+        "same-identity recreation must not repeat the retired observation; first={first:?} retired={retired:?} recreated={recreated:?}"
+    );
+
+    let moved = sample_schedule(2, 30, Some(1_000), true);
+    index.upsert("same", brain_id, &moved);
+    assert_eq!(
+        index.active_observation("same"),
+        Some(recreated),
+        "moving an existing recurring schedule must preserve its episode generation"
+    );
+}

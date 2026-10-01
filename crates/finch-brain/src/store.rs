@@ -2460,6 +2460,22 @@ impl BrainStore {
             .active_identity(name)
     }
 
+    /// Exact active identity plus its process-local schedule-set generation.
+    pub fn active_schedule_observation(&self, name: &str) -> Option<(BrainId, u64)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .active_observation(name)
+    }
+
+    /// Latest indexed schedule lifecycle, including an inactive final set.
+    pub fn schedule_lifecycle_observation(&self, name: &str) -> Option<(BrainId, u64, bool)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .lifecycle_observation(name)
+    }
+
     /// Every exact Brain identity currently owning active indexed schedules.
     ///
     /// This is a bounded, non-hydrating reconciliation view for daemon-owned
@@ -2469,6 +2485,14 @@ impl BrainStore {
             .read()
             .expect("schedule index lock poisoned")
             .active_identities()
+    }
+
+    /// Every active identity and its process-local schedule-set generation.
+    pub fn active_schedule_observations(&self) -> Vec<(BrainId, String, u64)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .active_observations()
     }
 
     /// Populate the due index from every Brain on disk, once.
