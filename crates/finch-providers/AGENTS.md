@@ -88,6 +88,10 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - `ValidatedProviderRequest` is unforgeable; backends consume `into_request_for`.
 - Tool calls become semantic `ToolUse` only after adapter validation.
 - Opaque reasoning/replay material is not display content.
+- Direct Meta Model API `reasoning_content` is dialect-scoped: buffered values are validated and
+  discarded, while streamed values become bounded `ThinkingDelta` events carrying Meta
+  provider/model provenance and no opaque replay. It never enters assistant-visible completed
+  content, and canonical OpenAI does not accept the Meta-only field.
 - Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
   OpenAI and Claude also emit native `ToolCallDelta` / `ToolCallComplete`.
   Generation-layer translation of `ContentBlockComplete(ToolUse)` into

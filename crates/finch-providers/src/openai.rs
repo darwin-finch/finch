@@ -383,7 +383,7 @@ async fn read_bounded_response_body(response: reqwest::Response) -> Result<Vec<u
     Ok(body)
 }
 
-fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
+fn validate_canonical_response_shape(value: &serde_json::Value, rule: TransportRule) -> Result<()> {
     let root = value
         .as_object()
         .context("OpenAI response was not a JSON object")?;
@@ -418,11 +418,27 @@ fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
             .get("message")
             .and_then(serde_json::Value::as_object)
             .context("OpenAI response choice omitted a valid message")?;
-        reject_unknown_keys(
-            message,
-            &["role", "content", "tool_calls", "refusal", "annotations"],
-            "response message",
-        )?;
+        let allowed_message_fields = match rule {
+            TransportRule::MetaModelApiChatCompletions => &[
+                "role",
+                "content",
+                "tool_calls",
+                "refusal",
+                "annotations",
+                "reasoning_content",
+            ][..],
+            TransportRule::CanonicalGpt56ChatCompletions
+            | TransportRule::CompatibleChatCompletions => {
+                &["role", "content", "tool_calls", "refusal", "annotations"][..]
+            }
+        };
+        reject_unknown_keys(message, allowed_message_fields, "response message")?;
+        if rule == TransportRule::MetaModelApiChatCompletions {
+            validate_reasoning_content_type(
+                message.get("reasoning_content"),
+                "OpenAI response did not match the documented schema",
+            )?;
+        }
         if message.get("refusal").is_some_and(|value| !value.is_null()) {
             anyhow::bail!("OpenAI response contained an unsupported refusal item");
         }
@@ -461,6 +477,7 @@ fn validate_canonical_actual_model(model: &str) -> Result<()> {
 }
 
 struct CanonicalStreamState {
+    rule: TransportRule,
     provider: String,
     response_id: Option<String>,
     model: Option<String>,
@@ -485,7 +502,14 @@ fn reject_unknown_keys(
     Ok(())
 }
 
-fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
+fn validate_reasoning_content_type(value: Option<&serde_json::Value>, error: &str) -> Result<()> {
+    if value.is_some_and(|value| !value.is_null() && !value.is_string()) {
+        anyhow::bail!("{error}");
+    }
+    Ok(())
+}
+
+fn validate_canonical_chunk_shape(value: &serde_json::Value, rule: TransportRule) -> Result<()> {
     let root = value
         .as_object()
         .context("OpenAI stream event was not a JSON object")?;
@@ -520,7 +544,20 @@ fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
             .get("delta")
             .and_then(serde_json::Value::as_object)
             .context("OpenAI stream choice omitted a valid delta object")?;
-        reject_unknown_keys(delta, &["role", "content", "tool_calls"], "delta")?;
+        let allowed_delta_fields = match rule {
+            TransportRule::MetaModelApiChatCompletions => {
+                &["role", "content", "reasoning_content", "tool_calls"][..]
+            }
+            TransportRule::CanonicalGpt56ChatCompletions
+            | TransportRule::CompatibleChatCompletions => &["role", "content", "tool_calls"][..],
+        };
+        reject_unknown_keys(delta, allowed_delta_fields, "delta")?;
+        if rule == TransportRule::MetaModelApiChatCompletions {
+            validate_reasoning_content_type(
+                delta.get("reasoning_content"),
+                "OpenAI stream event did not match the documented schema",
+            )?;
+        }
         if let Some(tool_calls) = delta.get("tool_calls") {
             let tool_calls = tool_calls
                 .as_array()
@@ -552,7 +589,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     }
     let value: serde_json::Value =
         serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
-    validate_canonical_chunk_shape(&value)?;
+    validate_canonical_chunk_shape(&value, state.rule)?;
     let chunk: OpenAIStreamChunk = serde_json::from_value(value)
         .context("OpenAI stream event did not match the documented schema")?;
     if chunk.object.as_deref() != Some("chat.completion.chunk") {
@@ -625,10 +662,33 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     }
     if choice.delta.role.is_none()
         && choice.delta.content.is_none()
+        && choice.delta.reasoning_content.is_none()
         && choice.delta.tool_calls.is_none()
         && choice.finish_reason.is_none()
     {
         anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
+    }
+    if let Some(reasoning) = &choice.delta.reasoning_content {
+        if reasoning.is_empty() {
+            anyhow::bail!("OpenAI stream returned an empty reasoning delta");
+        }
+        // A reasoning delta is already inside the strict 1 MiB SSE-line and
+        // 4 MiB whole-stream bounds. Keep the direct check at the semantic
+        // boundary too so future framing changes cannot silently unbound it.
+        if reasoning.len() > MAX_SSE_LINE_BYTES {
+            anyhow::bail!("OpenAI reasoning delta exceeded the 1 MiB limit");
+        }
+        state.sequence += 1;
+        output.push(StreamChunk::ThinkingDelta {
+            text: reasoning.clone(),
+            provenance: EventProvenance {
+                provider: state.provider.clone(),
+                model: state.model.clone().unwrap_or_default(),
+                event: "reasoning".to_string(),
+                sequence: state.sequence,
+                opaque_replay: None,
+            },
+        });
     }
     if let Some(content) = &choice.delta.content {
         state.accumulated_text.push_str(content);
@@ -797,6 +857,7 @@ fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
 
 fn spawn_canonical_stream_parser(
     response: reqwest::Response,
+    rule: TransportRule,
     provider: String,
     bindings: Arc<ToolBindingTable>,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
@@ -806,6 +867,7 @@ fn spawn_canonical_stream_parser(
         let mut buffer: Vec<u8> = Vec::new();
         let mut total = 0usize;
         let mut state = CanonicalStreamState {
+            rule,
             provider,
             response_id: None,
             model: None,
@@ -1929,7 +1991,7 @@ impl OpenAIProvider {
                 let body = read_bounded_response_body(response).await?;
                 let value: serde_json::Value =
                     serde_json::from_slice(&body).context("Failed to parse OpenAI API response")?;
-                validate_canonical_response_shape(&value)?;
+                validate_canonical_response_shape(&value, rule)?;
                 serde_json::from_value(value)
                     .context("OpenAI response did not match the documented schema")?
             }
@@ -2019,6 +2081,7 @@ impl OpenAIProvider {
             }
             return Ok(spawn_canonical_stream_parser(
                 response,
+                rule,
                 self.provider_name.clone(),
                 Arc::new(bindings.clone()),
             ));
@@ -2831,7 +2894,7 @@ struct OpenAIStreamChoice {
 struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
-    /// Reasoning text used by xAI and other compatible endpoints. This is
+    /// Reasoning text used by Meta, xAI, and other compatible endpoints. This is
     /// activity/reasoning, never assistant output.
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
@@ -2890,6 +2953,7 @@ mod tests {
 
     fn test_stream_state() -> CanonicalStreamState {
         CanonicalStreamState {
+            rule: TransportRule::CanonicalGpt56ChatCompletions,
             provider: "openai".into(),
             response_id: None,
             model: None,
@@ -3492,6 +3556,215 @@ mod tests {
         assert!(calls
             .iter()
             .all(|call| call.3 == "meta_model_api" && call.4 == "muse-spark-1.3"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_model_api_reasoning_is_private_bounded_stream_activity_at_http_boundary() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"checking \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"the answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"visible answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let mut receiver = meta_test_provider(server.url())
+            .send_message_stream(
+                &ProviderRequest::new(vec![crate::Message::user("hello")])
+                    .with_model("muse-spark-1.3"),
+            )
+            .await
+            .expect("the documented Meta reasoning stream must start");
+
+        let mut reasoning = Vec::new();
+        let mut visible_deltas = String::new();
+        let mut completions = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            match item {
+                Ok(StreamChunk::ThinkingDelta { text, provenance }) => {
+                    reasoning.push((text, provenance));
+                }
+                Ok(StreamChunk::TextDelta(text)) => visible_deltas.push_str(&text),
+                Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })) => {
+                    completions.push(text);
+                }
+                Err(error) => errors.push(error.to_string()),
+                _ => {}
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "documented Meta reasoning must not fail the HTTP stream: {errors:?}"
+        );
+        assert_eq!(
+            reasoning.len(),
+            2,
+            "each fragmented Meta reasoning delta must remain distinct activity: {reasoning:?}"
+        );
+        assert_eq!(
+            reasoning[0].0, "checking ",
+            "the first fragmented reasoning delta changed: {reasoning:?}"
+        );
+        assert_eq!(
+            reasoning[1].0, "the answer",
+            "the second fragmented reasoning delta changed: {reasoning:?}"
+        );
+        for (index, (_, provenance)) in reasoning.iter().enumerate() {
+            assert_eq!(
+                provenance.provider, "meta_model_api",
+                "reasoning activity carried the wrong provider provenance: {provenance:?}"
+            );
+            assert_eq!(
+                provenance.model, "muse-spark-1.3",
+                "reasoning activity carried the wrong model provenance: {provenance:?}"
+            );
+            assert_eq!(
+                provenance.event, "reasoning",
+                "reasoning activity carried the wrong event provenance: {provenance:?}"
+            );
+            assert_eq!(
+                provenance.sequence,
+                index as u64 + 1,
+                "reasoning activity sequence was not monotonic: {reasoning:?}"
+            );
+            assert!(
+                provenance.opaque_replay.is_none(),
+                "Meta reasoning must not carry opaque replay material: {provenance:?}"
+            );
+        }
+        assert_eq!(
+            visible_deltas, "visible answer",
+            "Meta reasoning leaked into assistant-visible deltas"
+        );
+        assert_eq!(
+            completions,
+            vec!["visible answer"],
+            "Meta must publish exactly one completed assistant block without reasoning"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_model_api_nonstream_reasoning_is_accepted_but_not_assistant_content() {
+        let mut server = mockito::Server::new_async().await;
+        let private_reasoning = "PRIVATE_META_REASONING";
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": "meta-buffered-reasoning",
+                    "object": "chat.completion",
+                    "model": "muse-spark-1.3",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "reasoning_content": private_reasoning,
+                            "content": "visible answer"
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let response = meta_test_provider(server.url())
+            .send_message(
+                &ProviderRequest::new(vec![crate::Message::user("hello")])
+                    .with_model("muse-spark-1.3"),
+            )
+            .await
+            .expect("documented buffered Meta reasoning must be accepted");
+
+        assert_eq!(
+            response.content,
+            vec![ContentBlock::Text {
+                text: "visible answer".into()
+            }],
+            "buffered Meta reasoning must not become assistant content"
+        );
+        assert!(
+            !format!("{response:?}").contains(private_reasoning),
+            "private Meta reasoning leaked into the buffered provider response"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_model_api_wrong_typed_reasoning_fails_closed_at_http_boundaries() {
+        let (complete, stream_errors) = meta_stream_outcome(concat!(
+            "data: {\"id\":\"meta-bad-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":17},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-bad-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"must not complete\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-bad-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"meta-bad-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        ).to_string()).await;
+        assert!(
+            !complete,
+            "a wrong-typed Meta reasoning delta must not publish completion"
+        );
+        assert!(
+            stream_errors
+                .iter()
+                .any(|error| error.contains("documented schema")),
+            "a wrong-typed Meta reasoning delta must fail with a bounded schema error: {stream_errors:?}"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .expect(3)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": "meta-bad-buffered-reasoning",
+                    "object": "chat.completion",
+                    "model": "muse-spark-1.3",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "reasoning_content": {"private": "must not leak"},
+                            "content": "must not complete"
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let error = meta_test_provider(server.url())
+            .send_message(
+                &ProviderRequest::new(vec![crate::Message::user("hello")])
+                    .with_model("muse-spark-1.3"),
+            )
+            .await
+            .expect_err("wrong-typed buffered Meta reasoning must fail closed")
+            .to_string();
+        assert!(
+            error.contains("documented schema"),
+            "wrong-typed buffered Meta reasoning must fail with a bounded schema error: {error}"
+        );
+        assert!(
+            !error.contains("must not leak"),
+            "wrong-typed private Meta reasoning leaked into its schema error: {error}"
+        );
         mock.assert_async().await;
     }
 
@@ -4351,6 +4624,19 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("unknown delta field")));
+
+        let meta_only_reasoning = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private\"},\"finish_reason\":null}]}\n\n";
+        let (complete, errors) = canonical_stream_outcome(meta_only_reasoning.to_string()).await;
+        assert!(
+            !complete,
+            "Meta-only reasoning_content must not relax canonical OpenAI parsing"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown delta field")),
+            "canonical OpenAI must continue rejecting Meta-only response fields: {errors:?}"
+        );
 
         let mut oversized_line = concat!(
             "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",

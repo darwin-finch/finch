@@ -34,6 +34,13 @@ ChatGPT use their service-managed implicit caches. Finch still sends complete re
 remote stateless APIs, because a cache hit is a provider optimization rather than stored
 conversation authority.
 
+The direct Meta Model API dialect accepts Muse Spark's documented `reasoning_content` response
+field without treating it as assistant output. Streaming reasoning crosses the provider boundary
+only as bounded `StreamChunk::ThinkingDelta` activity with Meta provider/model provenance;
+buffered reasoning is validated and discarded. It is never appended to `ProviderResponse`
+content, tool arguments, or opaque replay material. Canonical OpenAI parsing remains strict and
+does not inherit Meta-only response fields.
+
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth
 state machine has its own [capsule](src/oauth/AGENTS.md); its contract is re-exported flat from
