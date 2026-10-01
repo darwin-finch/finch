@@ -100,6 +100,63 @@ class WorkflowContractTests(unittest.TestCase):
     def test_current_workflows_pass(self) -> None:
         self.assert_passes()
 
+    def test_shared_proof_tests_keep_skip_and_exact_process_pairing(self) -> None:
+        workflow = "issue-56-brain-isolation.yml"
+        mutations = (
+            (
+                "missing reviewed skip",
+                "        --skip isolation_tests::isolated_proof_rejects_self_issued_environment_authority\n",
+                "",
+                "commands changed",
+            ),
+            (
+                "unreviewed broad exclusion",
+                "        --skip isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency\n",
+                "        --skip isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency\n"
+                "        --skip isolation_tests::unreviewed_shared_state_test\n",
+                "commands changed",
+            ),
+            (
+                "unsupervised exact process",
+                "        ./scripts/test_brains.sh cargo test -p finch-brain --lib\n"
+                "        isolation_tests::isolated_proof_rejects_self_issued_environment_authority\n",
+                "        cargo test -p finch-brain --lib\n"
+                "        isolation_tests::isolated_proof_rejects_self_issued_environment_authority\n",
+                "commands changed",
+            ),
+            (
+                "missing exact process",
+                "    - name: Validate isolation proof offsets in its own process\n",
+                "    - name: Unreviewed replacement process\n",
+                "must occur exactly once",
+            ),
+        )
+        for label, old, new, diagnostic in mutations:
+            with self.subTest(label=label):
+                repository = Repository()
+                try:
+                    repository.replace(workflow, old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"{label} unexpectedly passed")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+        duplicate = """
+    - name: Reject self-issued environment authority in its own process
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test -p finch-brain --lib
+        isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --exact --nocapture
+"""
+        self.repository.replace(
+            workflow,
+            "\n    - name: Validate isolation proof offsets in its own process\n",
+            duplicate + "\n    - name: Validate isolation proof offsets in its own process\n",
+        )
+        self.assert_fails("must occur exactly once")
+
     def test_workflow_inventory_addition_and_removal_fails(self) -> None:
         shutil.copy2(self.repository.workflow("docs.yml"), self.repository.workflow("surprise.yml"))
         self.assert_fails("workflow inventory changed", "surprise.yml")
