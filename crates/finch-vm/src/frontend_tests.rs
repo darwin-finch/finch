@@ -1,6 +1,61 @@
-use crate::interpreter::{DenyCapabilities, Interpreter};
 use crate::*;
 use finch_language::{compile_forth, compile_lisp};
+use std::collections::BTreeMap;
+
+fn runtime_with_stack(stack: &[TypedValue]) -> TypedRuntime {
+    TypedRuntime::from_checkpoint(TypedRuntimeCheckpoint {
+        version: VM_TYPE_SYSTEM_VERSION,
+        stack: stack.to_vec(),
+        functions: BTreeMap::new(),
+        producer_fibers: BTreeMap::new(),
+    })
+    .expect("test stack must restore into the production typed runtime")
+}
+
+fn commit_execution(
+    runtime: &TypedRuntime,
+    stack: &mut Vec<TypedValue>,
+    execution: TypedExecution,
+) -> Result<TypedExecution, Box<VmDiagnostic>> {
+    if execution.status == TypedExecutionStatus::Completed {
+        *stack = runtime.stack().to_vec();
+        return Ok(execution);
+    }
+    Err(Box::new(
+        execution.diagnostics.first().cloned().unwrap_or_else(|| {
+            VmDiagnostic::error(
+                "E-TEST-EXECUTION",
+                DiagnosticPhase::Interpretation,
+                format!(
+                    "production typed runtime did not complete: {:?}",
+                    execution.status
+                ),
+                None,
+            )
+        }),
+    ))
+}
+
+fn execute_module(
+    module: &ModuleVerified,
+    stack: &mut Vec<TypedValue>,
+    fuel: u64,
+) -> Result<TypedExecution, Box<VmDiagnostic>> {
+    let mut runtime = runtime_with_stack(stack);
+    let execution = runtime.execute(module, fuel);
+    commit_execution(&runtime, stack, execution)
+}
+
+fn execute_module_with_handler<H: CapabilityHandler>(
+    module: &ModuleVerified,
+    stack: &mut Vec<TypedValue>,
+    fuel: u64,
+    handler: &mut H,
+) -> Result<TypedExecution, Box<VmDiagnostic>> {
+    let mut runtime = runtime_with_stack(stack);
+    let execution = runtime.execute_with_handler(module, fuel, None, handler);
+    commit_execution(&runtime, stack, execution)
+}
 
 #[test]
 fn wire_failure_classifier_covers_every_stable_class() {
@@ -85,9 +140,7 @@ mod forth {
         let module =
             compile_forth("input.forth", "3 4 2 * +", Vec::new(), &core_vocabulary()).unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(11)]);
     }
 
@@ -102,8 +155,7 @@ mod forth {
         )
         .expect("typed result propagation compiles");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("error result is an ordinary return, not a VM failure");
         assert_eq!(
             stack,
@@ -127,9 +179,7 @@ mod forth {
         )
         .expect("successful result propagation compiles");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert!(matches!(
             stack.as_slice(),
             [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
@@ -167,19 +217,7 @@ mod forth {
             }
         }
         let mut handler = EmitHandler::default();
-        Interpreter::new(
-            &module,
-            &mut handler,
-            InterpreterConfig {
-                fuel: 100_000,
-                grants: EffectSet::from_requirement(CapabilityRequirement {
-                    capability: CapabilityKind::SessionEmit,
-                    selector: ResourceSelector::None,
-                }),
-            },
-        )
-        .execute(&mut stack)
-        .unwrap();
+        execute_module_with_handler(&module, &mut stack, 100_000, &mut handler).unwrap();
         assert_eq!(handler.output(), "Hello \"世界\"8! ");
     }
 
@@ -189,8 +227,7 @@ mod forth {
             let module = compile_forth("strings.forth", source, Vec::new(), &core_vocabulary())
                 .expect("typed string literal should compile");
             let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
+            execute_module(&module, &mut stack, 100_000)
                 .expect("typed string literal should execute");
             assert_eq!(stack, vec![TypedValue::String("hello there".into())]);
         }
@@ -227,19 +264,7 @@ mod forth {
         }
         let mut stack = Vec::new();
         let mut handler = EmitHandler::default();
-        Interpreter::new(
-            &module,
-            &mut handler,
-            InterpreterConfig {
-                fuel: 100_000,
-                grants: EffectSet::from_requirement(CapabilityRequirement {
-                    capability: CapabilityKind::SessionEmit,
-                    selector: ResourceSelector::None,
-                }),
-            },
-        )
-        .execute(&mut stack)
-        .unwrap();
+        execute_module_with_handler(&module, &mut stack, 100_000, &mut handler).unwrap();
         assert_eq!(handler.output(), "legacy output");
     }
 
@@ -253,13 +278,7 @@ mod forth {
         )
         .unwrap();
         let mut break_stack = Vec::new();
-        Interpreter::new(
-            &break_module,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut break_stack)
-        .unwrap();
+        execute_module(&break_module, &mut break_stack, 100_000).unwrap();
         assert_eq!(break_stack, vec![TypedValue::Int(2)]);
 
         let continue_module = compile_forth(
@@ -270,13 +289,7 @@ mod forth {
         )
         .unwrap();
         let mut continue_stack = Vec::new();
-        Interpreter::new(
-            &continue_module,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut continue_stack)
-        .unwrap();
+        execute_module(&continue_module, &mut continue_stack, 100_000).unwrap();
         assert_eq!(continue_stack, vec![TypedValue::Int(3)]);
     }
 
@@ -298,9 +311,7 @@ mod forth {
         .unwrap();
         for module in [ok_module, err_module] {
             let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
-                .unwrap();
+            execute_module(&module, &mut stack, 100_000).unwrap();
             assert!(stack.is_empty());
         }
     }
@@ -323,9 +334,7 @@ mod forth {
         .expect("integer case with otherwise should compile");
         for (module, expected) in [(selected, 20), (defaulted, 30)] {
             let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
-                .unwrap();
+            execute_module(&module, &mut stack, 100_000).unwrap();
             assert_eq!(stack, vec![TypedValue::Int(expected)]);
         }
 
@@ -337,9 +346,7 @@ mod forth {
         )
         .expect("a case without otherwise may leave no values on every path");
         let mut stack = Vec::new();
-        Interpreter::new(&effect_only, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&effect_only, &mut stack, 100_000).unwrap();
         assert!(stack.is_empty());
 
         let mismatch = compile_forth(
@@ -371,9 +378,7 @@ mod forth {
         )
         .expect("record literal should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("record projection should execute");
+        execute_module(&module, &mut stack, 100_000).expect("record projection should execute");
         assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
 
         let invalid = compile_forth(
@@ -393,9 +398,7 @@ mod forth {
         )
         .expect("record update should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&updated, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("record update should execute");
+        execute_module(&updated, &mut stack, 100_000).expect("record update should execute");
         assert_eq!(stack, vec![TypedValue::Int(38)]);
 
         let closure_field = compile_forth(
@@ -406,13 +409,7 @@ mod forth {
         )
         .expect("record closure should compile");
         let mut stack = Vec::new();
-        Interpreter::new(
-            &closure_field,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut stack)
-        .expect("record closure should execute");
+        execute_module(&closure_field, &mut stack, 100_000).expect("record closure should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -426,9 +423,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::String("bad".into())]);
     }
 
@@ -437,9 +432,7 @@ mod forth {
         let module =
             compile_forth("input.forth", "2 *", vec![Type::Int], &core_vocabulary()).unwrap();
         let mut stack = vec![TypedValue::Int(9)];
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(18)]);
     }
 
@@ -473,9 +466,7 @@ mod forth {
         ));
 
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(12)]);
     }
 
@@ -497,8 +488,7 @@ mod forth {
         )
         .expect("a declared-pure Co-Forth word should be able to recurse");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("recursive Co-Forth program should execute");
         assert_eq!(stack, vec![TypedValue::Int(720)]);
     }
@@ -513,8 +503,7 @@ mod forth {
         )
         .expect("a typed Co-Forth quotation should link to its definition");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("typed Co-Forth execute should call its quotation");
         assert_eq!(stack, vec![TypedValue::Int(81)]);
     }
@@ -536,9 +525,7 @@ mod forth {
             .expect("quotation lowering creates a typed hidden function");
         assert!(quote.captures.is_empty());
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("anonymous quotation should execute");
+        execute_module(&module, &mut stack, 100_000).expect("anonymous quotation should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -566,9 +553,7 @@ mod forth {
             .iter()
             .any(|located| matches!(located.instruction, Instruction::CaptureGet { index: 0 }))));
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("captured quotation should execute");
+        execute_module(&module, &mut stack, 100_000).expect("captured quotation should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -585,8 +570,7 @@ mod forth {
         )
         .expect("a declared function type should let a closure escape its frame");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("escaped closure owns its immutable capture");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
@@ -601,9 +585,7 @@ mod forth {
         )
         .expect("pure effect annotation should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("pure word should execute");
+        execute_module(&module, &mut stack, 100_000).expect("pure word should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
 
         let errors = compile_forth(
@@ -626,8 +608,7 @@ mod forth {
         )
         .expect("payload variant constructor should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("payload variant constructor should execute");
         assert_eq!(
             stack,
@@ -645,8 +626,7 @@ mod forth {
         )
         .expect("payload-free variant constructor should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("payload-free variant constructor should execute");
         assert_eq!(
             stack,
@@ -667,9 +647,7 @@ mod forth {
         )
         .expect("variant projection should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("variant projection should execute");
+        execute_module(&module, &mut stack, 100_000).expect("variant projection should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
 
         let module = compile_forth(
@@ -680,9 +658,7 @@ mod forth {
         )
         .expect("variant miss should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("variant miss should execute");
+        execute_module(&module, &mut stack, 100_000).expect("variant miss should execute");
         assert_eq!(stack, vec![TypedValue::Bool(false)]);
     }
 
@@ -696,9 +672,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(7)]);
     }
 
@@ -712,16 +686,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = vec![TypedValue::Int(42)];
-        let error = Interpreter::new(
-            &module,
-            DenyCapabilities,
-            InterpreterConfig {
-                fuel: 10,
-                ..InterpreterConfig::default()
-            },
-        )
-        .execute(&mut stack)
-        .unwrap_err();
+        let error = execute_module(&module, &mut stack, 10).unwrap_err();
         assert_eq!(error.code, "E-LIMIT-001");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
@@ -736,9 +701,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(10)]);
     }
 
@@ -746,9 +709,7 @@ mod forth {
     fn quoted_word_produces_a_typed_symbol_value() {
         let module = compile_forth("input.forth", "'bash", Vec::new(), &core_vocabulary()).unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Symbol("bash".into())]);
     }
 
@@ -762,9 +723,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -778,9 +737,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(3)]);
     }
 
@@ -794,9 +751,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&list, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&list, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(3)]);
 
         let json = compile_forth(
@@ -807,9 +762,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&json, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&json, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
     }
 
@@ -823,9 +776,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -839,9 +790,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(
             stack,
             vec![TypedValue::List {
@@ -861,9 +810,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(
             stack,
             vec![TypedValue::String(
@@ -882,9 +829,7 @@ mod forth {
         )
         .unwrap();
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(
             stack,
             vec![TypedValue::String(
@@ -903,8 +848,7 @@ mod forth {
         )
         .expect("typed Co-Forth compiles JSON field access");
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&module, &mut stack, 100_000)
             .expect("typed Co-Forth executes JSON field access");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
 
@@ -916,8 +860,7 @@ mod forth {
         )
         .expect("typed Co-Forth compiles JSON float access");
         let mut stack = Vec::new();
-        Interpreter::new(&float, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
+        execute_module(&float, &mut stack, 100_000)
             .expect("typed Co-Forth executes JSON float access");
         assert_eq!(stack, vec![TypedValue::Float(3.5)]);
     }
@@ -929,9 +872,7 @@ mod lisp {
     fn run(source: &str) -> Result<Vec<TypedValue>, Vec<VmDiagnostic>> {
         let module = compile_lisp("input.lisp", source, Vec::new(), &core_vocabulary())?;
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .map_err(|error| vec![error])?;
+        execute_module(&module, &mut stack, 100_000).map_err(|error| vec![*error])?;
         Ok(stack)
     }
 
@@ -1021,9 +962,7 @@ mod lisp {
         );
 
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -1105,9 +1044,7 @@ mod lisp {
             "the declared result contract remains visible to callers"
         );
         let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
+        execute_module(&module, &mut stack, 100_000).unwrap();
         assert!(matches!(
             stack.as_slice(),
             [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
@@ -1471,19 +1408,15 @@ fn public_frontend_facade_executes_equivalent_typed_records() {
     });
 
     let mut forth_stack = Vec::new();
-    Interpreter::new(&forth, DenyCapabilities, InterpreterConfig::default())
-        .execute(&mut forth_stack)
-        .unwrap_or_else(|error| {
-            panic!("Co-Forth typed-record fixture must execute: source={forth_source:?}, error={error:?}")
-        });
+    execute_module(&forth, &mut forth_stack, 100_000).unwrap_or_else(|error| {
+        panic!(
+            "Co-Forth typed-record fixture must execute: source={forth_source:?}, error={error:?}"
+        )
+    });
     let mut lisp_stack = Vec::new();
-    Interpreter::new(&lisp, DenyCapabilities, InterpreterConfig::default())
-        .execute(&mut lisp_stack)
-        .unwrap_or_else(|error| {
-            panic!(
-                "CoLisp typed-record fixture must execute: source={lisp_source:?}, error={error:?}"
-            )
-        });
+    execute_module(&lisp, &mut lisp_stack, 100_000).unwrap_or_else(|error| {
+        panic!("CoLisp typed-record fixture must execute: source={lisp_source:?}, error={error:?}")
+    });
 
     assert_eq!(
         forth_stack,

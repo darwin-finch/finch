@@ -24,8 +24,6 @@ pub enum CpuFiberStatus {
 
 #[derive(Debug, Clone)]
 pub struct CpuFiberSnapshot {
-    #[allow(dead_code)] // never read, even by tests; decision tracked in #587
-    pub id: Uuid,
     pub status: CpuFiberStatus,
     pub result: Option<Vec<TypedValue>>,
     pub diagnostic: Option<VmDiagnostic>,
@@ -56,21 +54,6 @@ impl CpuFiberScheduler {
         }
     }
 
-    /// Spawn a pure function with only explicit input values and captures.
-    /// Effects are rejected before a native worker exists, so a CPU fiber
-    /// cannot reach files, processes, UI output, memory, or agent operations.
-    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
-    pub fn spawn(
-        self: &Arc<Self>,
-        module: VerifiedModule,
-        function: impl Into<String>,
-        captures: Vec<TypedValue>,
-        arguments: Vec<TypedValue>,
-        fuel: u64,
-    ) -> Result<Uuid> {
-        self.spawn_with_owner(module, function, captures, arguments, fuel, None)
-    }
-
     fn spawn_with_owner(
         self: &Arc<Self>,
         module: VerifiedModule,
@@ -98,7 +81,6 @@ impl CpuFiberScheduler {
         let id = Uuid::new_v4();
         let record = Arc::new(CpuFiberRecord {
             state: Mutex::new(CpuFiberSnapshot {
-                id,
                 status: CpuFiberStatus::Running,
                 result: None,
                 diagnostic: None,
@@ -128,36 +110,6 @@ impl CpuFiberScheduler {
             bail!("could not start CPU fiber: {error}");
         }
         Ok(id)
-    }
-
-    /// Spawn a zero-argument closure exactly as represented by the typed VM.
-    /// Its captures are copied into the child activation; no parent frame or
-    /// data-stack reference crosses the worker boundary. The language-level
-    /// `defer :cpu` form lowers to this operation after checking that the
-    /// closure has no remaining positional arguments.
-    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
-    pub fn spawn_closure(
-        self: &Arc<Self>,
-        module: VerifiedModule,
-        closure: TypedValue,
-        fuel: u64,
-    ) -> Result<Uuid> {
-        let TypedValue::Closure {
-            function,
-            captures,
-            signature,
-        } = closure
-        else {
-            bail!("CPU fiber requires a typed closure");
-        };
-        if !signature.input.values.is_empty() {
-            bail!(
-                "CPU fiber closure '{}' requires {} positional arguments; capture them in a zero-argument closure before deferring",
-                function,
-                signature.input.values.len()
-            );
-        }
-        self.spawn(module, function, captures, Vec::new(), fuel)
     }
 
     /// Spawn a closure while atomically attaching its first private-runtime
@@ -248,10 +200,9 @@ impl CpuFiberScheduler {
         Ok(snapshot)
     }
 
-    /// Wait for terminal state. This blocks only a worker calling `join`, not
-    /// Finch's UI/event-loop thread; the language-level join will instead
-    /// suspend its VM continuation before calling this operation.
-    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
+    /// Test-only wait for terminal state. Production callers poll and suspend
+    /// the owning VM continuation instead of blocking an event-loop thread.
+    #[cfg(test)]
     pub fn join(&self, id: Uuid) -> Result<CpuFiberSnapshot> {
         let record = self.record(id)?;
         let mut state = record
@@ -430,78 +381,88 @@ fn run_fiber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_vocabulary;
-    use finch_language::{compile_forth, compile_lisp};
+    use crate::{core_vocabulary, ModuleVerified, TypedExecutionStatus, TypedRuntime};
+    use finch_language::compile_lisp;
+
+    fn compile_closure(source: &str) -> (ModuleVerified, TypedValue) {
+        let module = compile_lisp("fiber.lisp", source, Vec::new(), &core_vocabulary()).unwrap();
+        let mut runtime = TypedRuntime::new();
+        let execution = runtime.execute(&module, 1_000);
+        assert_eq!(
+            execution.status,
+            TypedExecutionStatus::Completed,
+            "production runtime must construct the CPU-fiber closure: source={source:?}, diagnostics={:?}",
+            execution.diagnostics
+        );
+        let [closure @ TypedValue::Closure { .. }] = execution.values.as_slice() else {
+            panic!(
+                "closure fixture must leave exactly one closure: source={source:?}, values={:?}",
+                execution.values
+            );
+        };
+        (module, closure.clone())
+    }
 
     #[test]
     fn pure_cpu_fiber_has_a_private_stack_and_returns_a_typed_result() {
-        let module = compile_forth(
-            "fiber.forth",
-            ": square ( S int -- S int ! pure ) dup * ;",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
+        let (module, closure) = compile_closure("(let ((value 7)) (lambda () (* value value)))");
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
+        let owner = Uuid::new_v4();
         let id = scheduler
-            .spawn(
-                module.into_verified(),
-                "square",
-                Vec::new(),
-                vec![TypedValue::Int(7)],
-                1_000,
-            )
+            .spawn_closure_owned(module.into_verified(), closure, 1_000, owner)
             .unwrap();
-        let result = scheduler.join(id).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            let snapshot = scheduler.poll(id).unwrap();
+            if snapshot.status != CpuFiberStatus::Running {
+                break snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pure CPU fiber did not reach terminal state"
+            );
+            std::thread::yield_now();
+        };
         assert_eq!(result.status, CpuFiberStatus::Completed);
         assert_eq!(result.result, Some(vec![TypedValue::Int(49)]));
+        assert!(scheduler.release_owner(id, owner).unwrap());
     }
 
     #[test]
     fn cpu_fibers_reject_effectful_functions_before_spawning() {
-        let module = compile_forth(
-            "fiber.forth",
-            ": announce ( S -- S ! infer ) s\" no\" say ;",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
+        let (module, closure) = compile_closure("(lambda () (say \"no\"))");
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
-        assert!(scheduler
-            .spawn(
-                module.into_verified(),
-                "announce",
-                Vec::new(),
-                Vec::new(),
-                1_000,
-            )
-            .is_err());
+        let error = scheduler
+            .spawn_closure_owned(module.into_verified(), closure, 1_000, Uuid::new_v4())
+            .expect_err("effectful closure must be rejected before a worker is spawned");
+        assert!(
+            error.to_string().contains("is not pure"),
+            "effect rejection must identify the non-pure function: {error:#}"
+        );
     }
 
     #[test]
     fn deferred_closure_copies_captures_into_a_private_frame() {
-        let module = compile_lisp(
-            "fiber.lisp",
-            "(let ((value 42)) (lambda () value))",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut closure_stack = Vec::new();
-        crate::interpreter::Interpreter::new(
-            &module,
-            crate::interpreter::DenyCapabilities,
-            crate::interpreter::InterpreterConfig::default(),
-        )
-        .execute(&mut closure_stack)
-        .unwrap();
-        let closure = closure_stack.pop().expect("lambda leaves one closure");
+        let (module, closure) = compile_closure("(let ((value 42)) (lambda () value))");
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
+        let owner = Uuid::new_v4();
         let id = scheduler
-            .spawn_closure(module.into_verified(), closure, 1_000)
+            .spawn_closure_owned(module.into_verified(), closure, 1_000, owner)
             .unwrap();
-        let result = scheduler.join(id).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            let snapshot = scheduler.poll(id).unwrap();
+            if snapshot.status != CpuFiberStatus::Running {
+                break snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "captured CPU fiber did not reach terminal state"
+            );
+            std::thread::yield_now();
+        };
         assert_eq!(result.status, CpuFiberStatus::Completed);
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));
+        assert!(scheduler.release_owner(id, owner).unwrap());
     }
 }

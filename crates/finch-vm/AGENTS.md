@@ -21,6 +21,10 @@ cross-crate contract; everything below it is tiered so implementation detail can
   execute through `TypedRuntime::{execute, execute_with_handler}`. Widening any of these is a
   capsule change, not cleanup.
 - **Test-only (`#[cfg(test)]`):** `TypedRuntime::grant` (unit tests seed grants directly).
+  `CpuFiberScheduler::join` also remains test-only while three runtime tests at
+  `src/runtime.rs:3195`, `src/runtime.rs:3507`, and `src/runtime.rs:3535` wait for deterministic
+  worker completion. Production execution polls CPU workers and suspends the owning VM
+  continuation; delete this blocking test convenience once those callers can move to polling.
 - **Contract (stays `pub`):** `PendingHostCall`. The audit's type-name reference pass saw no
   external callers, but its values are carried by the pub, wire-serialized
   `TypedSuspension.pending_host_call` field and read by `finch-runtime`'s approval-prompt flow
@@ -29,6 +33,12 @@ cross-crate contract; everything below it is tiered so implementation detail can
 
 Deleted as unreferenced by the same audit: the `SourceSpan::bytes` constructor in
 `finch-vm-core/src/diagnostic.rs`.
+
+The #587 test-only-surface cleanup also removed the obsolete typed-Forth migration audit, the
+synchronous `Interpreter`/`DenyCapabilities` adapter, scheduler `spawn`/`spawn_closure`
+conveniences, and the unread CPU-fiber snapshot ID. Unit and frontend-equivalence tests execute
+through `TypedRuntime::{execute, execute_with_handler}` or the production
+`spawn_closure_owned`/`poll` path, so test coverage follows the runtime boundary used by callers.
 
 **Boundary:** the [README](README.md) traces runtime execution and wire-failure classification;
 [`src/lib.rs`](src/lib.rs) is the flat facade, and `cargo doc -p finch-vm --no-deps --open`
