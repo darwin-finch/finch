@@ -2195,6 +2195,52 @@ fn canonical_brain_context_excludes_correlated_speculative_output() {
 }
 
 #[test]
+fn test_canonical_brain_context_attributes_interactive_result_to_assistant() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let mut started = brain_event(
+        1,
+        "daemon",
+        BrainEventKind::RunStarted {
+            run: BrainRun {
+                run_id,
+                kind: BrainRunKind::Interactive,
+                parent_run_id: None,
+                request_seq: 0,
+                initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+                initiated_by: "alice".into(),
+                status: BrainRunStatus::Running,
+                started_ms: 1,
+                updated_ms: 1,
+                detail: None,
+            },
+        },
+    );
+    started.run_id = Some(run_id);
+    let mut result = brain_event(
+        2,
+        "daemon",
+        BrainEventKind::Result {
+            request_seq: 0,
+            output: "semantic answer".into(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+    );
+    result.run_id = Some(run_id);
+
+    assert_eq!(
+        projected_brain_context_lines(&[started, result], 2, None),
+        vec!["assistant: semantic answer"],
+        "INVARIANT: an Interactive Result is assistant conversation, never daemon speech"
+    );
+}
+
+#[test]
 fn snapshot_groups_speculative_lifecycle_program_and_result_by_exact_run_id() {
     use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
@@ -2448,6 +2494,214 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert!(canonical.contains("value=7"));
 }
 
+/// Issue #422: an attached console must project a completed Interactive run
+/// as the semantic turn it represents, not as an opaque lifecycle group
+/// named by its internal RunId. The prompt is already its own canonical
+/// participant row; this correlated unit owns the inspectable program, tool
+/// exchange, assistant result, and terminal outcome exactly once.
+#[test]
+fn test_interactive_run_projects_semantic_turn_without_uuid_lifecycle_chrome() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+        RunId,
+    };
+
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "alice".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::Program {
+            language: ProgramLanguage::Lisp,
+            source: "(read \"notes.txt\")\n(say \"done\")".into(),
+        },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "call-read".into(),
+            name: "read".into(),
+            input: serde_json::json!({"file_path": "notes.txt"}),
+        },
+        BrainEventKind::ApprovalRequested {
+            request_seq: 1,
+            approval_id: "call-read".into(),
+            approval_kind: "tool".into(),
+            subject: "read".into(),
+            audience: None,
+            detail: serde_json::json!({"input": {"file_path": "notes.txt"}}),
+        },
+        BrainEventKind::ApprovalDecided {
+            request_seq: 1,
+            approval_id: "call-read".into(),
+            decision: serde_json::json!({"choice": "approve_once"}),
+        },
+        BrainEventKind::ToolResult {
+            request_seq: 1,
+            tool_id: "call-read".into(),
+            output: "contents".into(),
+            is_error: false,
+        },
+        BrainEventKind::Result {
+            request_seq: 1,
+            output: "done".into(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 2, "daemon", kind);
+        event.run_id = Some(run_id);
+        assert!(
+            super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+                &super::LocallyRenderedRuns::default(),
+                None,
+            ),
+            "INVARIANT: every correlated Interactive event is consumed by the semantic run projection; event={event:?}"
+        );
+    }
+
+    let unit = projections
+        .get(&run_id)
+        .expect("interactive run unit")
+        .unit
+        .clone();
+    let projected = crate::cli::test_projection::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .expect("interactive run projection");
+    let rendered = format!("{projected:#?}");
+    let canonical = crate::cli::messages::Message::complete_transcript(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    );
+    let run_uuid = run_id.0.to_string();
+
+    assert!(
+        !rendered.contains(&run_uuid) && !canonical.contains(&run_uuid),
+        "INVARIANT: an Interactive transcript exposes semantic turn content, never opaque RunId lifecycle chrome; projection={rendered}\ncanonical=\n{canonical}"
+    );
+    assert_eq!(
+        canonical.matches("(read \"notes.txt\")").count(),
+        1,
+        "INVARIANT: canonical scrollback retains the inspectable program exactly once; canonical=\n{canonical}"
+    );
+    assert_eq!(
+        projected.body,
+        vec!["done"],
+        "INVARIANT: the semantic root carries the assistant result once; projection={rendered}"
+    );
+    assert_eq!(
+        canonical.matches("⏺ done").count(),
+        1,
+        "INVARIANT: the assistant result is canonical conversation output exactly once; canonical=\n{canonical}"
+    );
+    assert!(
+        !canonical.lines().any(|line| line.contains("result —")),
+        "INVARIANT: assistant output is not hidden behind an internal result lifecycle row; canonical=\n{canonical}"
+    );
+    assert!(
+        canonical.contains("approve_once by daemon") && canonical.contains("contents"),
+        "INVARIANT: the gated tool row retains its approval and result details; canonical=\n{canonical}"
+    );
+    assert!(
+        crate::cli::messages::Message::status(unit.as_ref())
+            == crate::cli::messages::MessageStatus::Complete
+            && !canonical.contains("status — running"),
+        "INVARIANT: the terminal outcome is complete and no stale running state survives; status={:?}; canonical=\n{canonical}",
+        crate::cli::messages::Message::status(unit.as_ref())
+    );
+}
+
+#[test]
+fn test_interactive_run_failure_and_cancel_project_one_actionable_terminal_outcome() {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+    use crate::cli::messages::{Message, MessageStatus};
+
+    for (terminal, detail) in [
+        (BrainRunStatus::Failed, "provider authentication failed"),
+        (BrainRunStatus::Cancelled, "cancelled by alice"),
+    ] {
+        let output = replay_output_manager();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Interactive,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let kinds = [
+            BrainEventKind::RunStarted { run },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: terminal,
+                detail: Some(detail.into()),
+            },
+        ];
+        let mut projections = std::collections::HashMap::new();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let mut event = brain_event(index as u64 + 1, "daemon", kind);
+            event.run_id = Some(run_id);
+            assert!(super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+                &super::LocallyRenderedRuns::default(),
+                None,
+            ));
+        }
+
+        let unit = &projections.get(&run_id).expect("run projection").unit;
+        let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
+        assert_eq!(
+            unit.status(),
+            MessageStatus::Failed,
+            "INVARIANT: {terminal:?} is a terminal failed presentation; canonical=\n{canonical}"
+        );
+        assert_eq!(
+            canonical.matches(detail).count(),
+            1,
+            "INVARIANT: {terminal:?} renders one actionable outcome; canonical=\n{canonical}"
+        );
+        assert!(
+            !canonical.contains(&run_id.0.to_string())
+                && !canonical.contains("status — running")
+                && !canonical.contains("daemon"),
+            "INVARIANT: {terminal:?} contains no UUID lifecycle chrome, stale state, or daemon attribution; canonical=\n{canonical}"
+        );
+    }
+}
+
 /// Row report for #910 failure payloads: label and resolved status per row.
 fn run_group_row_report(unit: &crate::cli::messages::WorkUnit) -> String {
     let view = unit.domain_view(&crate::theme::ColorScheme::default());
@@ -2583,12 +2837,15 @@ fn test_run_terminal_status_resolves_stuck_child_rows_on_disconnect() {
         &crate::theme::ColorScheme::default(),
     )
     .unwrap();
-    assert!(
-        projected
-            .label
-            .contains("status failed: Disconnected: Peer disconnected."),
-        "the run group head must keep the parent's failed status; label={:?}",
-        projected.label
+    assert_eq!(
+        projected.role,
+        crate::cli::test_projection::NodeRole::Response,
+        "the failed Interactive run remains a semantic turn; projection={projected:?}"
+    );
+    assert_eq!(
+        projected.body,
+        vec![disconnect_detail],
+        "the semantic turn must expose the actionable failure once; projection={projected:?}"
     );
     assert!(
         !projected
@@ -2612,7 +2869,7 @@ fn test_run_terminal_status_resolves_stuck_child_rows_on_success() {
     use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
-    use crate::cli::messages::{MessageStatus, WorkRowStatus};
+    use crate::cli::messages::{Message, MessageStatus, WorkRowStatus};
 
     let output = replay_output_manager();
     let run_id = RunId(uuid::Uuid::new_v4());
@@ -2681,21 +2938,14 @@ fn test_run_terminal_status_resolves_stuck_child_rows_on_success() {
          rows:\n  {}",
         run_group_row_report(&unit)
     );
-    let result_row = view
-        .rows
-        .iter()
-        .find(|row| row.label == "result")
-        .unwrap_or_else(|| {
-            panic!(
-                "result row must exist; rows:\n  {}",
-                run_group_row_report(&unit)
-            )
-        });
     assert_eq!(
-        result_row.status,
-        WorkRowStatus::Complete("completed".to_string()),
-        "the terminal sweep must not clobber a row that already carries its own outcome; \
-         rows:\n  {}",
+        unit.content(),
+        "done",
+        "the assistant Result belongs on the semantic root, not a lifecycle row"
+    );
+    assert!(
+        view.rows.iter().all(|row| row.label != "result"),
+        "the assistant Result must not be duplicated as a child row; rows:\n  {}",
         run_group_row_report(&unit)
     );
     assert_eq!(
@@ -5208,12 +5458,13 @@ async fn pushed_program_echo_is_not_painted_twice_body() {
     );
 }
 
-/// #978 control regression: a genuinely remote run's events still project
-/// the legacy run group with its rows even while a local projection exists
-/// for a different run.
+/// #978/#422 control regression: a genuinely remote Interactive run still
+/// projects its semantic turn even while a local projection exists for a
+/// different run.
 #[tokio::test]
 async fn remote_run_events_still_paint_group_rows_beside_local_projections() {
     use crate::brain::{AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus};
+    use crate::cli::messages::Message;
 
     let greeting = "remote turn output";
     let source = "(say \"remote turn output\")";
@@ -5303,14 +5554,21 @@ async fn remote_run_events_still_paint_group_rows_beside_local_projections() {
         .unwrap_or_else(|| panic!("INVARIANT: a remote run still projects its run group"));
     let rendered = projection
         .unit
-        .format(&crate::theme::ColorScheme::default());
-    for expected in ["status", "Lisp program", "result", greeting, "completed"] {
+        .complete_transcript(&crate::theme::ColorScheme::default());
+    for expected in ["Lisp program", source, greeting] {
         assert!(
             rendered.contains(expected),
-            "INVARIANT: a genuinely remote Brain turn still renders its legacy rows; \
+            "INVARIANT: a genuinely remote Brain turn keeps its semantic transcript; \
              missing {expected:?}; rendered=\n{rendered}"
         );
     }
+    assert!(
+        !rendered.contains("Interactive run")
+            && !rendered.contains(&remote_run_id.0.to_string())
+            && !rendered.contains("result —"),
+        "INVARIANT: remote Interactive output is semantic, not UUID lifecycle chrome; \
+         rendered=\n{rendered}"
+    );
 }
 
 #[test]
@@ -9385,7 +9643,10 @@ fn queued_run_projection_uses_human_labels_not_debug_enum() {
         &crate::theme::ColorScheme::default(),
     )
     .unwrap();
-    let haystack = format!("{} {:?}", projected.label, projected.children);
+    let haystack = format!(
+        "{} {:?} {:?}",
+        projected.label, projected.body, projected.children
+    );
     assert!(
         !haystack.to_lowercase().contains("queuedforenvironment"),
         "queued-run rows must use human labels; haystack={haystack}"

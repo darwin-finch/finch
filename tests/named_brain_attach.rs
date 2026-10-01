@@ -1927,6 +1927,132 @@ fn daemon_runner_say_turn_renders_component_card_only() {
     );
 }
 
+/// Issue #422 at the executable boundary: a tool-bearing Interactive run is
+/// semantic conversation on its driver console and a later reconnect. The
+/// RunId remains correlation data in the journal; neither user surface grows
+/// an `Interactive run <UUID>` lifecycle group or attributes the answer to
+/// the daemon.
+#[test]
+fn test_tool_bearing_interactive_turn_is_semantic_on_attach_and_reconnect() {
+    const ANSWER: &str = "attach-tool-422-complete";
+    const SOURCE: &str =
+        "(begin (file-read (path \"Cargo.toml\")) (say \"attach-tool-422-complete\"))";
+
+    let daemon = IsolatedDaemon::start();
+    let mut driver = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    driver.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "the driver attach drew the header",
+    );
+    driver.wait_for_screen(
+        "· runner",
+        READY_DEADLINE,
+        "the driver attach acquired the named-Brain runner lease",
+    );
+    driver.send_line(SOURCE);
+    driver.wait_for_screen(
+        "Allow once",
+        ECHO_DEADLINE,
+        "the driver received the real file-read approval",
+    );
+    driver.send_line("");
+
+    driver.wait_for(
+        ANSWER,
+        ECHO_DEADLINE,
+        "the driver console received the completed assistant answer",
+    );
+    let journal_deadline = Instant::now() + ECHO_DEADLINE;
+    loop {
+        let journal = std::fs::read_to_string(daemon.events_path()).unwrap_or_default();
+        let completed = journal.lines().any(|line| {
+            line.contains("run_status_changed") && line.contains("\"status\":\"completed\"")
+        });
+        // The VM effect itself is represented by the persisted program plus
+        // RuntimeCommitted (the raw effect audit is stored separately); the
+        // trailing `say` cannot execute unless the approved file-read
+        // completed, so the terminal Result is deterministic tool evidence.
+        let committed_tool_program = journal.contains("file-read")
+            && journal.contains("runtime_committed")
+            && journal.contains(ANSWER);
+        if completed && committed_tool_program {
+            break;
+        }
+        if Instant::now() >= journal_deadline {
+            panic!(
+                "INVARIANT: the real delegated file-read turn must durably record its program, \
+                 runtime commit, answer, and terminal status before projection is judged. \
+                 Journal at {} never carried all facts.\njournal:\n{journal}\ndriver terminal:\n{}",
+                daemon.events_path().display(),
+                driver.readable_transcript()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let attached_text = driver.readable_transcript();
+    assert!(
+        attached_text.contains(SOURCE)
+            && attached_text.contains(ANSWER)
+            && attached_text.contains("Cargo.toml"),
+        "INVARIANT: the driver attachment retains prompt/program, tool detail, and \
+         assistant answer; terminal:\n{attached_text}"
+    );
+    assert!(
+        !attached_text.contains("Interactive run")
+            && !attached_text.contains("Brain run")
+            && !attached_text.contains(&format!("daemon: {ANSWER}")),
+        "INVARIANT: the driver attachment exposes semantic conversation, not run \
+         lifecycle chrome or daemon-authored prose; terminal:\n{attached_text}"
+    );
+    assert!(
+        uuid_only_lines(&attached_text).is_empty(),
+        "INVARIANT: the driver attachment contains no UUID-only lifecycle row; \
+         terminal:\n{attached_text}"
+    );
+
+    driver.send_line("/exit");
+    let status = driver.wait_for_exit();
+    assert!(
+        status.success(),
+        "the driver exits cleanly after the completed turn: {status:?}"
+    );
+    drop(driver);
+
+    let mut reconnected = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    reconnected.wait_for(
+        ANSWER,
+        READY_DEADLINE,
+        "the reconnect replayed the completed assistant answer",
+    );
+    reconnected.wait_for(
+        "Cargo.toml",
+        READY_DEADLINE,
+        "the reconnect replayed the inspectable program/tool detail",
+    );
+    let replay = reconnected.readable_transcript();
+    assert!(
+        replay.contains(SOURCE) && replay.contains(ANSWER),
+        "INVARIANT: reconnect retains the program and assistant answer; terminal:\n{replay}"
+    );
+    assert!(
+        !replay.contains("Interactive run")
+            && !replay.contains("Brain run")
+            && !replay.contains(&format!("daemon: {ANSWER}"))
+            && uuid_only_lines(&replay).is_empty(),
+        "INVARIANT: reconnect contains no UUID lifecycle group or daemon attribution; \
+         terminal:\n{replay}"
+    );
+
+    reconnected.send_line("/exit");
+    let status = reconnected.wait_for_exit();
+    assert!(
+        status.success(),
+        "the reconnect exits cleanly after replay: {status:?}"
+    );
+}
+
 fn overlay_from_metadata(path: &Path) -> (Option<String>, Option<String>) {
     let raw = std::fs::read_to_string(path).unwrap_or_else(|error| {
         panic!(

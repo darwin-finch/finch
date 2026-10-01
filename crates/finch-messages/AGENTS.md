@@ -54,6 +54,10 @@ on the message type. Say turns ride the same accessor (`ComponentView::Say`); `s
 stays for the consolidated-source pairing helper and the disclosure-direction read. Brain
 replay remains authoritative for durable state.
 
+`WorkUnitPresentation::Interactive` is the client-local semantic projection of a durable
+named-Brain Interactive run. It may retain program, tool, approval, and terminal child rows, but
+its root is assistant conversation and must never expose the run UUID as presentation text.
+
 **Extension rules:** add a concrete message only for a real application producer and renderer
 need. Keep pure snapshot-to-widget conversion in `finch-ui-model`; do not put terminal I/O or
 provider dispatch here. Child modules stay private; add a flat re-export only when an actual
