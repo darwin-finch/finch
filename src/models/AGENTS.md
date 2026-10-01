@@ -43,8 +43,10 @@ new suffix. Equal, shortened, or divergent prompts are evaluated in full, and re
 generator discards the cache.
 Memory model selection and persisted embedding identity belong to the separate memory work.
 `execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
-reports it; `cpu` forbids offload. ONNX and Candle are not chat providers. ORT remains only
-behind the separately owned frontend memory model path until that subsystem migrates it.
+reports it; `cpu` forbids offload. ONNX and Candle are not chat providers, and ORT is not a
+production dependency. The separately owned frontend memory path uses a fixed managed
+bge-small-en-v1.5 Q8_0 GGUF through llama.cpp, with a hashed-n-gram fallback while that artifact is
+unavailable. The chat-model selector does not configure that embedding model.
 
 **One family declaration, claims from the catalog.** `unified_loader::ModelFamily` is the single
 model-family declaration (its variant names are the persisted config wire form; a source-scan test
