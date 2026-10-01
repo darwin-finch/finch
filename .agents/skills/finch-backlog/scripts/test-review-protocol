@@ -27,6 +27,8 @@ reject_fixture() { matches "$2" "$3" && pass "$1" || fail "$1: harmful fixture w
 accept_fixture() { matches "$2" "$3" && fail "$1: harmless fixture was rejected" || pass "$1"; }
 
 for path in \
+    .agents/skills/finch-backlog-autonomous/SKILL.md \
+    .agents/skills/finch-backlog-triage/SKILL.md \
     .agents/skills/finch-backlog/SKILL.md \
     .agents/skills/finch-backlog/references/review-protocol.md \
     .agents/skills/finch-backlog/references/solution-contract.md \
@@ -40,6 +42,8 @@ do
 done
 
 DOCS=$(for file in "$SKILL" "$REFS"/*.md; do normalized < "$file"; printf ' '; done)
+AUTONOMOUS=$(normalized < "$ROOT/.agents/skills/finch-backlog-autonomous/SKILL.md")
+TRIAGE=$(normalized < "$ROOT/.agents/skills/finch-backlog-triage/SKILL.md")
 require_pattern "direct requests bypass backlog ceremony" 'direct[^.]{0,160}(skip|without)[^.]{0,160}(issue|claim)[^.]{0,160}(worktree|GitHub)' "$DOCS"
 require_pattern "backlog wrapper retains coordination steps" 'backlog wrapper[^.]{0,200}(issue readiness|readiness)[^.]{0,120}claim[^.]{0,120}worktree' "$DOCS"
 require_pattern "workflow optimizes coherent architecture rather than diff size" 'simplest coherent (resulting )?architecture[^.]{0,160}(not|rather than)[^.]{0,100}(fewest changed lines|diff)' "$DOCS"
@@ -49,6 +53,9 @@ require_pattern "refactor proof covers equivalence and integration" 'refactor(in
 require_pattern "deletion proof covers reachability and tests" 'deletion[^.]{0,100}(reference/reachability|reachability)[^.]{0,100}tests' "$DOCS"
 require_pattern "enabling work proves a downstream seam" 'enabling work[^.]{0,100}(usable )?downstream seam' "$DOCS"
 require_pattern "architectural boundaries support local reasoning" 'narrow deliberate facade[^.]{0,180}dependency direction[^.]{0,180}(co-located|integration)' "$DOCS"
+require_pattern "post-merge workflow fast-forwards the primary checkout" 'after every accepted merge[^.]{0,240}fetch[^.]{0,240}fast-forward[^.]{0,100}--ff-only' "$AUTONOMOUS"
+require_pattern "new worktrees use a freshly verified remote base" 'before each dispatch[^.]{0,180}fetch[^.]{0,180}verified remote commit[^.]{0,180}exact base' "$AUTONOMOUS"
+require_pattern "triage never infers base freshness from local branch names" 'exact base[^.]{0,180}fetch[^.]{0,180}remote default-branch tip[^.]{0,180}do not infer freshness[^.]{0,140}local' "$TRIAGE"
 
 COUNT_CANCEL='(auto|automatic(ally)?)[- ]*(cancel|close|waive)[^.]{0,100}(count|severity)|(count|severity)[^.]{0,100}(auto|automatic(ally)?)[- ]*(cancel|close|waive)'
 FIXED_REVIEW='(require(d)?|exactly|fixed)[^.]{0,80}(two|three|[2-9])[^.]{0,50}(review(er)?s?|rounds?|passes?)'

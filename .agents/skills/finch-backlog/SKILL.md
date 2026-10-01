@@ -149,6 +149,15 @@ risk-proportional review, then squash merge. Check current main for conflicts an
 do not require ritual rebases or review restarts merely to reproduce a SHA when GitHub can cleanly
 squash. If main later exposes a regression, fix it forward with a focused test and review.
 
+Immediately after an accepted merge, fetch the remote default branch and verify it contains the
+reported merge commit. Fast-forward the primary checkout's local default branch with `--ff-only`
+before post-merge verification, queue refresh, cleanup, or creation of the next worktree. Never use
+reset, history rewriting, or disposal of unrelated local changes to force synchronization. If the
+primary checkout cannot advance safely, record that blocker and use the verified remote
+default-branch commit as the exact base for any independent next work; never stack a new worktree
+on a stale local `main` or `master`. Re-fetch and re-verify that base immediately before each
+worktree is created.
+
 Squash each feature or fix into its own commit on `main`. Never combine separate features or fixes
 into one squash, and never integrate with a merge commit instead of squashing.
 
