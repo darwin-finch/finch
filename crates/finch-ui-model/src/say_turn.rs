@@ -615,7 +615,11 @@ mod tests {
         let mut open_vm = completed_vm();
         open_vm.program.lines.push("# second".to_string());
         open_vm.show_program = true;
-        let open = say_view(open_vm);
+        let open = SayTurnView {
+            message_id: closed.message_id,
+            vm: open_vm,
+            elapsed: closed.elapsed,
+        };
         let target = content_toggle(&closed);
         assert!(
             say_turn_lines(&closed)
