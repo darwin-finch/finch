@@ -19,7 +19,7 @@ pub use self::log::{
     prune_frontend_logs, LogStatus, RotatingLog, RotationPolicy, DEFAULT_MAX_FRONTEND_LOG_FILES,
 };
 pub use lifecycle::{DaemonInstanceGuard, DaemonLifecycle, DaemonStopOutcome};
-pub use spawn::{ensure_daemon_running, spawn_daemon};
+pub use spawn::{ensure_daemon_running, spawn_daemon, LocalDaemonAcquisition};
 pub use upgrade::{DaemonUpgradePlan, VerifiedDaemonUpgrade};
 
 #[cfg(test)]

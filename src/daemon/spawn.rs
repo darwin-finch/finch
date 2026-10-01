@@ -4,6 +4,8 @@
 // Used by CLI to automatically start daemon in background.
 
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -23,8 +25,63 @@ use crate::config::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
 ///
 /// Returns Ok(()) if daemon is ready, error otherwise.
 pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
-    ensure_daemon_access_allowed()?;
-    ensure_daemon_running_after_isolation_gate(bind_address).await
+    let executable =
+        std::env::current_exe().context("Failed to determine current executable path")?;
+    LocalDaemonAcquisition::new(executable, bind_address.unwrap_or(DEFAULT_BIND))?
+        .acquire()
+        .await
+}
+
+/// Exact executable and HTTP address used to acquire the local Finch daemon.
+///
+/// The executable must be an absolute path. Requiring the caller to name it
+/// explicitly keeps sibling frontends from accidentally launching themselves
+/// through [`std::env::current_exe`] and prevents fallback to ambient `PATH`
+/// lookup.
+#[derive(Debug, Clone)]
+pub struct LocalDaemonAcquisition {
+    executable: PathBuf,
+    bind_address: String,
+}
+
+impl LocalDaemonAcquisition {
+    /// Build an acquisition request for the exact Finch executable at
+    /// `executable` and the daemon HTTP listener at `bind_address`.
+    pub fn new(executable: impl Into<PathBuf>, bind_address: impl Into<String>) -> Result<Self> {
+        let executable = executable.into();
+        if !executable.is_absolute() {
+            bail!(
+                "Finch daemon executable must be an absolute path; refusing PATH lookup for {}",
+                executable.display()
+            );
+        }
+        Ok(Self {
+            executable,
+            bind_address: bind_address.into(),
+        })
+    }
+
+    /// Reuse a compatible daemon or launch the supplied Finch executable once.
+    pub async fn acquire(&self) -> Result<()> {
+        ensure_daemon_access_allowed()?;
+        connect_or_spawn(
+            &self.bind_address,
+            &self.executable,
+            DaemonLifecycle::new,
+            spawn_daemon_from,
+        )
+        .await
+    }
+
+    /// Exact executable that will be launched on a cold acquisition.
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// HTTP bind address whose compatibility is probed before launch.
+    pub fn bind_address(&self) -> &str {
+        &self.bind_address
+    }
 }
 
 fn ensure_daemon_access_allowed() -> Result<()> {
@@ -47,10 +104,6 @@ fn ensure_daemon_access_allowed() -> Result<()> {
 /// Client timeout on one `GET /health` probe.
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) -> Result<()> {
-    connect_or_spawn(bind_address.unwrap_or(DEFAULT_BIND), DaemonLifecycle::new).await
-}
-
 /// The connect path proper: probe, then retry behind a PID file, then spawn.
 ///
 /// `lifecycle` is a constructor rather than a `DaemonLifecycle` so the healthy
@@ -59,9 +112,10 @@ async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) 
 /// file instead of the developer's real one. #364, "Instrument and reduce
 /// Finch interactive TUI time-to-ready", is about what this function's phases
 /// say happened, so a test has to be able to run *this function*.
-async fn connect_or_spawn<F>(bind: &str, lifecycle: F) -> Result<()>
+async fn connect_or_spawn<F, S>(bind: &str, executable: &Path, lifecycle: F, spawn: S) -> Result<()>
 where
     F: FnOnce() -> Result<DaemonLifecycle>,
+    S: FnOnce(&Path, &str) -> Result<()>,
 {
     let base_url = format!("http://{}", bind);
 
@@ -78,8 +132,25 @@ where
         HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
     }
 
-    // Check PID file
+    // Serialize cold acquisition independently from the daemon's own
+    // process-lifetime lock. The child must acquire that lock, so holding it
+    // here while waiting for readiness would deadlock startup. After this
+    // lock is acquired, probe again: another caller may have launched the
+    // daemon while this caller waited.
     let lifecycle = lifecycle()?;
+    let acquisition_lock = acquire_spawn_lock(&lifecycle).await?;
+    match probe_daemon_health(&base_url).await {
+        HealthProbe::Compatible => {
+            debug!("Daemon became healthy while waiting for acquisition lock");
+            return Ok(());
+        }
+        HealthProbe::Incompatible(mismatch) => {
+            return Err(mismatch.into_error());
+        }
+        HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
+    }
+
+    // Check PID file
     if lifecycle.is_running() {
         // Daemon process exists but not responding yet
         // Wait a bit and retry (it might be starting up)
@@ -113,7 +184,7 @@ where
 
     // No daemon running, spawn it
     info!("Daemon not running, spawning...");
-    spawn_daemon(bind)?;
+    spawn(executable, bind)?;
 
     // Wait for daemon to start (max 10 seconds)
     for attempt in 0..20 {
@@ -122,6 +193,7 @@ where
         match probe_daemon_health(&base_url).await {
             HealthProbe::Compatible => {
                 info!("Daemon started successfully");
+                drop(acquisition_lock);
                 return Ok(());
             }
             HealthProbe::Incompatible(mismatch) => {
@@ -144,6 +216,27 @@ where
          • Insufficient permissions\n\
          • Missing dependencies"
     ))
+}
+
+async fn acquire_spawn_lock(lifecycle: &DaemonLifecycle) -> Result<std::fs::File> {
+    let path = lifecycle.pid_file().with_extension("spawn.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open daemon acquisition lock: {}", path.display()))?;
+    tokio::task::spawn_blocking(move || {
+        file.lock_exclusive().with_context(|| {
+            format!(
+                "Failed to acquire daemon acquisition lock: {}",
+                path.display()
+            )
+        })?;
+        Ok(file)
+    })
+    .await
+    .context("daemon acquisition lock task failed")?
 }
 
 /// Owner-only mode for the frontend-created daemon log.
@@ -227,7 +320,10 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     ensure_daemon_access_allowed()?;
     let exe_path =
         std::env::current_exe().context("Failed to determine current executable path")?;
+    spawn_daemon_from(&exe_path, bind_address)
+}
 
+fn spawn_daemon_from(exe_path: &Path, bind_address: &str) -> Result<()> {
     let log_path = crate::daemon::daemon_log_path()?;
     let log_file = open_frontend_log(&log_path)?;
 
@@ -241,7 +337,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::process::CommandExt;
-        let mut command = Command::new(&exe_path);
+        let mut command = Command::new(exe_path);
         command
             .arg("daemon")
             .arg("--bind")
@@ -296,7 +392,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        Command::new(&exe_path)
+        Command::new(exe_path)
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -728,6 +824,156 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    async fn controlled_health_endpoint(
+        ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::Ordering;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a kernel-assigned loopback port");
+        let address = listener.local_addr().expect("bound address");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let ready = std::sync::Arc::clone(&ready);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut scratch = [0u8; 1024];
+                    let _ = stream.read(&mut scratch).await;
+                    let (status, body) = if ready.load(Ordering::SeqCst) {
+                        ("200 OK", compatible_health_body())
+                    } else {
+                        ("503 Service Unavailable", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (address.to_string(), server)
+    }
+
+    #[test]
+    fn test_local_daemon_acquisition_rejects_relative_executable_before_path_lookup() {
+        let error = LocalDaemonAcquisition::new("finch", DEFAULT_BIND)
+            .expect_err("a bare executable name would search ambient PATH");
+        assert!(
+            error.to_string().contains("absolute path")
+                && error.to_string().contains("refusing PATH lookup"),
+            "relative executable rejection must explain the exact safety boundary; error={error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_acquisition_cold_start_launches_the_supplied_executable_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _serialised = timeline_lock().await;
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
+        let (bind, server) = controlled_health_endpoint(std::sync::Arc::clone(&ready)).await;
+        let home = tempfile::tempdir().expect("disposable daemon lifecycle root");
+        let pid_file = home.path().join("daemon.pid");
+        std::fs::write(&pid_file, "999999999").expect("plant stale daemon PID metadata");
+        let supplied = home.path().join("exact-finch");
+        let launches = AtomicUsize::new(0);
+        let observed = std::sync::Mutex::new(None::<PathBuf>);
+
+        connect_or_spawn(
+            &bind,
+            &supplied,
+            || Ok(DaemonLifecycle::with_pid_file(pid_file)),
+            |executable, launched_bind| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                *observed.lock().expect("observe executable") = Some(executable.to_owned());
+                assert_eq!(
+                    launched_bind, bind,
+                    "cold acquisition must launch against the exact probed bind address"
+                );
+                ready.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("controlled cold acquisition becomes compatible");
+        server.abort();
+
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "one cold acquisition must invoke one launch"
+        );
+        assert_eq!(
+            observed.into_inner().expect("observed executable"),
+            Some(supplied),
+            "the launch boundary must receive the caller-supplied executable unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_acquisition_warm_compatible_daemon_launches_nothing() {
+        let _serialised = timeline_lock().await;
+        let (url, server) = one_shot_health_endpoint("200 OK", compatible_health_body()).await;
+        let executable = std::env::current_exe().expect("test executable path");
+        connect_or_spawn(
+            url.trim_start_matches("http://"),
+            &executable,
+            || anyhow::bail!("warm compatibility must not construct lifecycle state"),
+            |_, _| anyhow::bail!("warm compatibility must not launch a process"),
+        )
+        .await
+        .expect("compatible warm daemon is reusable");
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_explicit_acquisitions_converge_on_one_launch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _serialised = timeline_lock().await;
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
+        let (bind, server) = controlled_health_endpoint(std::sync::Arc::clone(&ready)).await;
+        let home = tempfile::tempdir().expect("disposable daemon lifecycle root");
+        let pid_file = home.path().join("daemon.pid");
+        let supplied = home.path().join("exact-finch");
+        let launches = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let acquire = |pid_file: PathBuf| {
+            let bind = bind.clone();
+            let supplied = supplied.clone();
+            let ready = std::sync::Arc::clone(&ready);
+            let launches = std::sync::Arc::clone(&launches);
+            async move {
+                connect_or_spawn(
+                    &bind,
+                    &supplied,
+                    || Ok(DaemonLifecycle::with_pid_file(pid_file)),
+                    |_, _| {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        ready.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        };
+
+        let (first, second) = tokio::join!(acquire(pid_file.clone()), acquire(pid_file));
+        server.abort();
+        first.expect("first concurrent acquisition converges");
+        second.expect("second concurrent acquisition converges");
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "the acquisition lock and post-lock probe must collapse two cold callers to one launch"
+        );
+    }
+
     /// #364, "Instrument and reduce Finch interactive TUI time-to-ready",
     /// enumerates "daemon HTTP connect, separating probe latency from the
     /// `sleep(2s)` fallback". Undivided, both live inside one
@@ -866,9 +1112,13 @@ mod tests {
 
         let before = daemon_phase_names().len();
 
-        let error = connect_or_spawn(&dead_address, || {
-            Ok(DaemonLifecycle::with_pid_file(pid_file.clone()))
-        })
+        let executable = std::env::current_exe().expect("test executable path");
+        let error = connect_or_spawn(
+            &dead_address,
+            &executable,
+            || Ok(DaemonLifecycle::with_pid_file(pid_file.clone())),
+            |_, _| anyhow::bail!("live PID branch must not spawn"),
+        )
         .await
         .expect_err("nothing is listening on the address, so the connect must fail");
 
@@ -877,12 +1127,14 @@ mod tests {
             recorded,
             vec![
                 crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+                crate::startup::PHASE_DAEMON_HEALTH_PROBE,
                 crate::startup::PHASE_DAEMON_RETRY_BACKOFF,
                 crate::startup::PHASE_DAEMON_HEALTH_PROBE,
             ],
-            "the connect path must record its {:?} fallback wait as a phase of \
-             its own, between the probe that failed and the retry it is \
-             waiting for. Absorbed back into `daemon_http_connect`, a 2.5 s \
+            "the connect path must probe once before lifecycle state, probe \
+             again after acquiring the cold-start lock, then record its {:?} \
+             fallback wait as a phase of its own before the live-PID retry. \
+             Absorbed back into `daemon_http_connect`, a 2.5 s \
              launch reports one undivided `ms=2503.1` and a maintainer cannot \
              tell a slow daemon from this flat floor -- the split #364 \
              requires. Connect failed with: {error:#}",
@@ -952,11 +1204,41 @@ mod tests {
             "health_check_succeeds must not treat a leftover HTTP 200 as a reusable daemon; probe={probe:?}"
         );
 
+        let (omitted_url, omitted) = one_shot_health_endpoint(
+            "200 OK",
+            serde_json::json!({
+                "status": "healthy",
+                "uptime_seconds": 15,
+                "named_brains": 0
+            })
+            .to_string(),
+        )
+        .await;
+        let executable = std::env::current_exe().expect("test executable path");
+        let omitted_error = connect_or_spawn(
+            omitted_url.trim_start_matches("http://"),
+            &executable,
+            || anyhow::bail!("omitted generation must fail before lifecycle construction"),
+            |_, _| anyhow::bail!("omitted generation must fail before spawn"),
+        )
+        .await
+        .expect_err("omitted generation must fail closed at the acquisition boundary");
+        let _ = omitted.await;
+        assert!(
+            omitted_error.to_string().contains("speaks 0")
+                && omitted_error.to_string().contains("finch daemon-stop"),
+            "omitted generation diagnostic must name generation zero and the explicit recovery command; error={omitted_error:#}"
+        );
+
         let (old_url, old) =
             one_shot_health_endpoint("200 OK", leftover_health_body(8, 7200)).await;
-        let error = connect_or_spawn(old_url.trim_start_matches("http://"), || {
-            anyhow::bail!("leftover daemon must not reach PID-file or spawn construction")
-        })
+        let executable = std::env::current_exe().expect("test executable path");
+        let error = connect_or_spawn(
+            old_url.trim_start_matches("http://"),
+            &executable,
+            || anyhow::bail!("leftover daemon must not reach PID-file construction"),
+            |_, _| anyhow::bail!("leftover daemon must not reach spawn"),
+        )
         .await
         .expect_err("a leftover daemon must not be reused");
         let _ = old.await;

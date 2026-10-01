@@ -611,9 +611,27 @@ fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
 async fn test_daemon_spawn_and_health() -> Result<()> {
     let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
     let response = request_health(&daemon.address, Duration::from_secs(2))?;
-    assert_eq!(response["status"], "healthy");
-    assert!(daemon.ipc_socket.exists());
-    assert!(!daemon.home_path.join(".finch/daemon.sock").exists());
+    assert_eq!(
+        response["status"], "healthy",
+        "the supervised daemon's HTTP health boundary must be reachable; response={response}"
+    );
+    assert!(
+        daemon.ipc_socket.exists(),
+        "the supervised daemon must publish its sealed IPC socket at {}",
+        daemon.ipc_socket.display()
+    );
+    let ipc_socket = daemon.ipc_socket.clone();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            finch::client::IpcClient::connect_path(ipc_socket)
+                .await
+                .context("supervised daemon IPC compatibility handshake")
+        })
+        .await?;
+    assert!(
+        !daemon.home_path.join(".finch/daemon.sock").exists(),
+        "the isolated daemon must not create the ordinary user socket"
+    );
     Ok(())
 }
 
