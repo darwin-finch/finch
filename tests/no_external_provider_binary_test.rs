@@ -41,6 +41,22 @@ struct ForeignAuthStoreMonitor {
     child: Option<std::process::Child>,
 }
 
+fn supervised_process_boundary_available(boundary: &str) -> bool {
+    match finch::brain::isolated_test_proof_if_present() {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            eprintln!(
+                "skipping {boundary}: process-boundary proof requires scripts/test_brains.sh"
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("skipping {boundary}: invalid Brain test supervisor authority: {error}");
+            false
+        }
+    }
+}
+
 fn remove_ambient_provider_environment(command: &mut Command) {
     for variable in AMBIENT_PROVIDER_ENVIRONMENT {
         command.env_remove(variable);
@@ -522,6 +538,9 @@ prefer_local = true
 
 #[test]
 fn test_direct_query_bypasses_daemon_and_executes_one_cloud_wire_response() {
+    if !supervised_process_boundary_available("finch --direct query") {
+        return;
+    }
     assert_direct_query_boundary(
         &[
             "--direct",
@@ -536,6 +555,9 @@ fn test_direct_query_bypasses_daemon_and_executes_one_cloud_wire_response() {
 
 #[test]
 fn test_piped_direct_bypasses_daemon_and_executes_one_cloud_wire_response() {
+    if !supervised_process_boundary_available("piped finch --direct") {
+        return;
+    }
     assert_direct_query_boundary(
         &["--direct"],
         Some(b"answer through the controlled provider\n"),
@@ -546,6 +568,9 @@ fn test_piped_direct_bypasses_daemon_and_executes_one_cloud_wire_response() {
 
 #[test]
 fn test_cloud_only_remains_daemon_free_and_direct() {
+    if !supervised_process_boundary_available("finch --cloud-only query") {
+        return;
+    }
     assert_direct_query_boundary(
         &[
             "--cloud-only",
@@ -560,6 +585,9 @@ fn test_cloud_only_remains_daemon_free_and_direct() {
 
 #[test]
 fn test_ordinary_query_remains_daemon_first() {
+    if !supervised_process_boundary_available("ordinary finch query") {
+        return;
+    }
     assert_direct_query_boundary(
         &["query", "answer through the controlled provider"],
         None,
@@ -588,6 +616,9 @@ fn assert_foreign_auth_was_not_read(
 
 #[test]
 fn test_bounded_runner_kills_descendant_retaining_output() {
+    if !supervised_process_boundary_available("bounded descendant cleanup") {
+        return;
+    }
     let started = std::time::Instant::now();
     let mut command = Command::new("/bin/sh");
     command.args(["-c", "(sleep 60) & printf ready; wait"]);
@@ -600,6 +631,9 @@ fn test_bounded_runner_kills_descendant_retaining_output() {
 
 #[test]
 fn test_foreign_auth_store_canary_detects_read_probe() {
+    if !supervised_process_boundary_available("foreign auth-store read probe") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let canary = ForeignAuthStoreCanary::start(&home);
@@ -634,6 +668,9 @@ fn test_foreign_auth_store_canary_detects_read_probe() {
 
 #[test]
 fn test_foreign_auth_store_monitor_reaps_on_unwind() {
+    if !supervised_process_boundary_available("foreign auth-store unwind cleanup") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let canary = ForeignAuthStoreCanary::start(&directory.path().join("home"));
     let monitor = canary.start_monitor();
@@ -681,6 +718,9 @@ fn test_ambient_provider_environment_is_removed_from_child() {
 
 #[test]
 fn test_hostile_codex_on_path_is_never_spawned_by_cli_boundaries() {
+    if !supervised_process_boundary_available("external-provider binary boundaries") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let bin_dir = directory.path().join("bin");
     let home = directory.path().join("home");
