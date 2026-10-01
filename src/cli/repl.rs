@@ -4882,9 +4882,10 @@ impl Repl {
     /// Handle /model show command
     async fn handle_model_show(&self) -> Result<()> {
         let effective = self.legacy_effective_selection()?;
-        self.output_status(
-            effective.status_report(self._config.default_provider_name().as_deref()),
-        );
+        self.output_status(effective.status_report_with_provider(
+            self._config.default_provider_name().as_deref(),
+            &self.available_providers[effective.provider_index],
+        ));
 
         // Get conversation stats
         let conv = self.conversation.read().await;

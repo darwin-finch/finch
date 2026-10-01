@@ -115,6 +115,15 @@ initiate or execute, keeps its legacy rows (the control regressions pin this).
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.
 
+**Generic-compatible status is capability-aware and secret-free.** `/status` identifies an
+`openai_compatible` profile as generic OpenAI-compatible Chat Completions and reports only its
+profile/model, operator-configured context and output limits, image-input state, and whether
+capacity is configured. Endpoint URLs and paths, credential references, environment bindings,
+headers, and resolved secrets never enter the status view. Built-in provider reports retain their
+existing four-line shape. Capability values are attested for the configured compatible model only;
+when a Brain or one-shot model overlay selects a different model, `/status` withholds those values
+and names both the selected overlay and configured model in a secret-free provenance diagnostic.
+
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was
 created or loaded in the durable store (`EventLoop::home_brain_registered`), or a visible
