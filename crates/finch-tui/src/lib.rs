@@ -66,7 +66,7 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 #[cfg(test)]
 mod test_support;
 mod tool_viewport;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod vt_oracle;
 mod wizard_host;
 // Projection stays inside the renderer; application tests compose the lower
@@ -92,6 +92,42 @@ use command_autocomplete::{CommandRegistry, CommandSpec};
 pub use diagnostic_console::{DiagnosticConsolePort, DiagnosticConsoleSnapshot};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use tabbed_dialog::{QuestionOptionView, QuestionView};
+
+/// Screen-model VT oracle exposed only to cross-crate production-boundary tests.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestVtOracle {
+    inner: vt_oracle::VtOracle,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestVtOracle {
+    /// Create an empty modeled terminal with fixed dimensions.
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            inner: vt_oracle::VtOracle::new(width, height),
+        }
+    }
+
+    /// Interpret one production terminal byte stream in the existing model.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.inner.feed(bytes);
+    }
+
+    /// Find the first visible row containing `needle`.
+    pub fn find_row(&self, needle: &str) -> Option<usize> {
+        self.inner.find_row(needle)
+    }
+
+    /// Return whether any visible modeled row contains `needle`.
+    pub fn contains_visible(&self, needle: &str) -> bool {
+        self.inner.contains_visible(needle)
+    }
+
+    /// Describe the modeled screen and consumed bytes for assertion failures.
+    pub fn diagnostic(&self) -> String {
+        self.inner.diagnostic()
+    }
+}
 
 /// Application-owned status state read and updated by the terminal renderer.
 ///
@@ -2176,6 +2212,60 @@ impl TuiRenderer {
     ) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.draw_live_area_to_at(&mut bytes, term_width, term_height, None)?;
+        Ok(bytes)
+    }
+
+    /// Route a key through the production accordion dispatcher in a
+    /// cross-crate boundary test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn handle_accordion_key_for_test(&mut self, key: KeyEvent) -> bool {
+        self.handle_accordion_key(key)
+    }
+
+    /// Route a mouse event through the production renderer dispatcher while
+    /// keeping terminal bytes in memory for a cross-crate boundary test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn handle_mouse_for_test(&mut self, mouse: MouseEvent) -> bool {
+        self.handle_mouse_to(mouse, &mut Vec::new())
+    }
+
+    /// Capture the production full-viewport repaint at a deterministic size.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn redraw_full_viewport_bytes_for_test(
+        &mut self,
+        term_width: u16,
+        term_height: u16,
+    ) -> Result<Vec<u8>> {
+        self.pending_viewport_size = Some((term_width, term_height));
+        let mut bytes = Vec::new();
+        self.redraw_full_viewport_inner_to(&mut bytes, false)?;
+        Ok(bytes)
+    }
+
+    /// Capture the production canonical-commit transaction without writing
+    /// it to the test runner's terminal.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_complete_messages_bytes_for_test(
+        &mut self,
+        term_width: usize,
+        term_height: usize,
+    ) -> Result<Vec<u8>> {
+        let messages = self.output_manager.get_messages();
+        let plan = plan_canonical_commit(&messages, &self.printed_ids);
+        if plan.emit.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        prepare_canonical_commit(&mut bytes)?;
+        commit_complete_messages(
+            &mut bytes,
+            &plan.emit,
+            &mut self.accordion,
+            &self.colors,
+            &mut self.printed_ids,
+            term_height,
+            term_width,
+        )?;
         Ok(bytes)
     }
 

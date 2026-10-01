@@ -580,6 +580,7 @@ async fn execute_wire_with_single_repair(
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     query_id: Uuid,
     tool_call_history: &ToolCallHistory,
+    reasoning_source: Option<&crate::cli::messages::WorkUnit>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -596,6 +597,9 @@ async fn execute_wire_with_single_repair(
     );
     let output_unit = output_manager.start_work_unit("VM program output");
     output_unit.set_program_output();
+    if let Some(reasoning_source) = reasoning_source {
+        reasoning_source.transfer_provider_reasoning_to(&output_unit);
+    }
     // The say card owns the turn from here (#882): the producer retains the
     // wire source in the component ViewModel so the reader can reveal it.
     output_unit.begin_say_turn(
@@ -711,6 +715,7 @@ async fn execute_wire_with_single_repair(
         let wrapped = finch_programs::wrap_prose_as_say(&source, language);
         let wrapped_unit = output_manager.start_work_unit("VM program output");
         wrapped_unit.set_program_output();
+        output_unit.transfer_provider_reasoning_to(&wrapped_unit);
         wrapped_unit.begin_say_turn(language.as_str(), &wrapped);
         return match execute_direct_wire_response(
             runtime,
@@ -888,6 +893,7 @@ async fn execute_wire_with_single_repair(
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
     repair_output_unit.set_program_output();
+    output_unit.transfer_provider_reasoning_to(&repair_output_unit);
     repair_output_unit.begin_say_turn(
         finch_programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
         &repaired_source,
@@ -2265,9 +2271,9 @@ pub(crate) async fn process_query_with_tools(
                     effect_audit,
                     query_id,
                     &tool_call_history,
+                    Some(source_unit.as_ref()),
                 )
                 .await;
-                source_unit.transfer_provider_reasoning_to(&wire_execution.output_unit);
                 if query_states
                     .get_metadata(query_id)
                     .await
@@ -2528,9 +2534,9 @@ pub(crate) async fn process_query_with_tools(
                 effect_audit,
                 query_id,
                 &tool_call_history,
+                Some(source_unit.as_ref()),
             )
             .await;
-            source_unit.transfer_provider_reasoning_to(&wire_execution.output_unit);
             if query_states
                 .get_metadata(query_id)
                 .await
@@ -3247,7 +3253,6 @@ mod tests {
     use crate::tools::ToolRegistry;
     use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use vte::{Params, Parser, Perform};
 
     #[test]
     fn inject_recall_prefix_inserts_before_the_current_question_not_after() {
@@ -3457,45 +3462,6 @@ mod tests {
                 secret: ResolvedSecret::new("boundary-secret")?,
             })
         }
-    }
-
-    /// Deliberately small real-VT parser used by the cross-crate boundary
-    /// regression below. Escape/control sequences are interpreted by `vte`;
-    /// assertions only inspect glyphs that the terminal would print.
-    #[derive(Default)]
-    struct VtOracle {
-        visible: String,
-    }
-
-    impl VtOracle {
-        fn parse(bytes: &[u8]) -> Self {
-            let mut oracle = Self::default();
-            Parser::new().advance(&mut oracle, bytes);
-            oracle
-        }
-
-        fn contains(&self, text: &str) -> bool {
-            self.visible.contains(text)
-        }
-    }
-
-    impl Perform for VtOracle {
-        fn print(&mut self, character: char) {
-            self.visible.push(character);
-        }
-
-        fn execute(&mut self, byte: u8) {
-            if matches!(byte, b'\n' | b'\r') {
-                self.visible.push('\n');
-            }
-        }
-
-        fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
-        fn put(&mut self, _: u8) {}
-        fn unhook(&mut self) {}
-        fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
-        fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
-        fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {}
     }
 
     fn boundary_compatible_entry(endpoint: &str) -> crate::config::ProviderEntry {
@@ -4050,7 +4016,7 @@ mod tests {
         let body = format!(
             concat!(
                 "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{reasoning:?}}},\"finish_reason\":null}}]}}\n\n",
-                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"(say \\\"Boundary answer\\\")\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"(begin (say \\\"Boundary answer\\\") (file-read (path \\\"Cargo.toml\\\")) (say \\\" after approval\\\"))\"}},\"finish_reason\":null}}]}}\n\n",
                 "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
                 "data: [DONE]\n\n"
             ),
@@ -4127,51 +4093,167 @@ mod tests {
         );
         let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            process_query_with_tools(
-                query_id,
-                "show the boundary".into(),
-                event_tx,
-                Arc::clone(&selected),
-                Arc::clone(&selected),
-                Arc::new(Router::new(crate::models::ThresholdRouter::new())),
-                Arc::new(RwLock::new(GeneratorState::NotAvailable)),
-                Arc::new(Vec::new()),
-                Arc::clone(&conversation),
-                Arc::clone(&query_states),
-                tool_coordinator,
-                runtime,
-                tui_renderer,
-                Arc::new(RwLock::new(ReplMode::Normal)),
-                Arc::clone(&output),
-                Arc::clone(&status),
-                Arc::new(RwLock::new(HashMap::new())),
-                None,
-                crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
-                "boundary-brain".into(),
-                "/test/workspace".into(),
-                4,
-                20,
-                0,
-                true,
-                true,
-                vec![entry],
-                false,
-                false,
-                Arc::clone(&selected),
-                Arc::new(std::sync::Mutex::new(
-                    crate::cli::conversation_compactor::SummaryCache::new(),
-                )),
-                Arc::new(RwLock::new(HashMap::new())),
-                None,
-                "test persona".into(),
-                None,
-            ),
-        )
-        .await
-        .expect("configured compatible boundary query hung");
+        let execution = process_query_with_tools(
+            query_id,
+            "show the boundary".into(),
+            event_tx,
+            Arc::clone(&selected),
+            Arc::clone(&selected),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            Arc::clone(&conversation),
+            Arc::clone(&query_states),
+            tool_coordinator,
+            runtime,
+            Arc::clone(&tui_renderer),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            Arc::clone(&status),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            "boundary-brain".into(),
+            "/test/workspace".into(),
+            4,
+            20,
+            0,
+            true,
+            true,
+            vec![entry],
+            false,
+            false,
+            Arc::clone(&selected),
+            Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "test persona".into(),
+            None,
+        );
+        tokio::pin!(execution);
+        let mut projection_events = 0usize;
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("configured compatible query completed before approval: {result:?}")
+                }
+                event = events.recv() => match event.expect("boundary query event before approval") {
+                    ReplEvent::VmEffect { projection, envelope } => {
+                        projection_events += 1;
+                        projection.project_envelope(envelope);
+                    }
+                    ReplEvent::VmApprovalNeeded { prompt, response_tx } => {
+                        assert_eq!(
+                            prompt.exact.capability,
+                            crate::vm::CapabilityKind::FileRead,
+                            "real compatible-provider wire must suspend on the expected read boundary"
+                        );
+                        let approval_messages = output.get_messages();
+                        let approval_source = approval_messages
+                            .iter()
+                            .find(|message| message.content().contains("(begin (say"))
+                            .expect("approval state must retain the submitted program source");
+                        let approval_visible = approval_messages
+                            .iter()
+                            .find(|message| message.content() == "Boundary answer")
+                            .expect("the first say must be visible while approval is pending");
+                        assert!(
+                            approval_source.provider_reasoning_view().is_none(),
+                            "suppressed source must surrender the private facet before approval"
+                        );
+                        let approval_reasoning = approval_visible
+                            .provider_reasoning_view()
+                            .expect("visible running say must own reasoning throughout approval");
+                        assert_eq!(
+                            approval_reasoning.lines,
+                            vec![private_reasoning],
+                            "approval-visible owner lost normalized provider reasoning"
+                        );
+                        assert_eq!(
+                            approval_visible.status(),
+                            MessageStatus::InProgress,
+                            "say output must still be live while the VM awaits approval"
+                        );
+
+                        let mut renderer = tui_renderer.lock().await;
+                        let bytes = renderer
+                            .redraw_full_viewport_bytes_for_test(100, 30)
+                            .expect("approval-state frame must paint through the real renderer");
+                        let mut terminal = finch_tui::TestVtOracle::new(100, 30);
+                        terminal.feed(&bytes);
+                        let reasoning_row = terminal
+                            .find_row("Provider reasoning")
+                            .unwrap_or_else(|| panic!("approval frame omitted reasoning control: {}", terminal.diagnostic()));
+                        let down = crossterm::event::MouseEvent {
+                            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                            column: 0,
+                            row: reasoning_row as u16,
+                            modifiers: crossterm::event::KeyModifiers::NONE,
+                        };
+                        let up = crossterm::event::MouseEvent {
+                            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                            ..down
+                        };
+                        renderer.handle_mouse_for_test(down);
+                        assert!(
+                            renderer.handle_mouse_for_test(up),
+                            "real mouse click must toggle the approval-state reasoning control"
+                        );
+                        let opened = renderer
+                            .draw_live_area_bytes_for_test(100, 30)
+                            .expect("mouse-opened approval frame must paint");
+                        terminal.feed(&opened);
+                        assert!(
+                            terminal.contains_visible(private_reasoning),
+                            "mouse-opened approval frame omitted reasoning body: {}",
+                            terminal.diagnostic()
+                        );
+                        for _ in 0..4 {
+                            assert!(
+                                renderer.handle_accordion_key_for_test(crossterm::event::KeyEvent::new(
+                                    crossterm::event::KeyCode::F(6),
+                                    crossterm::event::KeyModifiers::NONE,
+                                )),
+                                "F6 must reach the real accordion focus path"
+                            );
+                            renderer.handle_accordion_key_for_test(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Left,
+                                crossterm::event::KeyModifiers::NONE,
+                            ));
+                            if !approval_visible
+                                .provider_reasoning_view()
+                                .expect("approval reasoning remains attached")
+                                .expanded
+                            {
+                                break;
+                            }
+                        }
+                        assert!(
+                            !approval_visible
+                                .provider_reasoning_view()
+                                .expect("approval reasoning remains attached")
+                                .expanded,
+                            "F6/Left must collapse the real reasoning disclosure"
+                        );
+                        drop(renderer);
+                        response_tx.send(crate::vm::ApprovalChoice::AllowOnce).unwrap();
+                        break;
+                    }
+                    ReplEvent::StatsUpdate { .. } | ReplEvent::StreamingComplete { .. } => {}
+                    other => panic!("unexpected event before VM approval: {other:?}"),
+                }
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut execution)
+            .await
+            .expect("approved compatible boundary query hung");
         drain_vm_events_as_event_loop(&mut events);
+        assert!(
+            projection_events > 0,
+            "approval must follow a real projected say effect"
+        );
         mock.assert_async().await;
 
         let retained = output.get_messages();
@@ -4181,8 +4263,24 @@ mod tests {
             .expect("query processor must retain the submitted program source");
         let visible = retained
             .iter()
-            .find(|message| message.content() == "Boundary answer")
+            .find(|message| message.provider_reasoning_view().is_some())
             .expect("successful say execution must retain its visible output unit");
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|message| message.provider_reasoning_view().is_some())
+                .count(),
+            1,
+            "private reasoning must have exactly one visible owner after consolidation: {:?}",
+            retained
+                .iter()
+                .map(|message| (
+                    message.id(),
+                    message.content(),
+                    message.provider_reasoning_view().is_some()
+                ))
+                .collect::<Vec<_>>()
+        );
         assert!(
             source.provider_reasoning_view().is_none(),
             "successful consolidation must move the private facet off the suppressed source"
@@ -4218,27 +4316,40 @@ mod tests {
         let mut renderer =
             TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors.clone());
         let collapsed_bytes = renderer
-            .draw_live_area_bytes_for_test(100, 30)
+            .redraw_full_viewport_bytes_for_test(100, 30)
             .expect("real TUI collapsed frame must paint");
-        let collapsed_terminal = VtOracle::parse(&collapsed_bytes);
+        let mut collapsed_terminal = finch_tui::TestVtOracle::new(100, 30);
+        collapsed_terminal.feed(&collapsed_bytes);
         assert!(
-            collapsed_terminal.contains("Provider reasoning (5 words)"),
-            "collapsed real TUI frame omitted the terminal reasoning control: {:?}",
-            collapsed_terminal.visible
+            collapsed_terminal.contains_visible("Provider reasoning (5 words)"),
+            "collapsed real TUI frame omitted the terminal reasoning control: {}",
+            collapsed_terminal.diagnostic()
         );
         assert!(
-            collapsed_terminal.contains("Boundary answer")
-                && !collapsed_terminal.contains(private_reasoning),
-            "collapsed frame must show the answer but not the reasoning body: {:?}",
-            collapsed_terminal.visible
+            collapsed_terminal.contains_visible("Boundary answer")
+                && collapsed_terminal.contains_visible("after approval")
+                && !collapsed_terminal.contains_visible(private_reasoning),
+            "collapsed frame must show the unchanged answer but not the reasoning body: {}",
+            collapsed_terminal.diagnostic()
         );
 
-        let action = visible
-            .transcript_action(&[2])
-            .expect("stable semantic reasoning path #2 must resolve after consolidation");
+        let reasoning_row = collapsed_terminal
+            .find_row("Provider reasoning")
+            .expect("collapsed screen model must locate the reasoning control");
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: reasoning_row as u16,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ..down
+        };
+        renderer.handle_mouse_for_test(down);
         assert!(
-            visible.handle_transcript_action(&action),
-            "reasoning disclosure action must reopen the retained visible unit"
+            renderer.handle_mouse_for_test(up),
+            "real mouse route must reopen the retained visible reasoning unit"
         );
         let component = visible
             .component_view()
@@ -4270,22 +4381,55 @@ mod tests {
             "manifest body must carry only the sanitized live-only reasoning facet"
         );
 
-        let mut reopened_renderer = TuiRenderer::new_headless(output, status, colors.clone());
-        let reopened_bytes = reopened_renderer
-            .draw_live_area_bytes_for_test(100, 30)
-            .expect("real TUI reopened frame must paint");
-        let reopened_terminal = VtOracle::parse(&reopened_bytes);
+        let reopened_bytes = renderer
+            .redraw_full_viewport_bytes_for_test(100, 30)
+            .expect("same renderer must repaint its reopened retained state");
+        collapsed_terminal.feed(&reopened_bytes);
         assert!(
-            reopened_terminal.contains(private_reasoning)
-                && reopened_terminal.contains("Boundary answer"),
-            "reopened real TUI frame must show both private reasoning and unchanged answer: {:?}",
-            reopened_terminal.visible
+            collapsed_terminal.contains_visible(private_reasoning)
+                && collapsed_terminal.contains_visible("Boundary answer"),
+            "same-process repaint must retain reasoning and unchanged answer: {}",
+            collapsed_terminal.diagnostic()
         );
         assert!(
             !visible
                 .complete_transcript(&colors)
                 .contains(private_reasoning),
             "reopening the live-only facet must not mutate canonical transcript bytes"
+        );
+
+        let canonical_bytes = renderer
+            .commit_complete_messages_bytes_for_test(100, 30)
+            .expect("real canonical commit path must succeed");
+        assert!(
+            !String::from_utf8_lossy(&canonical_bytes).contains(private_reasoning),
+            "canonical commit bytes leaked private reasoning: {:?}",
+            String::from_utf8_lossy(&canonical_bytes)
+        );
+
+        let fresh_output = Arc::new(OutputManager::new(colors.clone()));
+        fresh_output.disable_stdout();
+        let replayed = fresh_output.start_work_unit_with_id(visible.id(), "VM program output");
+        replayed.set_program_output();
+        replayed.begin_say_turn("lisp", &source.content());
+        replayed.set_response(visible.content());
+        replayed.set_complete();
+        assert!(
+            replayed.provider_reasoning_view().is_none(),
+            "fresh attach/restart must not reconstruct the live-only reasoning facet"
+        );
+        let mut fresh_renderer = TuiRenderer::new_headless(fresh_output, status, colors);
+        let fresh_bytes = fresh_renderer
+            .draw_live_area_bytes_for_test(100, 30)
+            .expect("fresh attach frame must paint");
+        let mut fresh_terminal = finch_tui::TestVtOracle::new(100, 30);
+        fresh_terminal.feed(&fresh_bytes);
+        assert!(
+            fresh_terminal.contains_visible("Boundary answer")
+                && !fresh_terminal.contains_visible("Provider reasoning")
+                && !fresh_terminal.contains_visible(private_reasoning),
+            "fresh attach must retain answer but omit ephemeral reasoning: {}",
+            fresh_terminal.diagnostic()
         );
     }
 
@@ -5422,6 +5566,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5860,6 +6005,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5971,6 +6117,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await;
                 let messages = output.get_messages();
@@ -6074,6 +6221,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         while event_rx.try_recv().is_ok() {}
@@ -6162,6 +6310,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -6264,6 +6413,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -6330,6 +6480,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -6419,6 +6570,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -6477,6 +6629,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -6548,6 +6701,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -6593,6 +6747,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await
             })
@@ -6693,6 +6848,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
