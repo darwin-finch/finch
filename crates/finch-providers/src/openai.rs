@@ -590,6 +590,11 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     let value: serde_json::Value =
         serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
     validate_canonical_chunk_shape(&value, state.rule)?;
+    let has_meta_reasoning_field = state.rule == TransportRule::MetaModelApiChatCompletions
+        && value
+            .pointer("/choices/0/delta")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|delta| delta.contains_key("reasoning_content"));
     let chunk: OpenAIStreamChunk = serde_json::from_value(value)
         .context("OpenAI stream event did not match the documented schema")?;
     if chunk.object.as_deref() != Some("chat.completion.chunk") {
@@ -665,13 +670,16 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         && choice.delta.reasoning_content.is_none()
         && choice.delta.tool_calls.is_none()
         && choice.finish_reason.is_none()
+        && !has_meta_reasoning_field
     {
         anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
     }
-    if let Some(reasoning) = &choice.delta.reasoning_content {
-        if reasoning.is_empty() {
-            anyhow::bail!("OpenAI stream returned an empty reasoning delta");
-        }
+    if let Some(reasoning) = choice
+        .delta
+        .reasoning_content
+        .as_ref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
         // A reasoning delta is already inside the strict 1 MiB SSE-line and
         // 4 MiB whole-stream bounds. Keep the direct check at the semantic
         // boundary too so future framing changes cannot silently unbound it.
@@ -3563,9 +3571,10 @@ mod tests {
     async fn test_meta_model_api_reasoning_is_private_bounded_stream_activity_at_http_boundary() {
         let mut server = mockito::Server::new_async().await;
         let body = concat!(
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"checking \"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"the answer\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"visible answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"the answer\",\"content\":\"visible answer\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: {\"id\":\"meta-reasoning\",\"object\":\"chat.completion.chunk\",\"model\":\"muse-spark-1.3\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n",
             "data: [DONE]\n\n"
@@ -3588,6 +3597,7 @@ mod tests {
         let mut reasoning = Vec::new();
         let mut visible_deltas = String::new();
         let mut completions = Vec::new();
+        let mut usage = Vec::new();
         let mut errors = Vec::new();
         while let Some(item) = receiver.recv().await {
             match item {
@@ -3598,6 +3608,10 @@ mod tests {
                 Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })) => {
                     completions.push(text);
                 }
+                Ok(StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                }) => usage.push((input_tokens, output_tokens)),
                 Err(error) => errors.push(error.to_string()),
                 _ => {}
             }
@@ -3651,6 +3665,11 @@ mod tests {
             completions,
             vec!["visible answer"],
             "Meta must publish exactly one completed assistant block without reasoning"
+        );
+        assert_eq!(
+            usage,
+            vec![(8, 5)],
+            "Meta no-op reasoning fragments must not suppress or duplicate terminal usage"
         );
         mock.assert_async().await;
     }

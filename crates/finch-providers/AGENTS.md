@@ -90,8 +90,9 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - Opaque reasoning/replay material is not display content.
 - Direct Meta Model API `reasoning_content` is dialect-scoped: buffered values are validated and
   discarded, while streamed values become bounded `ThinkingDelta` events carrying Meta
-  provider/model provenance and no opaque replay. It never enters assistant-visible completed
-  content, and canonical OpenAI does not accept the Meta-only field.
+  provider/model provenance and no opaque replay. Schema-valid `null` and empty streamed values are
+  ignored as no-ops. Reasoning never enters assistant-visible completed content, and canonical
+  OpenAI does not accept the Meta-only field.
 - Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
   OpenAI and Claude also emit native `ToolCallDelta` / `ToolCallComplete`.
   Generation-layer translation of `ContentBlockComplete(ToolUse)` into

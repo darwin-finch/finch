@@ -37,9 +37,9 @@ conversation authority.
 The direct Meta Model API dialect accepts Muse Spark's documented `reasoning_content` response
 field without treating it as assistant output. Streaming reasoning crosses the provider boundary
 only as bounded `StreamChunk::ThinkingDelta` activity with Meta provider/model provenance;
-buffered reasoning is validated and discarded. It is never appended to `ProviderResponse`
-content, tool arguments, or opaque replay material. Canonical OpenAI parsing remains strict and
-does not inherit Meta-only response fields.
+schema-valid `null` and empty streamed values are ignored, and buffered reasoning is validated and
+discarded. It is never appended to `ProviderResponse` content, tool arguments, or opaque replay
+material. Canonical OpenAI parsing remains strict and does not inherit Meta-only response fields.
 
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth
