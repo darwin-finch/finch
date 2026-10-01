@@ -2319,7 +2319,6 @@ impl OpenAIProvider {
                             ReasoningEffort::Medium,
                             ReasoningEffort::High,
                             ReasoningEffort::Xhigh,
-                            ReasoningEffort::Max,
                         ],
                         "2026-10-01",
                         "https://dev.meta.ai/docs/protocols/chat-completions",
@@ -3253,6 +3252,68 @@ mod tests {
             CapabilitySupport::Unknown,
             "undocumented future Muse models must remain fail-closed"
         );
+    }
+
+    #[tokio::test]
+    async fn meta_model_api_reasoning_efforts_are_exact_before_http_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let no_http = server
+            .mock("POST", "/v1/chat/completions")
+            .expect(0)
+            .with_status(500)
+            .create_async()
+            .await;
+        let base = meta_test_provider(server.url());
+        let documented = vec![
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+        ];
+        assert_eq!(
+            base.capabilities("muse-spark-1.3")
+                .reasoning
+                .allowed_efforts,
+            Some(documented.clone()),
+            "Muse Spark must expose exactly Meta's documented reasoning efforts"
+        );
+        for effort in documented {
+            let provider = base.clone().with_reasoning_effort(effort);
+            crate::validate_provider_request(
+                &provider,
+                &ProviderRequest::new(vec![]).with_model("muse-spark-1.3"),
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "documented Meta effort {} was rejected: {error}",
+                    effort.as_str()
+                )
+            });
+        }
+        for effort in [ReasoningEffort::None, ReasoningEffort::Max] {
+            let error = base
+                .clone()
+                .with_reasoning_effort(effort)
+                .send_message(
+                    &ProviderRequest::new(vec![crate::Message::user("hello")])
+                        .with_model("muse-spark-1.3"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "does not support reasoning effort '{}'",
+                    effort.as_str()
+                )),
+                "undocumented Meta effort must fail at validated dispatch: effort={} error={error}",
+                effort.as_str()
+            );
+        }
+        no_http.assert_async().await;
     }
 
     #[tokio::test]
