@@ -41,6 +41,15 @@ schema-valid `null` and empty streamed values are ignored, and buffered reasonin
 discarded. It is never appended to `ProviderResponse` content, tool arguments, or opaque replay
 material. Canonical OpenAI parsing remains strict and does not inherit Meta-only response fields.
 
+Configured generic OpenAI-compatible profiles use a strict, bounded response boundary without
+claiming first-party OpenAI semantics. Streaming requires `text/event-stream`, a valid terminal
+choice, and exactly one `[DONE]`; malformed, sparse, unknown, truncated, or post-terminal events
+fail the stream. Individual SSE lines and accumulated tool arguments are limited to 1 MiB, a whole
+stream to 4 MiB, a non-stream success body to 32 MiB, and an error body to 64 KiB. Compatible error
+diagnostics redact response bodies because an upstream can reflect the configured credential or
+private request headers. These response rules do not add request extensions or expose generic
+`reasoning_content`; legacy compatible constructors retain their existing dialect behavior.
+
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth
 state machine has its own [capsule](src/oauth/AGENTS.md); its contract is re-exported flat from
