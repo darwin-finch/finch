@@ -45,13 +45,26 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
 - Fixed seed, deterministic structure: identical (config, dim, seed, insert order) reproduces an
   identical tree; a freshly loaded tree continues the persisted structure. Callers that must
   re-hydrate into the same behavior use the same fixed seed every run.
-- Load is atomic in shape: `load_routing_tree` either returns a fully linked tree or `Err`; there
-  is no partial tree. What hydration *scheduling* (background, partial reads, degradation) looks
-  like is the caller's lifecycle, not this crate's.
+- Load is atomic in shape and database version: `load_routing_tree` opens one explicit SQLite read
+  transaction and either returns a fully linked tree from that single snapshot or `Err`; there is
+  no partial or mixed-version tree. `load_routing_tree_within` is the transaction-composable form
+  for callers already holding a read snapshot or `BEGIN IMMEDIATE` writer fence. Both reject
+  orphan points/memberships when there are no nodes, out-of-range node/point references, and dual
+  divergence ids that are not decision nodes actually encountered during replay. Every point
+  embedding and node `real_centroid` must have exactly `dim` values, and every persisted f32/f64
+  vector blob must contain a whole number of values; errors name the row, field, byte/value length,
+  and expectation before persisted input can reach vector indexing.
+  `test_load_snapshot_does_not_mix_rows_from_a_commit_between_queries`,
+  `test_load_rejects_points_when_routing_nodes_is_empty`,
+  `test_load_rejects_dual_divergence_decision_not_encountered_on_the_leaf_path`,
+  `test_load_validates_every_point_embedding_dimension_and_blob_width`, and
+  `test_load_validates_every_node_vector_dimension_and_blob_width` in
+  `routing_tree/persistence.rs` pin the snapshot and malformed-reference boundary. What hydration
+  *scheduling* looks like remains the caller's lifecycle, not this crate's.
 - **Fixed (issue #1384):** `dim` is fixed for the life of a store, not just for the life of one
   in-memory tree — `load_routing_tree` now rejects, with a named `Err`, a caller-supplied `dim`
   that disagrees with the dimensionality of the embeddings that store was actually built and split
-  under (checked against the first loaded `routing_points` row). Before this, reopening an existing
+  under (checked against every loaded `routing_points` row). Before this, reopening an existing
   store with a different `dim` than the session that built it (the real, reachable trigger: Finch's
   own composition root deliberately swaps the hashed-n-gram fallback for a neural embedding engine
   on the *next restart* once a background download completes, against the SAME on-disk store —
@@ -76,8 +89,9 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
   `test_hydrating_a_store_built_at_a_different_embedding_dimension_settles_failed_not_stuck`
   covers the same defect through the real async hydration path a background tokio worker uses in
   production.
-- **Reopened and fixed again, a different mechanism (issue #1384):** the fix above only catches a
-  whole-store `dim` mismatch (checked against the first loaded `routing_points` row); it does
+- **Reopened and fixed again, a different mechanism (issue #1384):** the original fix above only
+  caught a whole-store `dim` mismatch via the first `routing_points` row; current loading validates
+  every point and node vector. The original check did
   nothing for a single already-corrupted decision node whose OWN persisted `anchor`/`direction`
   is missing or wrong-length while the store's overall `dim` is perfectly consistent with every
   point's embedding — the shape #1384 was reopened over after live re-testing found the original

@@ -32,13 +32,15 @@ pub use quality::{MemoryClassifier, MemoryImportance};
 use confidence::{retrieval_margin, P2Quantile};
 use degenerate_gate::DegenerateContentGate;
 use finch_routing_tree::{save_point, write_dirty_nodes_within};
-use routing_memory::{LinkNextError, Occurrence, PointId, RoutingMemTree};
+use routing_memory::{LinkNextError, PointId, RoutingMemTree};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
@@ -693,6 +695,12 @@ enum Failure {
 pub struct MemorySystem {
     db: Arc<Mutex<Connection>>,
     tree: Arc<Mutex<RoutingMemTree>>,
+    /// `PRAGMA data_version` sampled on this instance's connection immediately before the
+    /// snapshot that produced `tree`. SQLite defines this as a same-connection equality token;
+    /// it is never compared across connections or interpreted as a monotonic generation.
+    tree_data_version: Arc<AtomicI64>,
+    #[cfg(test)]
+    tree_load_count: Arc<AtomicUsize>,
     /// Serialize conversation projection through semantic indexing. This keeps
     /// the SQLite identity, in-memory leaf, and durable leaf provenance from
     /// racing when the daemon retries one completed Brain run.
@@ -748,6 +756,9 @@ impl Drop for MemorySystem {
 struct ProjectionContext {
     db: Arc<Mutex<Connection>>,
     tree: Arc<Mutex<RoutingMemTree>>,
+    tree_data_version: Arc<AtomicI64>,
+    #[cfg(test)]
+    tree_load_count: Arc<AtomicUsize>,
     hydration: Arc<HydrationState>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     insert_lock: Arc<Mutex<()>>,
@@ -779,6 +790,11 @@ struct NewOccurrenceContent {
     embedding: Vec<f32>,
     importance: u8,
     created_at: i64,
+}
+
+struct SaveRoutingOccurrenceError {
+    source: anyhow::Error,
+    mutated_installed_tree: bool,
 }
 
 /// The pending-projection predicate.
@@ -1164,7 +1180,7 @@ impl MemorySystem {
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
     ) -> Result<Self> {
-        let (node_count, max_node_id) = {
+        let (node_count, initial_data_version) = {
             let conn = db.try_lock().context(
                 "new_with_connection requires the injected connection to be \
                  uncontended on entry",
@@ -1276,10 +1292,14 @@ impl MemorySystem {
             // against a full store, with no log line at all; a failed `MAX` left
             // `next_id` at 1, so the first write upserted over persisted node 1.
             // Refusing to open the store is the honest outcome.
+            // Sample before the count snapshot. If another connection commits between these two
+            // reads, the older token deliberately remains installed, so the first guarded
+            // operation refreshes instead of treating a newly non-empty store as current.
+            let initial_data_version = Self::data_version(&conn)?;
             let node_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))
                 .context("Failed to count stored routing points")?;
-            (node_count, 0i64)
+            (node_count, initial_data_version)
         };
 
         // Parameterize RoutingTree dimension to match the injected engine. Unlike MemTree, there
@@ -1296,6 +1316,9 @@ impl MemorySystem {
             hydration.install_sweep_pause(take_projection_sweep_pause(&config.db_path));
         }
         let tree = Arc::new(Mutex::new(tree));
+        let tree_data_version = Arc::new(AtomicI64::new(initial_data_version));
+        #[cfg(test)]
+        let tree_load_count = Arc::new(AtomicUsize::new(0));
         // Built before the loader is spawned, because the loader owns half of
         // it: the sweep it runs on completion has to serialize against
         // interactive writes on the SAME `insert_lock`, and clear the SAME
@@ -1306,6 +1329,9 @@ impl MemorySystem {
         let projection = ProjectionContext {
             db: Arc::clone(&db),
             tree: Arc::clone(&tree),
+            tree_data_version: Arc::clone(&tree_data_version),
+            #[cfg(test)]
+            tree_load_count: Arc::clone(&tree_load_count),
             hydration: Arc::clone(&hydration),
             embedding_engine: Arc::clone(&embedding_engine),
             insert_lock: Arc::clone(&insert_lock),
@@ -1364,6 +1390,9 @@ impl MemorySystem {
                         "new_with_connection requires the injected connection to be \
                          uncontended during synchronous hydration",
                     )?;
+                    let data_version = Self::data_version(&conn)?;
+                    #[cfg(test)]
+                    tree_load_count.fetch_add(1, Ordering::SeqCst);
                     match RoutingMemTree::load(&conn, dim) {
                         Err(error) => {
                             // Broken, not fresh. This arm is only entered when
@@ -1385,6 +1414,7 @@ impl MemorySystem {
                                 .loaded
                                 .store(loaded.size(), std::sync::atomic::Ordering::SeqCst);
                             *guard = loaded;
+                            tree_data_version.store(data_version, Ordering::SeqCst);
                             hydration.complete();
                         }
                     }
@@ -1395,6 +1425,9 @@ impl MemorySystem {
         Ok(Self {
             db,
             tree,
+            tree_data_version,
+            #[cfg(test)]
+            tree_load_count,
             hydration,
             needs_projection_sweep,
             hydration_task,
@@ -1544,7 +1577,7 @@ impl MemorySystem {
             )?
         };
         if already_classified {
-            return Ok(inserted);
+            return Ok(false);
         }
 
         // The gate guards semantic placement, and only that.
@@ -1564,7 +1597,7 @@ impl MemorySystem {
         // completes cleanly (#339).
         self.ensure_hydrated().await?;
 
-        Self::project_stored_conversation(
+        let projected = Self::project_stored_conversation(
             &self.projection(),
             &PendingConversation {
                 id: id.clone(),
@@ -1576,9 +1609,13 @@ impl MemorySystem {
         )
         .await?;
 
-        tracing::debug!("Inserted conversation into memory: {} chars", content.len());
+        tracing::debug!(
+            inserted_raw_row = inserted,
+            "Inserted conversation into memory: {} chars",
+            content.len()
+        );
 
-        Ok(true)
+        Ok(projected)
     }
 
     /// The `Arc`s the pending-projection sweep needs, as the loader holds them.
@@ -1586,12 +1623,76 @@ impl MemorySystem {
         ProjectionContext {
             db: Arc::clone(&self.db),
             tree: Arc::clone(&self.tree),
+            tree_data_version: Arc::clone(&self.tree_data_version),
+            #[cfg(test)]
+            tree_load_count: Arc::clone(&self.tree_load_count),
             hydration: Arc::clone(&self.hydration),
             embedding_engine: Arc::clone(&self.embedding_engine),
             insert_lock: Arc::clone(&self.insert_lock),
             needs_projection_sweep: Arc::clone(&self.needs_projection_sweep),
             degenerate_gate: Arc::clone(&self.degenerate_gate),
         }
+    }
+
+    fn data_version(conn: &Connection) -> Result<i64> {
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+            .context("memory: read SQLite data_version")
+    }
+
+    /// Refresh a tree-backed view after a commit made through another SQLite connection.
+    ///
+    /// The cheap comparison deliberately releases `db` before waiting for `insert_lock`. The
+    /// double-check then reacquires locks in db-before-tree order, so this guard cannot invert the
+    /// mutation path's order. While initial hydration is `Loading`, the existing partial/empty
+    /// read behavior remains in force and the background loader owns the only load.
+    async fn refresh_tree_if_changed(&self) -> Result<()> {
+        let ctx = self.projection();
+        Self::refresh_tree_if_changed_in(&ctx).await
+    }
+
+    async fn refresh_tree_if_changed_in(ctx: &ProjectionContext) -> Result<()> {
+        if matches!(ctx.hydration.status(), HydrationStatus::Loading { .. }) {
+            return Ok(());
+        }
+        let changed = {
+            let conn = ctx.db.lock().await;
+            Self::data_version(&conn)? != ctx.tree_data_version.load(Ordering::SeqCst)
+        };
+        if !changed {
+            return Ok(());
+        }
+
+        let _insert_guard = ctx.insert_lock.lock().await;
+        if matches!(ctx.hydration.status(), HydrationStatus::Loading { .. }) {
+            return Ok(());
+        }
+        Self::refresh_tree_locked(ctx).await
+    }
+
+    /// Double-checked refresh for a caller already holding `insert_lock`.
+    async fn refresh_tree_locked(ctx: &ProjectionContext) -> Result<()> {
+        let (restored, data_version) = {
+            let conn = ctx.db.lock().await;
+            let data_version = Self::data_version(&conn)?;
+            if data_version == ctx.tree_data_version.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let tx = conn
+                .unchecked_transaction()
+                .context("memory refresh: begin read snapshot")?;
+            #[cfg(test)]
+            ctx.tree_load_count.fetch_add(1, Ordering::SeqCst);
+            let restored = RoutingMemTree::load_within(&tx, ctx.embedding_engine.dimension())
+                .context("memory refresh: load routing tree")?;
+            tx.commit()
+                .context("memory refresh: commit read snapshot")?;
+            (restored, data_version)
+        };
+        let nodes = restored.size();
+        *ctx.tree.lock().await = restored;
+        ctx.tree_data_version.store(data_version, Ordering::SeqCst);
+        ctx.hydration.clear_failure(nodes);
+        Ok(())
     }
 
     /// Project one already-stored conversation into the semantic index and
@@ -1624,7 +1725,7 @@ impl MemorySystem {
     async fn project_stored_conversation(
         ctx: &ProjectionContext,
         pending: &PendingConversation,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let result = Self::project_stored_conversation_inner(ctx, pending).await;
         if result.is_err() {
             ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
@@ -1637,7 +1738,7 @@ impl MemorySystem {
     async fn project_stored_conversation_inner(
         ctx: &ProjectionContext,
         pending: &PendingConversation,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let PendingConversation {
             id,
             role,
@@ -1680,19 +1781,6 @@ impl MemorySystem {
             // must NOT call `observe_document` -- see `EmbeddingEngine`'s doc.
             ctx.embedding_engine.observe_document(&key_content)?;
             let embedding = ctx.embedding_engine.embed(&key_content)?;
-            // The occurrence chain's `prev`, resolved durably rather than from an in-memory
-            // cache: a plain `SELECT` over `conversations`/`memory_sources`/`routing_occurrences`
-            // for this session's most recently projected occurrence, so the chain survives a
-            // restart with no rebuild step (see `last_occurrence_uuid_for_session`). A stale read
-            // under cross-process contention is expected and benign -- `link_next` below resolves
-            // it (see `save_routing_occurrence`'s doc), it is never a correctness hazard.
-            let prev = match session_id.as_deref() {
-                Some(session_id) => {
-                    let conn = ctx.db.lock().await;
-                    Self::last_occurrence_uuid_for_session(&conn, session_id)?
-                }
-                None => None,
-            };
             // Unlike `MemTree::insert_with_effect`, `RoutingTree::insert` (via `RoutingMemTree`)
             // cannot fail -- there is no aggregation pass with its own failure mode, and no
             // promotion for a partial failure to leave stranded. Nothing here mutates the tree
@@ -1702,9 +1790,8 @@ impl MemorySystem {
             // forward link from `prev`, and the provenance row all in one transaction, so the DB
             // stays consistent across process restarts and a retry cannot create a second
             // semantic point -- or a second occurrence -- for the same turn.
-            if let Err(error) = Self::save_routing_occurrence(
-                &ctx.db,
-                &ctx.tree,
+            let projected = match Self::save_routing_occurrence(
+                ctx,
                 NewOccurrenceContent {
                     key_content,
                     embedding,
@@ -1712,47 +1799,49 @@ impl MemorySystem {
                     created_at: timestamp,
                 },
                 id.as_str(),
-                prev,
+                session_id.as_deref(),
             )
             .await
             {
-                // The SQLite transaction rolled back, but insertion already
-                // mutated the in-memory tree. Rebuild it from the durable
-                // snapshot before returning so a retry cannot add a duplicate
-                // semantic leaf for the same canonical turn.
-                //
-                // The reload's own failure is logged rather than returned, for
-                // the same reason as the branch above: replacing the error the
-                // caller actually needs with a second, coincidental one hides
-                // what went wrong.
-                //
-                // The sweep is re-armed by the wrapper, not here.
-                if let Err(reload_error) = Self::reload_tree(ctx).await {
-                    tracing::error!(
-                        ?reload_error,
-                        "could not restore the MemTree after a failed save; the \
-                         in-memory index is inconsistent until restart"
-                    );
+                Ok(projected) => projected,
+                Err(failure) => {
+                    // The SQLite transaction rolled back, but insertion already
+                    // mutated the in-memory tree. Rebuild it from the durable
+                    // snapshot before returning so a retry cannot add a duplicate
+                    // semantic leaf for the same canonical turn.
+                    //
+                    // The reload's own failure is logged rather than returned, for
+                    // the same reason as the branch above: replacing the error the
+                    // caller actually needs with a second, coincidental one hides
+                    // what went wrong.
+                    //
+                    // The sweep is re-armed by the wrapper, not here.
+                    if failure.mutated_installed_tree {
+                        if let Err(reload_error) = Self::reload_tree(ctx).await {
+                            tracing::error!(
+                                ?reload_error,
+                                "could not restore the MemTree after a failed save; the \
+                                 in-memory index is inconsistent until restart"
+                            );
+                        }
+                    }
+                    return Err(failure.source);
                 }
-                return Err(error);
-            }
-        } else {
-            // A classifier-discarded turn, OR one the degeneracy gate above
-            // rejected, is TERMINAL, not pending.
-            //
-            // This row, with its NULL `node_id`, is the only thing that lets
-            // "no `memory_sources` row" mean "never projected". Drop it and
-            // every low-signal turn becomes permanently pending, and the sweep
-            // re-classifies the whole backlog on every startup.
-            let conn = ctx.db.lock().await;
-            conn.execute(
-                "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
-                 VALUES (?1, NULL, ?2)",
-                params![id, timestamp],
-            )?;
+            };
+            return Ok(projected);
         }
 
-        Ok(())
+        // A classifier-discarded turn, OR one the degeneracy gate above rejected, is TERMINAL,
+        // not pending. This row, with its NULL `node_id`, is the only thing that lets "no
+        // `memory_sources` row" mean "never projected". Drop it and every low-signal turn becomes
+        // permanently pending, and the sweep re-classifies the whole backlog on every startup.
+        let conn = ctx.db.lock().await;
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO memory_sources (conversation_id, node_id, indexed_at)
+             VALUES (?1, NULL, ?2)",
+            params![id, timestamp],
+        )?;
+        Ok(changed != 0)
     }
 
     /// Every stored conversation that was never projected.
@@ -1835,7 +1924,7 @@ impl MemorySystem {
             // the loop proves nothing about the loop.
             #[cfg(any(test, feature = "test-support"))]
             ctx.hydration.pause_in_projection_sweep(repaired).await;
-            Self::project_stored_conversation(ctx, conversation)
+            let projected = Self::project_stored_conversation(ctx, conversation)
                 .await
                 .with_context(|| {
                     format!(
@@ -1845,7 +1934,7 @@ impl MemorySystem {
                         pending.len()
                     )
                 })?;
-            repaired += 1;
+            repaired += usize::from(projected);
         }
         ctx.needs_projection_sweep.store(false, Ordering::SeqCst);
         Ok(repaired)
@@ -1908,14 +1997,15 @@ impl MemorySystem {
     /// copies every embedding while holding the lock — around 137 MB at the
     /// scale measured on the dogfood store, blocking every concurrent insert
     /// and query — and the callers only ever needed these three numbers.
-    pub async fn index_shape(&self) -> (usize, usize, usize) {
+    pub async fn index_shape(&self) -> Result<(usize, usize, usize)> {
+        self.refresh_tree_if_changed().await?;
         let tree = self.tree.lock().await;
         let leaves = tree.tree().leaf_count();
         // RoutingTree is strictly binary (module doc): every decision node has exactly two
         // children, unlike MemTree's variable fan-out. "Widest fan-out" is no longer a meaningful
         // structural signal here -- 2 once any split exists, 0 otherwise.
         let widest = if leaves > 1 { 2 } else { 0 };
-        (leaves, tree.tree().max_depth(tree.tree().root()), widest)
+        Ok((leaves, tree.tree().max_depth(tree.tree().root()), widest))
     }
 
     /// Query memory for relevant context.
@@ -1999,6 +2089,7 @@ impl MemorySystem {
         query_text: &str,
         top_k: Option<usize>,
     ) -> Result<Vec<MemorySearchResult>> {
+        self.refresh_tree_if_changed().await?;
         let k = top_k.unwrap_or(self.config.max_context_items);
         let query_embedding = self.embedding_engine.embed(query_text)?;
         let retrieved = {
@@ -2122,6 +2213,7 @@ impl MemorySystem {
     pub async fn inspect_memory(&self, memory_id: &str) -> Result<Option<InspectedMemory>> {
         let memory_id = memory_id.trim();
         if let Some(node_id) = memory_id.strip_prefix("node:") {
+            self.refresh_tree_if_changed().await?;
             let node_id = node_id
                 .parse::<NodeId>()
                 .with_context(|| format!("invalid memory node reference '{memory_id}'"))?;
@@ -2193,40 +2285,83 @@ impl MemorySystem {
     /// larger, separate change; see this crate's `AGENTS.md`.
     pub async fn remove_memory(&self, memory_id: &str) -> Result<bool> {
         let memory_id = memory_id.trim();
+        let _insert_guard = self.insert_lock.lock().await;
+        let mut conn = self.db.lock().await;
+        let mut installed = self.tree.lock().await;
+        let mut mutated_installed_tree = false;
+        let operation = (|| -> Result<bool> {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("remove_memory: begin immediate transaction")?;
+            let data_version = Self::data_version(&tx)?;
+            let stale = data_version != self.tree_data_version.load(Ordering::SeqCst);
+            let mut candidate = if stale {
+                #[cfg(test)]
+                self.tree_load_count.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    RoutingMemTree::load_within(&tx, self.embedding_engine.dimension())
+                        .context("remove_memory: refresh stale routing tree")?,
+                )
+            } else {
+                None
+            };
+            let target = candidate.as_mut().unwrap_or(&mut installed);
 
-        let conn = self.db.lock().await;
-        let mut tree = self.tree.lock().await;
+            let node_id: Option<NodeId> = if let Some(node_id) = memory_id.strip_prefix("node:") {
+                Some(
+                    node_id
+                        .parse::<NodeId>()
+                        .with_context(|| format!("invalid memory node reference '{memory_id}'"))?,
+                )
+            } else {
+                tx.query_row(
+                    "SELECT ms.node_id FROM conversations c
+                     LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
+                     WHERE c.id = ?1",
+                    params![memory_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .context("remove_memory: query conversations/memory_sources by id")?
+                .flatten()
+                .map(|value| value as NodeId)
+            };
+            let mut dirty = Vec::new();
+            let removed = match node_id {
+                Some(node_id) if target.get_point(node_id as PointId).is_some() => {
+                    mutated_installed_tree = !stale;
+                    dirty = target.remove_within(&tx, node_id as PointId)?;
+                    true
+                }
+                _ => false,
+            };
 
-        let node_id: Option<NodeId> = if let Some(node_id) = memory_id.strip_prefix("node:") {
-            Some(
-                node_id
-                    .parse::<NodeId>()
-                    .with_context(|| format!("invalid memory node reference '{memory_id}'"))?,
-            )
-        } else {
-            conn.query_row(
-                "SELECT ms.node_id FROM conversations c
-                 LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
-                 WHERE c.id = ?1",
-                params![memory_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .context("remove_memory: query conversations/memory_sources by id")?
-            .flatten()
-            .map(|value| value as NodeId)
-        };
+            tx.commit().context("remove_memory: commit")?;
+            if let Some(mut candidate) = candidate {
+                candidate.tree_mut().mark_persisted(&dirty);
+                *installed = candidate;
+                self.tree_data_version.store(data_version, Ordering::SeqCst);
+            } else if removed {
+                installed.tree_mut().mark_persisted(&dirty);
+            }
+            Ok(removed)
+        })();
+        drop(installed);
+        drop(conn);
 
-        let Some(node_id) = node_id else {
-            return Ok(false);
-        };
-        if tree.get_point(node_id as PointId).is_none() {
-            // Already removed, or a `node:<id>` past the end of the tree -- a normal "nothing to
-            // remove" outcome, not an error.
-            return Ok(false);
+        match operation {
+            Ok(removed) => Ok(removed),
+            Err(error) if mutated_installed_tree => {
+                if let Err(reload_error) = Self::reload_tree(&self.projection()).await {
+                    tracing::error!(
+                        ?reload_error,
+                        "could not restore the routing tree after a failed removal; the in-memory index is inconsistent until restart"
+                    );
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
         }
-        tree.remove(&conn, node_id as PointId)?;
-        Ok(true)
     }
 
     /// Get recent conversations (for context window)
@@ -2247,6 +2382,7 @@ impl MemorySystem {
 
     /// Get memory statistics
     pub async fn stats(&self) -> Result<MemoryStats> {
+        self.refresh_tree_if_changed().await?;
         let conn = self.db.lock().await;
 
         let conversation_count: i64 =
@@ -2276,6 +2412,12 @@ impl MemorySystem {
     /// occurrence row exactly as it undoes the point row; nothing durable can name a point that
     /// was never persisted, or an occurrence whose point wasn't.
     ///
+    /// After acquiring `BEGIN IMMEDIATE`, the transaction rechecks the canonical
+    /// `memory_sources` mapping before it samples `data_version` or loads a stale candidate. This
+    /// closes the cross-process gap between the caller's optimistic precheck and the writer fence:
+    /// a concurrent retry that lost the race is an explicit no-op and cannot replace provenance or
+    /// advance the installed token.
+    ///
     /// `prev`'s forward link is attempted with the same transaction's connection. A
     /// [`LinkNextError::Conflict`] does NOT abort the transaction or fail this call: the new
     /// occurrence and its point are still real and still committed, they are just not linked
@@ -2288,12 +2430,11 @@ impl MemorySystem {
     /// background loader, which is spawned before `MemorySystem` exists, so it holds these
     /// `Arc`s and has no `&self`. One implementation, same locks, same order.
     async fn save_routing_occurrence(
-        db: &Mutex<Connection>,
-        tree_lock: &Mutex<RoutingMemTree>,
+        ctx: &ProjectionContext,
         content: NewOccurrenceContent,
         conversation_id: &str,
-        prev: Option<Uuid>,
-    ) -> Result<Occurrence> {
+        session_id: Option<&str>,
+    ) -> std::result::Result<bool, SaveRoutingOccurrenceError> {
         let NewOccurrenceContent {
             key_content,
             embedding,
@@ -2306,75 +2447,130 @@ impl MemorySystem {
         // concurrent `stats`. Same discipline `MemTree`'s own save path used (#313): no await
         // between reading the dirty set and committing, and the tree guard spans the commit so a
         // mutation landing mid-write cannot be marked and then silently unmarked.
-        let conn = db.lock().await;
-        let mut tree = tree_lock.lock().await;
+        let mut conn = ctx.db.lock().await;
+        let mut installed = ctx.tree.lock().await;
+        let mut mutated_installed_tree = false;
+        let operation = (|| -> Result<Option<_>> {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("save_routing_occurrence: begin immediate transaction")?;
+            let already_projected = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM memory_sources WHERE conversation_id = ?1
+                     )",
+                    [conversation_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .context("save_routing_occurrence: recheck canonical conversation provenance")?;
+            if already_projected {
+                tx.commit()
+                    .context("save_routing_occurrence: commit duplicate no-op")?;
+                return Ok(None);
+            }
+            let data_version = Self::data_version(&tx)?;
+            let stale = data_version != ctx.tree_data_version.load(Ordering::SeqCst);
+            let mut candidate = if stale {
+                #[cfg(test)]
+                ctx.tree_load_count.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    RoutingMemTree::load_within(&tx, ctx.embedding_engine.dimension())
+                        .context("save_routing_occurrence: refresh stale routing tree")?,
+                )
+            } else {
+                None
+            };
+            let target = candidate.as_mut().unwrap_or(&mut installed);
 
-        let tx = conn.unchecked_transaction()?;
-        let occurrence = tree
-            .insert_occurrence(&tx, key_content, embedding, importance, created_at, prev)
-            .context("save_routing_occurrence: insert_occurrence")?;
-        let point_id = occurrence.point_id;
+            let prev = session_id
+                .map(|session_id| Self::last_occurrence_uuid_for_session(&tx, session_id))
+                .transpose()?
+                .flatten();
+            mutated_installed_tree = !stale;
+            let occurrence = target
+                .insert_occurrence(&tx, key_content, embedding, importance, created_at, prev)
+                .context("save_routing_occurrence: insert_occurrence")?;
+            let point_id = occurrence.point_id;
 
-        let meta = tree
-            .get_point(point_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("memory: point {point_id} was just inserted but is not in the tree")
-            })?
-            .clone();
-        let point_embedding = tree.tree().embedding_of(point_id as usize).to_vec();
-        let dirty = tree.tree().dirty_node_ids();
+            let meta = target
+                .get_point(point_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "memory: point {point_id} was just inserted but is not in the tree"
+                    )
+                })?
+                .clone();
+            let point_embedding = target.tree().embedding_of(point_id as usize).to_vec();
+            let dirty = target.tree().dirty_node_ids();
 
-        save_point(
-            &tx,
-            point_id as usize,
-            &meta.text,
-            &point_embedding,
-            meta.importance,
-            meta.created_at,
-        )?;
-        write_dirty_nodes_within(tree.tree(), &dirty, &tx)?;
-        // `node_id` (`memory_sources`' own column name, unchanged) now holds a `routing_points`
-        // point id. `insert_occurrence` never dedups, so every occurrence's point is unique to
-        // it; `conversation_id` is still the primary key, so a retry of the same turn is still
-        // idempotent.
-        tx.execute(
-            "INSERT OR REPLACE INTO memory_sources (conversation_id, node_id, indexed_at)
-             VALUES (?1, ?2, ?3)",
-            params![conversation_id, point_id as i64, created_at],
-        )?;
+            save_point(
+                &tx,
+                point_id as usize,
+                &meta.text,
+                &point_embedding,
+                meta.importance,
+                meta.created_at,
+            )?;
+            write_dirty_nodes_within(target.tree(), &dirty, &tx)?;
+            // `node_id` (`memory_sources`' own column name, unchanged) now holds a `routing_points`
+            // point id. `insert_occurrence` never dedups, so every occurrence's point is unique to
+            // it; `conversation_id` is still the primary key, so a retry of the same turn is still
+            // idempotent.
+            tx.execute(
+                "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![conversation_id, point_id as i64, created_at],
+            )?;
 
-        if let Some(prev_uuid) = prev {
-            match RoutingMemTree::link_next(&tx, prev_uuid, occurrence.uuid) {
-                Ok(()) => {}
-                Err(LinkNextError::Conflict(_)) => {
-                    // Self-recovering and non-fatal (the occurrence and its point are
-                    // still recorded; only the chain link is missing), so this is
-                    // debug-level diagnostic, not a warning. The finch binary's
-                    // `OutputManagerLayer` (src/cli/output_layer.rs) forwards every
-                    // `tracing::warn!`/`error!` from a non-`finch::`-prefixed crate
-                    // straight into the interactive transcript, unframed -- a
-                    // WARN here previously surfaced as raw internal detail
-                    // (`⚠️  [finch_memory] occurrence chain link lost a race...`) in
-                    // the ordinary conversation, with no distinction from Finch's own
-                    // reply (#1383).
-                    tracing::debug!(
-                        prev = %prev_uuid,
-                        next = %occurrence.uuid,
-                        conversation_id,
-                        "occurrence chain link lost a race to a concurrent writer; the new \
-                         occurrence and its point are still recorded, just not linked from \
-                         their predecessor"
-                    );
-                }
-                Err(LinkNextError::Sql(sql_error)) => {
-                    return Err(sql_error).context("save_routing_occurrence: link_next");
+            if let Some(prev_uuid) = prev {
+                match RoutingMemTree::link_next(&tx, prev_uuid, occurrence.uuid) {
+                    Ok(()) => {}
+                    Err(LinkNextError::Conflict(_)) => {
+                        // Self-recovering and non-fatal (the occurrence and its point are
+                        // still recorded; only the chain link is missing), so this is
+                        // debug-level diagnostic, not a warning. The finch binary's
+                        // `OutputManagerLayer` (src/cli/output_layer.rs) forwards every
+                        // `tracing::warn!`/`error!` from a non-`finch::`-prefixed crate
+                        // straight into the interactive transcript, unframed -- a
+                        // WARN here previously surfaced as raw internal detail
+                        // (`⚠️  [finch_memory] occurrence chain link lost a race...`) in
+                        // the ordinary conversation, with no distinction from Finch's own
+                        // reply (#1383).
+                        tracing::debug!(
+                            prev = %prev_uuid,
+                            next = %occurrence.uuid,
+                            conversation_id,
+                            "occurrence chain link lost a race to a concurrent writer; the new \
+                             occurrence and its point are still recorded, just not linked from \
+                             their predecessor"
+                        );
+                    }
+                    Err(LinkNextError::Sql(sql_error)) => {
+                        return Err(sql_error).context("save_routing_occurrence: link_next");
+                    }
                 }
             }
-        }
 
-        tx.commit()?;
-        tree.tree_mut().mark_persisted(&dirty);
-        Ok(occurrence)
+            tx.commit()?;
+            Ok(Some((dirty, candidate, data_version)))
+        })();
+
+        let Some((dirty, candidate, data_version)) =
+            operation.map_err(|source| SaveRoutingOccurrenceError {
+                source,
+                mutated_installed_tree,
+            })?
+        else {
+            return Ok(false);
+        };
+        if let Some(mut candidate) = candidate {
+            candidate.tree_mut().mark_persisted(&dirty);
+            *installed = candidate;
+            ctx.tree_data_version.store(data_version, Ordering::SeqCst);
+        } else {
+            installed.tree_mut().mark_persisted(&dirty);
+        }
+        Ok(true)
     }
 
     /// The uuid of `session_id`'s most recently projected occurrence, or `None` when the session
@@ -2427,15 +2623,22 @@ impl MemorySystem {
 
     /// The body of `reload_tree_from_db`, over the `Arc`s rather than `self`.
     async fn reload_tree(ctx: &ProjectionContext) -> Result<()> {
-        let restored = {
+        let (restored, data_version) = {
             let conn = ctx.db.lock().await;
-            RoutingMemTree::load(&conn, ctx.embedding_engine.dimension())?
+            let data_version = Self::data_version(&conn)?;
+            #[cfg(test)]
+            ctx.tree_load_count.fetch_add(1, Ordering::SeqCst);
+            (
+                RoutingMemTree::load(&conn, ctx.embedding_engine.dimension())?,
+                data_version,
+            )
         };
         let nodes = restored.size();
         // `RoutingMemTree::load`/`load_routing_tree` clear the dirty set as part of installing
         // loaded state (`install_loaded_state`'s own doc comment) -- the tree was just built from
         // the durable rows, so nothing in it is pending.
         *ctx.tree.lock().await = restored;
+        ctx.tree_data_version.store(data_version, Ordering::SeqCst);
         // The tree now matches the durable snapshot, so whatever the loader
         // recorded no longer describes it. Leaving the failure set meant a
         // store that had been rebuilt successfully still refused every write,
@@ -2464,12 +2667,24 @@ impl MemorySystem {
     async fn hydrate_in_background(projection: ProjectionContext) {
         let restored = {
             let conn = projection.db.lock().await;
-            RoutingMemTree::load(&conn, projection.embedding_engine.dimension())
+            let data_version = Self::data_version(&conn);
+            match data_version {
+                Ok(data_version) => {
+                    #[cfg(test)]
+                    projection.tree_load_count.fetch_add(1, Ordering::SeqCst);
+                    RoutingMemTree::load(&conn, projection.embedding_engine.dimension())
+                        .map(|restored| (restored, data_version))
+                }
+                Err(error) => Err(error),
+            }
         };
         match restored {
-            Ok(restored) => {
+            Ok((restored, data_version)) => {
                 let nodes = restored.size();
                 *projection.tree.lock().await = restored;
+                projection
+                    .tree_data_version
+                    .store(data_version, Ordering::SeqCst);
                 projection.hydration.loaded.store(nodes, Ordering::SeqCst);
                 projection.hydration.complete();
                 #[cfg(any(test, feature = "test-support"))]
@@ -2648,6 +2863,8 @@ impl MemorySystem {
         if depth == 0 {
             return Ok(ConversationSummaryLines::default());
         }
+
+        self.refresh_tree_if_changed().await?;
 
         // Lock ordering matches `stats()`/`query_with_sources`: db before tree. `retrieve` now
         // needs `conn` for its neighbor-context tie-break even at `top_k=1` here (a tie for the
@@ -2838,6 +3055,28 @@ pub struct MemoryStats {
 
 #[cfg(test)]
 mod tests {
+
+    struct BarrierEmbedding {
+        barrier: Arc<std::sync::Barrier>,
+        wait_once: AtomicBool,
+    }
+
+    impl EmbeddingEngine for BarrierEmbedding {
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            if self.wait_once.swap(false, Ordering::SeqCst) {
+                self.barrier.wait();
+            }
+            let mut embedding = vec![0.0; 8];
+            for (index, byte) in text.bytes().enumerate() {
+                embedding[index % 8] += f32::from(byte) / 255.0;
+            }
+            Ok(embedding)
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
 
     /// Count writes to `routing_nodes` made by one closure.
     ///
@@ -7331,7 +7570,8 @@ mod tests {
 
     /// The production boundary this exists for: a memory removed in one process must stay
     /// removed after a full restart, not merely for the lifetime of the `MemorySystem` that
-    /// removed it. `RoutingMemTree::remove` persists the point's `removed` flag and its downdated
+    /// removed it. `RoutingMemTree::remove_within` persists the point's `removed` flag and its
+    /// downdated
     /// node rows inside one transaction specifically so this holds.
     #[tokio::test]
     async fn test_remove_memory_survives_a_process_restart() -> Result<()> {
@@ -7441,6 +7681,871 @@ mod tests {
              engine must be refused (matching how any other unreadable store is already handled), \
              not silently accepted with a tree whose self.dim no longer matches its own persisted \
              node geometry: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cross_session_commit_is_visible_to_the_next_tree_read_without_reopen(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        let reader = MemorySystem::new(config)?;
+
+        writer
+            .insert_conversation(
+                "user",
+                "the cross-session launch phrase is silver kestrel",
+                Some("test"),
+                Some("writer-session"),
+            )
+            .await?;
+
+        let recalled = reader
+            .query_with_sources("cross-session launch phrase silver kestrel", Some(5))
+            .await?;
+        assert!(
+            recalled.iter().any(|result| result.text.contains("silver kestrel")),
+            "a MemorySystem opened before another connection's committed projection must see it on its next tree-backed read without reopening; got {recalled:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_stale_writers_keep_both_distinct_points_and_provenance() -> Result<()>
+    {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first = Arc::new(MemorySystem::new_with_engine(
+            config.clone(),
+            Arc::new(BarrierEmbedding {
+                barrier: Arc::clone(&barrier),
+                wait_once: AtomicBool::new(true),
+            }),
+        )?);
+        let second = Arc::new(MemorySystem::new_with_engine(
+            config,
+            Arc::new(BarrierEmbedding {
+                barrier,
+                wait_once: AtomicBool::new(true),
+            }),
+        )?);
+
+        let write_first = {
+            let memory = Arc::clone(&first);
+            tokio::spawn(async move {
+                memory
+                    .insert_brain_conversation(
+                        "user",
+                        "first concurrent writer preserves amber albatross memory",
+                        Some("test"),
+                        Some("concurrent-a"),
+                        &BrainConversationProvenance {
+                            brain_id: "concurrent-brain".into(),
+                            run_id: "run-a".into(),
+                            request_seq: 1,
+                        },
+                    )
+                    .await
+            })
+        };
+        let write_second = {
+            let memory = Arc::clone(&second);
+            tokio::spawn(async move {
+                memory
+                    .insert_brain_conversation(
+                        "user",
+                        "second concurrent writer preserves cobalt kingfisher memory",
+                        Some("test"),
+                        Some("concurrent-b"),
+                        &BrainConversationProvenance {
+                            brain_id: "concurrent-brain".into(),
+                            run_id: "run-b".into(),
+                            request_seq: 2,
+                        },
+                    )
+                    .await
+            })
+        };
+        let (first_result, second_result) = tokio::join!(write_first, write_second);
+        assert!(
+            first_result??,
+            "the first distinct Brain turn must be inserted"
+        );
+        assert!(
+            second_result??,
+            "the second distinct Brain turn must be inserted"
+        );
+
+        let conn = Connection::open(temp.path())?;
+        let points: i64 =
+            conn.query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))?;
+        let sources: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_sources WHERE node_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let distinct_source_points: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT node_id) FROM memory_sources WHERE node_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            (points, sources, distinct_source_points),
+            (2, 2, 2),
+            "two independently opened stale writers must serialize derivation after the cross-process fence, preserving both unique points and provenance rows"
+        );
+        drop(conn);
+
+        let reopened = MemorySystem::new_with_engine(
+            MemoryConfig {
+                db_path: temp.path().to_path_buf(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            },
+            Arc::new(BarrierEmbedding {
+                barrier: Arc::new(std::sync::Barrier::new(1)),
+                wait_once: AtomicBool::new(false),
+            }),
+        )?;
+        reopened.ensure_hydrated().await?;
+        assert_eq!(
+            reopened.stats().await?.tree_node_count,
+            2,
+            "the complete routing tree and membership state must reload with both concurrent points"
+        );
+        for (marker, run_id, request_seq) in [
+            ("amber albatross", "run-a", 1),
+            ("cobalt kingfisher", "run-b", 2),
+        ] {
+            let recalled = reopened.query_with_sources(marker, Some(2)).await?;
+            let hit = recalled
+                .iter()
+                .find(|result| result.text.contains(marker))
+                .with_context(|| {
+                    format!(
+                        "a freshly opened third system must recall the distinct {marker} marker; got {recalled:?}"
+                    )
+                })?;
+            let source = hit
+                .source
+                .as_ref()
+                .with_context(|| format!("the recalled {marker} marker must retain provenance"))?;
+            assert_eq!(
+                (
+                    source.brain_id.as_deref(),
+                    source.run_id.as_deref(),
+                    source.request_seq,
+                ),
+                (Some("concurrent-brain"), Some(run_id), Some(request_seq)),
+                "the reopened {marker} memory must retain its exact conversation provenance; source={source:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_duplicate_brain_retry_projects_exactly_once_under_writer_fence(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first = Arc::new(MemorySystem::new_with_engine(
+            config.clone(),
+            Arc::new(BarrierEmbedding {
+                barrier: Arc::clone(&barrier),
+                wait_once: AtomicBool::new(true),
+            }),
+        )?);
+        let second = Arc::new(MemorySystem::new_with_engine(
+            config.clone(),
+            Arc::new(BarrierEmbedding {
+                barrier,
+                wait_once: AtomicBool::new(true),
+            }),
+        )?);
+        let first_token = first.tree_data_version.load(Ordering::SeqCst);
+        let second_token = second.tree_data_version.load(Ordering::SeqCst);
+        let provenance = BrainConversationProvenance {
+            brain_id: "duplicate-retry-brain".into(),
+            run_id: "duplicate-retry-run".into(),
+            request_seq: 17,
+        };
+
+        let write_first = {
+            let memory = Arc::clone(&first);
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                memory
+                    .insert_brain_conversation(
+                        "assistant",
+                        "duplicate concurrent retry preserves vermilion puffin memory",
+                        Some("test"),
+                        Some("duplicate-session"),
+                        &provenance,
+                    )
+                    .await
+            })
+        };
+        let write_second = {
+            let memory = Arc::clone(&second);
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                memory
+                    .insert_brain_conversation(
+                        "assistant",
+                        "duplicate concurrent retry preserves vermilion puffin memory",
+                        Some("test"),
+                        Some("duplicate-session"),
+                        &provenance,
+                    )
+                    .await
+            })
+        };
+        let (first_result, second_result) = tokio::join!(write_first, write_second);
+        let first_outcome = first_result??;
+        let second_outcome = second_result??;
+        let mut outcomes = [first_outcome, second_outcome];
+        outcomes.sort_unstable();
+        assert_eq!(
+            outcomes,
+            [false, true],
+            "two concurrent retries of one canonical Brain turn must report one projection and one explicit no-op"
+        );
+        let (loser, loser_token) = if first_outcome {
+            (&second, second_token)
+        } else {
+            (&first, first_token)
+        };
+        assert_eq!(
+            loser.tree_data_version.load(Ordering::SeqCst),
+            loser_token,
+            "the duplicate no-op must not advance its stale installed-tree token"
+        );
+        assert_eq!(
+            loser.tree_load_count.load(Ordering::SeqCst),
+            0,
+            "the duplicate no-op must recheck provenance before loading a private stale candidate"
+        );
+        assert_eq!(
+            loser.tree.lock().await.size(),
+            0,
+            "the duplicate no-op must leave its old installed tree untouched until a later guarded refresh"
+        );
+
+        let conn = Connection::open(temp.path())?;
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        assert_eq!(
+            journal_mode, "wal",
+            "the duplicate-retry regression must exercise independently opened WAL connections"
+        );
+        let counts: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM conversations WHERE brain_id = 'duplicate-retry-brain' AND run_id = 'duplicate-retry-run' AND request_seq = 17),
+                 (SELECT COUNT(*) FROM routing_points),
+                 (SELECT COUNT(*) FROM routing_occurrences),
+                 (SELECT COUNT(*) FROM memory_sources WHERE node_id IS NOT NULL)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            counts,
+            (1, 1, 1, 1),
+            "the writer fence must leave one canonical conversation, point, occurrence, and provenance mapping; counts={counts:?}"
+        );
+
+        let reopened = MemorySystem::new_with_engine(
+            config,
+            Arc::new(BarrierEmbedding {
+                barrier: Arc::new(std::sync::Barrier::new(1)),
+                wait_once: AtomicBool::new(false),
+            }),
+        )?;
+        reopened.ensure_hydrated().await?;
+        let recalled = reopened
+            .query_with_sources("vermilion puffin", Some(2))
+            .await?;
+        let hit = recalled
+            .iter()
+            .find(|result| result.text.contains("vermilion puffin"))
+            .context("a fresh third system must recall the exactly-once duplicate marker")?;
+        let source = hit
+            .source
+            .as_ref()
+            .context("the exactly-once recalled marker must retain canonical provenance")?;
+        assert_eq!(
+            (
+                source.brain_id.as_deref(),
+                source.run_id.as_deref(),
+                source.request_seq,
+            ),
+            (
+                Some("duplicate-retry-brain"),
+                Some("duplicate-retry-run"),
+                Some(17),
+            ),
+            "the one recalled memory must retain the canonical Brain identity; source={source:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cross_session_removal_is_visible_to_recall_and_node_inspection() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        let reader = MemorySystem::new(config)?;
+
+        writer
+            .insert_conversation(
+                "user",
+                "cross-session removal marker violet osprey",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        let hit = reader
+            .query_with_sources("cross-session removal marker violet osprey", Some(1))
+            .await?
+            .into_iter()
+            .next()
+            .context("reader must first observe the externally committed point")?;
+        assert!(
+            writer.remove_memory(&hit.memory_id).await?,
+            "the writer must remove the live point before cross-session invalidation is tested"
+        );
+
+        let recalled = reader
+            .query_with_sources("cross-session removal marker violet osprey", Some(5))
+            .await?;
+        assert!(
+            recalled
+                .iter()
+                .all(|result| result.memory_id != hit.memory_id),
+            "a reader opened before an external removal must not retain the removed point in recall; removed={}, got={recalled:?}",
+            hit.memory_id
+        );
+        assert!(
+            reader
+                .inspect_memory(&format!("node:{}", hit.node_id))
+                .await?
+                .is_none(),
+            "node-form inspection must refresh and stop resolving an externally removed point {}",
+            hit.node_id
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_refresh_installs_one_snapshot_then_converges_after_a_bracketing_commit(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        writer
+            .insert_conversation(
+                "user",
+                "snapshot baseline memory indigo tern",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        let reader = Arc::new(MemorySystem::new(config)?);
+        reader.ensure_hydrated().await?;
+
+        writer
+            .insert_conversation(
+                "user",
+                "snapshot first external commit amber swift",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        let (_registration, pause) =
+            routing_memory::register_routing_load_pause(temp.path().to_path_buf());
+        let refresh = {
+            let reader = Arc::clone(&reader);
+            tokio::spawn(async move { reader.stats().await })
+        };
+        let reached = {
+            let pause = Arc::clone(&pause);
+            tokio::task::spawn_blocking(move || pause.wait_until_reached()).await?
+        };
+        assert!(
+            reached,
+            "the refresh must reach the deterministic boundary between routing rows and memory metadata"
+        );
+
+        writer
+            .insert_conversation(
+                "user",
+                "snapshot second external commit cobalt rail",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        pause.release();
+        let first_snapshot = refresh.await??;
+        assert_eq!(
+            first_snapshot.tree_node_count, 2,
+            "a commit after the refresh snapshot begins must not create a mixed three-point install; stats={first_snapshot:?}"
+        );
+
+        let converged = reader.stats().await?;
+        assert_eq!(
+            converged.tree_node_count, 3,
+            "the commit owed after the first snapshot must be installed by the following guarded operation; stats={converged:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_malformed_external_state_fails_closed_and_recovers_after_repair() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        writer
+            .insert_conversation(
+                "user",
+                "malformed-state baseline memory copper petrel",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        let reader = MemorySystem::new(config)?;
+        reader.ensure_hydrated().await?;
+        let installed_before = reader.tree.lock().await.size();
+        let token_before = reader.tree_data_version.load(Ordering::SeqCst);
+
+        let corruptor = Connection::open(temp.path())?;
+        corruptor.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let leaf_id: i64 = corruptor.query_row(
+            "SELECT node_id FROM routing_nodes WHERE is_leaf = 1 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        corruptor.execute(
+            "INSERT INTO routing_leaf_membership
+             (leaf_node_id, point_id, is_dual, divergence_node_id)
+             VALUES (?1, 999999, 0, NULL)",
+            [leaf_id],
+        )?;
+
+        let error = reader
+            .stats()
+            .await
+            .expect_err("a malformed externally committed membership must fail closed");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("membership references point 999999"),
+            "refresh failure must name the malformed persisted reference; got {error:#}"
+        );
+        assert_eq!(
+            reader.tree.lock().await.size(),
+            installed_before,
+            "a failed refresh must leave the previously installed tree intact"
+        );
+        assert_eq!(
+            reader.tree_data_version.load(Ordering::SeqCst),
+            token_before,
+            "a failed refresh must leave the old data_version token intact so repair is retried"
+        );
+
+        corruptor.execute(
+            "DELETE FROM routing_leaf_membership WHERE point_id = 999999",
+            [],
+        )?;
+        let repaired = reader.stats().await?;
+        assert_eq!(
+            repaired.tree_node_count, installed_before,
+            "the first operation after external repair must refresh successfully without losing the valid tree; stats={repaired:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_malformed_external_vector_refresh_preserves_old_tree_and_recovers_after_repair(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        writer
+            .insert_conversation(
+                "user",
+                "malformed vector recovery marker chartreuse murre",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        let reader = MemorySystem::new(config)?;
+        reader.ensure_hydrated().await?;
+        let installed_before = reader.tree.lock().await.size();
+        let token_before = reader.tree_data_version.load(Ordering::SeqCst);
+
+        let corruptor = Connection::open(temp.path())?;
+        let journal_mode: String =
+            corruptor.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        assert_eq!(
+            journal_mode, "wal",
+            "the malformed-vector refresh regression must exercise a real external WAL commit"
+        );
+        let (point_id, original_embedding): (i64, Vec<u8>) = corruptor.query_row(
+            "SELECT point_id, embedding FROM routing_points ORDER BY point_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        corruptor.execute(
+            "UPDATE routing_points SET embedding = ?1 WHERE point_id = ?2",
+            params![vec![1_u8, 2, 3], point_id],
+        )?;
+
+        let error = reader
+            .stats()
+            .await
+            .expect_err("a malformed externally committed vector must fail refresh closed");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains(&format!(
+                "routing point {point_id} embedding blob has 3 bytes"
+            )),
+            "the refresh error must name the malformed point and exact byte length; got {error:#}"
+        );
+        assert_eq!(
+            reader.tree.lock().await.size(),
+            installed_before,
+            "a malformed vector refresh must preserve the previously installed tree"
+        );
+        assert_eq!(
+            reader.tree_data_version.load(Ordering::SeqCst),
+            token_before,
+            "a malformed vector refresh must preserve the old token so a repair is retried"
+        );
+
+        corruptor.execute(
+            "UPDATE routing_points SET embedding = ?1 WHERE point_id = ?2",
+            params![original_embedding, point_id],
+        )?;
+        let repaired = reader.stats().await?;
+        assert_eq!(
+            repaired.tree_node_count, installed_before,
+            "the first guarded operation after vector repair must restore the coherent external snapshot; stats={repaired:?}"
+        );
+        let recalled = reader
+            .query_with_sources("chartreuse murre", Some(1))
+            .await?;
+        assert!(
+            recalled
+                .iter()
+                .any(|result| result.text.contains("chartreuse murre")),
+            "the repaired vector must be recallable without reopening; got {recalled:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_external_commit_during_loading_is_owed_and_converges_after_hydration(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        writer
+            .insert_conversation(
+                "user",
+                "loading baseline memory silver auk",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+
+        let (_registration, pause) =
+            routing_memory::register_routing_load_pause(temp.path().to_path_buf());
+        let reader = MemorySystem::new(config)?;
+        let reached = {
+            let pause = Arc::clone(&pause);
+            tokio::task::spawn_blocking(move || pause.wait_until_reached()).await?
+        };
+        assert!(
+            reached,
+            "background hydration must reach its read snapshot pause"
+        );
+        assert!(
+            matches!(reader.hydration_status(), HydrationStatus::Loading { .. }),
+            "the reader must still report Loading while its one background snapshot is paused; status={:?}",
+            reader.hydration_status()
+        );
+        let loads_during_pause = reader.tree_load_count.load(Ordering::SeqCst);
+        let _ = reader.index_shape().await?;
+        assert_eq!(
+            reader.tree_load_count.load(Ordering::SeqCst),
+            loads_during_pause,
+            "a tree-backed operation during Loading must not launch a competing refresh"
+        );
+
+        writer
+            .insert_conversation(
+                "user",
+                "loading-race external commit golden shearwater",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+        pause.release();
+        reader.ensure_hydrated().await?;
+        let recalled = reader
+            .query_with_sources("loading-race external commit golden shearwater", Some(5))
+            .await?;
+        assert!(
+            recalled
+                .iter()
+                .any(|result| result.text.contains("golden shearwater")),
+            "the commit racing initial hydration must remain owed and become visible on the first guarded read after hydration; got {recalled:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_same_instance_insert_and_removal_do_not_self_reload() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let loads_before = memory.tree_load_count.load(Ordering::SeqCst);
+        memory
+            .insert_conversation(
+                "user",
+                "same-instance mutation marker crimson gannet",
+                Some("test"),
+                Some("local"),
+            )
+            .await?;
+        let hit = memory
+            .query_with_sources("same-instance mutation marker crimson gannet", Some(1))
+            .await?
+            .into_iter()
+            .next()
+            .context("same-instance insert must be immediately queryable")?;
+        assert!(memory.remove_memory(&hit.memory_id).await?);
+        assert!(
+            memory
+                .inspect_memory(&format!("node:{}", hit.node_id))
+                .await?
+                .is_none(),
+            "same-instance node inspection must stop resolving the removed routing point {}",
+            hit.node_id
+        );
+        assert_eq!(
+            memory.tree_load_count.load(Ordering::SeqCst),
+            loads_before,
+            "same-connection commits do not change PRAGMA data_version and must not trigger a full self-reload for insert, query, removal, or inspection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_stale_writer_keeps_installed_tree_and_token_then_recovers() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let writer = MemorySystem::new(config.clone())?;
+        let reader = MemorySystem::new(config.clone())?;
+        writer
+            .insert_conversation(
+                "user",
+                "stale-candidate committed memory emerald fulmar",
+                Some("test"),
+                Some("writer"),
+            )
+            .await?;
+
+        let installed_before = reader.tree.lock().await.size();
+        let token_before = reader.tree_data_version.load(Ordering::SeqCst);
+        let loads_before = reader.tree_load_count.load(Ordering::SeqCst);
+        let trigger = Connection::open(temp.path())?;
+        trigger.execute_batch(
+            "CREATE TRIGGER reject_stale_candidate_point BEFORE INSERT ON routing_points
+             BEGIN SELECT RAISE(FAIL, 'injected stale candidate failure'); END;",
+        )?;
+        let provenance = BrainConversationProvenance {
+            brain_id: "stale-candidate-brain".into(),
+            run_id: "stale-candidate-run".into(),
+            request_seq: 11,
+        };
+        let error = reader
+            .insert_brain_conversation(
+                "assistant",
+                "failed stale candidate mutation sapphire skua",
+                Some("test"),
+                Some("reader"),
+                &provenance,
+            )
+            .await
+            .expect_err("the real SQLite trigger must abort the stale candidate write");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("injected stale candidate failure"),
+            "the write must report the trigger failure that caused rollback; got {error:#}"
+        );
+        assert_eq!(
+            reader.tree.lock().await.size(),
+            installed_before,
+            "a stale candidate that fails to commit must never replace the previously installed tree"
+        );
+        assert_eq!(
+            reader.tree_data_version.load(Ordering::SeqCst),
+            token_before,
+            "a stale candidate that fails to commit must leave the old token unchanged"
+        );
+        assert_eq!(
+            reader.tree_load_count.load(Ordering::SeqCst),
+            loads_before + 1,
+            "the failed stale write may build exactly one private candidate but must not run the live-tree recovery reload"
+        );
+        let durable_after_failure: (i64, i64) = trigger.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM routing_points),
+                 (SELECT COUNT(*) FROM memory_sources WHERE node_id IS NOT NULL)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            durable_after_failure,
+            (1, 1),
+            "SQLite rollback must leave neither the failed point nor its provenance durable"
+        );
+
+        trigger.execute_batch("DROP TRIGGER reject_stale_candidate_point;")?;
+        let refreshed = reader
+            .query_with_sources("stale-candidate committed memory emerald fulmar", Some(5))
+            .await?;
+        assert!(
+            refreshed
+                .iter()
+                .any(|result| result.text.contains("emerald fulmar")),
+            "after trigger repair, the next guarded operation must retry the old token and install the external commit; got {refreshed:?}"
+        );
+        assert!(
+            reader
+                .insert_brain_conversation(
+                    "assistant",
+                    "failed stale candidate mutation sapphire skua",
+                    Some("test"),
+                    Some("reader"),
+                    &provenance,
+                )
+                .await?,
+            "retrying the same named-Brain turn must report work because it reuses and projects the pending raw row after repair"
+        );
+
+        let reopened = MemorySystem::new(config)?;
+        reopened.ensure_hydrated().await?;
+        let durable = reopened.stats().await?;
+        assert_eq!(
+            durable.tree_node_count, 2,
+            "a fresh connection must load both the external point and the successfully retried point; stats={durable:?}"
+        );
+        let conn = Connection::open(temp.path())?;
+        let durable_counts: (i64, i64, i64) = conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM routing_points),
+                 (SELECT COUNT(*) FROM memory_sources WHERE node_id IS NOT NULL),
+                 (SELECT COUNT(DISTINCT node_id) FROM memory_sources WHERE node_id IS NOT NULL)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            durable_counts,
+            (2, 2, 2),
+            "recovery must preserve two unique points and two distinct provenance mappings"
+        );
+        let external = reopened
+            .query_with_sources("emerald fulmar", Some(2))
+            .await?;
+        let external_hit = external
+            .iter()
+            .find(|result| result.text.contains("emerald fulmar"))
+            .with_context(|| {
+                format!(
+                    "the reopened store must recall the external writer marker; got {external:?}"
+                )
+            })?;
+        let external_source = external_hit
+            .source
+            .as_ref()
+            .context("the external writer marker must retain its conversation identity")?;
+        assert_eq!(
+            (
+                external_source.session_id.as_deref(),
+                external_source.brain_id.as_deref(),
+                external_source.run_id.as_deref(),
+                external_source.request_seq,
+            ),
+            (Some("writer"), None, None, None),
+            "the external marker must resolve to its original non-Brain conversation provenance; source={external_source:?}"
+        );
+        let retried = reopened
+            .query_with_sources("sapphire skua", Some(2))
+            .await?;
+        let retried_hit = retried
+            .iter()
+            .find(|result| result.text.contains("sapphire skua"))
+            .with_context(|| {
+                format!("the reopened store must recall the repaired retry marker; got {retried:?}")
+            })?;
+        let retried_source = retried_hit
+            .source
+            .as_ref()
+            .context("the repaired retry marker must retain named-Brain provenance")?;
+        assert_eq!(
+            (
+                retried_source.brain_id.as_deref(),
+                retried_source.run_id.as_deref(),
+                retried_source.request_seq,
+            ),
+            (
+                Some("stale-candidate-brain"),
+                Some("stale-candidate-run"),
+                Some(11),
+            ),
+            "the repaired retry must resolve to its exact named-Brain identity; source={retried_source:?}"
         );
         Ok(())
     }

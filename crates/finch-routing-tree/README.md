@@ -15,7 +15,10 @@ persistence codec; the caller owns everything around it:
 2. **Embeddings.** The caller embeds text into fixed-dimension vectors however it chooses and
    inserts the vectors; the tree knows nothing about text.
 3. **Lifecycle.** Background hydration, partial reads, and degradation policy are the caller's
-   storage discipline; `load_routing_tree` is one atomic all-or-nothing rebuild.
+   storage discipline; `load_routing_tree` is one atomic all-or-nothing rebuild from an explicit
+   SQLite read snapshot. A caller already inside a larger read or `BEGIN IMMEDIATE` write
+   transaction uses `load_routing_tree_within` so refresh, mutation derivation, and persistence
+   share that caller-owned snapshot without a nested transaction.
 
 [finch-memory](../finch-memory/README.md) is the sole in-repo caller today: its `RoutingMemTree`
 facade wraps this tree as the sole routing mechanism behind `MemorySystem`. The same shape serves

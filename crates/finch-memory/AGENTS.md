@@ -109,11 +109,44 @@ modules, including `memory_status`, are private.
   other disclosed regression of the port — the iterative parent-pointer walks in
   `RoutingTree::remove_point`'s downdate using `.expect()` on a missing parent — moved with the
   mechanism and is now **fixed**; see the [routing-tree capsule](../finch-routing-tree/AGENTS.md).
+- **Live cross-session routing coherence (issue #1177):** every `MemorySystem` records the
+  `PRAGMA data_version` sampled on its own SQLite connection immediately before the snapshot that
+  produced its installed `RoutingMemTree`. Tree-backed reads (`query_with_sources` and wrappers,
+  node-form inspection, stats/index shape, removal, and conversation summary) lazily compare that
+  same-connection equality token. An external commit completed before the guarded read snapshot is
+  included; a commit concurrent with or after that snapshot stays owed to the following guarded
+  operation. Initial `Loading` never launches a competing reload. A complete replacement tree is
+  swapped in only after its one-transaction load succeeds, and a malformed external commit leaves
+  both the prior tree and prior token intact so an external repair is retried. Because
+  `data_version` is database-wide, an external commit to an unrelated table can conservatively
+  cause a full routing reload; this is the accepted cost of avoiding a schema or polling task.
+  `test_cross_session_commit_is_visible_to_the_next_tree_read_without_reopen`,
+  `test_cross_session_removal_is_visible_to_recall_and_node_inspection`,
+  `test_refresh_installs_one_snapshot_then_converges_after_a_bracketing_commit`,
+  `test_malformed_external_state_fails_closed_and_recovers_after_repair`,
+  `test_malformed_external_vector_refresh_preserves_old_tree_and_recovers_after_repair`, and
+  `test_external_commit_during_loading_is_owed_and_converges_after_hydration` in `src/lib.rs`
+  exercise the real WAL boundary with independently opened systems.
+- **Cross-process routing mutations derive under one writer fence (issue #1177):** occurrence
+  insertion/projection and removal take the local `insert_lock`, acquire SQLite `BEGIN IMMEDIATE`,
+  and only then refresh a stale tree from that transaction snapshot, mutate, persist, and commit.
+  Named-Brain projection rechecks its canonical `memory_sources` provenance under that writer
+  fence before loading or mutating a stale candidate, so two independent frontends retrying the
+  same turn commit one conversation/point/occurrence/mapping; the loser is an explicit no-op and
+  does not advance its installed tree token.
+  A stale refresh is a private candidate until commit; rollback cannot install it or advance the
+  token. A mutation of the already-current installed tree retains the established reload-on-save-
+  failure recovery. Same-connection commits do not change `data_version`, so successful local
+  insert/removal stays immediately visible without a self-reload.
+  `test_concurrent_stale_writers_keep_both_distinct_points_and_provenance`,
+  `test_concurrent_duplicate_brain_retry_projects_exactly_once_under_writer_fence`,
+  `test_failed_stale_writer_keeps_installed_tree_and_token_then_recovers`, and
+  `test_same_instance_insert_and_removal_do_not_self_reload` in `src/lib.rs` pin these guarantees.
 - **`MemorySystem::remove_memory` (issue #1329)** is the first production caller of
-  `RoutingTree::remove_point`, reached through `RoutingMemTree::remove` (`src/routing_memory.rs`),
-  which is no longer `pub(crate)`-only-and-unused: it now also persists the removal, since the
-  bare tree primitive has no `Connection` of its own. It downdates the in-memory tree, drops the
-  point from `meta`/`text_index`, then writes the changed node rows and the point's `removed` flag
+  `RoutingTree::remove_point`, reached through `RoutingMemTree::remove_within`
+  (`src/routing_memory.rs`) inside the fenced transaction `MemorySystem::remove_memory` owns. It
+  downdates the in-memory tree, drops the point from `meta`/`text_index`, then writes the changed
+  node rows and the point's `removed` flag
   inside ONE transaction (`write_dirty_nodes_within` + `mark_point_removed`, the same atomicity
   discipline `save_routing_occurrence` already uses for insertion) before marking the dirty set
   persisted — so a removal a caller observed as `Ok(true)` survives a restart, not just the
