@@ -3936,6 +3936,444 @@ async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
 }
 
 #[tokio::test]
+async fn denied_tool_turn_with_unchanged_checkpoint_completes_once_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("shared").unwrap();
+    let pending = store
+        .attach("shared", "driver@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    let requester = store
+        .activate_connection(
+            "shared",
+            pending.attachment_id,
+            pending.connection_id.unwrap(),
+        )
+        .unwrap();
+
+    let runtime = crate::runtime::ProgramRuntime::new();
+    let seed = runtime
+        .submit_typed_only(crate::runtime::ProgramSubmission {
+            language: finch_programs::ProgramLanguage::Forth,
+            source_id: Some("denial-checkpoint-seed".into()),
+            source: "41".into(),
+            intent: "seed the durable runner checkpoint".into(),
+            effect: finch_programs::ExecutionEffect::Pure,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(runtime.revision()),
+            budget: None,
+        })
+        .await
+        .unwrap();
+    let checkpoint = runtime
+        .revision_history()
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.revision == seed.output_revision)
+        .and_then(|snapshot| snapshot.checkpoint)
+        .unwrap();
+    let seed_program = store
+        .push(
+            "shared",
+            &requester.subject,
+            BrainEventKind::Program {
+                language: ProgramLanguage::Forth,
+                source: "41".into(),
+            },
+        )
+        .unwrap();
+    let seed_run = store
+        .start_run(
+            "shared",
+            &requester.subject,
+            crate::brain::BrainRunKind::Interactive,
+            seed_program.seq,
+            requester.attachment_id,
+            crate::brain::BrainRunStatus::Running,
+        )
+        .unwrap();
+    store
+        .commit_runner_runtime_for_run(
+            "shared",
+            seed_run.run_id,
+            seed_program.seq,
+            seed.output_revision,
+            checkpoint.clone(),
+        )
+        .unwrap();
+    store
+        .transition_run(
+            "shared",
+            "daemon",
+            seed_run.run_id,
+            crate::brain::BrainRunStatus::Completed,
+            None,
+        )
+        .unwrap();
+    let prompt = store
+        .push(
+            "shared",
+            &requester.subject,
+            BrainEventKind::Prompt {
+                text: "write a file".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap();
+    let run = store
+        .start_run(
+            "shared",
+            &requester.subject,
+            crate::brain::BrainRunKind::Interactive,
+            prompt.seq,
+            requester.attachment_id,
+            crate::brain::BrainRunStatus::Running,
+        )
+        .unwrap();
+    let lease = store
+        .acquire_runner_lease(
+            "shared",
+            "runner@box.local",
+            store.environment().generation,
+            None,
+            60_000,
+        )
+        .unwrap();
+    let runners = crate::server::BrainRunnerBroker::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runners.register("shared", lease.lease_id, tx);
+    let runner = tokio::spawn(async move {
+        let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+            panic!("expected full turn request")
+        };
+        let audience = request.approval_audience.clone();
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerTurnResult {
+                source: "(.\"The write was denied.\")".into(),
+                language: ProgramLanguage::Lisp,
+                output: "The write was denied.".into(),
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+                turn_events: vec![
+                    crate::server::RunnerTurnEvent::Call {
+                        tool_id: "write-1".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"path": "denied.html"}),
+                    },
+                    crate::server::RunnerTurnEvent::ApprovalRequested {
+                        approval_id: "write-1".into(),
+                        approval_kind: "tool".into(),
+                        subject: "write".into(),
+                        audience,
+                        detail: serde_json::json!({"path": "denied.html"}),
+                    },
+                    crate::server::RunnerTurnEvent::ApprovalDecided {
+                        approval_id: "write-1".into(),
+                        decision: serde_json::json!({"choice": "deny"}),
+                    },
+                    crate::server::RunnerTurnEvent::Result {
+                        tool_id: "write-1".into(),
+                        output: "Tool execution denied by user".into(),
+                        is_error: true,
+                    },
+                ],
+                runtime_revision: seed.output_revision,
+                checkpoint,
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            }))
+            .unwrap();
+    });
+
+    let result = dispatch_named_brain_run(&store, &runners, "shared", &run)
+        .await
+        .unwrap()
+        .expect("the denied tool turn must publish its user-facing result");
+    runner.await.unwrap();
+    match &result.kind {
+        BrainEventKind::Result { output, error, .. }
+            if output == "The write was denied." && error.is_none() => {}
+        other => panic!(
+            "the denial continuation must retain its successful user-facing result; result={other:?}"
+        ),
+    }
+
+    let assert_terminal_history = |snapshot: &BrainSnapshot| {
+        let lifecycle = snapshot
+            .events
+            .iter()
+            .filter(|event| event.run_id == Some(run.run_id))
+            .filter_map(|event| match &event.kind {
+                BrainEventKind::ToolCall { .. } => Some("tool_call"),
+                BrainEventKind::ApprovalRequested { .. } => Some("approval_requested"),
+                BrainEventKind::ApprovalDecided { decision, .. }
+                    if decision["choice"] == "deny" =>
+                {
+                    Some("approval_denied")
+                }
+                BrainEventKind::ToolResult { is_error: true, .. } => Some("tool_denied"),
+                BrainEventKind::Program { .. } => Some("program"),
+                BrainEventKind::RuntimeCommitted { .. } => Some("runtime_committed"),
+                BrainEventKind::Result { error: None, .. } => Some("result"),
+                BrainEventKind::RunStatusChanged {
+                    status: crate::brain::BrainRunStatus::Completed,
+                    ..
+                } => Some("completed"),
+                BrainEventKind::RunStatusChanged { status, .. } if status.is_terminal() => {
+                    Some("other_terminal")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle,
+            vec![
+                "tool_call",
+                "approval_requested",
+                "approval_denied",
+                "tool_denied",
+                "program",
+                "result",
+                "completed",
+            ],
+            "a denial continuation must not add a redundant runtime commit or a second terminal outcome; events={:?}",
+            snapshot.events
+        );
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == run.run_id)
+                .map(|candidate| candidate.status),
+            Some(crate::brain::BrainRunStatus::Completed),
+            "the denial continuation must remain completed; runs={:?}",
+            snapshot.runs
+        );
+    };
+    assert_terminal_history(&store.snapshot("shared").unwrap());
+    let durable_checkpoint = store.runner_checkpoint("shared").unwrap();
+    assert_eq!(durable_checkpoint.0, seed.output_revision);
+
+    drop(store);
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert_terminal_history(&restarted.snapshot("shared").unwrap());
+    assert_eq!(
+        restarted.runner_checkpoint("shared").unwrap().0,
+        seed.output_revision,
+        "restart must not invent a later durable runtime revision"
+    );
+}
+
+#[tokio::test]
+async fn conflicting_equal_revision_checkpoint_keeps_exact_error_across_restart() {
+    async fn checkpoint_for(source: &str) -> (u64, crate::vm::TypedRuntimeCheckpoint) {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: finch_programs::ProgramLanguage::Forth,
+                source_id: Some(format!("checkpoint-conflict:{source}")),
+                source: source.into(),
+                intent: "build a checkpoint conflict fixture".into(),
+                effect: finch_programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == outcome.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+        (outcome.output_revision, checkpoint)
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let pending = store
+        .attach("shared", "driver@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    let requester = store
+        .activate_connection(
+            "shared",
+            pending.attachment_id,
+            pending.connection_id.unwrap(),
+        )
+        .unwrap();
+    let (revision, durable_checkpoint) = checkpoint_for("41").await;
+    let (conflicting_revision, conflicting_checkpoint) = checkpoint_for("42").await;
+    assert_eq!(revision, conflicting_revision);
+    let seed_program = store
+        .push(
+            "shared",
+            &requester.subject,
+            BrainEventKind::Program {
+                language: ProgramLanguage::Forth,
+                source: "41".into(),
+            },
+        )
+        .unwrap();
+    let seed_run = store
+        .start_run(
+            "shared",
+            &requester.subject,
+            crate::brain::BrainRunKind::Interactive,
+            seed_program.seq,
+            requester.attachment_id,
+            crate::brain::BrainRunStatus::Running,
+        )
+        .unwrap();
+    store
+        .commit_runner_runtime_for_run(
+            "shared",
+            seed_run.run_id,
+            seed_program.seq,
+            revision,
+            durable_checkpoint,
+        )
+        .unwrap();
+    store
+        .transition_run(
+            "shared",
+            "daemon",
+            seed_run.run_id,
+            crate::brain::BrainRunStatus::Completed,
+            None,
+        )
+        .unwrap();
+
+    let prompt = store
+        .push(
+            "shared",
+            &requester.subject,
+            BrainEventKind::Prompt {
+                text: "return conflicting state".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap();
+    let run = store
+        .start_run(
+            "shared",
+            &requester.subject,
+            crate::brain::BrainRunKind::Interactive,
+            prompt.seq,
+            requester.attachment_id,
+            crate::brain::BrainRunStatus::Running,
+        )
+        .unwrap();
+    let lease = store
+        .acquire_runner_lease(
+            "shared",
+            "runner@box.local",
+            store.environment().generation,
+            None,
+            60_000,
+        )
+        .unwrap();
+    let runners = crate::server::BrainRunnerBroker::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runners.register("shared", lease.lease_id, tx);
+    let runner = tokio::spawn(async move {
+        let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+            panic!("expected full turn request")
+        };
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerTurnResult {
+                source: "42".into(),
+                language: ProgramLanguage::Forth,
+                output: "42".into(),
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+                turn_events: Vec::new(),
+                runtime_revision: conflicting_revision,
+                checkpoint: conflicting_checkpoint,
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            }))
+            .unwrap();
+    });
+
+    let result = dispatch_named_brain_run(&store, &runners, "shared", &run)
+        .await
+        .unwrap()
+        .expect("checkpoint conflict must publish a durable error result");
+    runner.await.unwrap();
+    let expected = format!(
+        "runner checkpoint revision {revision} conflicts with the durable checkpoint at the same revision"
+    );
+    assert!(
+        matches!(
+            &result.kind,
+            BrainEventKind::Result {
+                error: Some(error),
+                ..
+            } if error == &expected
+        ),
+        "checkpoint conflict must retain the exact diagnostic; result={:?}",
+        result.kind
+    );
+    let assert_failed_once = |snapshot: &BrainSnapshot| {
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == run.run_id)
+                .map(|candidate| (&candidate.status, candidate.detail.as_deref())),
+            Some((
+                &crate::brain::BrainRunStatus::Failed,
+                Some(expected.as_str())
+            )),
+            "checkpoint conflict must remain a precisely diagnosed failed run; runs={:?}",
+            snapshot.runs
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(run.run_id)
+                        && matches!(
+                            event.kind,
+                            BrainEventKind::RunStatusChanged { ref status, .. }
+                                if status.is_terminal()
+                        )
+                })
+                .count(),
+            1,
+            "checkpoint conflict must have exactly one terminal state; events={:?}",
+            snapshot.events
+        );
+        assert!(
+            snapshot.events.iter().any(|event| {
+                event.run_id == Some(run.run_id)
+                    && matches!(
+                        &event.kind,
+                        BrainEventKind::Result {
+                            error: Some(error),
+                            ..
+                        } if error == &expected
+                    )
+            }),
+            "checkpoint conflict diagnostic must remain durable; events={:?}",
+            snapshot.events
+        );
+    };
+    assert_failed_once(&store.snapshot("shared").unwrap());
+
+    drop(store);
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert_failed_once(&restarted.snapshot("shared").unwrap());
+}
+
+#[tokio::test]
 async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));

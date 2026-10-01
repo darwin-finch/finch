@@ -5569,8 +5569,33 @@ async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
         .and_then(|revision| revision.checkpoint)
         .unwrap();
     store
-        .commit_runner_runtime("brain", 1, outcome.output_revision, checkpoint)
+        .commit_runner_runtime("brain", 1, outcome.output_revision, checkpoint.clone())
         .unwrap();
+    let committed_events = store
+        .snapshot("brain")
+        .unwrap()
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }))
+        .count();
+    assert!(
+        store
+            .commit_runner_runtime("brain", 2, outcome.output_revision, checkpoint)
+            .unwrap()
+            .is_none(),
+        "the exact durable runner checkpoint must be an idempotent no-op"
+    );
+    assert_eq!(
+        store
+            .snapshot("brain")
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }))
+            .count(),
+        committed_events,
+        "an equivalent runner checkpoint must not append another RuntimeCommitted event"
+    );
 
     let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
     let restored = restarted.program_runtime("brain").unwrap();
@@ -5589,6 +5614,83 @@ async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
         .await
         .unwrap();
     assert_eq!(called.values, vec![finch_programs::ProgramValue::Int(42)]);
+}
+
+#[tokio::test]
+async fn named_brain_rejects_conflicting_runner_checkpoint_at_durable_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("brain").unwrap();
+
+    let checkpoint_for = |source: &'static str| async move {
+        let runtime = finch_runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(finch_runtime::ProgramSubmission {
+                language: finch_programs::ProgramLanguage::Forth,
+                source_id: Some(format!("runner:{source}")),
+                source: source.into(),
+                intent: "build a same-revision checkpoint fixture".into(),
+                effect: finch_programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|revision| revision.revision == outcome.output_revision)
+            .and_then(|revision| revision.checkpoint)
+            .unwrap();
+        (outcome.output_revision, checkpoint)
+    };
+    let (revision, durable) = checkpoint_for("41").await;
+    let (conflicting_revision, conflicting) = checkpoint_for("42").await;
+    assert_eq!(revision, conflicting_revision);
+    assert!(
+        store
+            .commit_runner_runtime("brain", 1, revision, durable.clone())
+            .unwrap()
+            .is_some(),
+        "the first runner checkpoint must append a durable event"
+    );
+
+    let stale_revision = revision.checked_sub(1).unwrap();
+    let stale = store
+        .commit_runner_runtime("brain", 2, stale_revision, durable)
+        .unwrap_err();
+    assert_eq!(
+        stale.to_string(),
+        format!(
+            "runner checkpoint revision {stale_revision} does not advance durable revision {revision}"
+        ),
+        "the idempotent equality path must not weaken stale-checkpoint rejection"
+    );
+
+    let error = store
+        .commit_runner_runtime("brain", 3, conflicting_revision, conflicting)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "runner checkpoint revision {revision} conflicts with the durable checkpoint at the same revision"
+        ),
+        "same-revision checkpoint conflicts must retain the exact reconciliation diagnostic"
+    );
+    assert_eq!(
+        store
+            .snapshot("brain")
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }))
+            .count(),
+        1,
+        "a conflicting equal-revision checkpoint must not mutate durable history"
+    );
 }
 
 #[tokio::test]

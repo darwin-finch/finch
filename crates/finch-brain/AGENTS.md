@@ -103,6 +103,18 @@ callers use the `crate::brain` compatibility path, while direct dependents use `
 - Keep checkpoint, effect-delivery log, and Brain journal roles separate. Preserve idempotent
   receipt and terminalization behavior through disconnect, retry, and restart. Storage layout,
   credential verification, and wire compatibility are not facade-cleanup opportunities.
+- **An unchanged runner checkpoint is an idempotent no-op, not durable progress (#1443).**
+  `BrainStore::commit_runner_runtime_inner` compares both the returned runtime revision and the
+  canonical encoded checkpoint hash with the current durable checkpoint. A lower revision remains
+  stale; an equal revision with different bytes is a conflict; only an exact revision-and-hash
+  match returns `Ok(None)` without appending `RuntimeCommitted`. Appending the duplicate would
+  increment `runtime_commit_count` during projection and invent a later durable revision on replay.
+  `named_brain_commits_a_validated_frontend_runner_checkpoint` and
+  `named_brain_rejects_conflicting_runner_checkpoint_at_durable_revision` in
+  `src/store/tests.rs` pin the store contract; the root server tests
+  `denied_tool_turn_with_unchanged_checkpoint_completes_once_across_restart` and
+  `conflicting_equal_revision_checkpoint_keeps_exact_error_across_restart` exercise terminal
+  publication and restart at the production dispatch boundary.
 - **`BrainEventKind::ContextCompacted` (schema v16, #1265) is durable journal scaffolding with no
   producer yet** — a marker that local-model conversation history up through `covers_through` was
   compacted into a `ContextCompactionTier` (`Verbatim` / `LightlyCompressed` / `Gist`; provisional
