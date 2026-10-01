@@ -21,12 +21,127 @@
 
 use anyhow::{Context, Result};
 use finch_routing_tree::{
-    load_routing_tree, mark_point_removed, write_dirty_nodes_within, AdaptiveTopKResult,
+    load_routing_tree_within, mark_point_removed, write_dirty_nodes_within, AdaptiveTopKResult,
     RoutingConfig, RoutingTree,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RoutingLoadPause {
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl RoutingLoadPause {
+    fn pause(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    pub(crate) fn wait_until_reached(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| !state.0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+static ROUTING_LOAD_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<RoutingLoadPause>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct RoutingLoadPauseRegistration {
+    path: std::path::PathBuf,
+    pause: std::sync::Arc<RoutingLoadPause>,
+}
+
+#[cfg(test)]
+impl Drop for RoutingLoadPauseRegistration {
+    fn drop(&mut self) {
+        let mut pauses = ROUTING_LOAD_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pauses
+            .get(&self.path)
+            .is_some_and(|pause| std::sync::Arc::ptr_eq(pause, &self.pause))
+        {
+            pauses.remove(&self.path);
+        }
+        self.pause.release();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_routing_load_pause(
+    path: std::path::PathBuf,
+) -> (
+    RoutingLoadPauseRegistration,
+    std::sync::Arc<RoutingLoadPause>,
+) {
+    let pause = std::sync::Arc::new(RoutingLoadPause::default());
+    let mut pauses = ROUTING_LOAD_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses
+            .insert(path.clone(), std::sync::Arc::clone(&pause))
+            .is_none(),
+        "a routing load pause is already registered for {}",
+        path.display()
+    );
+    drop(pauses);
+    (
+        RoutingLoadPauseRegistration {
+            path,
+            pause: std::sync::Arc::clone(&pause),
+        },
+        pause,
+    )
+}
+
+#[cfg(test)]
+fn pause_after_routing_rows(conn: &Connection) {
+    let Some(path) = conn.path().map(std::path::PathBuf::from) else {
+        return;
+    };
+    let pause = ROUTING_LOAD_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&path);
+    if let Some(pause) = pause {
+        pause.pause();
+    }
+}
 
 /// Two retrieval candidates are a near-tie when their cosine scores differ by no more than this:
 /// close enough that raw ranking order between them is noise from `RoutingTree`'s float-precision
@@ -199,10 +314,10 @@ impl RoutingMemTree {
         }
     }
 
-    /// Rebuild from durable rows via `finch_routing_tree::load_routing_tree`. `created_at`
-    /// is not tracked by that function's own metadata tuple (text, importance only), so it is
-    /// re-read here directly -- a second, small query rather than widening that function's return
-    /// shape for one caller's own bookkeeping need.
+    /// Rebuild from durable rows through one explicit SQLite read transaction. `created_at` is not
+    /// tracked by the routing loader's own metadata tuple (text, importance only), so it is re-read
+    /// here directly inside that same snapshot rather than widening the loader's return shape for
+    /// one caller's own bookkeeping need.
     ///
     /// Disclosed narrowing: `text_index` is rebuilt here from every persisted point
     /// indiscriminately, including ones originally created through
@@ -214,7 +329,28 @@ impl RoutingMemTree {
     /// on both sides of a reload. Adding provenance tracking to fully close this gap was judged
     /// out of scope for the tie-break/dedup-removal work that introduced it.
     pub(crate) fn load(conn: &Connection, dim: usize) -> Result<Self> {
-        let (tree, points) = load_routing_tree(conn, RoutingConfig::default(), dim, FIXED_SEED)?;
+        let tx = conn
+            .unchecked_transaction()
+            .context("RoutingMemTree::load: begin read snapshot")?;
+        let loaded = Self::load_within(&tx, dim)?;
+        tx.commit()
+            .context("RoutingMemTree::load: commit read snapshot")?;
+        Ok(loaded)
+    }
+
+    pub(crate) fn load_within(conn: &Connection, dim: usize) -> Result<Self> {
+        let (tree, points) =
+            load_routing_tree_within(conn, RoutingConfig::default(), dim, FIXED_SEED)?;
+        #[cfg(test)]
+        pause_after_routing_rows(conn);
+        Self::from_loaded(conn, tree, points)
+    }
+
+    fn from_loaded(
+        conn: &Connection,
+        tree: RoutingTree,
+        points: Vec<(usize, String, u8)>,
+    ) -> Result<Self> {
         let mut meta = HashMap::with_capacity(points.len());
         let mut text_index = HashMap::with_capacity(points.len());
         for (point_id, text, importance) in points {
@@ -581,7 +717,7 @@ impl RoutingMemTree {
     /// `None` -- the documented "can't benefit from tie-breaking" case, not an error -- when this
     /// point has no `routing_occurrences` row at all (never inserted via `insert_occurrence`),
     /// when its occurrence has neither `prev_uuid` nor `next_uuid` set (first or last turn of its
-    /// chain), or when every linked neighbor's point has since been [`Self::remove`]d.
+    /// chain), or when every linked neighbor's point has since been removed.
     fn neighbor_context_score(
         &self,
         conn: &Connection,
@@ -644,34 +780,23 @@ impl RoutingMemTree {
             .map(|(&pid, m)| (pid, m, self.tree.embedding_of(pid as usize)))
     }
 
-    /// Removes a point from the routing index -- in-memory tree structure AND its durable rows --
-    /// so it can never be found by `retrieve`/`get_point` again, in this process or after a
-    /// restart.
-    ///
-    /// Downdates `real_centroid`/`real_count` via [`RoutingTree::remove_point`] (see its own docs
-    /// for the disclosed parent-chain fragility this now fails closed on instead of panicking,
-    /// issue #1329), drops the in-memory metadata/text-index entries, then persists both the
-    /// changed node rows and the point's `removed` flag inside ONE transaction -- the same
-    /// atomicity discipline `save_routing_occurrence` already uses for insertion, so a caller
-    /// never observes a centroid downdate committed without its point actually being marked
-    /// removed on disk, or vice versa. Mirrors `RoutingTree::remove_point`'s own fail-closed
-    /// contract: an unknown or already-removed `point_id` returns a named `Err`, never a panic.
-    pub(crate) fn remove(&mut self, conn: &Connection, point_id: PointId) -> anyhow::Result<()> {
+    /// Mutate and persist a removal through the caller's existing writer transaction. The caller
+    /// owns commit/rollback and marks the returned dirty nodes persisted only after commit.
+    pub(crate) fn remove_within(
+        &mut self,
+        conn: &Connection,
+        point_id: PointId,
+    ) -> anyhow::Result<Vec<usize>> {
         self.tree.remove_point(point_id as usize)?;
         if let Some(m) = self.meta.remove(&point_id) {
             self.text_index.remove(&m.text);
         }
         let dirty = self.tree.dirty_node_ids();
-        let tx = conn
-            .unchecked_transaction()
-            .context("RoutingMemTree::remove: begin transaction")?;
-        write_dirty_nodes_within(&self.tree, &dirty, &tx)
-            .context("RoutingMemTree::remove: write dirty nodes")?;
-        mark_point_removed(&tx, point_id as usize)
-            .context("RoutingMemTree::remove: mark point removed")?;
-        tx.commit().context("RoutingMemTree::remove: commit")?;
-        self.tree.mark_persisted(&dirty);
-        Ok(())
+        write_dirty_nodes_within(&self.tree, &dirty, conn)
+            .context("RoutingMemTree::remove_within: write dirty nodes")?;
+        mark_point_removed(conn, point_id as usize)
+            .context("RoutingMemTree::remove_within: mark point removed")?;
+        Ok(dirty)
     }
 
     pub(crate) fn size(&self) -> usize {

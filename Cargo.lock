@@ -1934,6 +1934,7 @@ version = "0.7.31"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

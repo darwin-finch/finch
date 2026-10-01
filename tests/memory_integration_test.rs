@@ -133,7 +133,7 @@ async fn test_memory_stats() -> Result<()> {
     // bound on a leaf, so an unbounded chain of matches was the failure
     // mode). The structural invariant that still applies regardless of how
     // many leaves exist is a bounded depth.
-    let (leaves, depth, _widest) = memory.index_shape().await;
+    let (leaves, depth, _widest) = memory.index_shape().await?;
     assert!(leaves >= 1, "an index holding points has at least one leaf");
     assert!(
         depth <= 4,

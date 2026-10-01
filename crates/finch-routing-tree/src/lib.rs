@@ -19,7 +19,8 @@
 mod routing_tree;
 
 pub use routing_tree::persistence::{
-    load_routing_tree, mark_point_removed, save_dirty_nodes, save_point, write_dirty_nodes_within,
+    load_routing_tree, load_routing_tree_within, mark_point_removed, save_dirty_nodes, save_point,
+    write_dirty_nodes_within,
 };
 pub use routing_tree::{
     AdaptiveResult, AdaptiveTopKResult, BranchScorer, RoutingConfig, RoutingTree, TopKCandidate,
