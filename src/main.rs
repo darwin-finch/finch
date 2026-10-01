@@ -2,6 +2,7 @@
 // Main entry point
 
 use anyhow::{Context, Result};
+use clap::error::ContextValue;
 use clap::Parser;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -215,6 +216,52 @@ fn parse_nonblank_query(query: &str) -> std::result::Result<String, String> {
         return Err("query must contain at least one non-whitespace character".to_string());
     }
     Ok(query.to_string())
+}
+
+fn escape_cli_diagnostic_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            // Keep ESC unchanged so Clap's existing ANSI handling still strips
+            // complete escape sequences instead of making them printable.
+            '\u{001b}' => escaped.push(character),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:04x}}}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn exit_with_safe_cli_error(mut error: clap::Error) -> ! {
+    let sanitized_context = error
+        .context()
+        .filter_map(|(kind, value)| match value {
+            ContextValue::String(value) => Some((
+                kind,
+                ContextValue::String(escape_cli_diagnostic_controls(value)),
+            )),
+            ContextValue::Strings(values) => Some((
+                kind,
+                ContextValue::Strings(
+                    values
+                        .iter()
+                        .map(|value| escape_cli_diagnostic_controls(value))
+                        .collect(),
+                ),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (kind, value) in sanitized_context {
+        error.insert(kind, value);
+    }
+    error.exit()
 }
 
 #[derive(Parser, Debug)]
@@ -981,7 +1028,7 @@ async fn main() -> Result<()> {
     // Parse command-line arguments
     let mut args = {
         let _phase = finch::startup::phase(finch::startup::PHASE_ARGS);
-        Args::parse()
+        Args::try_parse().unwrap_or_else(|error| exit_with_safe_cli_error(error))
     };
     reject_retired_session_flags(&args)?;
     // `finch attach NAME` is the canonical REPL entry; take it so the
