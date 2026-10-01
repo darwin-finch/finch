@@ -16,6 +16,12 @@ impl EventLoop {
                             .context("Failed to send shutdown event")?;
                         return Ok(());
                     }
+                    Command::Clear => {
+                        self.conversation.write().await.clear();
+                        self.output_manager
+                            .write_info("Conversation history cleared. Starting fresh.");
+                        self.render_tui().await?;
+                    }
                     Command::Help => {
                         let help_text = format_help();
                         self.output_manager.write_info(help_text);

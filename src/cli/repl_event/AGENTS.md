@@ -138,6 +138,14 @@ existing four-line shape. Capability values are attested for the configured comp
 when a Brain or one-shot model overlay selects a different model, `/status` withholds those values
 and names both the selected overlay and configured model in a secret-free provenance diagnostic.
 
+**`/clear` and `/reset` clear the provider context, not only the visible transcript.** The active
+event-loop command path calls `ConversationHistory::clear`, which removes committed messages and
+provider-invisible staged tool rounds together before the next query is assembled, then confirms
+that the conversation is starting fresh. `test_clear_and_reset_commands_remove_committed_and_staged_provider_context`
+drives both spellings through `EventLoop::handle_user_input` and observes the next provider request;
+`test_unrelated_help_command_preserves_provider_context_and_staged_round` keeps unrelated slash
+commands non-destructive.
+
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was
 created or loaded in the durable store (`EventLoop::home_brain_registered`), or a visible

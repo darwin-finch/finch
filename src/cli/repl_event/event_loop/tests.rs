@@ -7238,6 +7238,164 @@ fn observe_llm_queries(
     observed_rx
 }
 
+async fn assert_clear_command_resets_provider_context(command: &str) {
+    use crate::cli::conversation::ToolRoundError;
+    use crate::providers::{ContentBlock, Message};
+
+    let (mut event_loop, output) = lifecycle_test_event_loop();
+    output.disable_stdout();
+    let query_id = uuid::Uuid::new_v4();
+    let round_token = {
+        let mut conversation = event_loop.conversation.write().await;
+        conversation.add_user_message("history before clear".to_string());
+        conversation.add_assistant_message("answer before clear".to_string());
+        conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_before_clear".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                },
+            )
+            .expect("the fixture must stage the provider-invisible tool round")
+    };
+    let mut observed_rx = observe_llm_queries(&mut event_loop);
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the advertised clear command must dispatch through the active event loop");
+
+    let mut conversation = event_loop.conversation.write().await;
+    assert!(
+        conversation.get_messages().is_empty(),
+        "{command} must remove every committed provider-visible message; messages={:?}",
+        conversation.get_messages()
+    );
+    assert_eq!(
+        conversation.record_tool_result(
+            query_id,
+            round_token,
+            "call_before_clear",
+            &Ok("stale result".to_string()),
+        ),
+        Err(ToolRoundError::NoActiveStage),
+        "{command} must remove provider-invisible staged tool rounds as part of the same conversation-owned clear boundary"
+    );
+    drop(conversation);
+
+    let transcript = output
+        .get_messages()
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    assert!(
+        transcript
+            .iter()
+            .any(|message| message.contains("Conversation history cleared. Starting fresh.")),
+        "{command} must visibly confirm the fresh context; transcript={transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .all(|message| !message.contains("recognized but not yet implemented")),
+        "{command} must never reach the generic command fallback; transcript={transcript:?}"
+    );
+
+    event_loop
+        .handle_user_input("fresh question".to_string())
+        .await
+        .expect("the first post-clear query must dispatch");
+    let (_, text, request_messages) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+            .await
+            .expect("the first post-clear provider request must not stall")
+            .expect("the provider request observer must remain open");
+    assert_eq!(
+        text, "fresh question",
+        "the provider request must carry the post-clear query, not prior text"
+    );
+    assert_eq!(
+        request_messages,
+        vec![Message::user("fresh question")],
+        "the first provider request after {command} must contain only the fresh user turn; request_messages={request_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_commands_remove_committed_and_staged_provider_context() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_command_resets_provider_context(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_unrelated_help_command_preserves_provider_context_and_staged_round() {
+    use crate::cli::conversation::ToolRoundProgress;
+    use crate::providers::{ContentBlock, Message};
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = uuid::Uuid::new_v4();
+            let round_token = {
+                let mut conversation = event_loop.conversation.write().await;
+                conversation.add_user_message("history before help".to_string());
+                conversation.add_assistant_message("answer before help".to_string());
+                conversation
+                    .stage_assistant(
+                        query_id,
+                        Message {
+                            role: "assistant".into(),
+                            content: vec![ContentBlock::ToolUse {
+                                id: "call_before_help".into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            }],
+                        },
+                    )
+                    .expect("the fixture must stage the provider-invisible tool round")
+            };
+
+            event_loop
+                .handle_user_input("/help".to_string())
+                .await
+                .expect("the unrelated help command must retain its existing dispatch");
+
+            let mut conversation = event_loop.conversation.write().await;
+            assert_eq!(
+                conversation.get_messages(),
+                vec![
+                    Message::user("history before help"),
+                    Message::assistant("answer before help"),
+                ],
+                "an unrelated slash command must not clear committed provider context"
+            );
+            assert_eq!(
+                conversation
+                    .record_tool_result(
+                        query_id,
+                        round_token,
+                        "call_before_help",
+                        &Ok("retained result".to_string()),
+                    )
+                    .expect("the unrelated command must preserve the staged round"),
+                ToolRoundProgress::Complete,
+                "the staged round must remain usable after an unrelated command"
+            );
+        })
+        .await;
+}
+
 async fn start_executing_tools_query(
     event_loop: &mut EventLoop,
     tool_id: &str,
