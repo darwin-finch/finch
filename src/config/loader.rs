@@ -2,7 +2,6 @@
 // Loads API key from ~/.finch/config.toml or environment variable
 
 use anyhow::{bail, Context, Result};
-use crossterm::style::Stylize as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,7 +91,7 @@ pub fn load_config() -> Result<Config> {
         • Model size selection based on your RAM\n\n\
         Alternatively, set environment variable:\n\
         export ANTHROPIC_API_KEY=\"sk-ant-...\"",
-        "finch setup".cyan().bold()
+        "finch setup"
     );
 }
 

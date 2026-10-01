@@ -853,6 +853,54 @@ fn test_ambient_provider_environment_is_removed_from_child() {
 }
 
 #[test]
+fn test_missing_configuration_guidance_is_plain_on_redirected_stderr() {
+    if !supervised_process_boundary_available("missing-configuration diagnostic") {
+        return;
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+    remove_ambient_provider_environment(&mut command);
+    command
+        .env("HOME", home.path())
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .args(["query", "show the missing configuration diagnostic"]);
+
+    let output = run_bounded_with_timeout(&mut command, std::time::Duration::from_secs(15));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.timed_out,
+        "missing-configuration Finch process did not terminate: status={} stdout={:?} stderr={stderr:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        !output.status.success(),
+        "missing-configuration Finch process unexpectedly succeeded: status={} stdout={:?} stderr={stderr:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "missing-configuration Finch process wrote to redirected stdout: status={} stdout={:?} stderr={stderr:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("finch setup"),
+        "missing-configuration stderr lost its actionable setup command: status={} stderr={stderr:?}",
+        output.status,
+    );
+    assert!(
+        !output.stderr.contains(&0x1b) && !output.stderr.contains(&0x9b),
+        "missing-configuration stderr contained ANSI styling control bytes despite redirected stderr, TERM=dumb, and NO_COLOR=1: status={} stderr_bytes={:?}",
+        output.status,
+        output.stderr,
+    );
+}
+
+#[test]
 fn test_hostile_codex_on_path_is_never_spawned_by_cli_boundaries() {
     if !supervised_process_boundary_available("external-provider binary boundaries") {
         return;
