@@ -157,6 +157,11 @@ never hold component rows: they register in `AccordionState::component_regions` 
 only. Unmigrated rows (non-say WorkUnit presentations — the open stage-2 scope) keep the maps
 and the legacy projection path.
 
+An opted-in generic-compatible turn may prepend a live `Provider reasoning` disclosure at semantic
+path `[2]`. It starts expanded while streaming, collapses on the WorkUnit's terminal transition,
+and can be reopened through the same mouse and keyboard disclosure routing. Its sanitized body is
+component-only: canonical commit reads `complete_transcript` and never receives it.
+
 `MemoryRecalledMessage` rides the same component-owned disclosure mechanism (#1235): each
 recalled-memory row's full text is collapsed behind its identity/summary line by default and
 expands on click, addressed by semantic path `[row index]` (one toggle target per row, unlike

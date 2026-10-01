@@ -56,9 +56,11 @@ pub fn random_spinner_verb() -> &'static str {
 
 use super::{
     AgentActivityView, AgentToolView, ComponentView, Message, MessageId, MessageStatus, OutputVm,
-    ProgramSourceVm, SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView,
-    WorkUnitHead, WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
+    ProgramSourceVm, ProviderReasoningView, SayTurnStatus, SayTurnView, WorkRowPresentation,
+    WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation, WorkUnitView,
+    WorkUnitViewModel,
 };
+use crate::reasoning::ReasoningSanitizer;
 use finch_diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use finch_theme::{ColorScheme, MessageBand};
 
@@ -95,6 +97,9 @@ const GRAY_DIM: GrayDim = GrayDim;
 /// `handle_say_turn_action`); narrowed from `pub`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ToggleProgram;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ToggleProviderReasoning;
 
 /// Opaque component-defined action. The engine never inspects the payload;
 /// the owning component downcasts it in its handle.
@@ -203,6 +208,16 @@ struct WorkUnitInner {
     /// the row on the pre-component projection path; renderer-side RowId-keyed
     /// state maps hold disclosure only for those unmigrated rows.
     say_vm: Option<WorkUnitViewModel>,
+    /// Private live-only facet. It is intentionally absent from response
+    /// text, WorkUnit domain snapshots, formatting, and canonical transcript.
+    provider_reasoning: Option<ProviderReasoningState>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderReasoningState {
+    sanitizer: ReasoningSanitizer,
+    expanded: bool,
+    terminal: bool,
 }
 
 // ============================================================================
@@ -263,6 +278,7 @@ impl WorkUnit {
                 as_assistant_prose: false,
                 host_lifecycle: false,
                 say_vm: None,
+                provider_reasoning: None,
             })),
         }
     }
@@ -424,6 +440,44 @@ impl WorkUnit {
         });
     }
 
+    /// Append one eligible normalized reasoning delta to private live state.
+    /// Terminalized facets reject late data and cannot reopen themselves.
+    pub fn append_provider_reasoning(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
+        let state = inner
+            .provider_reasoning
+            .get_or_insert_with(|| ProviderReasoningState {
+                sanitizer: ReasoningSanitizer::default(),
+                expanded: true,
+                terminal: false,
+            });
+        if state.terminal {
+            return;
+        }
+        state.sanitizer.push(text);
+    }
+
+    fn provider_reasoning_snapshot(&self) -> Option<ProviderReasoningView> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        inner.provider_reasoning.as_ref().and_then(|state| {
+            (!state.sanitizer.is_empty()).then(|| ProviderReasoningView {
+                lines: state.sanitizer.lines(),
+                expanded: state.expanded,
+                terminal: state.terminal,
+                word_count: state.sanitizer.word_count(),
+                elapsed: inner
+                    .elapsed_at_finish
+                    .unwrap_or_else(|| self.started_at.elapsed()),
+            })
+        })
+    }
+
     /// The component-owned ViewModel snapshot plus chrome timing, read under
     /// the message's own lock. `None` for rows that have not migrated to
     /// component-owned rendering; those keep the renderer's RowId-keyed
@@ -433,6 +487,17 @@ impl WorkUnit {
         Some(SayTurnView {
             message_id: self.id,
             vm: inner.say_vm.as_ref()?.clone(),
+            reasoning: inner.provider_reasoning.as_ref().and_then(|state| {
+                (!state.sanitizer.is_empty()).then(|| ProviderReasoningView {
+                    lines: state.sanitizer.lines(),
+                    expanded: state.expanded,
+                    terminal: state.terminal,
+                    word_count: state.sanitizer.word_count(),
+                    elapsed: inner
+                        .elapsed_at_finish
+                        .unwrap_or_else(|| self.started_at.elapsed()),
+                })
+            }),
             elapsed: inner
                 .elapsed_at_finish
                 .unwrap_or_else(|| self.started_at.elapsed()),
@@ -445,8 +510,9 @@ impl WorkUnit {
     /// rows are not targets. Rows without a ViewModel produce nothing.
     pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        inner.say_vm.as_ref()?;
-        if path == [1] {
+        if path == [2] && inner.provider_reasoning.is_some() {
+            Some(ComponentAction::new(ToggleProviderReasoning))
+        } else if path == [1] && inner.say_vm.is_some() {
             Some(ComponentAction::new(ToggleProgram))
         } else {
             None
@@ -458,6 +524,14 @@ impl WorkUnit {
     /// answer visible and adds/removes source beneath it. False for foreign
     /// actions or unmigrated rows.
     pub fn handle_say_turn_action(&self, action: &ComponentAction) -> bool {
+        if action.downcast_ref::<ToggleProviderReasoning>().is_some() {
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+            let Some(reasoning) = &mut inner.provider_reasoning else {
+                return false;
+            };
+            reasoning.expanded = !reasoning.expanded;
+            return true;
+        }
         if action.downcast_ref::<ToggleProgram>().is_none() {
             return false;
         }
@@ -863,6 +937,7 @@ impl WorkUnit {
         }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Complete;
+        terminalize_provider_reasoning(&mut inner);
         // The completion path owns the say card's status transition: exactly
         // once, guarded, so a settled turn cannot keep wearing `running`
         // (#820-class residue is impossible by construction here).
@@ -887,6 +962,7 @@ impl WorkUnit {
         }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
+        terminalize_provider_reasoning(&mut inner);
     }
 }
 
@@ -903,6 +979,18 @@ fn finish_requested_terminal(inner: &mut WorkUnitInner, elapsed: std::time::Dura
     };
     inner.elapsed_at_finish = Some(elapsed);
     inner.status = status;
+    terminalize_provider_reasoning(inner);
+}
+
+fn terminalize_provider_reasoning(inner: &mut WorkUnitInner) {
+    let Some(reasoning) = &mut inner.provider_reasoning else {
+        return;
+    };
+    if reasoning.terminal {
+        return;
+    }
+    reasoning.terminal = true;
+    reasoning.expanded = false;
 }
 
 // ============================================================================
@@ -1138,6 +1226,10 @@ impl Message for WorkUnit {
     /// pairing helper and the disclosure-direction read.
     fn component_view(&self) -> Option<ComponentView> {
         self.say_turn_snapshot().map(ComponentView::Say)
+    }
+
+    fn provider_reasoning_view(&self) -> Option<ProviderReasoningView> {
+        self.provider_reasoning_snapshot()
     }
 
     fn transcript_action(&self, path: &[u32]) -> Option<ComponentAction> {
@@ -3094,5 +3186,82 @@ mod tests {
         let inner = wu.inner.read().unwrap();
         assert_eq!(inner.token_count, 16); // 8 threads × 2 tokens
         assert_eq!(inner.rows.len(), 8);
+    }
+
+    #[test]
+    fn test_provider_reasoning_is_live_only_then_collapses_and_rejects_late_delta() {
+        let wu = WorkUnit::new("Calculating");
+        wu.append_provider_reasoning("first private thought\nsecond thought");
+
+        let live_reasoning = wu.provider_reasoning_view().expect("reasoning facet");
+        assert!(live_reasoning.expanded && !live_reasoning.terminal);
+        assert_eq!(
+            live_reasoning.lines,
+            ["first private thought", "second thought"]
+        );
+        assert_eq!(wu.content(), "", "reasoning must not enter response text");
+        assert!(
+            !wu.format(&colors()).contains("private thought")
+                && !wu
+                    .complete_transcript(&colors())
+                    .contains("private thought")
+                && !format!("{:?}", wu.work_unit_view(&colors())).contains("private thought"),
+            "reasoning leaked through a canonical/domain projection"
+        );
+
+        wu.set_complete();
+        wu.set_complete();
+        wu.append_provider_reasoning(" late secret");
+        let done = wu
+            .provider_reasoning_view()
+            .expect("terminal reasoning facet");
+        assert!(done.terminal && !done.expanded);
+        assert_eq!(done.word_count, 5);
+        assert!(!done.lines.join("\n").contains("late secret"));
+
+        let action = wu
+            .say_turn_action(&[2])
+            .expect("stable reasoning disclosure target");
+        assert!(wu.handle_say_turn_action(&action));
+        assert!(
+            wu.provider_reasoning_view()
+                .expect("reopened facet")
+                .expanded
+        );
+        assert!(
+            wu.say_turn_action(&[1]).is_none(),
+            "[1] stays reserved for program disclosure"
+        );
+
+        let already_complete = WorkUnit::new("Calculating");
+        already_complete.set_complete();
+        already_complete.append_provider_reasoning("first delta arrived late");
+        assert!(
+            already_complete.provider_reasoning_view().is_none(),
+            "a first reasoning delta arriving after terminalization must also be rejected"
+        );
+    }
+
+    #[test]
+    fn test_provider_reasoning_fresh_attach_and_failed_terminal_have_no_leak() {
+        let id = MessageId::new();
+        let original = WorkUnit::with_id(id, "Calculating");
+        original.append_provider_reasoning("process-local secret");
+        original.set_failed();
+        assert!(
+            original
+                .provider_reasoning_view()
+                .expect("failed reasoning")
+                .terminal
+        );
+
+        let fresh = WorkUnit::with_id(id, "Calculating");
+        assert!(
+            fresh.provider_reasoning_view().is_none(),
+            "a fresh attach must not reconstruct process-local reasoning"
+        );
+        assert!(!fresh
+            .complete_transcript(&colors())
+            .contains("process-local secret"));
     }
 }

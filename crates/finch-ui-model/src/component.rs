@@ -555,6 +555,7 @@ mod tests {
                 }),
                 show_program: false,
             },
+            reasoning: None,
             elapsed: std::time::Duration::from_millis(2350),
         };
         let via_component = component_lines(&ComponentView::Say(view.clone()), &PALETTE);
@@ -590,6 +591,7 @@ mod tests {
                 }),
                 show_program: false,
             },
+            reasoning: None,
             elapsed: std::time::Duration::from_millis(2350),
         };
         const CARD: u16 = 9;

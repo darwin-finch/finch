@@ -114,6 +114,7 @@ impl EventLoop {
                 output: output_manager,
                 status_bar,
                 streaming_enabled: false,
+                display_model_reasoning: false,
                 mention_port,
             },
             ToolParts {
@@ -253,6 +254,7 @@ impl EventLoop {
                 output: output_manager,
                 status_bar,
                 streaming_enabled: true,
+                display_model_reasoning: false,
                 mention_port,
             },
             ToolParts {

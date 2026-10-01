@@ -28,6 +28,7 @@ fn say_view(show_program: bool) -> SayTurnView {
             }),
             show_program,
         },
+        reasoning: None,
         elapsed: std::time::Duration::from_millis(2350),
     }
 }

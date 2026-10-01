@@ -25,7 +25,8 @@ pub use component::{
     StaticTextView,
 };
 pub use say_turn::{
-    say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
+    provider_reasoning_lines, say_turn_lines, OutputVm, ProgramSourceVm, ProviderReasoningView,
+    SayTurnStatus, SayTurnView, WorkUnitViewModel,
 };
 pub use span::{spans_text, Span, SpanColor, SpanStyle};
 pub use work_unit::{

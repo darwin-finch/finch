@@ -22,6 +22,11 @@ pub struct FeaturesConfig {
     #[serde(default = "default_true")]
     pub streaming_enabled: bool,
 
+    /// Show sanitized reasoning emitted by configured generic compatible
+    /// providers in the local live transcript. Never changes requests.
+    #[serde(default)]
+    pub display_model_reasoning: bool,
+
     /// Enable debug logging for troubleshooting
     #[serde(default)]
     pub debug_logging: bool,
@@ -106,6 +111,7 @@ impl Default for FeaturesConfig {
         Self {
             auto_approve_tools: false,
             streaming_enabled: true,
+            display_model_reasoning: false,
             debug_logging: false,
             memory_context_lines: 5,
             max_verbatim_messages: 20,
@@ -1135,6 +1141,10 @@ mod tests {
             "auto_approve_tools must default to false"
         );
         assert!(f.streaming_enabled, "streaming should be on by default");
+        assert!(
+            !f.display_model_reasoning,
+            "provider reasoning display must require explicit local opt-in"
+        );
         assert!(!f.debug_logging, "debug logging should be off by default");
         assert!(
             !f.auto_compact_enabled,
@@ -1162,6 +1172,10 @@ mod tests {
         let decoded: FeaturesConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.auto_approve_tools, original.auto_approve_tools);
         assert_eq!(decoded.streaming_enabled, original.streaming_enabled);
+        assert_eq!(
+            decoded.display_model_reasoning,
+            original.display_model_reasoning
+        );
         assert_eq!(decoded.debug_logging, original.debug_logging);
     }
 
@@ -1190,6 +1204,21 @@ mod tests {
         let json = r#"{"auto_approve_tools": false, "debug_logging": false}"#;
         let f: FeaturesConfig = serde_json::from_str(json).unwrap();
         assert!(f.streaming_enabled);
+        assert!(
+            !f.display_model_reasoning,
+            "an absent reasoning-display key must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_features_config_reasoning_display_round_trips_only_when_opted_in() {
+        let original = FeaturesConfig {
+            display_model_reasoning: true,
+            ..FeaturesConfig::default()
+        };
+        let encoded = toml::to_string(&original).expect("encode feature config");
+        let decoded: FeaturesConfig = toml::from_str(&encoded).expect("decode feature config");
+        assert!(decoded.display_model_reasoning);
     }
 
     #[test]

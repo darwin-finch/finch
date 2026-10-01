@@ -58,6 +58,11 @@ replay remains authoritative for durable state.
 named-Brain Interactive run. It may retain program, tool, approval, and terminal child rows, but
 its root is assistant conversation and must never expose the run UUID as presentation text.
 
+Generic-compatible provider reasoning is a separate private WorkUnit facet used only by the live
+renderer snapshot. It is sanitized and bounded before retention and is structurally absent from
+`response_text`, `content`, WorkUnit domain snapshots, `format`, and `complete_transcript`; terminal
+outcomes collapse it once and reject late deltas. Fresh replay therefore reconstructs no body.
+
 **Extension rules:** add a concrete message only for a real application producer and renderer
 need. Keep pure snapshot-to-widget conversion in `finch-ui-model`; do not put terminal I/O or
 provider dispatch here. Child modules stay private; add a flat re-export only when an actual

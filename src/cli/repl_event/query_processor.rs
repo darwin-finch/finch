@@ -83,12 +83,32 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
-fn record_reasoning_activity(work_unit: &crate::cli::messages::WorkUnit, text: &str) {
+fn record_reasoning_activity(
+    work_unit: &crate::cli::messages::WorkUnit,
+    text: &str,
+    provenance: &crate::providers::EventProvenance,
+    display_reasoning: bool,
+) {
     // Provider adapters emit reasoning on a distinct stream variant. Count it
     // as live provider activity so a reasoning model does not remain stuck on
     // the pre-token "thinking" state, but do not mix private reasoning into
     // visible wire source or conversation.
     work_unit.add_tokens(text);
+    if display_reasoning && provenance.opaque_replay.is_none() && !text.trim().is_empty() {
+        work_unit.append_provider_reasoning(text);
+    }
+}
+
+fn generic_compatible_reasoning_enabled(
+    display_model_reasoning: bool,
+    generator: &dyn Generator,
+    providers: &[crate::config::ProviderEntry],
+) -> bool {
+    display_model_reasoning
+        && providers.iter().any(|entry| {
+            matches!(entry, crate::config::ProviderEntry::OpenAiCompatible { .. })
+                && entry.profile_name() == generator.name()
+        })
 }
 
 /// Strip stray Markdown inline-code backtick(s) from a provider wire response
@@ -1632,6 +1652,8 @@ pub(crate) async fn process_query_with_tools(
     max_verbatim: usize,
     recall_k: usize,
     streaming_enabled: bool,
+    display_model_reasoning: bool,
+    available_providers: Vec<crate::config::ProviderEntry>,
     enable_summarization: bool,
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
@@ -1854,6 +1876,11 @@ pub(crate) async fn process_query_with_tools(
         msgs
     };
     let caps = generator.capabilities();
+    let display_reasoning = generic_compatible_reasoning_enabled(
+        display_model_reasoning,
+        generator.as_ref(),
+        &available_providers,
+    );
 
     // Create the WorkUnit for this generation turn BEFORE attempting either
     // the streaming or non-streaming path below, and share it between both.
@@ -1982,8 +2009,13 @@ pub(crate) async fn process_query_with_tools(
                                 work_unit.set_response(&text);
                             }
                         }
-                        Ok(StreamChunk::ThinkingDelta { text, .. }) => {
-                            record_reasoning_activity(work_unit.as_ref(), &text);
+                        Ok(StreamChunk::ThinkingDelta { text, provenance }) => {
+                            record_reasoning_activity(
+                                work_unit.as_ref(),
+                                &text,
+                                &provenance,
+                                display_reasoning,
+                            );
                         }
                         Ok(StreamChunk::ToolCallDelta {
                             id,
@@ -3347,6 +3379,7 @@ mod tests {
     struct PacedStreamGenerator {
         receiver:
             std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>,
+        requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
     }
 
     impl PacedStreamGenerator {
@@ -3358,6 +3391,7 @@ mod tests {
             (
                 Arc::new(Self {
                     receiver: std::sync::Mutex::new(Some(receiver)),
+                    requests: std::sync::Mutex::new(Vec::new()),
                 }),
                 sender,
             )
@@ -3376,10 +3410,14 @@ mod tests {
 
         async fn generate_stream(
             &self,
-            _messages: Vec<crate::providers::Message>,
+            messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
         {
+            self.requests
+                .lock()
+                .expect("paced request lock poisoned")
+                .push(messages);
             Ok(self
                 .receiver
                 .lock()
@@ -3424,6 +3462,7 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
         colors: crate::theme::ColorScheme,
         tool_coordinator: ToolExecutionCoordinator,
+        generator: Arc<PacedStreamGenerator>,
         workspace_root: std::path::PathBuf,
         _workspace: tempfile::TempDir,
         _tempdir: tempfile::TempDir,
@@ -3438,6 +3477,16 @@ mod tests {
             query: &str,
             registry: ToolRegistry,
             tool_definitions: Vec<ToolDefinition>,
+        ) -> Self {
+            Self::spawn_with_reasoning(query, registry, tool_definitions, false, Vec::new()).await
+        }
+
+        async fn spawn_with_reasoning(
+            query: &str,
+            registry: ToolRegistry,
+            tool_definitions: Vec<ToolDefinition>,
+            display_model_reasoning: bool,
+            available_providers: Vec<crate::config::ProviderEntry>,
         ) -> Self {
             let colors = crate::theme::ColorScheme::default();
             let output = Arc::new(OutputManager::new(colors.clone()));
@@ -3532,6 +3581,8 @@ mod tests {
                 20,
                 0,
                 true,
+                display_model_reasoning,
+                available_providers,
                 false,
                 false,
                 selected,
@@ -3556,6 +3607,7 @@ mod tests {
                 task,
                 colors,
                 tool_coordinator: harness_coordinator,
+                generator,
                 workspace_root,
                 _workspace: workspace,
                 _tempdir: tempdir,
@@ -3677,8 +3729,15 @@ mod tests {
     fn reasoning_delta_advances_activity_without_exposing_reasoning() {
         let work_unit = crate::cli::messages::WorkUnit::new("Calculating");
         let colors = crate::theme::ColorScheme::default();
+        let provenance = crate::providers::EventProvenance {
+            provider: "test".into(),
+            model: "test".into(),
+            event: "reasoning".into(),
+            sequence: 1,
+            opaque_replay: None,
+        };
 
-        record_reasoning_activity(&work_unit, "private reasoning words");
+        record_reasoning_activity(&work_unit, "private reasoning words", &provenance, false);
 
         let rendered = work_unit.format(&colors);
         assert!(
@@ -3688,6 +3747,187 @@ mod tests {
         assert!(
             !rendered.contains("private reasoning words"),
             "reasoning activity leaked into visible assistant output: {rendered:?}"
+        );
+    }
+
+    fn compatible_test_provider(name: &str) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry::OpenAiCompatible {
+            name: name.into(),
+            base_url: "https://example.invalid/v1".into(),
+            chat_path: None,
+            models_path: None,
+            model: "test-model".into(),
+            credential: crate::config::CredentialBinding {
+                credential_ref: "test-credential".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: Default::default(),
+            },
+            capabilities: Default::default(),
+            tool_choice: Default::default(),
+            strict_tool_schemas: None,
+        }
+    }
+
+    fn reasoning_provenance(opaque_replay: Option<&str>) -> crate::providers::EventProvenance {
+        crate::providers::EventProvenance {
+            provider: "compatible".into(),
+            model: "test-model".into(),
+            event: "reasoning".into(),
+            sequence: 1,
+            opaque_replay: opaque_replay.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn test_reasoning_display_eligibility_requires_selected_compatible_profile() {
+        let (generator, _sender) = PacedStreamGenerator::new();
+        assert!(generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[compatible_test_provider("paced-stream")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            false,
+            generator.as_ref(),
+            &[compatible_test_provider("paced-stream")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[compatible_test_provider("some-other-profile")],
+        ));
+        assert!(!generic_compatible_reasoning_enabled(
+            true,
+            generator.as_ref(),
+            &[],
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_compatible_reasoning_stream_is_live_only_collapses_and_opaque_stays_hidden() {
+        let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+            "reason first",
+            ToolRegistry::new(),
+            Vec::new(),
+            true,
+            vec![compatible_test_provider("paced-stream")],
+        )
+        .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "visible safe reasoning".into(),
+                provenance: reasoning_provenance(None),
+            }))
+            .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "opaque secret".into(),
+                provenance: reasoning_provenance(Some("encrypted-replay")),
+            }))
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if harness
+                    .canonical
+                    .provider_reasoning_view()
+                    .is_some_and(|view| view.lines.join("\n").contains("visible safe reasoning"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normalized compatible reasoning never reached the live component");
+        let live = format!("{:?}", harness.canonical.provider_reasoning_view());
+        assert!(live.contains("visible safe reasoning"));
+        assert!(!live.contains("opaque secret") && !live.contains("encrypted-replay"));
+        assert_eq!(harness.canonical.content(), "");
+        assert!(!harness
+            .canonical
+            .complete_transcript(&harness.colors)
+            .contains("visible safe reasoning"));
+
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"done\")".into())))
+            .await;
+        harness.close_stream();
+        harness.task.await.expect("reasoning query task panicked");
+        let terminal = format!("{:?}", harness.canonical.provider_reasoning_view());
+        assert!(terminal.contains("terminal: true") && terminal.contains("expanded: false"));
+        assert_eq!(harness.canonical.content(), "(say \"done\")");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_display_default_off_has_zero_live_or_canonical_leak() {
+        let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+            "reason privately",
+            ToolRegistry::new(),
+            Vec::new(),
+            false,
+            vec![compatible_test_provider("paced-stream")],
+        )
+        .await;
+        harness
+            .send(Ok(StreamChunk::ThinkingDelta {
+                text: "must stay private".into(),
+                provenance: reasoning_provenance(None),
+            }))
+            .await;
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"answer\")".into())))
+            .await;
+        harness.close_stream();
+        harness.task.await.expect("default-off query task panicked");
+
+        let all_live = format!("{:?}", harness.canonical.provider_reasoning_view());
+        assert!(!all_live.contains("must stay private"));
+        assert!(!harness
+            .canonical
+            .format(&harness.colors)
+            .contains("must stay private"));
+        assert_eq!(harness.canonical.content(), "(say \"answer\")");
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_display_flag_does_not_change_provider_request_bytes() {
+        async fn request_bytes(display: bool) -> Vec<u8> {
+            let mut harness = StreamingQueryHarness::spawn_with_reasoning(
+                "same request",
+                ToolRegistry::new(),
+                Vec::new(),
+                display,
+                vec![compatible_test_provider("paced-stream")],
+            )
+            .await;
+            harness
+                .send(Ok(StreamChunk::TextDelta("(say \"same\")".into())))
+                .await;
+            harness.close_stream();
+            let generator = Arc::clone(&harness.generator);
+            harness
+                .task
+                .await
+                .expect("request-byte query task panicked");
+            let request = generator
+                .requests
+                .lock()
+                .expect("paced request lock poisoned")
+                .first()
+                .expect("paced generator received no request")
+                .clone();
+            serde_json::to_vec(&request).expect("serialize request messages")
+        }
+
+        let disabled = request_bytes(false).await;
+        let enabled = request_bytes(true).await;
+        assert_eq!(
+            enabled, disabled,
+            "local reasoning display must not change serialized provider request messages"
         );
     }
 
@@ -8234,6 +8474,8 @@ mod tests {
             20,
             0,
             false,
+            false,
+            Vec::new(),
             true,
             false,
             summary_gen,
@@ -8358,6 +8600,8 @@ mod tests {
             recall_k,
             false,
             false,
+            Vec::new(),
+            false,
             false,
             no_summary_gen,
             Arc::new(std::sync::Mutex::new(
@@ -8458,6 +8702,8 @@ mod tests {
             10_000,
             recall_k,
             true,
+            false,
+            Vec::new(),
             false,
             false,
             no_summary_gen,
@@ -8772,6 +9018,8 @@ mod tests {
             // true so the streaming attempt (and its WorkUnit) actually
             // happens before `generate_stream` declines it.
             true,
+            false,
+            Vec::new(),
             false,
             false,
             Arc::clone(&generator),

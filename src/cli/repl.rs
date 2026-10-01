@@ -630,6 +630,7 @@ pub struct Repl {
     // UI state
     is_interactive: bool,
     streaming_enabled: bool,
+    display_model_reasoning: bool,
     debug_enabled: bool,
     // Readline input handler
     input_handler: Option<InputHandler>,
@@ -1487,6 +1488,7 @@ impl Repl {
         let tool_executor = Arc::new(tokio::sync::Mutex::new(executor));
 
         let streaming_enabled = config.features.streaming_enabled;
+        let display_model_reasoning = config.features.display_model_reasoning;
         let memory_context_lines = config.features.memory_context_lines;
         let max_verbatim_messages = config.features.max_verbatim_messages;
         let context_recall_k = config.features.context_recall_k;
@@ -1661,6 +1663,7 @@ impl Repl {
             program_runtime,
             is_interactive,
             streaming_enabled,
+            display_model_reasoning,
             debug_enabled: false,
             input_handler,
             conversation: Arc::new(RwLock::new(ConversationHistory::new())),
@@ -2799,6 +2802,7 @@ impl Repl {
                 output: Arc::new(self.output_manager.clone()),
                 status_bar: Arc::new(self.status_bar.clone()),
                 streaming_enabled: self.streaming_enabled,
+                display_model_reasoning: self.display_model_reasoning,
                 mention_port: Arc::clone(&self.mention_port),
             },
             ToolParts {

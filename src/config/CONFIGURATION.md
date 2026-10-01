@@ -4,6 +4,21 @@
 
 Optional `default_provider = "profile-name"` names the global default new Brains inherit once. Changing it does not rewrite existing Brain overlays.
 
+## Local display features
+
+Provider reasoning is hidden by default. To show a sanitized, bounded live
+reasoning disclosure for configured `openai_compatible` profiles only:
+
+```toml
+[features]
+display_model_reasoning = true
+```
+
+This is a local presentation preference. It does not add or change provider
+request fields, and reasoning is not added to conversation history, Brain
+state, checkpoints, logs, or native terminal scrollback. The live body is
+discarded on a fresh attach or restart.
+
 ## Format — `[[providers]]`
 
 ```toml

@@ -3313,28 +3313,36 @@ impl TuiRenderer {
         // trait answers with the snapshot, and the component capsule renders
         // it. Component state lives on the ViewModel, not the renderer's
         // RowId-keyed maps.
-        if let Some(view) = message.component_view() {
+        let component = message.component_view();
+        let say_owns_reasoning = matches!(&component, Some(ComponentView::Say(_)));
+        let mut lines = if let Some(view) = component {
             // Stage 4 (#1141): the palette is built from the user's scheme at
             // the one engine boundary; the component capsule never sees it.
             let palette = span_render::component_style_palette(&self.colors);
-            let lines = finch_ui_model::component_lines(&view, &palette);
-            return self
-                .tool_viewports
-                .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);
-        }
-        // The ViewModel is the one domain → widget projection: convert the
-        // message to props, then render them under the renderer's disclosure
-        // state. Widgets never query WorkUnits to decide visibility (#805).
-        // Unmigrated rows — non-say WorkUnit presentations, the open stage-2
-        // scope — keep this legacy path, which is also the canonical-commit
-        // projection: the component is the live reader; the settled record
-        // keeps today's exact bytes (the say-turn precedent, #882).
-        let lines = match view_model::project_message(message, &self.colors) {
-            view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
-            view_model::ProjectedMessage::Plain(formatted) => {
-                self.accordion.render_plain(&formatted.join("\n"))
+            finch_ui_model::component_lines(&view, &palette)
+        } else {
+            // The ViewModel is the one domain → widget projection: convert the
+            // message to props, then render them under the renderer's disclosure
+            // state. Widgets never query WorkUnits to decide visibility (#805).
+            // Unmigrated rows — non-say WorkUnit presentations, the open stage-2
+            // scope — keep this legacy path, which is also the canonical-commit
+            // projection: the component is the live reader; the settled record
+            // keeps today's exact bytes (the say-turn precedent, #882).
+            match view_model::project_message(message, &self.colors) {
+                view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
+                view_model::ProjectedMessage::Plain(formatted) => {
+                    self.accordion.render_plain(&formatted.join("\n"))
+                }
             }
         };
+        if !say_owns_reasoning {
+            if let Some(reasoning) = message.provider_reasoning_view() {
+                let mut reasoning_lines =
+                    finch_ui_model::provider_reasoning_lines(message.id(), &reasoning);
+                reasoning_lines.append(&mut lines);
+                lines = reasoning_lines;
+            }
+        }
         // Tool results are bounded child viewports (#656): the visible
         // projection shows a configured number of rows with a scroll offset
         // the control owns. Canonical scrollback is projected separately
@@ -3635,14 +3643,20 @@ impl TuiRenderer {
             // ViewModel. Say has exactly one toggle target per message (the
             // output region, path `[1]`); MemoryRecalled has one per
             // recalled-memory row (#1235), addressed by `row_id.path`.
-            let already_matches = match message.component_view() {
-                Some(ComponentView::Say(view)) => view.vm.show_program == want,
-                Some(ComponentView::MemoryRecalled(view)) => row_id
-                    .path
-                    .first()
-                    .and_then(|&index| view.rows.get(index as usize))
-                    .is_some_and(|row| row.expanded == want),
-                _ => false,
+            let already_matches = if row_id.path == [2] {
+                message
+                    .provider_reasoning_view()
+                    .is_some_and(|reasoning| reasoning.expanded == want)
+            } else {
+                match message.component_view() {
+                    Some(ComponentView::Say(view)) => view.vm.show_program == want,
+                    Some(ComponentView::MemoryRecalled(view)) => row_id
+                        .path
+                        .first()
+                        .and_then(|&index| view.rows.get(index as usize))
+                        .is_some_and(|row| row.expanded == want),
+                    _ => false,
+                }
             };
             if already_matches {
                 return false;
@@ -9282,6 +9296,115 @@ mod tests {
         assert!(
             !output.say_turn_view().expect("say VM").vm.show_program,
             "the second keyboard activation restores the closed state"
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_disclosure_has_mouse_keyboard_directional_parity_and_no_canonical_body() {
+        let colors = ColorScheme::default();
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&manager),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        let unit = Arc::new(WorkUnit::new("Calculating"));
+        let tool_row = unit.add_row("read(config.toml)");
+        unit.complete_row(tool_row, "ok");
+        unit.append_provider_reasoning("safe live thought");
+        manager.add_trait_message(unit.clone());
+
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let control = lines
+            .iter()
+            .find(|line| line.text.starts_with("▼ Provider reasoning"))
+            .expect("running reasoning disclosure");
+        let target = control.row_id.clone().expect("semantic reasoning target");
+        assert_eq!(target.path, vec![2]);
+        assert!(lines.iter().any(|line| line.text == "safe live thought"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("read(config.toml)")),
+            "additive reasoning must not replace the WorkUnit's tool rows: {lines:?}"
+        );
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&lines, 0, 80);
+        let row = lines
+            .iter()
+            .position(|line| line.row_id.as_ref() == Some(&target))
+            .expect("reasoning control row") as u16;
+        assert!(
+            renderer.handle_accordion_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                column: 0,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        );
+        let collapsed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(!collapsed
+            .iter()
+            .any(|line| line.text == "safe live thought"));
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&collapsed, 0, 80);
+
+        for _ in 0..4 {
+            assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+            if renderer.accordion.focused.as_ref() == Some(&target) {
+                break;
+            }
+        }
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(open.iter().any(|line| line.text == "safe live thought"));
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&open, 0, 80);
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        let closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&closed, 0, 80);
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&open, 0, 80);
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::SHIFT,)));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+
+        unit.set_complete();
+        let terminal = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(terminal
+            .iter()
+            .any(|line| line.text == "▶ Provider reasoning (3 words)"));
+        assert!(!terminal.iter().any(|line| line.text == "safe live thought"));
+
+        let mut staged = Vec::new();
+        let plan = plan_canonical_commit(&manager.get_messages(), &HashSet::new());
+        commit_complete_messages(
+            &mut staged,
+            &plan.emit,
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            8,
+            80,
+        )
+        .expect("commit terminal reasoning work unit");
+        let canonical = String::from_utf8(staged).expect("canonical terminal bytes are UTF-8");
+        assert!(
+            !canonical.contains("safe live thought"),
+            "reasoning body leaked into canonical terminal bytes: {canonical:?}"
         );
     }
 

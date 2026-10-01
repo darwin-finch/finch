@@ -83,6 +83,7 @@ pub struct LlmLoop {
     max_verbatim_messages: usize,
     context_recall_k: usize,
     streaming_enabled: bool,
+    display_model_reasoning: bool,
     enable_summarization: bool,
     auto_compact_enabled: bool,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
@@ -131,6 +132,7 @@ impl LlmLoop {
             status_bar,
             renderer: tui_renderer,
             streaming_enabled,
+            display_model_reasoning,
         } = ui;
         let crate::cli::repl_event::parts::LlmSession {
             conversation,
@@ -187,6 +189,7 @@ impl LlmLoop {
             max_verbatim_messages,
             context_recall_k,
             streaming_enabled,
+            display_model_reasoning,
             enable_summarization,
             auto_compact_enabled,
             wire_metrics_logger,
@@ -284,6 +287,8 @@ impl LlmLoop {
         let max_verbatim = self.max_verbatim_messages;
         let recall_k = self.context_recall_k;
         let streaming_enabled = self.streaming_enabled;
+        let display_model_reasoning = self.display_model_reasoning;
+        let available_providers = self.available_providers.clone();
         let enable_summarization = self.enable_summarization;
         let auto_compact_enabled = self.auto_compact_enabled;
         let wire_metrics_logger = self.wire_metrics_logger.clone();
@@ -344,6 +349,8 @@ impl LlmLoop {
                 max_verbatim,
                 recall_k,
                 streaming_enabled,
+                display_model_reasoning,
+                available_providers,
                 enable_summarization,
                 auto_compact_enabled,
                 summary_gen,

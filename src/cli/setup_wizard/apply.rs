@@ -76,6 +76,7 @@ pub(super) fn apply_setup_result_to_config(
     new_config.features = FeaturesConfig {
         auto_approve_tools: result.auto_approve_tools,
         streaming_enabled: result.streaming_enabled,
+        display_model_reasoning: new_config.features.display_model_reasoning,
         debug_logging: result.debug_logging,
         #[cfg(target_os = "macos")]
         gui_automation: result.gui_automation,
