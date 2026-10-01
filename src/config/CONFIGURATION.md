@@ -162,6 +162,19 @@ cross-origin chat or model paths are rejected. `tool_choice = "auto"` and
 streaming path consumes OpenAI Chat Completions SSE and converts native tool
 call deltas through Finch's normal tool-binding validation.
 
+`finch setup` exposes the same shape as **Generic OpenAI-compatible**. Its
+connection screen records the profile, endpoint, model, and the name of an
+environment variable containing the secret; the secret itself is never
+written to `config.toml`. Its capability screen starts every assertion as
+unknown and only persists support the operator explicitly selects. For the
+Ciru-shaped example above, enter `CIRU_API_KEY` as the secret environment
+variable, not the key value. Completing setup validates and reloads the
+configuration but does not probe the service or claim live conformance. Ciru
+conformance can be established only by the opt-in, credential-gated
+Ciru/Dunamis live fixture tracked by #1440 (generic OpenAI-compatible provider
+live conformance); configuration and hermetic mock fixtures are not a live
+service attestation.
+
 ## Post-edit diagnostics — `[diagnostics]` (issue #757)
 
 Diagnostics after write/edit/patch run only from a source declared here;

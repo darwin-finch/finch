@@ -166,6 +166,250 @@ fn commit_remote_provider(
     }
 }
 
+const COMPATIBLE_CONNECTION_LAST_FIELD: usize = 7;
+const COMPATIBLE_CAPABILITIES_LAST_FIELD: usize = 7;
+
+fn cycle_attestation(value: &mut Option<bool>, forward: bool) {
+    *value = match (*value, forward) {
+        (None, true) | (Some(false), false) => Some(true),
+        (Some(true), true) | (None, false) => Some(false),
+        (Some(false), true) | (Some(true), false) => None,
+    };
+}
+
+fn is_valid_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn optional_positive_u32(label: &str, value: &str) -> Result<Option<u32>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let parsed = value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("{label} must be a positive whole number"))?;
+    if parsed == 0 {
+        anyhow::bail!("{label} must be positive");
+    }
+    Ok(Some(parsed))
+}
+
+fn compatible_profile_and_credential(
+    draft: &OpenAiCompatibleDraft,
+) -> Result<(ProviderEntry, crate::config::ProviderCredential)> {
+    let name = draft.name.trim();
+    let base_url = draft.base_url.trim();
+    let model = draft.model.trim();
+    let credential_ref = draft.credential_ref.trim();
+    let secret_env = draft.secret_env.trim();
+    if name.is_empty() || base_url.is_empty() || model.is_empty() || credential_ref.is_empty() {
+        anyhow::bail!("Profile name, base URL, model, and credential name are required");
+    }
+    if !is_valid_env_name(secret_env) {
+        anyhow::bail!(
+            "Secret environment variable must use letters, digits, and underscores and cannot start with a digit"
+        );
+    }
+    let audience = crate::config::required_audience(
+        crate::config::CredentialProvider::OpenaiCompatible,
+        Some(base_url),
+    )?;
+    let context_window_tokens =
+        optional_positive_u32("Context window", &draft.context_window_tokens)?;
+    let max_output_tokens = optional_positive_u32("Maximum output", &draft.max_output_tokens)?;
+    let capabilities = crate::config::OpenAiCompatibleCapabilities {
+        streaming: draft.streaming,
+        tools: draft.tools,
+        parallel_tool_calls: draft.parallel_tool_calls,
+        image_input: draft.image_input,
+        context_window_tokens,
+        max_output_tokens,
+    };
+    if capabilities.tools == Some(false) && capabilities.parallel_tool_calls == Some(true) {
+        anyhow::bail!(
+            "parallel tool calls cannot be supported when tools are declared unsupported"
+        );
+    }
+    let persisted_connection = draft.original_profile.as_ref().and_then(|profile| {
+        if let ProviderEntry::OpenAiCompatible {
+            base_url,
+            credential,
+            ..
+        } = profile
+        {
+            Some((base_url, credential))
+        } else {
+            None
+        }
+    });
+    let endpoint_changed =
+        persisted_connection.is_some_and(|(persisted_base_url, _)| persisted_base_url != base_url);
+    let mut binding = persisted_connection
+        .map(|(_, binding)| binding.clone())
+        .unwrap_or_else(|| crate::config::CredentialBinding {
+            credential_ref: credential_ref.to_string(),
+            audience: None,
+            tenant: None,
+            project: None,
+            account: None,
+            required_scopes: Default::default(),
+        });
+    binding.credential_ref = credential_ref.to_string();
+    if endpoint_changed && binding.audience.is_some() {
+        binding.audience = Some(audience.clone());
+    }
+    let profile = ProviderEntry::OpenAiCompatible {
+        name: name.to_string(),
+        base_url: base_url.to_string(),
+        chat_path: (!draft.chat_path.trim().is_empty()).then(|| draft.chat_path.trim().to_string()),
+        models_path: (!draft.models_path.trim().is_empty())
+            .then(|| draft.models_path.trim().to_string()),
+        model: model.to_string(),
+        credential: binding,
+        capabilities,
+        tool_choice: draft.tool_choice,
+        strict_tool_schemas: draft.strict_tool_schemas,
+    };
+    let mut credential =
+        draft
+            .original_credential
+            .clone()
+            .unwrap_or_else(|| crate::config::ProviderCredential {
+                name: credential_ref.to_string(),
+                kind: draft.credential_kind,
+                provider: crate::config::CredentialProvider::OpenaiCompatible,
+                issuer: "openai-compatible".into(),
+                audience: audience.clone(),
+                tenant: None,
+                project: None,
+                account: None,
+                scopes: Default::default(),
+                secret_ref: format!("env:{secret_env}"),
+                lifecycle: Default::default(),
+                revocation: Default::default(),
+            });
+    credential.name = credential_ref.to_string();
+    credential.kind = draft.credential_kind;
+    credential.secret_ref = format!("env:{secret_env}");
+    if endpoint_changed {
+        credential.audience = audience;
+    }
+    crate::config::Config::with_providers(vec![profile.clone()])
+        .with_credentials(vec![credential.clone()])
+        .validate()?;
+    Ok((profile, credential))
+}
+
+fn compatible_draft_from_persisted(
+    profile: &ProviderEntry,
+    credentials: &[crate::config::ProviderCredential],
+) -> Result<OpenAiCompatibleDraft> {
+    let ProviderEntry::OpenAiCompatible {
+        name,
+        base_url,
+        chat_path,
+        models_path,
+        model,
+        credential,
+        capabilities,
+        tool_choice,
+        strict_tool_schemas,
+    } = profile
+    else {
+        anyhow::bail!("selected provider is not OpenAI-compatible");
+    };
+    let stored = credentials
+        .iter()
+        .find(|candidate| candidate.name == credential.credential_ref)
+        .with_context(|| {
+            format!(
+                "Compatible profile '{name}' references missing credential '{}'",
+                credential.credential_ref
+            )
+        })?;
+    let secret_env = stored.secret_ref.strip_prefix("env:").with_context(|| {
+        format!(
+            "Compatible credential '{}' is not environment-backed and cannot be edited in setup",
+            stored.name
+        )
+    })?;
+    Ok(OpenAiCompatibleDraft {
+        name: name.clone(),
+        base_url: base_url.clone(),
+        chat_path: chat_path.clone().unwrap_or_default(),
+        models_path: models_path.clone().unwrap_or_default(),
+        model: model.clone(),
+        credential_ref: credential.credential_ref.clone(),
+        secret_env: secret_env.to_string(),
+        credential_kind: stored.kind,
+        streaming: capabilities.streaming,
+        tools: capabilities.tools,
+        parallel_tool_calls: capabilities.parallel_tool_calls,
+        image_input: capabilities.image_input,
+        context_window_tokens: capabilities
+            .context_window_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        max_output_tokens: capabilities
+            .max_output_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        tool_choice: *tool_choice,
+        strict_tool_schemas: *strict_tool_schemas,
+        original_profile: Some(profile.clone()),
+        original_credential: Some(stored.clone()),
+    })
+}
+
+fn commit_compatible_provider(
+    primary_model: &mut ModelConfig,
+    tool_models: &mut Vec<ModelConfig>,
+    selected_idx: &mut usize,
+    profile: ProviderEntry,
+    editing_idx: Option<usize>,
+) {
+    let ProviderEntry::OpenAiCompatible { name, model, .. } = &profile else {
+        unreachable!("compatible editor only commits compatible profiles");
+    };
+    let name = name.clone();
+    let model = model.clone();
+    commit_remote_provider(
+        primary_model,
+        tool_models,
+        selected_idx,
+        "openai-compatible",
+        &name,
+        &model,
+        None,
+        editing_idx,
+        Some(profile),
+    );
+}
+
+fn compatible_credential_reference_count(
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    credential_name: &str,
+) -> usize {
+    std::iter::once(primary_model)
+        .chain(tool_models)
+        .filter(|model| {
+            matches!(
+                model,
+                ModelConfig::Remote {
+                    persisted: Some(ProviderEntry::OpenAiCompatible { credential, .. }),
+                    ..
+                } if credential.credential_ref == credential_name
+            )
+        })
+        .count()
+}
+
 /// Handle input for Models section (unified provider entries)
 pub(super) fn handle_models_input(
     state: &mut WizardState,
@@ -178,6 +422,7 @@ pub(super) fn handle_models_input(
     // Credential published by a completed add-time device ceremony (#424),
     // recorded into wizard state once the section borrow ends.
     let mut record_named_credential: Option<crate::config::ProviderCredential> = None;
+    let mut remove_named_credential: Option<String> = None;
     let mut overlay_handled = false;
     if let Some(SectionState::Models {
         primary_model,
@@ -249,6 +494,17 @@ pub(super) fn handle_models_input(
                             focused_field: 1,
                             editing_idx: *editing_idx,
                         });
+                    } else if let Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                        draft,
+                        editing_idx,
+                        ..
+                    }) = adding_provider.take()
+                    {
+                        *adding_provider = Some(AddProviderStep::ConfigureCompatibleConnection {
+                            draft,
+                            focused_field: 0,
+                            editing_idx,
+                        });
                     } else {
                         *adding_provider = None;
                     }
@@ -265,6 +521,15 @@ pub(super) fn handle_models_input(
                         *focused_field = focused_field.saturating_sub(1);
                     }
                     Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                        *focused_field = focused_field.saturating_sub(1);
+                    }
+                    Some(AddProviderStep::ConfigureCompatibleConnection {
+                        focused_field, ..
+                    })
+                    | Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                        focused_field,
+                        ..
+                    }) => {
                         *focused_field = focused_field.saturating_sub(1);
                     }
                     Some(AddProviderStep::SelectAgent { selected, .. }) => {
@@ -295,6 +560,21 @@ pub(super) fn handle_models_input(
                             *focused_field += 1;
                         }
                     }
+                    Some(AddProviderStep::ConfigureCompatibleConnection {
+                        focused_field, ..
+                    }) => {
+                        if *focused_field < COMPATIBLE_CONNECTION_LAST_FIELD {
+                            *focused_field += 1;
+                        }
+                    }
+                    Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                        focused_field,
+                        ..
+                    }) => {
+                        if *focused_field < COMPATIBLE_CAPABILITIES_LAST_FIELD {
+                            *focused_field += 1;
+                        }
+                    }
                     Some(AddProviderStep::SelectAgent { agents, selected }) => {
                         if *selected + 1 < agents.len() {
                             *selected += 1;
@@ -304,6 +584,40 @@ pub(super) fn handle_models_input(
                 },
                 KeyCode::Left => {
                     match adding_provider {
+                        Some(AddProviderStep::ConfigureCompatibleConnection {
+                            draft,
+                            focused_field: 7,
+                            ..
+                        }) => {
+                            draft.credential_kind = match draft.credential_kind {
+                                crate::config::CredentialKind::Bearer => {
+                                    crate::config::CredentialKind::ApiKey
+                                }
+                                _ => crate::config::CredentialKind::Bearer,
+                            };
+                        }
+                        Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                            draft,
+                            focused_field,
+                            ..
+                        }) => match *focused_field {
+                            0 => cycle_attestation(&mut draft.streaming, false),
+                            1 => cycle_attestation(&mut draft.tools, false),
+                            2 => cycle_attestation(&mut draft.parallel_tool_calls, false),
+                            3 => cycle_attestation(&mut draft.image_input, false),
+                            6 => {
+                                draft.tool_choice = match draft.tool_choice {
+                                    crate::config::OpenAiCompatibleToolChoice::Auto => {
+                                        crate::config::OpenAiCompatibleToolChoice::Omit
+                                    }
+                                    crate::config::OpenAiCompatibleToolChoice::Omit => {
+                                        crate::config::OpenAiCompatibleToolChoice::Auto
+                                    }
+                                }
+                            }
+                            7 => cycle_attestation(&mut draft.strict_tool_schemas, false),
+                            _ => {}
+                        },
                         Some(AddProviderStep::ConfigureLocal {
                             inference_provider: _,
                             family,
@@ -396,6 +710,40 @@ pub(super) fn handle_models_input(
                 }
                 KeyCode::Right => {
                     match adding_provider {
+                        Some(AddProviderStep::ConfigureCompatibleConnection {
+                            draft,
+                            focused_field: 7,
+                            ..
+                        }) => {
+                            draft.credential_kind = match draft.credential_kind {
+                                crate::config::CredentialKind::ApiKey => {
+                                    crate::config::CredentialKind::Bearer
+                                }
+                                _ => crate::config::CredentialKind::ApiKey,
+                            };
+                        }
+                        Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                            draft,
+                            focused_field,
+                            ..
+                        }) => match *focused_field {
+                            0 => cycle_attestation(&mut draft.streaming, true),
+                            1 => cycle_attestation(&mut draft.tools, true),
+                            2 => cycle_attestation(&mut draft.parallel_tool_calls, true),
+                            3 => cycle_attestation(&mut draft.image_input, true),
+                            6 => {
+                                draft.tool_choice = match draft.tool_choice {
+                                    crate::config::OpenAiCompatibleToolChoice::Omit => {
+                                        crate::config::OpenAiCompatibleToolChoice::Auto
+                                    }
+                                    crate::config::OpenAiCompatibleToolChoice::Auto => {
+                                        crate::config::OpenAiCompatibleToolChoice::Omit
+                                    }
+                                }
+                            }
+                            7 => cycle_attestation(&mut draft.strict_tool_schemas, true),
+                            _ => {}
+                        },
                         Some(AddProviderStep::ConfigureLocal {
                             inference_provider: _,
                             family,
@@ -607,6 +955,37 @@ pub(super) fn handle_models_input(
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
+                    if let Some(AddProviderStep::ConfigureCompatibleConnection {
+                        draft,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
+                        match *focused_field {
+                            0 => draft.name.push(c),
+                            1 => draft.base_url.push(c),
+                            2 => draft.chat_path.push(c),
+                            3 => draft.models_path.push(c),
+                            4 => draft.model.push(c),
+                            5 => draft.credential_ref.push(c),
+                            6 => draft.secret_env.push(c),
+                            _ => {}
+                        }
+                    }
+                    if let Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                        draft,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
+                        if c.is_ascii_digit() {
+                            match *focused_field {
+                                4 => draft.context_window_tokens.push(c),
+                                5 => draft.max_output_tokens.push(c),
+                                _ => {}
+                            }
+                        }
+                    }
                     if let Some(AddProviderStep::ConfigureLocal {
                         inference_provider: InferenceProvider::LlamaCpp,
                         model_path,
@@ -646,6 +1025,53 @@ pub(super) fn handle_models_input(
                     }
                 }
                 KeyCode::Backspace => {
+                    if let Some(AddProviderStep::ConfigureCompatibleConnection {
+                        draft,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
+                        match *focused_field {
+                            0 => {
+                                draft.name.pop();
+                            }
+                            1 => {
+                                draft.base_url.pop();
+                            }
+                            2 => {
+                                draft.chat_path.pop();
+                            }
+                            3 => {
+                                draft.models_path.pop();
+                            }
+                            4 => {
+                                draft.model.pop();
+                            }
+                            5 => {
+                                draft.credential_ref.pop();
+                            }
+                            6 => {
+                                draft.secret_env.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                        draft,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
+                        match *focused_field {
+                            4 => {
+                                draft.context_window_tokens.pop();
+                            }
+                            5 => {
+                                draft.max_output_tokens.pop();
+                            }
+                            _ => {}
+                        }
+                    }
                     if let Some(AddProviderStep::ConfigureLocal {
                         inference_provider: InferenceProvider::LlamaCpp,
                         model_path,
@@ -699,6 +1125,17 @@ pub(super) fn handle_models_input(
                         Some(AddProviderStep::SelectAddType { selected }) => {
                             let n_cloud = CLOUD_PROVIDERS.len();
                             if selected < n_cloud {
+                                if CLOUD_PROVIDERS[selected].0 == "openai-compatible" {
+                                    return {
+                                        *adding_provider =
+                                            Some(AddProviderStep::ConfigureCompatibleConnection {
+                                                draft: OpenAiCompatibleDraft::default(),
+                                                focused_field: 1,
+                                                editing_idx: None,
+                                            });
+                                        Ok(false)
+                                    };
+                                }
                                 // Open single-screen remote dialog pre-selected to this provider
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
                                 *catalog_model_provenance = if default_model.is_empty() {
@@ -918,6 +1355,131 @@ pub(super) fn handle_models_input(
                                 }
                             }
                         }
+                        Some(AddProviderStep::ConfigureCompatibleConnection {
+                            draft,
+                            editing_idx,
+                            ..
+                        }) => {
+                            if draft.name.trim().is_empty()
+                                || draft.base_url.trim().is_empty()
+                                || draft.model.trim().is_empty()
+                                || draft.credential_ref.trim().is_empty()
+                                || !is_valid_env_name(draft.secret_env.trim())
+                            {
+                                *error = Some(
+                                    "Compatible provider requires a profile name, HTTP(S) base URL, model, credential name, and valid secret environment variable"
+                                        .into(),
+                                );
+                                Some(AddProviderStep::ConfigureCompatibleConnection {
+                                    draft,
+                                    focused_field: 0,
+                                    editing_idx,
+                                })
+                            } else if let Err(failure) =
+                                crate::config::validate_authenticated_endpoints(
+                                    crate::config::CredentialProvider::OpenaiCompatible,
+                                    Some(draft.base_url.trim()),
+                                    &[
+                                        (!draft.chat_path.trim().is_empty())
+                                            .then_some(draft.chat_path.trim()),
+                                        (!draft.models_path.trim().is_empty())
+                                            .then_some(draft.models_path.trim()),
+                                    ],
+                                )
+                            {
+                                *error = Some(format!("Compatible endpoint is invalid: {failure}"));
+                                Some(AddProviderStep::ConfigureCompatibleConnection {
+                                    draft,
+                                    focused_field: 1,
+                                    editing_idx,
+                                })
+                            } else {
+                                Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                                    draft,
+                                    focused_field: 0,
+                                    editing_idx,
+                                })
+                            }
+                        }
+                        Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                            draft,
+                            editing_idx,
+                            ..
+                        }) => match compatible_profile_and_credential(&draft) {
+                            Ok((profile, credential)) => {
+                                let original = draft.original_credential.as_ref();
+                                let occupied = credentials
+                                    .iter()
+                                    .find(|existing| existing.name == credential.name);
+                                let owns_occupied_name = occupied.is_some_and(|existing| {
+                                    original.is_some_and(|original| {
+                                        original.name == credential.name && existing == original
+                                    })
+                                });
+                                if let Some(existing) = occupied.filter(|_| !owns_occupied_name) {
+                                    *error = Some(format!(
+                                        "Credential '{}' is already in use by provider namespace '{}'; choose a different credential name",
+                                        credential.name,
+                                        existing.provider.as_str()
+                                    ));
+                                    *adding_provider =
+                                        Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                                            draft,
+                                            focused_field: 0,
+                                            editing_idx,
+                                        });
+                                    return Ok(false);
+                                }
+                                if let Some(original) = original {
+                                    let dependent_count = compatible_credential_reference_count(
+                                        primary_model,
+                                        tool_models,
+                                        &original.name,
+                                    );
+                                    if original.name == credential.name
+                                        && original != &credential
+                                        && dependent_count > 1
+                                    {
+                                        *error = Some(format!(
+                                            "Credential '{}' is shared by {dependent_count} compatible profiles; choose a new credential name before changing its auth settings",
+                                            original.name
+                                        ));
+                                        *adding_provider = Some(
+                                            AddProviderStep::ConfigureCompatibleCapabilities {
+                                                draft,
+                                                focused_field: 0,
+                                                editing_idx,
+                                            },
+                                        );
+                                        return Ok(false);
+                                    }
+                                    if original.name != credential.name && dependent_count == 1 {
+                                        remove_named_credential = Some(original.name.clone());
+                                    }
+                                }
+                                commit_compatible_provider(
+                                    primary_model,
+                                    tool_models,
+                                    selected_idx,
+                                    profile,
+                                    editing_idx,
+                                );
+                                if occupied != Some(&credential) {
+                                    record_named_credential = Some(credential);
+                                }
+                                None
+                            }
+                            Err(failure) => {
+                                *error = Some(format!(
+                                    "Compatible provider configuration is invalid: {failure:#}"
+                                ));
+                                Some(AddProviderStep::ConfigureCompatibleCapabilities {
+                                    draft,
+                                    focused_field: 0,
+                                    editing_idx,
+                                })
+                            }
+                        },
                         // ── add-time ChatGPT device ceremony (#424) ──────────────────
                         Some(AddProviderStep::DeviceAuth {
                             provider_idx,
@@ -1173,6 +1735,9 @@ pub(super) fn handle_models_input(
             // ceremony (#424) now that the section borrow has ended. It
             // replaces any record of the same named credential, matching
             // `save_named_credential`.
+            if let Some(name) = remove_named_credential.take() {
+                state.credentials.retain(|existing| existing.name != name);
+            }
             if let Some(credential) = record_named_credential.take() {
                 state
                     .credentials
@@ -1331,6 +1896,24 @@ pub(super) fn handle_models_input(
                         ..
                     }) = selected
                     {
+                        if let Some(profile @ ProviderEntry::OpenAiCompatible { .. }) = persisted {
+                            match compatible_draft_from_persisted(profile, &credentials) {
+                                Ok(draft) => {
+                                    *adding_provider =
+                                        Some(AddProviderStep::ConfigureCompatibleConnection {
+                                            draft,
+                                            focused_field: 0,
+                                            editing_idx: Some(*selected_idx),
+                                        });
+                                }
+                                Err(failure) => {
+                                    *error = Some(format!(
+                                        "Editing compatible provider '{name}' is unavailable: {failure:#}"
+                                    ));
+                                }
+                            }
+                            return Ok(false);
+                        }
                         let provider_idx = persisted.as_ref().map_or_else(
                             || CLOUD_PROVIDERS.iter().position(|(id, ..)| *id == provider),
                             |entry| {
