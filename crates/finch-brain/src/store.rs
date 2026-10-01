@@ -5040,17 +5040,23 @@ impl BrainStore {
 
     /// Commit reducible state returned by the frontend that owns this Brain's
     /// environment. The daemon validates and journals the checkpoint but does
-    /// not execute the source or inherit the frontend's host authority.
+    /// not execute the source or inherit the frontend's host authority. An
+    /// exact revision-and-checkpoint retry returns `None` without journaling a
+    /// second commit.
     pub(crate) fn commit_runner_runtime(
         &self,
         name: &str,
         request_seq: u64,
         runtime_revision: u64,
         checkpoint: finch_vm::TypedRuntimeCheckpoint,
-    ) -> Result<BrainEvent> {
+    ) -> Result<Option<BrainEvent>> {
         self.commit_runner_runtime_inner(name, None, request_seq, runtime_revision, checkpoint)
     }
 
+    /// Commit a runner checkpoint associated with one run.
+    ///
+    /// Returns the new durable event, or `None` when the supplied revision and
+    /// canonical checkpoint bytes exactly match the current durable state.
     pub fn commit_runner_runtime_for_run(
         &self,
         name: &str,
@@ -5058,7 +5064,7 @@ impl BrainStore {
         request_seq: u64,
         runtime_revision: u64,
         checkpoint: finch_vm::TypedRuntimeCheckpoint,
-    ) -> Result<BrainEvent> {
+    ) -> Result<Option<BrainEvent>> {
         self.commit_runner_runtime_inner(
             name,
             Some(run_id),
@@ -5075,9 +5081,11 @@ impl BrainStore {
         request_seq: u64,
         runtime_revision: u64,
         checkpoint: finch_vm::TypedRuntimeCheckpoint,
-    ) -> Result<BrainEvent> {
+    ) -> Result<Option<BrainEvent>> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let encoded = finch_runtime::encode_checkpoint_bytes(&checkpoint)?;
+        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         if let Some(current) = self
             .brains
             .read()
@@ -5085,10 +5093,18 @@ impl BrainStore {
             .get(name)
             .and_then(|state| state.runtime_checkpoint.as_ref())
         {
-            if runtime_revision <= current.durable_revision {
+            if runtime_revision < current.durable_revision {
                 anyhow::bail!(
                     "runner checkpoint revision {runtime_revision} does not advance durable revision {}",
                     current.durable_revision
+                );
+            }
+            if runtime_revision == current.durable_revision {
+                if checkpoint_sha256 == current.checkpoint_sha256 {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "runner checkpoint revision {runtime_revision} conflicts with the durable checkpoint at the same revision"
                 );
             }
         }
@@ -5097,8 +5113,6 @@ impl BrainStore {
             runtime_revision,
         )?);
         self.bind_runtime_delivery_log(name, &restored)?;
-        let encoded = finch_runtime::encode_checkpoint_bytes(&checkpoint)?;
-        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
         self.runtime_checkpoints
             .write()
@@ -5113,10 +5127,11 @@ impl BrainStore {
             runtime_revision,
             checkpoint_sha256,
         };
-        match run_id {
+        let event = match run_id {
             Some(run_id) => self.push_for_run(name, "runner", run_id, kind),
             None => self.push(name, "runner", kind),
-        }
+        }?;
+        Ok(Some(event))
     }
 
     fn read_runtime_checkpoint(
