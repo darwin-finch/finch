@@ -2210,7 +2210,7 @@ impl BrainStore {
                 .write()
                 .expect("schedule index lock poisoned");
             let earliest_before = index.next_due_ms();
-            index.reindex(name, &state.schedules);
+            index.reindex(name, state.brain_id, &state.schedules);
             let earliest_after = index.next_due_ms();
             // Only wake the delivery loop when the head actually moved earlier.
             // A schedule created far in the future must not interrupt a sleep
@@ -2235,14 +2235,14 @@ impl BrainStore {
 
     /// Move one schedule in the due index, waking the loop if it became the
     /// head. The per-event path: O(log n), touching only this schedule.
-    fn upsert_schedule_locked(&self, name: &str, schedule: &BrainSchedule) {
+    fn upsert_schedule_locked(&self, name: &str, brain_id: BrainId, schedule: &BrainSchedule) {
         let moved_earlier = {
             let mut index = self
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
             let earliest_before = index.next_due_ms();
-            index.upsert(name, schedule);
+            index.upsert(name, brain_id, schedule);
             let earliest_after = index.next_due_ms();
             match (earliest_before, earliest_after) {
                 (Some(before), Some(after)) => after < before,
@@ -2446,6 +2446,29 @@ impl BrainStore {
             .read()
             .expect("schedule index lock poisoned")
             .due_brains(now_ms)
+    }
+
+    /// Exact identity currently owning active indexed schedules under `name`.
+    ///
+    /// The daemon uses this non-hydrating snapshot to fence process-ephemeral
+    /// delivery diagnostics against archive, removal, external absence, and
+    /// alias reuse. `None` means the identity is no longer delivery-eligible.
+    pub fn active_schedule_identity(&self, name: &str) -> Option<BrainId> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .active_identity(name)
+    }
+
+    /// Every exact Brain identity currently owning active indexed schedules.
+    ///
+    /// This is a bounded, non-hydrating reconciliation view for daemon-owned
+    /// ephemeral state; it does not expose schedule contents or due arithmetic.
+    pub fn active_schedule_identities(&self) -> Vec<(BrainId, String)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .active_identities()
     }
 
     /// Populate the due index from every Brain on disk, once.
@@ -4880,7 +4903,7 @@ impl BrainStore {
         // process-wide `brains` write guard.
         if let Some(schedule_id) = touched {
             if let Some(schedule) = state.schedules.get(&schedule_id).cloned() {
-                self.upsert_schedule_locked(name, &schedule);
+                self.upsert_schedule_locked(name, state.brain_id, &schedule);
             }
         }
         let _ = state.tx.send(event.clone());

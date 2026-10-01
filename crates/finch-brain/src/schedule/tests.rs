@@ -44,12 +44,14 @@ fn test_schedule_due_window_counts_missed_ticks_without_rewriting_policy() {
 #[test]
 fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
     let mut index = ScheduleIndex::default();
+    let alpha_id = BrainId(uuid::Uuid::from_u128(10));
+    let bravo_id = BrainId(uuid::Uuid::from_u128(20));
     let early = sample_schedule(1, 10, Some(1_000), true);
     let late = sample_schedule(2, 20, Some(1_000), true);
     let inactive = sample_schedule(3, 5, Some(1_000), false);
-    index.upsert("bravo", &late);
-    index.upsert("alpha", &early);
-    index.upsert("alpha", &inactive);
+    index.upsert("bravo", bravo_id, &late);
+    index.upsert("alpha", alpha_id, &early);
+    index.upsert("alpha", alpha_id, &inactive);
 
     assert_eq!(
         index.due_brains(15),
@@ -62,6 +64,7 @@ fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
         "later due times must not reorder earlier Brains ahead of their due instant"
     );
     assert_eq!(index.next_due_ms(), Some(10));
+    assert_eq!(index.active_identity("alpha"), Some(alpha_id));
 
     index.forget("alpha");
     assert_eq!(
@@ -74,4 +77,5 @@ fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
         !index.is_indexed("alpha"),
         "forget must mark the Brain unknown so the next warm can repair it"
     );
+    assert_eq!(index.active_identity("alpha"), None);
 }

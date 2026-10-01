@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{BrainSchedule, ScheduleId};
+use super::{BrainId, BrainSchedule, ScheduleId};
 
 /// Every active schedule in the store, ordered by when it next comes due.
 ///
@@ -38,6 +38,10 @@ pub struct ScheduleIndex {
     /// forever — the growth curve `upsert`'s own doc comment exists to
     /// describe.
     indexed: HashSet<String>,
+    /// Exact durable identity observed when this Brain's schedules were
+    /// indexed. Names are reusable after archive or removal, so delivery-side
+    /// ephemeral state must never key on the alias alone.
+    identities: HashMap<String, BrainId>,
 }
 
 impl ScheduleIndex {
@@ -47,7 +51,8 @@ impl ScheduleIndex {
     /// ever held): schedules are never pruned — deactivation sets a flag in
     /// place and one-shot schedules stay in the map forever — and the rescan
     /// ran inside the process-wide brains write guard, once per schedule event.
-    pub fn upsert(&mut self, name: &str, schedule: &BrainSchedule) {
+    pub fn upsert(&mut self, name: &str, brain_id: BrainId, schedule: &BrainSchedule) {
+        self.identities.insert(name.to_string(), brain_id);
         let slots = self.by_brain.entry(name.to_string()).or_default();
         if let Some(previous) = slots.remove(&schedule.schedule_id) {
             self.due
@@ -69,21 +74,28 @@ impl ScheduleIndex {
     ///
     /// Used where the whole set is the unit of work — a Brain becoming
     /// resident — rather than on the per-event path.
-    pub fn reindex(&mut self, name: &str, schedules: &HashMap<ScheduleId, BrainSchedule>) {
+    pub fn reindex(
+        &mut self,
+        name: &str,
+        brain_id: BrainId,
+        schedules: &HashMap<ScheduleId, BrainSchedule>,
+    ) {
         self.forget(name);
         for schedule in schedules.values().filter(|schedule| schedule.active) {
-            self.upsert(name, schedule);
+            self.upsert(name, brain_id, schedule);
         }
         // After `forget`, so the Brain ends up marked known rather than
         // unknown. This is the only place a Brain becomes known: every other
         // mutation either moves a single schedule of an already-known Brain
         // (`upsert`) or makes it unknown again (`forget`).
         self.indexed.insert(name.to_string());
+        self.identities.insert(name.to_string(), brain_id);
     }
 
     /// Forget a Brain entirely, for removal and archival.
     pub fn forget(&mut self, name: &str) {
         self.indexed.remove(name);
+        self.identities.remove(name);
         if let Some(previous) = self.by_brain.remove(name) {
             for (schedule_id, next_due_ms) in previous {
                 self.due
@@ -141,6 +153,26 @@ impl ScheduleIndex {
     /// Whether this Brain currently has at least one active indexed schedule.
     pub fn has_active(&self, name: &str) -> bool {
         self.by_brain.contains_key(name)
+    }
+
+    /// Exact identity of a Brain that currently owns active scheduled work.
+    pub fn active_identity(&self, name: &str) -> Option<BrainId> {
+        self.has_active(name)
+            .then(|| self.identities.get(name).copied())
+            .flatten()
+    }
+
+    /// Every exact Brain identity that currently owns active scheduled work.
+    pub fn active_identities(&self) -> Vec<(BrainId, String)> {
+        self.by_brain
+            .keys()
+            .filter_map(|name| {
+                self.identities
+                    .get(name)
+                    .copied()
+                    .map(|brain_id| (brain_id, name.clone()))
+            })
+            .collect()
     }
 
     /// Diagnostic snapshot of every due key, never a rebuild.

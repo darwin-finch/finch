@@ -30,6 +30,14 @@ mutates Brain state or dispatches a runner request. An IPC disconnect or retry m
 a second committed Brain turn. Keep runner callback and approval protocol changes covered by
 the server and supervised IPC tests, not just a helper unit test.
 
+**Schedule-delivery diagnostics report transitions, not retry cadence.** The process-ephemeral
+failure registry in `schedule_delivery::FailureEpisodes` is keyed by exact indexed `BrainId` plus
+display name. The first failed attempt emits one actionable WARN with the full cause chain;
+unchanged retries are silent; the first real success emits one INFO and clears the episode.
+Archive, unused removal, external absence, and schedule retirement silently reconcile the entry,
+and a completion that crossed one of those boundaries cannot reinsert it. Restart deliberately
+starts empty, so the first real post-restart failure may warn again but never invents recovery.
+
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and
 `SpeculativePrompt` receives the daemon-authored `TypedRuntime::intrinsic_grants()` ceiling in its
 `RunnerTurnRequest`; the frontend may transport and apply that ceiling but may not reconstruct it
