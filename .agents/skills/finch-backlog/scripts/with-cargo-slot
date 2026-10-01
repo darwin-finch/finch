@@ -334,6 +334,16 @@ esac
 # Acquire nonblocking in a bounded loop, then retain the lock in a supervising
 # parent. The command child closes the lock descriptor before exec so a
 # compiler cache or other daemon cannot keep the slot after Cargo exits.
+#
+# The parent forwards and reaps HUP, INT, QUIT, and TERM, but SIGKILL and an
+# OOM kill cannot be trapped. If either kills this lock-holding parent, the
+# kernel releases the flock even when Cargo, rustc, or other command
+# descendants survive, so another slot user can enter prematurely. A caller
+# that force-kills the wrapper must independently track, terminate, and reap
+# the complete command subtree, prove it is quiescent, and restore any
+# temporary worktree mutation before starting another slot user. Do not pass
+# the lock descriptor into that subtree as a workaround: an outliving compiler
+# cache or daemon would then retain the slot after the foreground command exits.
 exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -MPOSIX=SIG_BLOCK,SIG_SETMASK,SIG_UNBLOCK,SIGHUP,SIGINT,SIGQUIT,SIGTERM -e '
     use strict;
     use warnings;
