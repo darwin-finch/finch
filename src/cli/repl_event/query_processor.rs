@@ -5750,6 +5750,64 @@ mod tests {
         drain_vm_events_as_event_loop(&mut event_rx);
     }
 
+    #[tokio::test]
+    async fn named_brain_raw_prose_file_creation_claim_is_caveated_without_creating_the_file() {
+        let mut harness = StreamingQueryHarness::spawn("create pagoda.html").await;
+        let claim = "Created pagoda.html with a basic website.";
+        let claimed_path = harness.workspace_path("pagoda.html");
+
+        harness
+            .send(Ok(StreamChunk::TextDelta(claim.to_string())))
+            .await;
+        harness.wait_for_content(claim).await;
+        harness.close_stream();
+        harness.task.await.expect("named-Brain query task panicked");
+
+        assert!(
+            !claimed_path.exists(),
+            "the deterministic raw-prose fallback must not create the file it only claimed to \
+             create; unexpected path={}",
+            claimed_path.display()
+        );
+        let expected = format!("{claim}{UNVERIFIED_TOOL_CLAIM_CAVEAT}");
+        let visible = harness
+            .query_states
+            .brain_output_work_unit(harness.query_id)
+            .await
+            .expect("named-Brain completion must retain its live output projection");
+        assert_eq!(
+            visible.content(),
+            expected,
+            "the visible named-Brain output must caption the unsupported filesystem mutation \
+             claim; messages={:?}",
+            harness
+                .output
+                .get_messages()
+                .iter()
+                .map(|message| (message.id(), message.status(), message.content()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(
+                harness.query_states.get_state(harness.query_id).await,
+                Some(QueryState::Completed { response }) if response == expected
+            ),
+            "the canonical completed response must retain the caveat for later named-Brain \
+             commit/projection; state={:?}",
+            harness.query_states.get_state(harness.query_id).await
+        );
+
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ReplEvent::StreamingComplete { full_response, .. } if full_response == &expected
+            )),
+            "the StreamingComplete payload consumed by the named-Brain commit path must retain \
+             the caveat so replay cannot promote a clean assertion; events={events:?}"
+        );
+    }
+
     fn drain_vm_events_as_event_loop(event_rx: &mut mpsc::UnboundedReceiver<ReplEvent>) {
         while let Ok(event) = event_rx.try_recv() {
             match event {
