@@ -528,6 +528,105 @@ fn claims_tool_grounded_fact(text: &str) -> bool {
     UNVERIFIED_GROUNDING_PHRASES
         .iter()
         .any(|phrase| lower.contains(phrase))
+        || claims_completed_filesystem_mutation(&lower)
+}
+
+/// Whether the response opens with a completed filesystem mutation claim.
+///
+/// This is intentionally grammar-shaped rather than a bag of mutation words:
+/// the completed verb must lead the response (optionally after a first-person
+/// subject), and its direct target must look like a path or explicitly name a
+/// file/directory. That catches terse success reports such as `Created
+/// pagoda.html` while keeping prospective instructions, requests, plans,
+/// refusals, examples, and ordinary creative claims such as `I wrote a poem`
+/// out of the policy.
+fn claims_completed_filesystem_mutation(text: &str) -> bool {
+    let first_line = text.lines().find(|line| !line.trim().is_empty());
+    let Some(mut claim) = first_line.map(str::trim) else {
+        return false;
+    };
+
+    claim = claim.strip_prefix("successfully ").unwrap_or(claim);
+    for subject in ["i've ", "i have ", "i ", "we've ", "we have ", "we "] {
+        if let Some(rest) = claim.strip_prefix(subject) {
+            claim = rest;
+            break;
+        }
+    }
+    claim = claim.strip_prefix("successfully ").unwrap_or(claim);
+
+    const ACTIVE_VERBS: &[&str] = &[
+        "created ", "wrote ", "written ", "edited ", "updated ", "patched ", "moved ", "renamed ",
+        "deleted ",
+    ];
+    if ACTIVE_VERBS
+        .iter()
+        .find_map(|verb| claim.strip_prefix(verb))
+        .is_some_and(starts_with_filesystem_target)
+    {
+        return true;
+    }
+
+    for separator in [" was ", " has been "] {
+        let Some((target, completion)) = claim.split_once(separator) else {
+            continue;
+        };
+        const PASSIVE_VERBS: &[&str] = &[
+            "created", "written", "edited", "updated", "patched", "moved", "renamed", "deleted",
+        ];
+        if starts_with_filesystem_target(target)
+            && PASSIVE_VERBS
+                .iter()
+                .any(|verb| starts_with_word(completion, verb))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn starts_with_filesystem_target(text: &str) -> bool {
+    let mut target = text.trim_start_matches([' ', '\t', '`', '\'', '"', '(', '[']);
+    for article in ["the ", "a ", "an ", "new "] {
+        if let Some(rest) = target.strip_prefix(article) {
+            target = rest;
+            break;
+        }
+    }
+    if ["file", "directory", "folder"]
+        .iter()
+        .any(|noun| starts_with_word(target, noun))
+    {
+        return true;
+    }
+
+    let token = target
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['`', '\'', '"', ',', ';', ':', '!', '?', ')', ']', '}'])
+        .trim_end_matches('.');
+    looks_like_filesystem_path(token)
+}
+
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with(|ch: char| !ch.is_alphanumeric() && ch != '_')
+    })
+}
+
+fn looks_like_filesystem_path(token: &str) -> bool {
+    if token.contains(['/', '\\']) {
+        return token.chars().any(char::is_alphanumeric);
+    }
+    let Some((stem, extension)) = token.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !extension.is_empty()
+        && stem.chars().any(char::is_alphanumeric)
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
 /// Whether any tool actually completed during `query_id`, per the same
@@ -5635,6 +5734,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_filesystem_mutation_claims_match_only_asserted_effects() {
+        for claim in [
+            "Created pagoda.html with a basic website.",
+            "I created the file pagoda.html.",
+            "I've written src/site.html.",
+            "Wrote index.html.",
+            "Edited src/main.rs.",
+            "Updated the file config.toml.",
+            "Patched /tmp/example.txt.",
+            "Moved old.txt to archive/old.txt.",
+            "Renamed old.txt to new.txt.",
+            "Deleted obsolete.txt.",
+            "pagoda.html was created successfully.",
+            "The directory build has been deleted.",
+        ] {
+            assert!(
+                claims_tool_grounded_fact(claim),
+                "a completed filesystem mutation assertion must be treated as tool-grounded: \
+                 {claim:?}"
+            );
+        }
+
+        for prose in [
+            "To create pagoda.html, start with a doctype.",
+            "For example: create pagoda.html with a basic website.",
+            "Please write pagoda.html for me.",
+            "I will create pagoda.html next.",
+            "Plan: update config.toml after reviewing it.",
+            "I can't create pagoda.html without a write tool.",
+            "I wrote a poem about a pagoda.",
+            "I wrote a story called pagoda.html.",
+            "`Created pagoda.html` is an example of a completion message.",
+        ] {
+            assert!(
+                !claims_tool_grounded_fact(prose),
+                "prospective, requested, refused, example, or creative prose must not be \
+                 mislabeled merely for containing a mutation verb: {prose:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unattempted_prose_claiming_file_content_gets_unverified_caveat_when_no_tool_ran() {
         let runtime = crate::runtime::ProgramRuntime::new();
@@ -5751,6 +5892,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unattempted_prose_claiming_file_creation_gets_no_caveat_after_completed_write() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "Created pagoda.html with a basic website.".to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let query_id = Uuid::new_v4();
+        let tool_call_history = ToolCallHistory::default();
+        record_completed_tool_result(
+            &tool_call_history,
+            query_id,
+            "write",
+            &serde_json::json!({"file_path": "pagoda.html", "content": "<!doctype html>"}),
+            "Wrote pagoda.html",
+        )
+        .await;
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::providers::Message::user("create pagoda.html")],
+            source.clone(),
+            None,
+            None,
+            None,
+            query_id,
+            &tool_call_history,
+        )
+        .await;
+
+        assert_eq!(
+            execution.response, source,
+            "a completed write in this query must keep the mutation success report uncaveated"
+        );
+        assert!(
+            !execution.response.contains("unverified"),
+            "a completed write must suppress the existing caveat entirely: {:?}",
+            execution.response
+        );
+        drain_vm_events_as_event_loop(&mut event_rx);
+    }
+
+    #[tokio::test]
     async fn named_brain_raw_prose_file_creation_claim_is_caveated_without_creating_the_file() {
         let mut harness = StreamingQueryHarness::spawn("create pagoda.html").await;
         let claim = "Created pagoda.html with a basic website.";
@@ -5770,16 +5960,39 @@ mod tests {
             claimed_path.display()
         );
         let expected = format!("{claim}{UNVERIFIED_TOOL_CLAIM_CAVEAT}");
+        let mut completed_response = None;
+        while let Ok(event) = harness.events.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    for envelope in projection.project_envelope(envelope) {
+                        if envelope.effect.requirement.capability
+                            == crate::vm::CapabilityKind::ProgramInvoke
+                        {
+                            projection.append_default("Proposal awaiting review");
+                        }
+                    }
+                }
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::StreamingComplete { full_response, .. } => {
+                    completed_response = Some(full_response)
+                }
+                _ => {}
+            }
+        }
         let visible = harness
             .query_states
             .brain_output_work_unit(harness.query_id)
             .await
             .expect("named-Brain completion must retain its live output projection");
-        assert_eq!(
-            visible.content(),
-            expected,
-            "the visible named-Brain output must caption the unsupported filesystem mutation \
-             claim; messages={:?}",
+        let visible_content = visible.content();
+        assert!(
+            visible_content.contains(claim)
+                && visible_content.contains(UNVERIFIED_TOOL_CLAIM_CAVEAT),
+            "the visible named-Brain output must retain both the unsupported filesystem \
+             mutation claim and its caveat; messages={:?}",
             harness
                 .output
                 .get_messages()
@@ -5797,14 +6010,11 @@ mod tests {
             harness.query_states.get_state(harness.query_id).await
         );
 
-        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                ReplEvent::StreamingComplete { full_response, .. } if full_response == &expected
-            )),
+        assert_eq!(
+            completed_response.as_deref(),
+            Some(expected.as_str()),
             "the StreamingComplete payload consumed by the named-Brain commit path must retain \
-             the caveat so replay cannot promote a clean assertion; events={events:?}"
+             the caveat so replay cannot promote a clean assertion"
         );
     }
 
