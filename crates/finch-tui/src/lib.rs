@@ -998,6 +998,8 @@ pub(crate) struct LiveFrame {
     /// Disclosure hit rects the layout pass claimed inside the transcript
     /// viewport, in the frame's own coordinates.
     pub hitboxes: Vec<ClaimedDisclosureRect>,
+    /// Largest legal offset for the dialog body described by `rects`.
+    pub dialog_body_max_offset: usize,
 }
 
 impl LiveFrame {
@@ -1020,6 +1022,32 @@ impl LiveFrame {
 
     fn push(&mut self, line: impl Into<String>) {
         self.lines.push(line.into());
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DialogMouseRegions {
+    card: widgets::Rect,
+    body: widgets::Rect,
+    controls: widgets::Rect,
+    body_max_offset: usize,
+}
+
+impl DialogMouseRegions {
+    fn contains(rect: widgets::Rect, column: u16, row: u16) -> bool {
+        !rect.is_empty()
+            && usize::from(row) >= rect.y
+            && usize::from(row) < rect.bottom()
+            && usize::from(column) >= rect.x
+            && usize::from(column) < rect.right()
+    }
+
+    fn body_owns(self, column: u16, row: u16) -> bool {
+        Self::contains(self.body, column, row)
+    }
+
+    fn card_owns(self, column: u16, row: u16) -> bool {
+        Self::contains(self.card, column, row)
     }
 }
 
@@ -1215,7 +1243,7 @@ pub(crate) fn plan_live_frame(
     // disclosure hit rects the depth-first claim produced. The dialog card's
     // lines are pinned to the height the sizing pass claimed and padded to
     // exactly that height, so both passes claim the same card box (#807).
-    let dialog_card_lines = vm
+    let dialog_card_layout = vm
         .dialog
         .map(|dialog| {
             TuiRenderer::dialog_card_lines_for_claim(dialog, width, rects.dialog_card.height)
@@ -1224,10 +1252,25 @@ pub(crate) fn plan_live_frame(
     let content = view_model::LiveFrameContent {
         viewport: viewport_content.clone(),
         completions: completion_lines.clone(),
-        dialog_card: dialog_card_lines,
+        dialog_card: dialog_card_layout.lines.clone(),
     };
     let claimed = view_model::claim_live_frame(vm, Some(&content), 0, dialog_card_natural);
-    let claimed_rects = view_model::frame_rects(&claimed);
+    let mut claimed_rects = view_model::frame_rects(&claimed);
+    let translate_dialog_rect = |rect: widgets::Rect| {
+        if rect.is_empty() {
+            return rect;
+        }
+        widgets::Rect {
+            x: claimed_rects.dialog_card.x + rect.x,
+            y: claimed_rects.dialog_card.y + rect.y,
+            width: rect.width.min(claimed_rects.dialog_card.width),
+            height: rect
+                .height
+                .min(claimed_rects.dialog_card.height.saturating_sub(rect.y)),
+        }
+    };
+    claimed_rects.dialog_body = translate_dialog_rect(dialog_card_layout.body);
+    claimed_rects.dialog_controls = translate_dialog_rect(dialog_card_layout.controls);
 
     // ── 3. Paint in claimed order: transcript, task rows, tracked rows,
     //       completions, hr, input, hr, status ────────────────────────────────
@@ -1283,6 +1326,7 @@ pub(crate) fn plan_live_frame(
         frame.cursor_visible = false;
         frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
         frame.rects = claimed_rects;
+        frame.dialog_body_max_offset = dialog_card_layout.body_max_offset;
         frame.hitboxes = transcript_disclosure_hitboxes(&claimed, &viewport_content, width);
         return frame;
     }
@@ -1528,6 +1572,10 @@ pub struct TuiRenderer {
 
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
+    // Semantic regions from the last painted dialog card. They are rebuilt
+    // with the frame claims, so wheel dispatch never infers ownership from
+    // glyphs or stale terminal coordinates.
+    dialog_mouse_regions: DialogMouseRegions,
     // Crate-internal (#1078 facade audit): no external caller reads or
     // writes this field; unlike `active_dialog`, `show_tabbed_dialog` runs
     // its own alternate-screen loop with a local `dialog` binding.
@@ -1702,6 +1750,7 @@ impl TuiRenderer {
             diagnostic_console: diagnostic_console::DiagnosticConsoleState::default(),
             transcript_scroll: TranscriptScrollView::new(),
             active_dialog: None,
+            dialog_mouse_regions: DialogMouseRegions::default(),
             active_tabbed_dialog: None,
             attention_dialog_live: false,
             is_active: false,
@@ -1794,6 +1843,7 @@ impl TuiRenderer {
             transcript_scroll: TranscriptScrollView::new(),
 
             active_dialog: None,
+            dialog_mouse_regions: DialogMouseRegions::default(),
             active_tabbed_dialog: None,
             attention_dialog_live: false,
 
@@ -2155,6 +2205,7 @@ impl TuiRenderer {
                 .rebuild_retained_hit_regions(&[], 0, term_width);
             self.tool_viewports.rebuild_hit_regions(&[], 0, term_width);
             self.transcript_scroll.set_claim(widgets::Rect::default());
+            self.dialog_mouse_regions = DialogMouseRegions::default();
             return Ok(());
         }
 
@@ -3375,6 +3426,12 @@ impl TuiRenderer {
         // ScrollView's wheel hitbox: the leftover frame under the bottom
         // chrome (#806). A dialog or tiny frame claims nothing.
         self.transcript_scroll.set_claim(frame.rects.transcript);
+        self.dialog_mouse_regions = DialogMouseRegions {
+            card: frame.rects.dialog_card,
+            body: frame.rects.dialog_body,
+            controls: frame.rects.dialog_controls,
+            body_max_offset: frame.dialog_body_max_offset,
+        };
         let transcript_budget = height.saturating_sub(live_rows);
         // The scroll window is derived at paint time from the projected
         // live + retained union (#897): the same committed source the full
@@ -3610,10 +3667,48 @@ impl TuiRenderer {
 
     fn handle_mouse_to(&mut self, mouse: MouseEvent, _out: &mut impl Write) -> bool {
         if mouse_capture::is_wheel(mouse.kind) {
-            // A dialog owns the live area: native scroll would move Yes/No
-            // off-screen. Leave the wheel for the dialog (ignored today; body
-            // scroll later).
-            if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
+            // An inline approval card and the conversation above it remain
+            // independently readable. Route before nested transcript controls:
+            // a wheel in the transcript moves the conversation only, a wheel
+            // in the proposed-write body moves that body only, and the fixed
+            // card chrome consumes the event without changing selection.
+            if self.active_dialog.is_some() {
+                let Some(delta) = wheel_delta(mouse.kind) else {
+                    return false;
+                };
+                let regions = self.dialog_mouse_regions;
+                if regions.body_owns(mouse.column, mouse.row) {
+                    let dialog = self
+                        .active_dialog
+                        .as_mut()
+                        .expect("dialog wheel routing requires the active dialog");
+                    let current = dialog.body_scroll_offset.min(regions.body_max_offset);
+                    let next = if delta < 0 {
+                        current.saturating_sub(delta.unsigned_abs())
+                    } else {
+                        current
+                            .saturating_add(delta as usize)
+                            .min(regions.body_max_offset)
+                    };
+                    if next != dialog.body_scroll_offset {
+                        dialog.body_scroll_offset = next;
+                        self.live_area_dirty = true;
+                    }
+                    return true;
+                }
+                if self.transcript_scroll.owns(mouse.column, mouse.row) {
+                    let transcript_delta = scroll_view::transcript_wheel_delta(mouse.kind)
+                        .expect("vertical wheel already established");
+                    self.scroll_transcript_view(transcript_delta);
+                    return true;
+                }
+                if DialogMouseRegions::contains(regions.controls, mouse.column, mouse.row) {
+                    return true;
+                }
+                return regions.card_owns(mouse.column, mouse.row);
+            }
+            // Tabbed dialogs still own their alternate-screen input loop.
+            if self.active_tabbed_dialog.is_some() {
                 return false;
             }
             // A horizontal wheel has no vertical scroll owner; it stays
@@ -4791,6 +4886,21 @@ fn render_other_row_inline(
     Ok(1)
 }
 
+#[derive(Debug, Default)]
+struct DialogRenderMetrics {
+    control_start: usize,
+    body_range: Option<(usize, usize)>,
+    body_max_offset: usize,
+}
+
+#[derive(Debug, Default)]
+struct DialogCardLayout {
+    lines: Vec<String>,
+    body: widgets::Rect,
+    controls: widgets::Rect,
+    body_max_offset: usize,
+}
+
 impl TuiRenderer {
     /// Paint a dialog and report the logical line index where the control
     /// suffix starts (the options divider after title/help/body).
@@ -4806,7 +4916,7 @@ impl TuiRenderer {
         dialog: &Dialog,
         box_width: usize,
         max_rows: Option<usize>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, DialogRenderMetrics)> {
         // Wrap width inside the 2-space left indent (no right border to reserve for).
         let inner = box_width.saturating_sub(2).max(1);
 
@@ -4829,6 +4939,9 @@ impl TuiRenderer {
             }
         }
 
+        let mut body_range = None;
+        let mut body_max_offset = 0;
+
         // Body text (optional, shown above the options divider) with scroll support
         if let Some(ref body) = dialog.body {
             let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
@@ -4837,6 +4950,7 @@ impl TuiRenderer {
 
             execute!(out, Print(&rule), Print("\r\n"))?;
             rows += 1;
+            let body_start = rows;
 
             // Collect all wrapped lines.
             let mut all_body_lines: Vec<String> = Vec::new();
@@ -4858,6 +4972,7 @@ impl TuiRenderer {
                 // Reserve 1 row for the scroll indicator.
                 let content_rows = max_body_rows.saturating_sub(1).max(1);
                 let max_offset = total_lines.saturating_sub(content_rows);
+                body_max_offset = max_offset;
                 let offset = dialog.body_scroll_offset.min(max_offset);
 
                 for line in &all_body_lines[offset..total_lines.min(offset + content_rows)] {
@@ -4885,6 +5000,7 @@ impl TuiRenderer {
                     rows += 1;
                 }
             }
+            body_range = Some((body_start, rows));
         }
 
         let control_start = rows;
@@ -5089,7 +5205,14 @@ impl TuiRenderer {
         execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 1;
 
-        Ok((rows, control_start))
+        Ok((
+            rows,
+            DialogRenderMetrics {
+                control_start,
+                body_range,
+                body_max_offset,
+            },
+        ))
     }
 
     /// The dialog's lines, clipped to `max_rows` **physical** terminal rows.
@@ -5108,32 +5231,72 @@ impl TuiRenderer {
     /// pinned so approve/deny stay reachable. Too many options still clip from
     /// the top and show the viewport marker.
     pub(crate) fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
+        Self::dialog_card_layout(dialog, width, max_rows).lines
+    }
+
+    fn dialog_card_layout(dialog: &Dialog, width: usize, max_rows: usize) -> DialogCardLayout {
         if max_rows == 0 {
-            return Vec::new();
+            return DialogCardLayout::default();
         }
         let width = width.max(1);
         let mut rendered = Vec::new();
-        let control_start = match Self::draw_dialog_with_control_start(
+        let metrics = match Self::draw_dialog_with_control_start(
             &mut rendered,
             dialog,
             width,
             Some(max_rows),
         ) {
-            Ok((_, start)) => start,
-            Err(_) => return Vec::new(),
+            Ok((_, metrics)) => metrics,
+            Err(_) => return DialogCardLayout::default(),
         };
         let text = String::from_utf8_lossy(&rendered).into_owned();
         let all = text
             .split_terminator("\r\n")
             .map(str::to_string)
             .collect::<Vec<_>>();
-        dialog::pin_dialog_controls(
+        let pinned = dialog::pin_dialog_controls_with_indices(
             all,
-            control_start,
+            metrics.control_start,
             max_rows,
             width,
             dialog.option_row_count(),
-        )
+        );
+        let mut body_top = None;
+        let mut body_bottom = 0;
+        let mut controls_top = None;
+        let mut controls_bottom = 0;
+        let mut row = 0;
+        for line in &pinned {
+            let physical_rows = shadow_buffer::physical_rows(&line.text, width);
+            if let Some(index) = line.original_index {
+                if metrics
+                    .body_range
+                    .is_some_and(|(start, end)| index >= start && index < end)
+                {
+                    body_top.get_or_insert(row);
+                    body_bottom = row + physical_rows;
+                }
+                if index >= metrics.control_start {
+                    controls_top.get_or_insert(row);
+                    controls_bottom = row + physical_rows;
+                }
+            }
+            row += physical_rows;
+        }
+        let rect = |top: Option<usize>, bottom: usize| {
+            top.map_or_else(widgets::Rect::default, |top| widgets::Rect {
+                x: 0,
+                y: top,
+                width,
+                height: bottom.saturating_sub(top),
+            })
+        };
+        DialogCardLayout {
+            lines: pinned.into_iter().map(|line| line.text).collect(),
+            body: rect(body_top, body_bottom),
+            controls: rect(controls_top, controls_bottom),
+            body_max_offset: metrics.body_max_offset,
+        }
     }
 
     /// The open dialog card's pinned natural extent at `width` (#807).
@@ -5157,22 +5320,23 @@ impl TuiRenderer {
     /// The dialog card's lines pinned to `claimed_rows` and padded to exactly
     /// that many physical rows, so the sizing and content claiming passes both
     /// see the same card box and the chrome below never shifts (#807).
-    pub(crate) fn dialog_card_lines_for_claim(
+    fn dialog_card_lines_for_claim(
         dialog: &Dialog,
         width: usize,
         claimed_rows: usize,
-    ) -> Vec<String> {
+    ) -> DialogCardLayout {
         let width = width.max(1);
-        let mut lines = TuiRenderer::dialog_lines(dialog, width, claimed_rows);
-        let mut rows: usize = lines
+        let mut layout = TuiRenderer::dialog_card_layout(dialog, width, claimed_rows);
+        let mut rows: usize = layout
+            .lines
             .iter()
             .map(|line| shadow_buffer::physical_rows(line, width))
             .sum();
         while rows < claimed_rows {
-            lines.push(String::new());
+            layout.lines.push(String::new());
             rows += 1;
         }
-        lines
+        layout
     }
 
     /// Complete the active dialog: freeze its settled record into the
@@ -6322,6 +6486,202 @@ mod tests {
              DisableMouseCapture, so Yes/No stay on-screen (#806). \
              terminal received {bytes:?}"
         );
+        renderer.is_active = false;
+    }
+
+    fn wheel_at(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn drawn_write_approval_renderer() -> (TuiRenderer, VtOracle) {
+        let (mut renderer, _) = committed_tool_result_renderer(80);
+        let body = (0..80)
+            .map(|row| format!("preview-line-{row:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        renderer.active_dialog =
+            Some(Dialog::tool_approval("Write", "replace docs/guide.md").with_body(body));
+        let (width, height) = (80, 30);
+        let mut bytes = Vec::new();
+        renderer.pending_viewport_size = Some((width as u16, height as u16));
+        renderer
+            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .expect("the production full-viewport renderer must draw the write approval");
+        let mut terminal = VtOracle::new(width, height);
+        terminal.feed(&bytes);
+        (renderer, terminal)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DialogWheelState {
+        transcript: usize,
+        body: usize,
+        selection: Option<usize>,
+    }
+
+    fn dialog_wheel_state(renderer: &TuiRenderer) -> DialogWheelState {
+        let dialog = renderer
+            .active_dialog
+            .as_ref()
+            .expect("approval remains open");
+        DialogWheelState {
+            transcript: renderer.transcript_scroll.offset(),
+            body: dialog.body_scroll_offset,
+            selection: dialog.current_cursor(),
+        }
+    }
+
+    #[test]
+    fn test_write_approval_wheel_over_transcript_scrolls_only_conversation() {
+        let (mut renderer, terminal) = drawn_write_approval_renderer();
+        let transcript = renderer.transcript_scroll.claim();
+        let row = transcript.bottom().saturating_sub(1) as u16;
+        assert!(
+            !transcript.is_empty() && row < transcript.bottom() as u16,
+            "precondition: the real dialog frame must retain a transcript claim; \
+             claim={transcript:?} terminal={}",
+            terminal.diagnostic()
+        );
+        let before = dialog_wheel_state(&renderer);
+
+        assert!(
+            renderer.handle_mouse_to(wheel_at(MouseEventKind::ScrollUp, row), &mut Vec::new(),),
+            "a wheel on the real transcript claim must be consumed by the conversation \
+             while approval remains open; claim={transcript:?} terminal={}",
+            terminal.diagnostic()
+        );
+        let after = dialog_wheel_state(&renderer);
+        assert_eq!(after.transcript, before.transcript + scroll_view::TRANSCRIPT_WHEEL_STEP_LINES, "one transcript wheel tick must apply the conversation's step exactly once; before={before:?} after={after:?} claim={transcript:?} terminal={}", terminal.diagnostic());
+        assert_eq!((after.body, after.selection), (before.body, before.selection), "a transcript wheel must not move the preview or approval selection; before={before:?} after={after:?}");
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_write_approval_wheel_over_preview_scrolls_only_preview_body() {
+        let (mut renderer, terminal) = drawn_write_approval_renderer();
+        let preview_row = terminal
+            .find_row("preview-line-000")
+            .expect("the real dialog layout paints the first preview row")
+            as u16;
+        let body_claim = renderer.dialog_mouse_regions.body;
+        assert!(
+            DialogMouseRegions::contains(body_claim, 1, preview_row),
+            "the painted preview row must belong to the dialog body's real layout claim; \
+             preview_row={preview_row} body_claim={body_claim:?} terminal={}",
+            terminal.diagnostic()
+        );
+        let before = dialog_wheel_state(&renderer);
+
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollDown, preview_row),
+                &mut Vec::new(),
+            ),
+            "a wheel on the painted preview body must be consumed by that body; \
+             preview_row={preview_row} terminal={}",
+            terminal.diagnostic()
+        );
+        let bottom_boundary = body_claim.bottom().saturating_sub(1) as u16;
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollDown, bottom_boundary),
+                &mut Vec::new(),
+            ),
+            "the body's inclusive bottom boundary must still belong to the preview; \
+             body_claim={body_claim:?} terminal={}",
+            terminal.diagnostic()
+        );
+        let after = dialog_wheel_state(&renderer);
+        assert_eq!(after.body, before.body + 2, "the preview's first and last claimed rows must each consume exactly one tick; before={before:?} after={after:?} claim={body_claim:?} terminal={}", terminal.diagnostic());
+        assert_eq!((after.transcript, after.selection), (before.transcript, before.selection), "preview wheels must not move the conversation or approval selection; before={before:?} after={after:?}");
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_write_approval_wheel_over_fixed_control_is_consumed_without_state_change() {
+        let (mut renderer, terminal) = drawn_write_approval_renderer();
+        let control_row = terminal
+            .find_row("1. Yes")
+            .expect("the real dialog layout paints the approval choice")
+            as u16;
+        let cancel_row = terminal
+            .find_row("[ Cancel ]")
+            .expect("the real dialog layout paints the fixed cancel control")
+            as u16;
+        let controls_claim = renderer.dialog_mouse_regions.controls;
+        assert!(
+            DialogMouseRegions::contains(controls_claim, 1, control_row)
+                && DialogMouseRegions::contains(controls_claim, 1, cancel_row),
+            "the painted choice and cancel button must belong to the fixed-controls layout claim; \
+             choice_row={control_row} cancel_row={cancel_row} controls={controls_claim:?} terminal={}",
+            terminal.diagnostic()
+        );
+        let before = dialog_wheel_state(&renderer);
+
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollDown, control_row),
+                &mut Vec::new(),
+            ),
+            "a wheel on a fixed approval control must be consumed exactly once; \
+             control_row={control_row} terminal={}",
+            terminal.diagnostic()
+        );
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollDown, cancel_row),
+                &mut Vec::new(),
+            ),
+            "a wheel on the fixed cancel control must be consumed exactly once; \
+             cancel_row={cancel_row} terminal={}",
+            terminal.diagnostic()
+        );
+        let control_bottom = controls_claim.bottom().saturating_sub(1) as u16;
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollUp, control_bottom),
+                &mut Vec::new(),
+            ),
+            "the fixed controls' inclusive bottom boundary must consume the wheel; \
+             controls={controls_claim:?} terminal={}",
+            terminal.diagnostic()
+        );
+        assert_eq!(dialog_wheel_state(&renderer), before, "wheels on both fixed-control boundaries must leave conversation, preview, and selection unchanged; controls={controls_claim:?} terminal={}", terminal.diagnostic());
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "dialog-region wheel routing must keep mouse capture coherent"
+        );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_write_approval_non_scrollable_body_consumes_wheel_without_state_change() {
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        renderer.active_dialog = Some(
+            Dialog::tool_approval("Write", "replace docs/guide.md")
+                .with_body("one visible preview line"),
+        );
+        renderer.pending_viewport_size = Some((80, 30));
+        renderer
+            .redraw_full_viewport_inner_to(&mut Vec::new(), false)
+            .expect("the production full-viewport renderer must draw the short write approval");
+        let body = renderer.dialog_mouse_regions.body;
+        let before = dialog_wheel_state(&renderer);
+
+        assert!(
+            renderer.handle_mouse_to(
+                wheel_at(MouseEventKind::ScrollDown, body.y as u16),
+                &mut Vec::new(),
+            ),
+            "a non-scrollable body still owns and consumes the wheel tick; body={body:?}"
+        );
+        assert_eq!(dialog_wheel_state(&renderer), before, "a non-scrollable preview must consume the wheel without acquiring an offset or moving conversation/selection; body={body:?}");
         renderer.is_active = false;
     }
 

@@ -809,29 +809,43 @@ impl DialogResult {
 /// If chrome makes the suffix one or more rows over but the options themselves
 /// fit, keep the suffix tail so Yes/No stay. Top-clip + marker only when there
 /// are too many options to present.
-pub(crate) fn pin_dialog_controls(
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedDialogLine {
+    pub original_index: Option<usize>,
+    pub text: String,
+}
+
+pub(crate) fn pin_dialog_controls_with_indices(
     lines: Vec<String>,
     control_start: usize,
     max_rows: usize,
     width: usize,
     option_row_count: usize,
-) -> Vec<String> {
+) -> Vec<PinnedDialogLine> {
     let width = width.max(1);
     let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
     let total: usize = lines.iter().map(|line| rows_of(line)).sum();
+    let indexed = lines
+        .into_iter()
+        .enumerate()
+        .map(|(original_index, text)| PinnedDialogLine {
+            original_index: Some(original_index),
+            text,
+        })
+        .collect::<Vec<_>>();
     if total <= max_rows {
-        return lines;
+        return indexed;
     }
 
-    let start = control_start.min(lines.len());
-    let suffix = &lines[start..];
-    let control_phys: usize = suffix.iter().map(|line| rows_of(line)).sum();
+    let start = control_start.min(indexed.len());
+    let suffix = &indexed[start..];
+    let control_phys: usize = suffix.iter().map(|line| rows_of(&line.text)).sum();
     if control_phys <= max_rows {
         let budget = max_rows - control_phys;
         let mut kept = Vec::new();
         let mut used = 0;
-        for line in &lines[..start] {
-            let rows = rows_of(line);
+        for line in &indexed[..start] {
+            let rows = rows_of(&line.text);
             if used + rows > budget {
                 break;
             }
@@ -843,33 +857,40 @@ pub(crate) fn pin_dialog_controls(
     }
 
     if option_row_count < max_rows {
-        return take_last_physical(suffix, max_rows, width);
+        return take_last_physical_indexed(suffix, max_rows, width);
     }
 
     let budget = max_rows.saturating_sub(1);
     let mut kept = Vec::new();
     let mut used = 0;
-    for line in lines {
-        let rows = rows_of(&line);
+    for line in indexed {
+        let rows = rows_of(&line.text);
         if used + rows > budget {
             break;
         }
         used += rows;
         kept.push(line);
     }
-    kept.push(super::shadow_buffer::truncate_to_columns(
-        "… dialog clipped to viewport; use navigation keys …",
-        width,
-    ));
+    kept.push(PinnedDialogLine {
+        original_index: None,
+        text: super::shadow_buffer::truncate_to_columns(
+            "… dialog clipped to viewport; use navigation keys …",
+            width,
+        ),
+    });
     kept
 }
 
-fn take_last_physical(lines: &[String], max_rows: usize, width: usize) -> Vec<String> {
+fn take_last_physical_indexed(
+    lines: &[PinnedDialogLine],
+    max_rows: usize,
+    width: usize,
+) -> Vec<PinnedDialogLine> {
     let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
     let mut kept = Vec::new();
     let mut used = 0;
     for line in lines.iter().rev() {
-        let rows = rows_of(line);
+        let rows = rows_of(&line.text);
         if used + rows > max_rows {
             break;
         }
