@@ -219,6 +219,7 @@ fn run_bounded_with_timeout_and_input(
 struct ProviderServer {
     address: std::net::SocketAddr,
     requests: Arc<Mutex<Vec<String>>>,
+    accepted_connections: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -229,8 +230,10 @@ impl ProviderServer {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let accepted_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_requests = Arc::clone(&requests);
+        let thread_accepted_connections = Arc::clone(&accepted_connections);
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
             while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -245,6 +248,7 @@ impl ProviderServer {
                 if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
+                thread_accepted_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
@@ -274,6 +278,7 @@ impl ProviderServer {
         Self {
             address,
             requests,
+            accepted_connections,
             stop,
             thread: Some(thread),
         }
@@ -281,6 +286,11 @@ impl ProviderServer {
 
     fn request_bodies(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn accepted_connections(&self) -> usize {
+        self.accepted_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -372,46 +382,27 @@ fn daemon_connection_count(listener: &std::net::TcpListener) -> usize {
     }
 }
 
-fn assert_direct_query_boundary(
-    arguments: &[&str],
-    input: Option<&[u8]>,
-    expects_daemon_acquisition: bool,
-    boundary: &str,
-) {
-    const WIRE_OUTPUT: &str = "direct-wire-executed-1457";
-    const DAEMON_ACQUISITION_DIAGNOSTIC: &str = "daemon lifecycle gate";
-
-    let directory = tempfile::tempdir().unwrap();
-    let home = directory.path().join("home");
-    let workspace = directory.path().join("workspace");
-    let bin_dir = directory.path().join("bin");
-    let finch_dir = home.join(".finch");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::create_dir_all(&finch_dir).unwrap();
-
-    let external_binary_marker = directory.path().join("external-provider-executed");
+fn install_external_provider_canaries(bin_dir: &std::path::Path, marker: &std::path::Path) {
     for binary in ["codex", "claude"] {
         let path = bin_dir.join(binary);
         std::fs::write(
             &path,
             format!(
                 "#!/bin/sh\nprintf executed > '{}'\nexit 99\n",
-                external_binary_marker.display()
+                marker.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
 
-    let foreign_auth_canary = ForeignAuthStoreCanary::start(&home);
-    let provider = ProviderServer::start("(say \"direct-wire-executed-1457\")");
-    let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    daemon_listener.set_nonblocking(true).unwrap();
-    std::fs::write(
-        finch_dir.join("config.toml"),
-        format!(
-            r#"[[credentials]]
+fn controlled_provider_config(
+    provider_address: std::net::SocketAddr,
+    daemon_address: std::net::SocketAddr,
+) -> String {
+    format!(
+        r#"[[credentials]]
 name = "fixture-key"
 kind = "api_key"
 provider = "openai_compatible"
@@ -420,7 +411,7 @@ secret_ref = "env:FIXTURE_PROVIDER_KEY"
 
 [credentials.audience]
 family = "custom"
-endpoint = "http://{}"
+endpoint = "http://{provider_address}"
 
 [credentials.lifecycle]
 state = "active"
@@ -429,7 +420,7 @@ refreshable = false
 [[providers]]
 type = "openai_compatible"
 name = "fixture"
-base_url = "http://{}"
+base_url = "http://{provider_address}"
 chat_path = "/v1/chat/completions"
 models_path = "/v1/models"
 model = "fixture-model"
@@ -449,16 +440,43 @@ max_output_tokens = 32768
 
 [client]
 use_daemon = true
-daemon_address = "{}"
+daemon_address = "{daemon_address}"
 auto_spawn = false
 timeout_seconds = 1
 auto_discover = false
 prefer_local = true
 "#,
-            provider.address,
-            provider.address,
-            daemon_listener.local_addr().unwrap(),
-        ),
+    )
+}
+
+fn assert_direct_query_boundary(
+    arguments: &[&str],
+    input: Option<&[u8]>,
+    expects_daemon_acquisition: bool,
+    boundary: &str,
+) {
+    const WIRE_OUTPUT: &str = "direct-wire-executed-1457";
+    const DAEMON_ACQUISITION_DIAGNOSTIC: &str = "daemon lifecycle gate";
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let workspace = directory.path().join("workspace");
+    let bin_dir = directory.path().join("bin");
+    let finch_dir = home.join(".finch");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&finch_dir).unwrap();
+
+    let external_binary_marker = directory.path().join("external-provider-executed");
+    install_external_provider_canaries(&bin_dir, &external_binary_marker);
+
+    let foreign_auth_canary = ForeignAuthStoreCanary::start(&home);
+    let provider = ProviderServer::start("(say \"direct-wire-executed-1457\")");
+    let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    daemon_listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        finch_dir.join("config.toml"),
+        controlled_provider_config(provider.address, daemon_listener.local_addr().unwrap()),
     )
     .unwrap();
 
@@ -533,6 +551,124 @@ prefer_local = true
             && !stderr.contains("Approve")
             && !directory.path().join("tool-effect").exists(),
         "{boundary} surfaced a prompt or tool effect: stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+fn assert_blank_query_has_no_external_or_durable_effects(
+    arguments: &[&str],
+    input: Option<&[u8]>,
+    expects_usage_error: bool,
+    boundary: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let workspace = directory.path().join("workspace");
+    let bin_dir = directory.path().join("bin");
+    let finch_dir = home.join(".finch");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&finch_dir).unwrap();
+
+    let external_binary_marker = directory.path().join("external-provider-executed");
+    install_external_provider_canaries(&bin_dir, &external_binary_marker);
+
+    let foreign_auth_canary = ForeignAuthStoreCanary::start(&home);
+    let provider = ProviderServer::start("(say \"blank-query-reached-provider\")");
+    let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    daemon_listener.set_nonblocking(true).unwrap();
+    let config_path = finch_dir.join("config.toml");
+    let config =
+        controlled_provider_config(provider.address, daemon_listener.local_addr().unwrap());
+    std::fs::write(&config_path, &config).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+    remove_ambient_provider_environment(&mut command);
+    command
+        .args(arguments)
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("PATH", &bin_dir)
+        .env("FIXTURE_PROVIDER_KEY", "fixture-key-secret")
+        .env_remove("CODEX_HOME")
+        .env_remove("FINCH_LIVE_CHATGPT_APP_SERVER");
+    let output = run_bounded_with_canary_and_input(command, &foreign_auth_canary, input);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.timed_out,
+        "{boundary} must terminate without provider or daemon work: status={} stdout={stdout:?} stderr={stderr:?}",
+        output.status,
+    );
+    if expects_usage_error {
+        assert!(
+            !output.status.success()
+                && stderr.contains("query must contain at least one non-whitespace character"),
+            "{boundary} must return an actionable nonzero usage error: status={} stdout={stdout:?} stderr={stderr:?}",
+            output.status,
+        );
+    } else {
+        assert!(
+            output.status.success() && stdout.is_empty() && stderr.is_empty(),
+            "{boundary} must preserve blank-piped-input silent success: status={} stdout={stdout:?} stderr={stderr:?}",
+            output.status,
+        );
+    }
+    assert_eq!(
+        provider.accepted_connections(),
+        0,
+        "{boundary} must make zero provider connections: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        daemon_connection_count(&daemon_listener),
+        0,
+        "{boundary} must make zero daemon connections: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        config,
+        "{boundary} must not modify configuration state"
+    );
+    assert!(
+        !external_binary_marker.exists()
+            && !finch_dir.join("brains").exists()
+            && !finch_dir.join("tool_patterns.json").exists()
+            && !finch_dir.join("source-index").exists()
+            && !directory.path().join("tool-effect").exists(),
+        "{boundary} produced an external-provider, Brain, query-tool, source-index, or tool effect: home_entries={:?} stdout={stdout:?} stderr={stderr:?}",
+        std::fs::read_dir(&finch_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert_foreign_auth_was_not_read(&foreign_auth_canary, boundary, &output);
+}
+
+#[test]
+fn test_explicit_blank_queries_fail_before_external_or_durable_effects() {
+    if !supervised_process_boundary_available("explicit blank one-shot query") {
+        return;
+    }
+    for query in ["", "\u{2003}\t\u{00a0}\n"] {
+        assert_blank_query_has_no_external_or_durable_effects(
+            &["--direct", "query", query],
+            None,
+            true,
+            &format!("explicit one-shot query {query:?}"),
+        );
+    }
+}
+
+#[test]
+fn test_blank_piped_query_remains_silent_success_without_effects() {
+    if !supervised_process_boundary_available("blank piped one-shot query") {
+        return;
+    }
+    assert_blank_query_has_no_external_or_durable_effects(
+        &["--direct"],
+        Some("\u{2003}\t\u{00a0}\n".as_bytes()),
+        false,
+        "blank piped one-shot query",
     );
 }
 
