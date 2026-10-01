@@ -125,6 +125,7 @@ enum Command {
     /// Execute a single query
     Query {
         /// Query text
+        #[arg(value_parser = parse_nonblank_query)]
         query: String,
         /// Print each raw provider VM program to stderr before Finch executes it
         #[arg(long)]
@@ -207,6 +208,13 @@ enum Command {
         #[command(subcommand)]
         brain_command: BrainCommand,
     },
+}
+
+fn parse_nonblank_query(query: &str) -> std::result::Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("query must contain at least one non-whitespace character".to_string());
+    }
+    Ok(query.to_string())
 }
 
 #[derive(Parser, Debug)]
