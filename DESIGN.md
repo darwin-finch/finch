@@ -152,8 +152,9 @@ bound used by runtime host I/O and the CLI preview is owned behind runtime's fla
 does not import `cli`, `theme`, `tools`, or another root-package implementation module.
 
 Memory has no two-way edge and no production `crate::` import. Callers inject
-`EmbeddingEngine`; `models::neural_embedding` owns ONNX Runtime (`ort`), `tokenizers`, and
-`hf_hub` download/load. Program-definition mapping lives in the composition adapter
+`EmbeddingEngine`; `models::neural_embedding` owns the llama.cpp-backed BGE GGUF embedding engine
+and uses the models-owned managed-GGUF download boundary. Program-definition mapping lives in the
+composition adapter
 [`src/program_registry.rs`](src/program_registry.rs).
 
 The former `tools` knot is broken (issue #872): the tool surface the whole application layer
@@ -208,9 +209,9 @@ by Finch or an explicit user-selected GGUF file. Download bytes cross the daemon
 `/v1/status`; terminal presentation remains client-owned. Legacy ONNX/Candle
 chat providers and their setup-migration markers have been removed. Configurations naming those
 engines are rejected instead of entering the runtime.
-The frontend memory selector still owns its required defaults, automatic model download, and
-current ONNX/hashed-n-gram implementation; its replacement and index-identity migration belong to
-separate memory work. Historical backend experiments
+The frontend memory selector separately owns its fixed managed bge-small-en-v1.5 Q8_0 GGUF,
+automatic download, llama.cpp embedding engine, and hashed-n-gram fallback; the chat-model selector
+does not choose that artifact. Historical backend experiments
 are recorded in `docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or
 conformance evidence.
 
@@ -247,7 +248,7 @@ Brain and daemon tests must use the isolated launchers and kernel-assigned endpo
 ### Technology stack
 
 - **Language:** Rust (memory safety, performance, Apple Silicon support)
-- **ML frameworks in source:** llama.cpp (`llama-cpp-2`) for daemon chat; ONNX Runtime (`ort`) only for the separately owned frontend memory embedder
+- **ML frameworks in source:** llama.cpp (`llama-cpp-2`) for daemon chat and the separately owned frontend memory embedder
 - **Async:** Tokio
 - **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
   routes; not the full OpenAI API and not the Responses API)
