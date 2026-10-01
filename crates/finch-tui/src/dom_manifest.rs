@@ -22,7 +22,7 @@ use ts_rs::TS;
 
 /// The manifest contract version. Bump on any shape change and update
 /// `docs/UI_MANIFEST.md` in the same commit; consumers read this first.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// One node of the serializable UI manifest: an element type (the registry
 /// key the JSX side maps to a component), a derived stable id, JSON-valued
@@ -137,7 +137,7 @@ pub fn manifest_id(message_id: &MessageId) -> String {
 
 /// The manifest id of a semantic path under a message: `{uuid}#1.2` — the
 /// append-only path segments joined by dots. A single-segment path `[1]` (the
-/// say output region, the toggle hit target) reads `{uuid}#1`.
+/// say program-disclosure control) reads `{uuid}#1`.
 pub fn manifest_path_id(message_id: &MessageId, path: &[u32]) -> String {
     if path.is_empty() {
         manifest_id(message_id)
@@ -239,27 +239,57 @@ pub fn component_manifest(view: &ComponentView) -> DynamicUiNode {
     }
 }
 
-/// The say-turn card's manifest: the VM fields a GUI card component reads,
-/// with the program and output regions as children carrying their semantic
-/// paths (`#0` program, `#1` output — the toggle hit target's path).
+/// The say-turn card's manifest: the VM fields a GUI card component reads.
+/// Completed cards lower in terminal order: answer, explicit labelled
+/// disclosure control, then exact source only while open. The control alone
+/// carries semantic path `#1`; answer and source content are not action
+/// targets. Running cards retain their inline source/output representation.
 pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
     let status = match view.vm.status {
         SayTurnStatus::Running => "running",
         SayTurnStatus::Completed => "completed",
     };
-    let program = DynamicUiNode::leaf("ProgramSource", manifest_path_id(&view.message_id, &[0]))
-        .with_prop("language", view.vm.program.language.clone())
-        .with_prop("lines", view.vm.program.lines.clone());
+    let program = || {
+        DynamicUiNode::leaf("ProgramSource", "")
+            .with_prop("language", view.vm.program.language.clone())
+            .with_prop("lines", view.vm.program.lines.clone())
+    };
+    let output = || {
+        view.vm.output.as_ref().map(|output| {
+            DynamicUiNode::leaf("Output", "").with_prop("lines", output.lines.clone())
+        })
+    };
     let mut card = DynamicUiNode::leaf("SayTurnCard", manifest_id(&view.message_id))
         .with_prop("status", status)
         .with_prop("elapsedMs", view.elapsed.as_millis() as u64)
-        .with_prop("showProgram", view.vm.show_program)
-        .with_child(program);
-    if let Some(output) = &view.vm.output {
-        card = card.with_child(
-            DynamicUiNode::leaf("Output", manifest_path_id(&view.message_id, &[1]))
-                .with_prop("lines", output.lines.clone()),
-        );
+        .with_prop("showProgram", view.vm.show_program);
+
+    if view.vm.status == SayTurnStatus::Running {
+        card = card.with_child(program());
+        if let Some(output) = output() {
+            card = card.with_child(output);
+        }
+        return card;
+    }
+
+    if let Some(output) = output() {
+        card = card.with_child(output);
+    }
+    let label = if view.vm.show_program {
+        "Hide program"
+    } else {
+        "Show program"
+    };
+    card = card.with_child(
+        DynamicUiNode::leaf(
+            "ProgramDisclosureControl",
+            manifest_path_id(&view.message_id, &[1]),
+        )
+        .with_prop("label", label)
+        .with_prop("expanded", view.vm.show_program),
+    );
+    if view.vm.show_program {
+        card = card.with_child(program());
     }
     card
 }

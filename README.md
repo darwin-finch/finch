@@ -212,8 +212,9 @@ ONNX/CoreML repeatedly crashed the daemon during Qwen session construction, whil
 path lacked kernels required by the supported model families and produced wrong, absent, or
 impractically slow output. The replacement llama.cpp/GGUF path had completed real buffered,
 streamed, and CPU generation on the target MacBook before the cutover. The historical commit is
-for source archaeology, not a supported installation recommendation. Frontend memory's separately
-owned ONNX embedder is unaffected by this chat-provider decision.
+for source archaeology, not a supported installation recommendation. Frontend memory remains a
+separate path: it uses its own fixed managed bge-small-en-v1.5 Q8_0 GGUF through llama.cpp rather
+than the user-selected chat GGUF, with a hashed-n-gram fallback while that artifact is unavailable.
 
 ### HTTP daemon
 

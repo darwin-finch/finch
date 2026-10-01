@@ -71,13 +71,18 @@ For a coding agent, this maps naturally onto the structure of software. A conver
 
 The other thing MemTree does for us that RAG doesn't: it's also the UI. The MemTree console shows your conversation history as a navigable tree — user messages as parent nodes, assistant responses and tool calls as children. You can expand and collapse branches, navigate with the keyboard, and see the structure of a long agentic session at a glance rather than a flat scroll of text.
 
-### What MemTree Has Right Now
+### What MemTree Had When This Post Was Written
+
+*Historical snapshot:* this section records the implementation before Finch moved memory
+embeddings to a fixed managed bge-small-en-v1.5 Q8_0 GGUF through llama.cpp. Current source uses
+that separate memory artifact, with a hashed-n-gram fallback while it is unavailable; the
+user-selected chat GGUF does not select the memory embedder.
 
 The core data structure is implemented: O(log N) insertion, cosine similarity navigation, parent aggregation after each insertion. The console layer (event handler, node types, expand/collapse state) is wired to the REPL event system so tool calls become child nodes of the response that triggered them.
 
 What's missing:
 
-**Real embeddings.** The current implementation uses a hash-based TF-IDF placeholder that fits in 384 dimensions. It works for tests and gives correct structure, but the semantic similarity is weak — two functions that do the same thing but use different variable names won't cluster together. For production use, this needs to be replaced with actual sentence embeddings: either a small local ONNX model (something like `nomic-embed-text` or `all-MiniLM-L6-v2`, both available in ONNX format and fast on CPU), or an embeddings API call.
+**Real embeddings.** At publication, the implementation used a hash-based TF-IDF placeholder that fit in 384 dimensions. It worked for tests and gave correct structure, but the semantic similarity was weak — two functions that did the same thing but used different variable names would not cluster together. The planned replacement was a small local ONNX model or an embeddings API call; that plan is historical and is not the boundary current source implements.
 
 **TUI rendering.** The tree state and event wiring exist, but the ratatui widget that actually draws the tree to the terminal isn't done. This is the most visible gap — the "memtree view" mode doesn't show anything useful yet.
 
@@ -101,7 +106,9 @@ But MemTree is worth the extra complexity here because:
 2. **The console view is valuable independently.** Even if you ignored the memory aspect entirely, having a navigable tree view of a long agentic session — with tool calls as collapsible children, with latency and token counts on each branch — is a genuinely better UI for agentic work than a flat chat transcript.
 3. **Cross-session memory.** Once we persist the tree, a user can ask "what did we do with the auth system last month?" and get a hierarchically organized answer rather than a bag of retrieved chunks.
 
-The key question is embeddings. The TF-IDF placeholder needs to become a real model. The good news: there are small ONNX sentence transformer models (100-300MB) that run on CPU in milliseconds. We already have the ONNX Runtime infrastructure. It's a well-defined next step.
+At publication, the key question was how to replace the TF-IDF placeholder with a real embedding
+model. The proposed ONNX sentence-transformer path was a planned next step, not the current
+implementation described by the source today.
 
 ---
 
@@ -163,7 +170,12 @@ These felt like oversight numbers left over from early testing. A coding agent t
 
 In rough priority order:
 
-*Update (v0.6.0, Feb 2026): The list below reflects the state at time of writing. Several items have since shipped: `/plan` is live (7-persona IMPCPD loop), Phi and DeepSeek ONNX support is in, and the universal alignment prompt lets the planning loop swap providers mid-session. LoRA and MemTree persistence remain open.*
+*Historical update (v0.6.0, Feb 2026): The list below records the state at the time of writing,
+not the current roadmap. Its planned ONNX memory embedder predates the fixed managed BGE GGUF path
+through llama.cpp now present in source. Several other items had already shipped at that point:
+`/plan` was live (7-persona IMPCPD loop), Phi and DeepSeek ONNX support was in, and the universal
+alignment prompt let the planning loop swap providers mid-session. LoRA and MemTree persistence
+remained open.*
 
 **Short term:**
 - MemTree TUI rendering and keyboard navigation (the thing that should be visible now but isn't)

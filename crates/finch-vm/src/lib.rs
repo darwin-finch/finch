@@ -7,8 +7,6 @@ mod fiber;
 #[cfg(test)]
 mod frontend_tests;
 mod interpreter;
-#[cfg(test)]
-mod migration;
 mod runtime;
 
 pub use finch_vm_core::{

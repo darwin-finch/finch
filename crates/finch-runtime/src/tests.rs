@@ -1199,22 +1199,21 @@ fn tree_list_is_sorted_bounded_and_structural() {
 
 #[tokio::test]
 async fn typed_tree_list_has_identical_lisp_and_forth_results() {
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
+    let workspace = tempfile::tempdir().expect("create disposable tree-list workspace");
+    let tree = workspace.path().join("tree");
+    std::fs::create_dir(&tree).expect("create deterministic tree-list fixture directory");
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"] {
+        std::fs::write(tree.join(name), name)
+            .unwrap_or_else(|error| panic!("create tree-list fixture entry {name}: {error}"));
+    }
+
     let mut results = Vec::new();
     for (language, source) in [
-        (
-            ProgramLanguage::Lisp,
-            "(tree-list (path \"crates/finch-vm/src\") 5)",
-        ),
-        (
-            ProgramLanguage::Forth,
-            "s\"crates/finch-vm/src\" path 5 tree-list",
-        ),
+        (ProgramLanguage::Lisp, "(tree-list (path \"tree\") 5)"),
+        (ProgramLanguage::Forth, "s\"tree\" path 5 tree-list"),
     ] {
-        let runtime = ProgramRuntime::with_automation_in_workspace(false, workspace_root.clone());
+        let runtime =
+            ProgramRuntime::with_automation_in_workspace(false, workspace.path().to_path_buf());
         runtime
             .grant_typed_capability(finch_vm::CapabilityRequirement::file(
                 finch_vm::FileOperation::Read,
@@ -1225,17 +1224,27 @@ async fn typed_tree_list_has_identical_lisp_and_forth_results() {
             .submit_typed_only(submission(language, source, ExecutionEffect::WorkspaceRead))
             .await
             .unwrap();
-        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "{language:?} tree-list must complete through ProgramRuntime: source={source:?}, diagnostics={:?}, values={:?}",
+            outcome.diagnostics,
+            outcome.values
+        );
         assert!(matches!(
             outcome.values.as_slice(),
             [ProgramValue::Record(fields)]
                 if fields.iter().any(|(name, value)| {
                     name == "truncated" && value == &ProgramValue::Bool(true)
                 })
-        ));
+        ), "{language:?} tree-list must report truncation for six entries at limit five: source={source:?}, values={:?}", outcome.values);
         results.push(outcome.values);
     }
-    assert_eq!(results[0], results[1]);
+    assert_eq!(
+        results[0], results[1],
+        "Lisp and Forth tree-list must return identical typed results: lisp={:?}, forth={:?}",
+        results[0], results[1]
+    );
 }
 
 #[tokio::test]

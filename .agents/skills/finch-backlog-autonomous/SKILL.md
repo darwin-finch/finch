@@ -21,6 +21,15 @@ Build use their own task/subagent APIs. Preserve the packet fields and report th
 actually selected. If the harness cannot select the requested lane, report that instead of silently
 substituting the primary model.
 
+After every accepted merge, synchronize the coordinator's primary checkout before refreshing the
+queue or creating another worktree: fetch the repository's remote default branch, verify the merged
+commit is reachable there, and fast-forward the local default branch with `--ff-only`. Never reset,
+rewrite, or discard pre-existing changes to make this succeed. If the primary checkout cannot be
+fast-forwarded safely, record the divergence and base any new worktree on the verified remote
+default-branch commit, not on stale local `main`/`master`. Before each dispatch, fetch again and put
+that verified remote commit in the packet as its exact base. A GitHub merge is not locally
+integrated merely because the pull request reports `MERGED`.
+
 Stop when the user-requested budget is exhausted, no eligible work remains, or authority, safety,
 claim, dependency, or scope decisions require the user. Do not merge or close issues merely because
 a worker reports success. `$finch-implement-ticket` owns each individual ticket lifecycle; this

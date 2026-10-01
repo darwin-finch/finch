@@ -1,5 +1,5 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "root": {
     "element_type": "SayTurnCard",
     "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -10,23 +10,21 @@
     },
     "children": [
       {
-        "element_type": "ProgramSource",
-        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7#0",
+        "element_type": "Output",
+        "id": "",
         "props": {
-          "language": "Co-Forth",
           "lines": [
-            "(say \"Hi, Shammah!\")"
+            "Hi, Shammah! What would you like to work on?"
           ]
         },
         "children": []
       },
       {
-        "element_type": "Output",
+        "element_type": "ProgramDisclosureControl",
         "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7#1",
         "props": {
-          "lines": [
-            "Hi, Shammah! What would you like to work on?"
-          ]
+          "expanded": false,
+          "label": "Show program"
         },
         "children": []
       }
