@@ -18,7 +18,7 @@ use crate::oauth::{
     DeviceAuthorization, FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthDialect,
     OAuthTokenRecord,
 };
-use crate::providers::XaiGrokOAuthDialect;
+use crate::providers::{GrokDeviceClientSurface, XaiGrokOAuthDialect};
 use chrono::Utc;
 
 /// Default descriptor-anchored Finch store. No foreign application path is
@@ -189,6 +189,7 @@ pub trait GrokCredentialAuthenticator: Send + Sync {
 /// Production Finch-native SuperGrok authentication service.
 pub struct GrokAuthService {
     store: Arc<FileOAuthCredentialStore>,
+    device_surface: GrokDeviceClientSurface,
 }
 
 impl std::fmt::Debug for GrokAuthService {
@@ -199,10 +200,15 @@ impl std::fmt::Debug for GrokAuthService {
 
 impl GrokAuthService {
     pub fn production() -> Result<Self> {
+        Self::production_for_surface(GrokDeviceClientSurface::Headless)
+    }
+
+    pub fn production_for_surface(device_surface: GrokDeviceClientSurface) -> Result<Self> {
         Ok(Self {
             store: Arc::new(FileOAuthCredentialStore::new(
                 default_grok_oauth_store_root()?,
             )),
+            device_surface,
         })
     }
 
@@ -215,7 +221,9 @@ impl GrokAuthService {
         >,
     > {
         OAuthClient::new(
-            Arc::new(XaiGrokOAuthDialect::production()?),
+            Arc::new(XaiGrokOAuthDialect::production_for_surface(
+                self.device_surface,
+            )?),
             self.store.clone(),
         )
     }
@@ -302,7 +310,17 @@ impl GrokAuthService {
     }
 
     pub fn recover(&self, reference: &str) -> Result<ProviderCredential> {
-        self.client()?.recover_interrupted_as_revoked(reference)
+        let client = self.client()?;
+        let Some(record) = self.store.load_existing(reference)? else {
+            bail!("named OAuth credential is missing");
+        };
+        if record.protocol_revision == crate::providers::GROK_PREVIOUS_OAUTH_PROTOCOL_REVISION {
+            return client.recover_predecessor_revision_as_revoked(
+                reference,
+                crate::providers::GROK_PREVIOUS_OAUTH_PROTOCOL_REVISION,
+            );
+        }
+        client.recover_interrupted_as_revoked(reference)
     }
 }
 
@@ -355,7 +373,12 @@ where
     client
         .begin_device_authorization_cancellable(cancel)
         .await
-        .context("Grok device login could not start")
+        .map_err(|error| {
+            preserve_or_mark_stage(
+                error,
+                crate::providers::GrokAuthStageError::DeviceStartTransport,
+            )
+        })
 }
 
 async fn finish_device_login_with<D, S>(
@@ -371,11 +394,39 @@ where
     let commit = client
         .finish_device_authorization_commit(reference, pending, cancel)
         .await
-        .context("Grok device login did not complete")?;
+        .map_err(|error| {
+            preserve_or_mark_stage(
+                error,
+                crate::providers::GrokAuthStageError::DevicePollTransport,
+            )
+        })?;
     Ok(EnsuredGrokCredential {
         credential: commit.credential,
         compensation: Some(GrokCompensationHandle::issued(reference, commit.generation)),
     })
+}
+
+fn preserve_or_mark_stage(
+    error: anyhow::Error,
+    fallback: crate::providers::GrokAuthStageError,
+) -> anyhow::Error {
+    let typed = error
+        .downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
+        .is_some()
+        || error
+            .downcast_ref::<crate::oauth::OAuthCredentialPersistenceError>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::providers::GrokDeviceEndpointError>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::providers::GrokAuthStageError>()
+            .is_some();
+    if typed {
+        error
+    } else {
+        error.context(fallback)
+    }
 }
 
 async fn begin_named_credential_with<D, S>(
@@ -631,6 +682,20 @@ mod tests {
         let mut hostile = record();
         hostile.provider = CredentialProvider::Xai;
         assert!(status_from_record("grok-sub:work", Some(hostile)).is_err());
+    }
+
+    #[test]
+    fn nested_typed_stage_is_not_overwritten_by_transport_fallback() {
+        let error = anyhow::anyhow!("redacted inner diagnostic")
+            .context(crate::providers::GrokAuthStageError::PollContract);
+        let marked = preserve_or_mark_stage(
+            error,
+            crate::providers::GrokAuthStageError::DevicePollTransport,
+        );
+        assert!(matches!(
+            marked.downcast_ref::<crate::providers::GrokAuthStageError>(),
+            Some(crate::providers::GrokAuthStageError::PollContract)
+        ));
     }
 
     struct UnreachableVerifier;

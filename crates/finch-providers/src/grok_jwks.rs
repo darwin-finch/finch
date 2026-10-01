@@ -23,8 +23,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::grok_oauth::{
-    GrokTokenVerifier, VerifiedGrokClaims, GROK_REQUIRED_TOKEN_ISSUER, XAI_AUTH_ORIGIN,
-    XAI_PUBLIC_CLIENT_ID,
+    GrokAuthStageError, GrokTokenVerifier, VerifiedGrokClaims, GROK_REQUIRED_TOKEN_ISSUER,
+    XAI_AUTH_ORIGIN, XAI_PUBLIC_CLIENT_ID,
 };
 
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -200,7 +200,10 @@ impl GrokJwksVerifier {
                 .cloned()
                 .context("xAI JWKS rotation did not contain the signed token key");
         }
-        let (keys, lifetime) = self.fetch_keys(cancel).await?;
+        let (keys, lifetime) = self
+            .fetch_keys(cancel)
+            .await
+            .context(GrokAuthStageError::JwksTransport)?;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         cache.keys = keys;
         cache.expires_at = Some(tokio::time::Instant::now() + lifetime);
@@ -263,7 +266,7 @@ impl GrokJwksVerifier {
         cancel: &CancellationToken,
     ) -> Result<(Option<String>, Vec<u8>)> {
         let response = tokio::select! {
-            _ = cancel.cancelled() => bail!("xAI token verification was cancelled"),
+            _ = cancel.cancelled() => return Err(crate::oauth::OAuthDeviceAuthorizationError::Cancelled.into()),
             response = self.http.get(url.clone()).send() => response.context("xAI verification authority is unavailable")?,
         };
         if response.status() != StatusCode::OK {
@@ -290,7 +293,7 @@ impl GrokJwksVerifier {
         let mut stream = response.bytes_stream();
         loop {
             let next = tokio::select! {
-                _ = cancel.cancelled() => bail!("xAI token verification was cancelled"),
+                _ = cancel.cancelled() => return Err(crate::oauth::OAuthDeviceAuthorizationError::Cancelled.into()),
                 next = stream.next() => next,
             };
             let Some(chunk) = next else { break };
@@ -325,43 +328,95 @@ impl GrokTokenVerifier for GrokJwksVerifier {
         cancel: &CancellationToken,
     ) -> Result<VerifiedGrokClaims> {
         crate::oauth::validate_secret_field(access_token, "access token")?;
-        let identity = self.verify_compact(access_token, cancel).await?;
-        if !identity.audiences.contains(&self.client_id)
-            || (identity.audiences.len() > 1
-                && identity.authorized_party.as_deref() != Some(self.client_id.as_str()))
-            || identity
-                .authorized_party
-                .as_deref()
-                .is_some_and(|party| party != self.client_id)
-        {
-            bail!("xAI access token audience does not match the pinned public client");
-        }
-        if let Some(id_token) = id_token {
-            let id_claims = self.verify_compact(id_token, cancel).await?;
-            if id_claims.subject != identity.subject {
-                bail!("xAI identity token subject does not match the access token");
+        let identity = match id_token {
+            Some(id_token) => {
+                crate::oauth::validate_secret_field(id_token, "identity token")?;
+                let identity = self
+                    .verify_compact(id_token, cancel)
+                    .await
+                    .map_err(mark_identity_error)?;
+                validate_client_binding(&identity, &self.client_id)?;
+                identity
             }
-        }
-        let account_id = identity
+            None => self
+                .verify_compact(access_token, cancel)
+                .await
+                .map_err(mark_identity_error)?,
+        };
+
+        let signed_access = if id_token.is_some() && is_compact_jws_candidate(access_token) {
+            let claims = self
+                .verify_compact(access_token, cancel)
+                .await
+                .map_err(mark_identity_error)?;
+            if claims.subject != identity.subject {
+                return Err(GrokAuthStageError::IdentitySignature.into());
+            }
+            Some(claims)
+        } else if id_token.is_none() {
+            validate_client_binding(&identity, &self.client_id)?;
+            None
+        } else {
+            None
+        };
+
+        let authority = signed_access.as_ref().unwrap_or(&identity);
+        let account_id = authority
             .principal_id
             .clone()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| identity.subject.clone());
-        validate_signed_public_claim(&account_id, "account")?;
-        if let Some(principal_type) = identity.principal_type.as_deref() {
-            validate_signed_public_claim(principal_type, "principal type")?;
+        validate_signed_public_claim(&account_id, "account")
+            .context(GrokAuthStageError::AccountEntitlement)?;
+        if let Some(principal_type) = authority.principal_type.as_deref() {
+            validate_signed_public_claim(principal_type, "principal type")
+                .context(GrokAuthStageError::AccountEntitlement)?;
         }
+        let principal_type = authority.principal_type.clone();
         Ok(VerifiedGrokClaims {
             issuer: identity.issuer,
             audiences: identity.audiences,
             authorized_party: identity.authorized_party,
             subject: identity.subject,
             account_id,
-            principal_type: identity.principal_type,
+            principal_type,
             nonce: identity.nonce,
             expires_at: identity.expires_at,
             not_before: identity.not_before,
         })
+    }
+}
+
+fn validate_client_binding(claims: &SignedClaims, client_id: &str) -> Result<()> {
+    if !claims.audiences.contains(client_id)
+        || (claims.audiences.len() > 1 && claims.authorized_party.as_deref() != Some(client_id))
+        || claims
+            .authorized_party
+            .as_deref()
+            .is_some_and(|party| party != client_id)
+    {
+        return Err(GrokAuthStageError::ClientBinding.into());
+    }
+    Ok(())
+}
+
+fn is_compact_jws_candidate(token: &str) -> bool {
+    let mut segments = token.split('.');
+    segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_none()
+}
+
+fn mark_identity_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
+        .is_some()
+        || error.downcast_ref::<GrokAuthStageError>().is_some()
+    {
+        error
+    } else {
+        error.context(GrokAuthStageError::IdentitySignature)
     }
 }
 
@@ -636,6 +691,244 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use serde_json::json;
+
+    fn signed_identity_fixture() -> (String, Value) {
+        let rng = SystemRandom::new();
+        let key_document =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            key_document.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let public_key = key_pair.public_key().as_ref();
+        assert_eq!(
+            public_key.first(),
+            Some(&0x04),
+            "ES256 fixture key must use uncompressed SEC1 encoding"
+        );
+        let jwk = json!({
+            "kty": "EC",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": "fixture-key",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(&public_key[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&public_key[33..65]),
+        });
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"alg":"ES256", "kid":"fixture-key", "typ":"JWT"})).unwrap(),
+        );
+        let now = Utc::now().timestamp();
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "iss": GROK_REQUIRED_TOKEN_ISSUER,
+                "aud": XAI_PUBLIC_CLIENT_ID,
+                "sub": "acct-work",
+                "iat": now,
+                "exp": now + 3600,
+            }))
+            .unwrap(),
+        );
+        let signing_input = format!("{header}.{claims}");
+        let signature = key_pair.sign(&rng, signing_input.as_bytes()).unwrap();
+        (
+            format!(
+                "{signing_input}.{}",
+                URL_SAFE_NO_PAD.encode(signature.as_ref())
+            ),
+            jwk,
+        )
+    }
+
+    #[tokio::test]
+    async fn signed_identity_token_authorizes_opaque_access_token_without_trusting_access_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (identity_token, jwk) = signed_identity_fixture();
+        let discovery = Arc::new(json!({
+            "issuer": GROK_REQUIRED_TOKEN_ISSUER,
+            "jwks_uri": format!("{origin}{JWKS_PATH}"),
+        }));
+        let keys = Arc::new(json!({"keys": [jwk]}));
+        let app = axum::Router::new()
+            .route(
+                DISCOVERY_PATH,
+                axum::routing::get({
+                    let discovery = discovery.clone();
+                    move || {
+                        let discovery = discovery.clone();
+                        async move { axum::Json(discovery.as_ref().clone()) }
+                    }
+                }),
+            )
+            .route(
+                JWKS_PATH,
+                axum::routing::get({
+                    let keys = keys.clone();
+                    move || {
+                        let keys = keys.clone();
+                        async move { axum::Json(keys.as_ref().clone()) }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let verified = verifier
+            .verify(
+                Some(&identity_token),
+                "opaque-access-token",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("a signed identity token must authorize a bounded opaque access bearer");
+        server.abort();
+
+        assert_eq!(verified.subject, "acct-work");
+        assert_eq!(verified.account_id, "acct-work");
+        assert_eq!(
+            verified.audiences,
+            BTreeSet::from([XAI_PUBLIC_CLIENT_ID.into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_access_token_without_verified_identity_fails_closed_before_network() {
+        let verifier = GrokJwksVerifier::new(
+            "http://127.0.0.1:9",
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let error = verifier
+            .verify(None, "opaque-access-sentinel", &CancellationToken::new())
+            .await
+            .expect_err("an opaque bearer alone is not signed identity evidence");
+        assert!(
+            error.downcast_ref::<GrokAuthStageError>().is_some(),
+            "unsigned identity rejection must retain a safe stage marker: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("opaque-access-sentinel"),
+            "identity diagnostics must not reflect bearer bytes: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_jwks_authority_fetch_is_terminal_and_typed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requested = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            DISCOVERY_PATH,
+            axum::routing::get({
+                let requested = requested.clone();
+                move || {
+                    let requested = requested.clone();
+                    async move {
+                        requested.notify_one();
+                        std::future::pending::<axum::Json<Value>>().await
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let (identity_token, _) = signed_identity_fixture();
+        let cancel = CancellationToken::new();
+        let verify_cancel = cancel.clone();
+        let verification = tokio::spawn(async move {
+            verifier
+                .verify(Some(&identity_token), "opaque-access-token", &verify_cancel)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), requested.notified())
+            .await
+            .expect("the verifier must reach the local pinned discovery authority");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), verification)
+            .await
+            .expect("cancellation must stop a pending JWKS authority fetch")
+            .unwrap()
+            .expect_err("cancelled verification must not return identity claims");
+        server.abort();
+        assert!(
+            error
+                .downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
+                .is_some(),
+            "JWKS cancellation must retain the terminal cancellation type: {error:#}"
+        );
+    }
+
+    #[test]
+    fn client_binding_requires_exact_audience_and_multi_audience_azp() {
+        let now = Utc::now();
+        let claims = |audiences: BTreeSet<String>, authorized_party: Option<String>| SignedClaims {
+            issuer: GROK_REQUIRED_TOKEN_ISSUER.into(),
+            audiences,
+            subject: "acct-work".into(),
+            authorized_party,
+            exp: (now + TimeDelta::hours(1)).timestamp(),
+            nbf: None,
+            iat: now.timestamp(),
+            nonce: None,
+            principal_type: None,
+            principal_id: None,
+            expires_at: now + TimeDelta::hours(1),
+            not_before: None,
+        };
+        assert!(validate_client_binding(
+            &claims(BTreeSet::from([XAI_PUBLIC_CLIENT_ID.into()]), None),
+            XAI_PUBLIC_CLIENT_ID
+        )
+        .is_ok());
+        let wrong = validate_client_binding(
+            &claims(BTreeSet::from(["another-client".into()]), None),
+            XAI_PUBLIC_CLIENT_ID,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            wrong.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::ClientBinding)
+        ));
+        assert!(validate_client_binding(
+            &claims(
+                BTreeSet::from([XAI_PUBLIC_CLIENT_ID.into(), "another-audience".into()]),
+                None,
+            ),
+            XAI_PUBLIC_CLIENT_ID,
+        )
+        .is_err());
+        assert!(validate_client_binding(
+            &claims(
+                BTreeSet::from([XAI_PUBLIC_CLIENT_ID.into(), "another-audience".into()]),
+                Some(XAI_PUBLIC_CLIENT_ID.into()),
+            ),
+            XAI_PUBLIC_CLIENT_ID,
+        )
+        .is_ok());
+    }
 
     #[test]
     fn production_verifier_pins_exact_auth_xai_authority() {

@@ -30,6 +30,12 @@ injected through `ProviderPorts`.
 - Cancellation, expiry, and denial are terminal and must not persist tokens.
 - Refresh writes `mutation_pending` before remote rotation. Interrupted mutations recover only as
   durable tombstones; they must not resurrect possibly rotated secrets.
+- A protocol revision change is not a token migration. A dialect may recognize one exact
+  predecessor and replace it with a current-revision, secret-cleared tombstone through generation
+  CAS; every other revision fails closed and requires explicit reauthentication.
+- Provider request metadata crosses the HTTP port only through a typed, construction-restricted
+  allowlist. It must not become a general header map capable of carrying authorization, cookies,
+  forwarding metadata, or content-framing fields.
 - Unix file persistence is descriptor-anchored, `0700`/`0600`, generation-CAS, and fails closed on
   other platforms.
 - Debug formatting never reveals secrets, correlation data, or token material.

@@ -25,10 +25,10 @@ pub use finch_providers::{
     CatalogSource, ChatGptAuthStageError, ChatGptDeviceEndpointError, ChatGptSubscriptionProvider,
     ClaudeAuthStageError, ClaudeOAuthDialect, ClaudeProvider, ClaudeSubscriptionProvider,
     ContentBlock, ContextWindowCapability, EventProvenance, FallbackChain, GeminiProvider,
-    GrokAuthStageError, GrokDeviceEndpointError, GrokJwksVerifier, GrokSubscriptionProvider,
-    GrokTokenVerifier, ImageSource, InvocationMetadata, LlmProvider, Message, MessageRequest,
-    MessageResponse, ModelCapabilities, ModelCatalog, ModelCatalogProfile, ModelFeature,
-    NativeToolGrant, OpenAIProvider, OpenAiChatGptOAuthDialect, OpenAiJwksVerifier,
+    GrokAuthStageError, GrokDeviceClientSurface, GrokDeviceEndpointError, GrokJwksVerifier,
+    GrokSubscriptionProvider, GrokTokenVerifier, ImageSource, InvocationMetadata, LlmProvider,
+    Message, MessageRequest, MessageResponse, ModelCapabilities, ModelCatalog, ModelCatalogProfile,
+    ModelFeature, NativeToolGrant, OpenAIProvider, OpenAiChatGptOAuthDialect, OpenAiJwksVerifier,
     OpenAiTokenVerifier, OutputTokenLimitCapability, ProviderAllowance, ProviderBackend,
     ProviderConcreteType, ProviderEndpoints, ProviderRequest, ProviderResponse, ProviderSession,
     ProviderUsage, ReasoningCapability, SemanticTool, SessionContextConfig, StreamChunk,
@@ -37,9 +37,9 @@ pub use finch_providers::{
     XaiGrokOAuthDialect, CHATGPT_OAUTH_PROTOCOL_REVISION, CLAUDE_AUTHORIZATION_ENDPOINT,
     CLAUDE_OAUTH_BETA_HEADER, CLAUDE_OAUTH_PROTOCOL_REVISION, CLAUDE_SUBSCRIPTION_CLIENT_ID,
     CLAUDE_TOKEN_ENDPOINT, DEFAULT_CLAUDE_MODEL, GROK_OAUTH_PROTOCOL_REVISION,
-    GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER, GROK_SUBSCRIPTION_BASE_URL,
-    OPENAI_PUBLIC_CLIENT_ID, REQUIRED_TOKEN_ISSUER, STATIC_FALLBACK_AS_OF,
-    UNIVERSAL_ALIGNMENT_PROMPT, XAI_PUBLIC_CLIENT_ID,
+    GROK_PREVIOUS_OAUTH_PROTOCOL_REVISION, GROK_PUBLIC_CLIENT_VERSION, GROK_REQUIRED_TOKEN_ISSUER,
+    GROK_SESSION_TOKEN_HEADER, GROK_SUBSCRIPTION_BASE_URL, OPENAI_PUBLIC_CLIENT_ID,
+    REQUIRED_TOKEN_ISSUER, STATIC_FALLBACK_AS_OF, UNIVERSAL_ALIGNMENT_PROMPT, XAI_PUBLIC_CLIENT_ID,
 };
 
 #[cfg(test)]
