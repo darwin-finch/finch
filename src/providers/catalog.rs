@@ -48,6 +48,13 @@ pub async fn refresh_from_config(
             CatalogAuth::Bearer,
             "openai",
         ),
+        CredentialProvider::MetaModelApi => (
+            "https://api.meta.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "meta_model_api",
+        ),
         CredentialProvider::Xai => (
             "https://api.x.ai",
             "/v1/chat/completions",

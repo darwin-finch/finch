@@ -646,6 +646,29 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_model_api_named_profile_roundtrips() {
+        let source = r#"
+type = "credentialed"
+provider = "meta_model_api"
+model = "muse-spark-1.3"
+name = "muse"
+reasoning_effort = "high"
+
+[credential]
+credential_ref = "meta-work"
+"#;
+        let entry: ProviderEntry = toml::from_str(source)
+            .expect("the direct Meta Model API provider vocabulary must deserialize");
+        let encoded = toml::to_string(&entry).expect("the Meta profile must serialize");
+        let decoded: ProviderEntry =
+            toml::from_str(&encoded).expect("the serialized Meta profile must deserialize");
+        assert_eq!(
+            decoded, entry,
+            "the direct Meta profile must preserve model, credential, name, and reasoning"
+        );
+    }
+
+    #[test]
     fn claude_cli_backend_toml_roundtrip_carries_all_fields_and_defaults() {
         let entry = ProviderEntry::ClaudeCliBackend {
             model: Some("claude-opus-4-6".to_string()),

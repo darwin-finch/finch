@@ -30,6 +30,7 @@ pub enum CredentialKind {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialProvider {
     Anthropic,
+    MetaModelApi,
     OpenaiPlatform,
     OpenaiCompatible,
     ChatgptSubscription,
@@ -47,6 +48,7 @@ impl CredentialProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
+            Self::MetaModelApi => "meta_model_api",
             Self::OpenaiPlatform => "openai_platform",
             Self::OpenaiCompatible => "openai_compatible",
             Self::ChatgptSubscription => "chatgpt_subscription",
@@ -68,6 +70,7 @@ impl CredentialProvider {
 #[serde(rename_all = "snake_case")]
 pub enum EndpointFamily {
     AnthropicApi,
+    MetaModelApi,
     OpenaiPlatform,
     ChatgptSubscription,
     ClaudeSubscription,
@@ -328,6 +331,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             kinds: API_KEY,
             family: EndpointFamily::AnthropicApi,
             standard_origin: "https://api.anthropic.com",
+        },
+        CredentialProvider::MetaModelApi => ProviderAuthDescriptor {
+            provider,
+            issuer: "meta-model-api",
+            kinds: API_KEY,
+            family: EndpointFamily::MetaModelApi,
+            standard_origin: "https://api.meta.ai",
         },
         CredentialProvider::OpenaiPlatform => ProviderAuthDescriptor {
             provider,
@@ -691,6 +701,7 @@ mod tests {
     fn test_provider_kind_audience_matrix() {
         let providers = [
             CredentialProvider::Anthropic,
+            CredentialProvider::MetaModelApi,
             CredentialProvider::OpenaiPlatform,
             CredentialProvider::OpenaiCompatible,
             CredentialProvider::ChatgptSubscription,

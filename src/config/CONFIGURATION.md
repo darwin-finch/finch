@@ -50,6 +50,12 @@ migration guidance and is rejected before provider construction. Current
 ChatGPT subscription support is configured as `type = "credentialed"` with
 `provider = "chatgpt_subscription"`.
 
+Direct Meta Model API uses `type = "credentialed"` with
+`provider = "meta_model_api"`, an `api_key` credential issued by
+`meta-model-api`, and audience family `meta_model_api`. Its service origin is
+fixed to `https://api.meta.ai`; base, chat-path, and model-path overrides are
+rejected. See [`docs/META_MODEL_API.md`](../../docs/META_MODEL_API.md).
+
 **Backwards-compatible:** The removed legacy `[[teachers]]` format still loads (one private migration shim); saves write `[[providers]]` only.
 
 ## Named provider credentials

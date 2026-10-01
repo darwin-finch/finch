@@ -1,7 +1,8 @@
 # Finch provider transports
 
 This crate owns provider-neutral request and stream contracts plus the concrete Claude,
-OpenAI-compatible, Gemini, ChatGPT, Grok, and Claude-subscription transports, provider capability
+OpenAI-compatible (including direct Meta Model API for Muse Spark), Gemini, ChatGPT, Grok, and
+Claude-subscription transports, provider capability
 and model-catalog logic, credential ports, and OAuth state machines. It validates
 provider-specific wire behavior without importing Finch application configuration. The root
 application maps `Config` onto these contracts and decides which provider profile to run;

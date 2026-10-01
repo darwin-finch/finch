@@ -438,26 +438,32 @@ fn create_provider_from_resolved_entry(
             Ok(Box::new(provider))
         }
         CredentialProvider::OpenaiPlatform
+        | CredentialProvider::MetaModelApi
         | CredentialProvider::Xai
         | CredentialProvider::Mistral
         | CredentialProvider::Groq
         | CredentialProvider::Openrouter => {
             let (default_base, default_model, provider_name) = match provider {
                 CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "gpt-4o", "openai"),
+                CredentialProvider::MetaModelApi => ("https://api.meta.ai", "muse-spark-1.3", "meta_model_api"),
                 CredentialProvider::Xai => ("https://api.x.ai", "grok-4.6", "grok"),
                 CredentialProvider::Mistral => ("https://api.mistral.ai", "mistral-large-2512", "mistral"),
                 CredentialProvider::Groq => ("https://api.groq.com/openai", "openai/gpt-oss-120b", "groq"),
                 CredentialProvider::Openrouter => ("https://openrouter.ai/api", "z-ai/glm-5.3-flash", "openrouter"),
                 _ => unreachable!("outer match limits provider"),
             };
-            let mut provider = OpenAIProvider::new_compatible(
-                secret,
-                base_url.clone().unwrap_or_else(|| default_base.to_string()),
-                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
-                models_path.as_deref().unwrap_or("/v1/models"),
-                default_model.to_string(),
-                provider_name.to_string(),
-            )?;
+            let mut provider = if *provider == CredentialProvider::MetaModelApi {
+                OpenAIProvider::new_meta_model_api(secret)?
+            } else {
+                OpenAIProvider::new_compatible(
+                    secret,
+                    base_url.clone().unwrap_or_else(|| default_base.to_string()),
+                    chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                    models_path.as_deref().unwrap_or("/v1/models"),
+                    default_model.to_string(),
+                    provider_name.to_string(),
+                )?
+            };
             if let Some(model) = model {
                 provider = provider.with_model(model.clone());
             }
@@ -546,6 +552,7 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
         base_url,
         chat_path,
         models_path,
+        model,
         ..
     } = entry
     else {
@@ -574,6 +581,18 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("Gemini AI Studio custom endpoints are not supported by this transport")
+        }
+        CredentialProvider::MetaModelApi
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Meta Model API profiles are fixed to https://api.meta.ai/v1 and do not accept endpoint overrides")
+        }
+        CredentialProvider::MetaModelApi
+            if model
+                .as_deref()
+                .is_some_and(|model| model != "muse-spark-1.3") =>
+        {
+            bail!("Meta Model API currently supports only muse-spark-1.3")
         }
         _ => Ok(()),
     }
@@ -1128,6 +1147,111 @@ mod tests {
             name: Some(profile_name.into()),
             reasoning_effort: None,
         }
+    }
+
+    fn named_meta(profile_name: &str, credential_ref: &str) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::MetaModelApi,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("muse-spark-1.3".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(profile_name.into()),
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+        }
+    }
+
+    fn meta_credential(name: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::MetaModelApi,
+            issuer: "meta-model-api".into(),
+            audience: AudienceBinding::standard(EndpointFamily::MetaModelApi),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::Active {
+                expires_at: None,
+                refreshable: false,
+            },
+            revocation: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_meta_named_profile_constructs_truthful_model_identity_and_rejects_overrides() {
+        let profile = named_meta("muse", "meta-work");
+        let config = Config::with_providers(vec![profile.clone()])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let graph = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .expect("the origin-bound Meta profile must construct");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "muse");
+        assert_eq!(graph.profiles()[0].provider().name(), "meta_model_api");
+        assert_eq!(
+            graph.profiles()[0].provider().default_model(),
+            "muse-spark-1.3"
+        );
+        assert!(graph.profiles()[0]
+            .capabilities()
+            .unwrap()
+            .tools
+            .is_supported());
+
+        let mut overridden = profile;
+        if let ProviderEntry::Credentialed { chat_path, .. } = &mut overridden {
+            *chat_path = Some("/compatible-but-not-meta".into());
+        }
+        let invalid = Config::with_providers(vec![overridden])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let calls_before = resolver.calls.load(Ordering::SeqCst);
+        let error = match create_provider_graph_from_config_with_resolver(&invalid, &resolver) {
+            Ok(_) => panic!("Meta profiles must not silently redirect their credential"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("do not accept endpoint overrides"),
+            "{error}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            calls_before,
+            "unsafe Meta endpoint overrides must fail before secret resolution"
+        );
+
+        let mut future_model = named_meta("future-muse", "meta-work");
+        if let ProviderEntry::Credentialed { model, .. } = &mut future_model {
+            *model = Some("muse-spark-future".into());
+        }
+        let invalid = Config::with_providers(vec![future_model])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let error = match create_provider_graph_from_config_with_resolver(&invalid, &resolver) {
+            Ok(_) => panic!("undocumented future Muse models must remain unavailable"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("currently supports only muse-spark-1.3"),
+            "{error}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            calls_before,
+            "unknown Meta models must fail before secret resolution"
+        );
     }
 
     fn named_openai_credential(name: &str, account: &str) -> ProviderCredential {

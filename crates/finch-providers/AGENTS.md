@@ -5,7 +5,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `crates/finch-providers/src/`: the `LlmProvider` / `ProviderBackend` dispatch
 boundary, provider-neutral wire types and stream events, model catalog, capabilities,
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
-and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok / Claude-subscription adapters.
+and the Claude / OpenAI-compatible (including origin-pinned direct Meta Model API) / Gemini /
+ChatGPT / SuperGrok / Claude-subscription adapters.
 
 **Platform boundary (issue #1357).** `claude_cli.rs`'s MCP tool-call bridge is a
 `tokio::net::{UnixListener, UnixStream}` transport with no Windows equivalent. Rather than gating
@@ -316,6 +317,13 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
+- **Direct Meta Model API credentials are a distinct origin-bound namespace.**
+  `CredentialProvider::MetaModelApi` requires issuer `meta-model-api`, audience
+  `EndpointFamily::MetaModelApi`, and the fixed `https://api.meta.ai` origin.
+  `OpenAIProvider::new_meta_model_api` uses the documented Chat Completions
+  surface and `muse-spark-1.3`; it never falls back to OpenCode Zen, Muse Code,
+  contributor-tier models, or a custom compatible origin (#317, direct Meta Model API for Muse Spark; reviewed
+  against official Meta documentation on 2026-10-01).
 - Subscription and API billing are never automatically interchangeable.
 - Claude requests opt into Anthropic's top-level automatic moving-prefix cache. OpenAI API and
   ChatGPT transports continue to send stable, complete prefixes and rely on those services'
