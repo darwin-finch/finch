@@ -8928,7 +8928,7 @@ mod tests {
             !after_rendered
                 .iter()
                 .any(|line| line.contains("(say \"hello\")")),
-            "the say card must not swap to its program source after a click on \
+            "the say card must not reveal its program source after a click on \
              an unrelated legacy row; rendered={after_rendered:?}"
         );
         assert!(
@@ -9113,12 +9113,11 @@ mod tests {
     }
 
     #[test]
-    fn say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps() {
-        // INVARIANT (#882): a migrated say turn's show_program state lives on
-        // the component ViewModel. The renderer's RowId-keyed maps must stay
-        // empty for the card's rows, and toggling must go through the
-        // component action, not the accordion. Stage 2: the toggle hit target
-        // is the completed output region — there is no chrome row.
+    fn say_card_labelled_disclosure_preserves_answer_for_mouse_and_keyboard() {
+        // INVARIANT (#350): the renderer exposes one labelled control whose
+        // mouse and F6/Enter routes mutate the same component ViewModel. The
+        // answer stays visible, exact source is additive beneath it, and the
+        // semantic identity plus narrow wrapped hit region stay stable.
         let colors = ColorScheme::default();
         let manager = Arc::new(OutputManager::new(colors.clone()));
         manager.disable_stdout();
@@ -9130,101 +9129,159 @@ mod tests {
 
         let output = Arc::new(WorkUnit::new("VM program output"));
         output.set_program_output();
-        output.begin_say_turn("lisp", "(say \"hello\")");
-        output.append_response("hello");
+        let exact_source = "(say \"hello\")\n# exact second line";
+        output.begin_say_turn("lisp", exact_source);
+        output.append_response("answer stays visible");
         output.set_complete();
         manager.add_trait_message(output.clone());
 
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        const WIDTH: usize = 12;
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
         let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(rendered.contains(&"answer stays visible"));
         assert!(
-            !lines
+            !rendered
                 .iter()
-                .any(|line| line.text.contains("(say \"hello\")")),
-            "show_program defaults to false for a say turn; got {rendered:?}"
+                .any(|line| exact_source.lines().any(|source| line == &source)),
+            "source stays hidden until activation; rendered={rendered:?}"
         );
+        let closed_control = lines
+            .iter()
+            .find(|line| line.text.starts_with("Show program"))
+            .expect("the completed card renders its labelled control");
         assert!(
-            rendered.iter().any(|line| line.contains("hello"))
-                && rendered.iter().any(|line| line.contains("(ran ")),
-            "the completed card renders prose plus the `(ran Ns)` annotation; got {rendered:?}"
+            closed_control.text.contains(" · (ran ") && closed_control.text.ends_with(')'),
+            "the explicit Show program label keeps the elapsed annotation visible; \
+             control={closed_control:?}"
         );
-        let target = lines
-            .first()
-            .expect("the completed card renders toggle-target lines")
+        let closed_label = closed_control.text.clone();
+        let open_label = closed_label.replacen("Show program", "Hide program", 1);
+        let target = closed_control
             .row_id
             .clone()
-            .expect("completed lines carry the output-region identity");
+            .expect("the labelled control carries the stable identity");
         assert_eq!(
             target.path,
             vec![1],
-            "the output region is the toggle target; got {:?}",
+            "the program control keeps the established semantic path; got {:?}",
             target.path
         );
-        assert!(
-            lines.iter().all(|line| line.component_owned),
-            "the completed card's lines are component-owned routing"
-        );
-        assert!(
-            !lines.iter().any(|line| line.text.contains('\u{23fa}')),
-            "the completed card wears no chrome glyph; got {rendered:?}"
+        assert_eq!(
+            lines.iter().filter(|line| line.component_owned).count(),
+            1,
+            "only the labelled control routes disclosure; answer is readable prose; \
+             lines={lines:?}"
         );
 
-        // Click anywhere in the output region: the hitbox resolves to the
-        // output region's RowId and the routed action toggles the ViewModel.
         renderer
             .accordion
-            .rebuild_retained_hit_regions(&lines, 0, 80);
-        let clicked = renderer
-            .accordion
-            .component_region_at(0, 0)
-            .expect("the output region registers as a component hit region");
-        assert_eq!(
-            clicked, target,
-            "the component hit region is the output region"
-        );
+            .rebuild_retained_hit_regions(&lines, 0, WIDTH);
+        let control_rows = (0..12)
+            .filter(|&row| renderer.accordion.component_region_at(0, row) == Some(target.clone()))
+            .collect::<Vec<_>>();
         assert!(
-            !renderer
-                .accordion
-                .handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(
-                        crossterm::event::MouseButton::Left
-                    ),
-                    column: 0,
-                    row: 0,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                }),
-            "the accordion must NOT toggle a component-owned row through its own maps"
+            control_rows.len() > 1,
+            "the real hit-region rebuild must include every physical row of the narrow \
+             wrapped label; rows={control_rows:?} {}",
+            renderer.accordion.diagnostic_state()
         );
 
+        let click = |row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
         assert!(
-            renderer.dispatch_component_disclosure(&target, None),
-            "the routed action must reach the component's handle"
+            renderer.handle_accordion_mouse(click(control_rows[0])),
+            "clicking the labelled region must route to the component handle; {}",
+            renderer.accordion.diagnostic_state()
         );
-        let view = output.say_turn_view().expect("migrated say turn");
-        assert!(
-            view.vm.show_program,
-            "the component handle toggled show_program through the message lock"
-        );
-
-        // The next frame re-renders from the mutated VM: the prose swapped to
-        // the program source, the annotation stayed.
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
         let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert!(
-            !rendered.contains(&"hello"),
-            "the prose swapped away; got {rendered:?}"
+            rendered.contains(&"answer stays visible") && rendered.contains(&open_label.as_str()),
+            "opening changes the inverse label without replacing the answer; \
+             rendered={rendered:?}"
+        );
+        assert_eq!(
+            &rendered[rendered.len() - 2..],
+            exact_source.lines().collect::<Vec<_>>(),
+            "the exact source appears beneath answer and labelled control; rendered={rendered:?}"
+        );
+        let open_control = lines
+            .iter()
+            .find(|line| line.row_id.as_ref() == Some(&target))
+            .expect("same semantic control remains present while open");
+        assert_eq!(
+            open_control.row_expanded,
+            Some(true),
+            "visible Hide label and structured expanded state must agree; \
+             control={open_control:?}"
+        );
+
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&lines, 0, WIDTH);
+        let open_control_rows = (0..12)
+            .filter(|&row| renderer.accordion.component_region_at(0, row) == Some(target.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            open_control_rows,
+            control_rows,
+            "equal-width inverse labels keep the narrow wrapped hit region stable; {}",
+            renderer.accordion.diagnostic_state()
+        );
+        assert!(renderer.handle_accordion_mouse(click(open_control_rows[0])));
+
+        let closed_again = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
+        assert!(
+            closed_again
+                .iter()
+                .any(|line| line.text == "answer stays visible")
+                && closed_again.iter().any(|line| line.text == closed_label)
+                && !closed_again
+                    .iter()
+                    .any(|line| exact_source.lines().any(|source| line.text == source)),
+            "second mouse activation is the inverse: answer stays, source hides, Show label \
+             returns; lines={closed_again:?}"
+        );
+
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&closed_again, 0, WIDTH);
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&target),
+            "F6 focuses the same semantic control mouse activation used; {}",
+            renderer.accordion.diagnostic_state()
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        let keyboard_open = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&keyboard_open, 0, WIDTH);
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&target),
+            "keyboard activation keeps focus on the stable control after source insertion; {}",
+            renderer.accordion.diagnostic_state()
         );
         assert!(
-            rendered.iter().any(|line| line.contains("(say \"hello\")")),
-            "the program source renders in the card after the toggle; got {rendered:?}"
+            keyboard_open
+                .iter()
+                .any(|line| line.text == "answer stays visible")
+                && keyboard_open
+                    .iter()
+                    .any(|line| line.text == exact_source.lines().next().unwrap()),
+            "F6/Enter produces the same answer-preserving open state as mouse; \
+             lines={keyboard_open:?}"
         );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
         assert!(
-            rendered.iter().any(|line| line.contains("(ran ")),
-            "the `(ran Ns)` annotation stays through the swap; got {rendered:?}"
-        );
-        assert!(
-            lines.iter().all(|line| line.row_expanded == Some(true)),
-            "row_expanded reports the opened state for assistive consumers"
+            !output.say_turn_view().expect("say VM").vm.show_program,
+            "the second keyboard activation restores the closed state"
         );
     }
 

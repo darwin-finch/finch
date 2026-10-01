@@ -140,10 +140,12 @@ semantics; the style-spans migration is stage 4. Say turns: `say_turn_lines` ren
 one animated line, Running as the program source inline (arrived output bytes beneath it, never
 hidden), and Completed as the output prose plus `(ran Ns)` — no Program source row, no Brain run
 row, no result row, no card chrome. The stage-1 chrome (glyph + arrow + the `[0]` hitbox) is
-deleted; the toggle hit target is the completed output region (semantic path `[1]`, clicked or
-driven by F6/Enter), routing the opaque action to the message's `handle_transcript_action`, which
-toggles `show_program` under the message's lock; the next frame re-renders from the mutated
-ViewModel. The legacy source-group row does not render beside the card: `TuiRenderer::projected_lines`
+deleted; a completed turn keeps its answer visible and puts exact source beneath it only while
+open. One explicit `Show program` / `Hide program` control (semantic path `[1]`, clicked or driven
+by F6/Enter) carries the elapsed annotation and structured disclosure state, routing the opaque
+action to the message's `handle_transcript_action`, which toggles `show_program` under the
+message's lock; answer and source lines are not hit targets. The next frame re-renders from the
+mutated ViewModel. The legacy source-group row does not render beside the card: `TuiRenderer::projected_lines`
 pairs each say-VM unit with the adjacent completed Program-source unit whose response text is
 byte-identical to the turn's program (`say_turn_consolidated_source_ids`) and suppresses that
 row from the viewport only — byte identity holds by construction in every producer path and a

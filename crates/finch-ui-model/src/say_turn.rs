@@ -10,25 +10,25 @@
 //!   bytes that have already arrived (streaming `say` chunks, wire-error
 //!   diagnostics, transient status) render beneath the source; hiding arrived
 //!   say bytes is the pre-#350 defect class, so they are never suppressed.
-//! - **Completed**: the output prose inline, plus the `(ran Ns)` annotation.
-//!   No Program source row, no Brain run row, no result row, no card chrome.
-//!   The program source replaces the prose only while `show_program` —
-//!   clicking (or the keyboard disclosure path on) the completed output
-//!   toggles it.
+//! - **Completed**: the output prose inline, followed by a labelled
+//!   `Show program` / `Hide program` control carrying the `(ran Ns)`
+//!   annotation. No Program source row, Brain run row, result row, or card
+//!   chrome. The answer remains visible while `show_program` reveals the
+//!   exact source beneath it.
 //!
 //! The ViewModel (status, program, output, `show_program`) lives on the
 //! message behind its own lock; subwidgets are constructed
 //! from it each frame and choose to render or not, so a subwidget with
 //! nothing to show contributes zero lines and claims zero rows. The engine
 //! never matches on the message type: it asks the `Message` trait for
-//! [`SayTurnView`] and hands the snapshot here; clicks
+//! [`SayTurnView`] and hands the snapshot here; clicks on the labelled control
 //! resolve to `(RowId, action)` and route to the component's handle, which
 //! toggles `show_program` under the message's lock. Repaints stay
 //! pull-per-frame — the next frame re-renders from the mutated ViewModel.
 //!
 //! The stage-1 chrome (`chrome_line`, status glyph, the `[0]` disclosure
-//! hitbox) is deleted: the completed output region is the toggle target, so
-//! no chrome furniture exists to carry an affordance.
+//! hitbox) is deleted. The completed turn's explicit labelled control owns
+//! the stable `[1]` target; answer and source text are never click targets.
 
 use crate::{MessageId, NodeRole, RenderedTranscriptLine, RowId};
 
@@ -80,10 +80,9 @@ pub struct SayTurnView {
     pub elapsed: std::time::Duration,
 }
 
-/// Semantic path of the say turn's output region: the toggle hit target of a
-/// completed turn. New in stage 2 — the chrome's `[0]` retired with the
-/// chrome and is never reused.
-pub(crate) const OUTPUT_PATH: &[u32] = &[1];
+/// Semantic path of the say turn's program-disclosure control. The chrome's
+/// `[0]` retired in stage 2 and is never reused.
+pub(crate) const PROGRAM_CONTROL_PATH: &[u32] = &[1];
 
 /// Braille spinner frames for the animated generating state; the blit tick
 /// re-snapshots every frame, so sub-second elapsed animates the indicator.
@@ -140,9 +139,15 @@ fn body_line(text: String) -> RenderedTranscriptLine {
     }
 }
 
-/// A completed turn's toggle-target line: the whole output region is the hit
-/// target, and `row_expanded` carries the disclosure state for assistive
-/// consumers (`true` while the program source is shown).
+fn program_line(text: String) -> RenderedTranscriptLine {
+    RenderedTranscriptLine {
+        role: Some(NodeRole::Program),
+        ..body_line(text)
+    }
+}
+
+/// A completed turn's labelled toggle line. `row_expanded` carries the same
+/// disclosure state as its visible Show/Hide label for assistive consumers.
 fn toggle_line(text: String, target: &RowId, show_program: bool) -> RenderedTranscriptLine {
     RenderedTranscriptLine {
         text,
@@ -155,10 +160,10 @@ fn toggle_line(text: String, target: &RowId, show_program: bool) -> RenderedTran
     }
 }
 
-fn output_region(view: &SayTurnView) -> RowId {
+fn program_control(view: &SayTurnView) -> RowId {
     RowId {
         message_id: view.message_id,
-        path: OUTPUT_PATH.to_vec(),
+        path: PROGRAM_CONTROL_PATH.to_vec(),
     }
 }
 
@@ -173,7 +178,7 @@ fn generating_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 }
 
 /// `ProgramSource`: the exact wire text the turn ran, inline while it
-/// executes (and in place of the prose while a completed turn is toggled).
+/// executes and beneath the answer while a completed turn is toggled.
 /// Constructed from the outer ViewModel each frame; with nothing to show it
 /// renders nothing and claims zero rows.
 pub(crate) struct ProgramSource<'a> {
@@ -233,50 +238,45 @@ fn running_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     lines
 }
 
-/// Completed: the output prose inline (or the program source while toggled),
-/// one blank row, then the `(ran Ns)` annotation. Every content line is the
-/// toggle hit target.
-///
-/// #1259: the `(ran Ns)` annotation is the one line that renders unchanged in
-/// both states, so it carries the static chevron affordance -- collapsed
-/// `▸` (prose showing, source hidden) or expanded `▾` (source revealed) --
-/// the same convention `memory_recalled_lines` uses on a row's summary line.
-/// The whole completed region is always a toggle target (even an empty
-/// program still flips `show_program`, #1185), so the chevron always renders
-/// here, unlike a memory row with nothing to disclose.
+/// Completed: output prose remains visible, followed immediately by the
+/// labelled program-disclosure control and, while open, the exact source.
+/// Only the control is interactive. `Show program` and `Hide program` have
+/// equal display width, so its wrapped hit region is stable on narrow
+/// terminals. Even an empty program keeps the control (#1185).
 fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
-    let target = output_region(view);
-    let content = if view.vm.show_program {
-        ProgramSource::from_vm(&view.vm).render_toggled()
-    } else {
-        view.vm
-            .output
-            .as_ref()
-            .map(|output| Output::from_vm(output).render())
-            .unwrap_or_default()
-    };
-    let mut lines: Vec<RenderedTranscriptLine> = content
+    let target = program_control(view);
+    let mut lines: Vec<RenderedTranscriptLine> = view
+        .vm
+        .output
+        .as_ref()
+        .map(|output| Output::from_vm(output).render())
+        .unwrap_or_default()
         .into_iter()
-        .map(|text| toggle_line(text, &target, view.vm.show_program))
+        .map(body_line)
         .collect();
-    lines.push(toggle_line(String::new(), &target, view.vm.show_program));
-    let chevron = if view.vm.show_program {
-        '\u{25be}'
+    let label = if view.vm.show_program {
+        "Hide program"
     } else {
-        '\u{25b8}'
+        "Show program"
     };
     lines.push(toggle_line(
-        format!("{chevron} (ran {})", fmt_elapsed(view.elapsed.as_secs())),
+        format!("{label} · (ran {})", fmt_elapsed(view.elapsed.as_secs())),
         &target,
         view.vm.show_program,
     ));
+    lines.extend(
+        ProgramSource::from_vm(&view.vm)
+            .render_toggled()
+            .into_iter()
+            .map(program_line),
+    );
     lines
 }
 
 /// Render the say turn's lines for one frame: exactly one representation for
 /// the turn's current state. The transcript viewport's claiming pass turns
-/// the completed output region into the toggle hitboxes; a hidden subwidget
-/// claims nothing.
+/// the completed labelled control into one stable toggle hitbox; a hidden
+/// subwidget claims nothing.
 pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     match say_state(&view.vm) {
         SayTurnState::Generating => generating_lines(view),
@@ -448,7 +448,7 @@ mod tests {
     // ── Completed ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_completed_state_renders_prose_then_the_ran_annotation_and_no_legacy_rows() {
+    fn test_completed_state_renders_prose_then_the_labelled_control_and_no_legacy_rows() {
         // INVARIANT (stage 2, the maintainer's verbatim target): the completed
         // say turn is the prose inline plus `(ran Ns)` — no Program source
         // row, no Brain run row, no UUID, no result row, no card chrome.
@@ -457,10 +457,9 @@ mod tests {
         let rendered = texts(&lines);
         assert_eq!(
             rendered,
-            vec!["hello", "", "\u{25b8} (ran 2s)"],
-            "completed renders prose, a blank separator, then the elapsed annotation \
-             prefixed with the #1259 collapsed chevron '▸' (the program source stays \
-             hidden); got {rendered:?}"
+            vec!["hello", "Show program · (ran 2s)"],
+            "completed renders prose followed immediately by an explicit labelled control \
+             carrying the elapsed annotation; got {rendered:?}"
         );
         for line in &rendered {
             assert!(
@@ -487,8 +486,8 @@ mod tests {
         assert!(
             texts(&say_turn_lines(&quick))
                 .last()
-                .is_some_and(|line| *line == "\u{25b8} (ran 2s)"),
-            "the annotation always renders, chevron-prefixed; got {:?}",
+                .is_some_and(|line| *line == "Show program · (ran 2s)"),
+            "the annotation always renders on the labelled control; got {:?}",
             texts(&say_turn_lines(&quick))
         );
         let long = SayTurnView {
@@ -498,7 +497,7 @@ mod tests {
         assert!(
             texts(&say_turn_lines(&long))
                 .last()
-                .is_some_and(|line| *line == "\u{25b8} (ran 1m 15s)"),
+                .is_some_and(|line| *line == "Show program · (ran 1m 15s)"),
             "minutes render readably; got {:?}",
             texts(&say_turn_lines(&long))
         );
@@ -538,13 +537,14 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            vec!["", "\u{25b8} (ran 2s)"],
+            vec!["Show program · (ran 2s)"],
             "the completed empty turn renders its empty output region plus the \
-             chevron-prefixed elapsed annotation; got {rendered:?}"
+             labelled elapsed control; got {rendered:?}"
         );
-        assert!(
-            lines.iter().all(|line| line.row_id.is_some()),
-            "the completed region stays the toggle hit target; got {lines:?}"
+        assert_eq!(
+            lines.iter().filter(|line| line.row_id.is_some()).count(),
+            1,
+            "only the labelled control is the toggle hit target; got {lines:?}"
         );
     }
 
@@ -557,83 +557,111 @@ mod tests {
         let view = say_view(vm);
         let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
-        assert_eq!(rendered, vec!["", "\u{25b8} (ran 2s)"], "got {rendered:?}");
-        assert!(lines.iter().all(|line| line.row_id.is_some()));
+        assert_eq!(
+            rendered,
+            vec!["Show program · (ran 2s)"],
+            "got {rendered:?}"
+        );
+        assert_eq!(lines.iter().filter(|line| line.row_id.is_some()).count(), 1);
     }
 
     // ── Toggle ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_toggle_target_is_the_output_region_and_the_swap_re_claims() {
-        // INVARIANT (stage 2): clicking the completed output swaps it to the
-        // program source and back. Every completed content line carries the
-        // output-region RowId (component-owned), so the whole region is the
-        // hit target, and the claiming pass re-claims the swap.
+    fn test_labelled_toggle_preserves_answer_and_reveals_exact_source_beneath_it() {
+        // INVARIANT (#350): the answer is never the disclosure control and
+        // never disappears. One labelled row owns the stable action path.
         let view = say_view(completed_vm());
         let lines = say_turn_lines(&view);
-        let target = output_region(&view);
+        let target = program_control(&view);
         assert!(
-            lines
-                .iter()
-                .all(|line| line.row_id.as_ref() == Some(&target)),
-            "every completed line is the output-region toggle target; got {lines:?}"
+            lines.first().is_some_and(|line| line.row_id.is_none()),
+            "the answer stays ordinary readable prose, not a click target; got {lines:?}"
         );
         assert!(
-            lines.iter().all(|line| line.component_owned),
-            "the toggle target is component-owned routing"
+            lines.iter().filter(|line| line.component_owned).count() == 1,
+            "exactly one labelled control owns component routing; got {lines:?}"
         );
         assert!(
-            lines.iter().all(|line| line.row_expanded == Some(false)),
-            "row_expanded reports show_program=false for assistive consumers"
+            lines.last().is_some_and(|line| {
+                line.row_id.as_ref() == Some(&target)
+                    && line.row_expanded == Some(false)
+                    && line.text == "Show program · (ran 2s)"
+            }),
+            "the labelled control exposes its closed structured state; got {lines:?}"
         );
-        assert!(
-            texts(&lines)
-                .last()
-                .is_some_and(|line| line.starts_with('\u{25b8}')),
-            "#1259: collapsed (source hidden), the annotation leads with the collapsed \
-             chevron '▸'; got {:?}",
-            texts(&lines)
-        );
-        let hit_rects: Vec<_> = viewport_layout(say_turn_lines(&view)).hit_rects().collect();
-        assert!(
-            hit_rects.len() >= 3,
-            "the prose rows, the separator, and the annotation are all part of the \
-             output-region hit target; got {hit_rects:?}"
+        assert_eq!(
+            hit_rect_count(say_turn_lines(&view)),
+            1,
+            "only the explicit Show program control is clickable"
         );
 
-        // Toggle through the component handle path: prose swaps to source,
-        // the annotation stays, and the region reports the opened state.
+        // Toggle through the component handle path: answer persists, exact
+        // source appears beneath it, and the same control reports open.
         let mut vm = completed_vm();
         vm.show_program = true;
         let toggled = say_view(vm);
+        let toggled_target = program_control(&toggled);
         let toggled_lines = say_turn_lines(&toggled);
         let rendered = texts(&toggled_lines);
         assert_eq!(
             rendered,
-            vec!["(say \"hello\")", "", "\u{25be} (ran 2s)"],
-            "toggled on, the program source replaces the prose; the annotation stays and \
-             its chevron flips to the #1259 expanded glyph '▾'; got {rendered:?}"
+            vec!["hello", "Hide program · (ran 2s)", "(say \"hello\")"],
+            "toggled on, the answer stays visible and exact program source appears beneath \
+             the labelled inverse control; got {rendered:?}"
         );
         assert!(
-            say_turn_lines(&toggled)
-                .iter()
-                .all(|line| line.row_expanded == Some(true)),
-            "row_expanded tracks the opened state"
+            say_turn_lines(&toggled).iter().any(|line| {
+                line.row_id.as_ref() == Some(&toggled_target)
+                    && line.row_expanded == Some(true)
+                    && line.text == "Hide program · (ran 2s)"
+            }),
+            "the same control reports the opened state and inverse label"
         );
         assert_eq!(
             hit_rect_count(say_turn_lines(&view)),
             hit_rect_count(say_turn_lines(&toggled)),
-            "the swap re-claims one output region either way"
+            "opening source must not add click targets or move focus identity"
         );
     }
 
     #[test]
-    fn test_output_region_path_is_derived_and_never_reuses_the_retired_chrome_path() {
-        let view = say_view(completed_vm());
-        let target = output_region(&view);
+    fn test_labelled_control_wraps_to_the_same_hit_region_in_both_states() {
+        let closed = say_view(completed_vm());
+        let mut open_vm = completed_vm();
+        open_vm.show_program = true;
+        let open = say_view(open_vm);
+        let layout_at = |view: &SayTurnView| {
+            crate::layout(
+                &Widget::Viewport {
+                    lines: say_turn_lines(view),
+                },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 12,
+                    height: 40,
+                },
+            )
+            .hit_rects()
+            .map(|(_, rect)| rect)
+            .collect::<Vec<_>>()
+        };
         assert_eq!(
-            target.path, OUTPUT_PATH,
-            "the target's path is the declared OUTPUT_PATH"
+            layout_at(&closed),
+            layout_at(&open),
+            "Show/Hide controls have equal display width, so narrow wrapping keeps the \
+             same focusable hit region while source is revealed below"
+        );
+    }
+
+    #[test]
+    fn test_program_control_path_is_derived_and_never_reuses_the_retired_chrome_path() {
+        let view = say_view(completed_vm());
+        let target = program_control(&view);
+        assert_eq!(
+            target.path, PROGRAM_CONTROL_PATH,
+            "the target's path is the declared PROGRAM_CONTROL_PATH"
         );
         assert_ne!(
             target.path,
@@ -735,7 +763,7 @@ mod tests {
     #[test]
     fn test_the_completed_card_participates_in_a_claiming_frame_as_a_subtree() {
         // The engine's claiming pass offers a box; the completed card claims
-        // prose + blank + annotation rows inside it.
+        // prose + labelled control rows inside it.
         let view = say_view(completed_vm());
         const CARD: u16 = 7;
         let tree = Widget::Stack {
@@ -764,8 +792,8 @@ mod tests {
         );
         let rect = layout.keyed(CARD).expect("the card claims a rect");
         assert_eq!(
-            rect.height, 3,
-            "prose + blank + annotation claim three rows; got {rect:?}"
+            rect.height, 2,
+            "prose + labelled control claim two rows; got {rect:?}"
         );
     }
 }
