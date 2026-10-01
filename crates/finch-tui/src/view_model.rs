@@ -89,6 +89,13 @@ pub(crate) struct FrameRects {
     /// The open dialog's inline card (#807). Empty when no dialog is open or
     /// the card was squeezed out of a tiny frame.
     pub dialog_card: Rect,
+    /// The scrollable body inside the dialog card, derived from the same
+    /// pinned lines the card paints. Empty for dialogs without a body or when
+    /// clipping leaves no body row visible.
+    pub dialog_body: Rect,
+    /// The fixed option/button suffix inside the dialog card. Wheel input in
+    /// this claim is consumed without changing the dialog selection.
+    pub dialog_controls: Rect,
     /// The session task list's furniture claim (#966). Empty when there is
     /// nothing to show.
     pub tasks: Rect,
@@ -344,6 +351,8 @@ pub(crate) fn frame_rects(layout: &widgets::Layout) -> FrameRects {
         status_rule: layout.keyed(frame_key::STATUS_RULE).unwrap_or_default(),
         status: layout.keyed(frame_key::STATUS).unwrap_or_default(),
         dialog_card: layout.keyed(frame_key::DIALOG_CARD).unwrap_or_default(),
+        dialog_body: Rect::default(),
+        dialog_controls: Rect::default(),
         tasks: layout.keyed(frame_key::TASKS).unwrap_or_default(),
         tracked: layout.keyed(frame_key::TRACKED).unwrap_or_default(),
     }
