@@ -72,6 +72,20 @@ prefer showing instead. `test_repairable_rejection_diagnostic_reaches_debug_log_
 `query_processor.rs` cover the successful-repair, cancelled-before-repair, and cancelled-during-repair
 cases.
 
+**A deterministic raw-prose fallback must caption unsupported completed filesystem mutation
+claims.** `claims_tool_grounded_fact` (`query_processor.rs`) recognizes a narrow completed-claim
+grammar for create/write/edit/update/patch/move/rename/delete assertions whose direct target is a
+path, file, or directory, optionally after the bounded standalone acknowledgement `Done.`/`Done!`.
+When that query has no completed tool call, the existing visible unverified-tool caveat is retained
+in the live output and canonical `StreamingComplete` response; prospective instructions, requests,
+plans, refusals, examples, hyphenated adjectives such as `file-based`, and creative prose remain
+uncaveated. `named_brain_raw_prose_file_creation_claim_is_caveated_without_creating_the_file`,
+`completed_filesystem_mutation_claims_match_only_asserted_effects`,
+`completed_filesystem_mutation_claim_after_done_line_is_detected`,
+`hyphenated_file_adjective_is_not_a_filesystem_target`, and
+`unattempted_prose_claiming_file_creation_gets_no_caveat_after_completed_write` in
+`query_processor.rs` cover the production boundary and controls (#1477).
+
 **Snapshot replay reconstructs say-turn cards (#970).** The say ViewModel is produced only by
 the live paths, so `project_remote_brain_snapshot_runs` also runs
 `reconstruct_replayed_say_turn_cards`: a freshly replayed Interactive run whose journal pattern is
