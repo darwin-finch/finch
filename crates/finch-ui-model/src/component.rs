@@ -566,9 +566,9 @@ mod tests {
         let texts: Vec<String> = via_component.iter().map(|line| line.text.clone()).collect();
         assert_eq!(
             texts,
-            vec!["hello", "Show program · (ran 2s)"],
-            "the say card renders prose and its labelled elapsed control through the \
-             generalized accessor; got {texts:?}"
+            vec!["hello", "(ran 2s)"],
+            "the say card renders its actionable prose and non-control elapsed metadata \
+             through the generalized accessor; got {texts:?}"
         );
     }
 
@@ -620,7 +620,7 @@ mod tests {
         let rect = layout.keyed(CARD).expect("the card claims a rect");
         assert_eq!(
             rect.height, 2,
-            "prose + labelled control claim two rows; got {rect:?}"
+            "prose + elapsed metadata claim two rows; got {rect:?}"
         );
     }
 

@@ -40,7 +40,8 @@ interrupted run may resume, so its child rows intentionally stay live rather tha
 force-resolved. `test_run_terminal_status_resolves_stuck_child_rows_on_disconnect` in
 `src/cli/repl_event/event_loop/tests.rs` replays the issue's real disconnect transcript capture. A complete transcript is canonical text for copying and permanent
 scrollback; renderer disclosure may change visible rows but must not change that text. A say-turn
-component action mutates its owning ViewModel under the message lock; unmigrated rows keep the
+component action swaps the visible output/exact-source state in its owning ViewModel under the
+message lock; unmigrated rows keep the
 renderer-owned `RowId` open set. `MemoryRecalledMessage` (#1235) rides the same component-owned
 disclosure pattern: `header`/`rows` are immutable once constructed, but each row's `expanded`
 flag lives in its own `RwLock<Vec<bool>>`, collapsed by default, and `ToggleMemoryRow` (addressed

@@ -1416,6 +1416,7 @@ fn transcript_disclosure_hitboxes(
             },
             row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
             component_owned: viewport_content[index].component_owned,
+            single_focus_target: viewport_content[index].single_focus_target,
         })
         .collect()
 }
@@ -2576,8 +2577,8 @@ struct CanonicalCommitPlan {
 }
 
 /// Completed prefix of unprinted messages. Since the component-owned say turn
-/// (#882) the program source is show_program-gated card content, never a
-/// deleted row: every completed message emits its canonical record exactly
+/// (#882) the program source is mutually exclusive component content, never a
+/// deleted canonical row: every completed message emits its canonical record exactly
 /// once. A completed program source only waits (staying in the live suffix)
 /// while its paired output is still running without body, so source and
 /// output cannot commit out of order.
@@ -9113,11 +9114,7 @@ mod tests {
     }
 
     #[test]
-    fn say_card_labelled_disclosure_preserves_answer_for_mouse_and_keyboard() {
-        // INVARIANT (#350): the renderer exposes one labelled control whose
-        // mouse and F6/Enter routes mutate the same component ViewModel. The
-        // answer stays visible, exact source is additive beneath it, and the
-        // semantic identity plus narrow wrapped hit region stay stable.
+    fn say_card_content_is_the_stable_in_place_toggle_target() {
         let colors = ColorScheme::default();
         let manager = Arc::new(OutputManager::new(colors.clone()));
         manager.disable_stdout();
@@ -9126,162 +9123,289 @@ mod tests {
             Arc::new(StatusBar::new()),
             colors.clone(),
         );
+        fn component_point(
+            renderer: &TuiRenderer,
+            target: &view_model::RowId,
+            width: u16,
+            height: u16,
+        ) -> (u16, u16) {
+            for row in 0..height {
+                for column in 0..width {
+                    if renderer.accordion.component_region_at(column, row).as_ref() == Some(target)
+                    {
+                        return (column, row);
+                    }
+                }
+            }
+            panic!(
+                "the painted frame must expose the stable component target; target={target:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+        }
 
         let output = Arc::new(WorkUnit::new("VM program output"));
         output.set_program_output();
         let exact_source = "(say \"hello\")\n# exact second line";
         output.begin_say_turn("lisp", exact_source);
-        output.append_response("answer stays visible");
+        output.append_response("assistant answer");
         output.set_complete();
         manager.add_trait_message(output.clone());
 
-        const WIDTH: usize = 12;
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
-        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert!(rendered.contains(&"answer stays visible"));
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| exact_source.lines().any(|source| line == &source)),
-            "source stays hidden until activation; rendered={rendered:?}"
-        );
-        let closed_control = lines
+        let canonical_before = output.complete_transcript(&colors);
+        let closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let target = closed
             .iter()
-            .find(|line| line.text.starts_with("Show program"))
-            .expect("the completed card renders its labelled control");
-        assert!(
-            closed_control.text.contains(" · (ran ") && closed_control.text.ends_with(')'),
-            "the explicit Show program label keeps the elapsed annotation visible; \
-             control={closed_control:?}"
-        );
-        let closed_label = closed_control.text.clone();
-        let open_label = closed_label.replacen("Show program", "Hide program", 1);
-        let target = closed_control
-            .row_id
-            .clone()
-            .expect("the labelled control carries the stable identity");
+            .find(|line| line.text == "assistant answer")
+            .and_then(|line| line.row_id.clone())
+            .expect("the displayed assistant output itself is the toggle target");
         assert_eq!(
             target.path,
             vec![1],
-            "the program control keeps the established semantic path; got {:?}",
-            target.path
+            "the existing stable action path is retained"
         );
-        assert_eq!(
-            lines.iter().filter(|line| line.component_owned).count(),
-            1,
-            "only the labelled control routes disclosure; answer is readable prose; \
-             lines={lines:?}"
-        );
-
-        renderer
-            .accordion
-            .rebuild_retained_hit_regions(&lines, 0, WIDTH);
-        let control_rows = (0..12)
-            .filter(|&row| renderer.accordion.component_region_at(0, row) == Some(target.clone()))
-            .collect::<Vec<_>>();
         assert!(
-            control_rows.len() > 1,
-            "the real hit-region rebuild must include every physical row of the narrow \
-             wrapped label; rows={control_rows:?} {}",
-            renderer.accordion.diagnostic_state()
+            !closed.iter().any(|line| {
+                line.text.contains("Show program") || line.text.contains("Hide program")
+            }),
+            "no separate visible show/hide control row may remain; lines={closed:?}"
         );
 
-        let click = |row| crossterm::event::MouseEvent {
+        let mut paint_bytes = Vec::new();
+        renderer
+            .draw_live_area_to_at(&mut paint_bytes, 80, 24, None)
+            .expect("the production live-frame paint must register output hit regions");
+        let (output_column, output_row) = component_point(&renderer, &target, 80, 24);
+        let press = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row,
+            column: output_column,
+            row: output_row,
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         assert!(
-            renderer.handle_accordion_mouse(click(control_rows[0])),
-            "clicking the labelled region must route to the component handle; {}",
-            renderer.accordion.diagnostic_state()
+            !renderer.handle_mouse_to(press, &mut Vec::new()),
+            "the real mouse path must defer disclosure until a matching Up"
         );
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
-        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert!(
-            rendered.contains(&"answer stays visible") && rendered.contains(&open_label.as_str()),
-            "opening changes the inverse label without replacing the answer; \
-             rendered={rendered:?}"
-        );
-        assert_eq!(
-            &rendered[rendered.len() - 2..],
-            exact_source.lines().collect::<Vec<_>>(),
-            "the exact source appears beneath answer and labelled control; rendered={rendered:?}"
-        );
-        let open_control = lines
-            .iter()
-            .find(|line| line.row_id.as_ref() == Some(&target))
-            .expect("same semantic control remains present while open");
-        assert_eq!(
-            open_control.row_expanded,
-            Some(true),
-            "visible Hide label and structured expanded state must agree; \
-             control={open_control:?}"
-        );
-
-        renderer
-            .accordion
-            .rebuild_retained_hit_regions(&lines, 0, WIDTH);
-        let open_control_rows = (0..12)
-            .filter(|&row| renderer.accordion.component_region_at(0, row) == Some(target.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            open_control_rows,
-            control_rows,
-            "equal-width inverse labels keep the narrow wrapped hit region stable; {}",
-            renderer.accordion.diagnostic_state()
-        );
-        assert!(renderer.handle_accordion_mouse(click(open_control_rows[0])));
-
-        let closed_again = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
-        assert!(
-            closed_again
-                .iter()
-                .any(|line| line.text == "answer stays visible")
-                && closed_again.iter().any(|line| line.text == closed_label)
-                && !closed_again
-                    .iter()
-                    .any(|line| exact_source.lines().any(|source| line.text == source)),
-            "second mouse activation is the inverse: answer stays, source hides, Show label \
-             returns; lines={closed_again:?}"
-        );
-
-        renderer
-            .accordion
-            .rebuild_retained_hit_regions(&closed_again, 0, WIDTH);
-        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
-        assert_eq!(
-            renderer.accordion.focused.as_ref(),
-            Some(&target),
-            "F6 focuses the same semantic control mouse activation used; {}",
-            renderer.accordion.diagnostic_state()
-        );
-        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
-        let keyboard_open = renderer.projected_message_lines(&manager.get_messages()[0], WIDTH);
-        renderer
-            .accordion
-            .rebuild_retained_hit_regions(&keyboard_open, 0, WIDTH);
-        assert_eq!(
-            renderer.accordion.focused.as_ref(),
-            Some(&target),
-            "keyboard activation keeps focus on the stable control after source insertion; {}",
-            renderer.accordion.diagnostic_state()
-        );
-        assert!(
-            keyboard_open
-                .iter()
-                .any(|line| line.text == "answer stays visible")
-                && keyboard_open
-                    .iter()
-                    .any(|line| line.text == exact_source.lines().next().unwrap()),
-            "F6/Enter produces the same answer-preserving open state as mouse; \
-             lines={keyboard_open:?}"
-        );
-        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
         assert!(
             !output.say_turn_view().expect("say VM").vm.show_program,
-            "the second keyboard activation restores the closed state"
+            "Down alone must not swap the displayed output"
+        );
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..press
+                },
+                &mut Vec::new(),
+            ),
+            "a matching Down -> Up on the displayed output must route through the production \
+             click gesture and component action path"
+        );
+
+        let open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let open_text = open
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        let source_lines = exact_source.lines().collect::<Vec<_>>();
+        assert!(
+            !open_text.contains(&"assistant answer")
+                && open_text
+                    .windows(2)
+                    .any(|lines| lines == source_lines.as_slice()),
+            "activation swaps output for exact source in place and never shows both; lines={open:?}"
+        );
+        assert!(
+            open.iter()
+                .filter(|line| line.text == "(say \"hello\")" || line.text == "# exact second line")
+                .all(|line| line.row_id.as_ref() == Some(&target)),
+            "every displayed source line routes to the same stable component identity; lines={open:?}"
+        );
+
+        renderer
+            .handle_resize(64, 20)
+            .expect("the production resize path must accept the source-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the source state");
+        assert_eq!(
+            renderer.accordion.visible_order_count(&target),
+            1,
+            "multiline source remains one keyboard target after resize/repaint; {}",
+            renderer.accordion.diagnostic_state()
+        );
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_press = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(!renderer.handle_mouse_to(source_press, &mut Vec::new()));
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: source_column.saturating_add(1),
+            ..source_press
+        };
+        assert!(renderer.handle_mouse_to(drag, &mut Vec::new()));
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..drag
+                },
+                &mut Vec::new(),
+            ),
+            "a drag that begins on source content must finish as selection"
+        );
+        assert!(
+            output.say_turn_view().expect("say VM").vm.show_program,
+            "a real drag must not also activate the source toggle"
+        );
+
+        // This press clears the finalized selection through a synchronous
+        // full repaint. The production Down -> Up gesture must survive that
+        // repaint and still swap source back to output.
+        // `redraw_full_viewport()` reads the real terminal size in production;
+        // this headless test instead pins the same 64x20 geometry it simulated
+        // above so the repaint cannot move content under the recorded press.
+        renderer.pending_viewport_size = Some((64, 20));
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(renderer.handle_mouse_to(source_click, &mut Vec::new()));
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..source_click
+                },
+                &mut Vec::new(),
+            ),
+            "clicking displayed source through the real gesture path swaps back to output"
+        );
+        let mouse_closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(mouse_closed.iter().any(|line| {
+            line.text == "assistant answer" && line.row_id.as_ref() == Some(&target)
+        }));
+
+        renderer
+            .handle_resize(80, 24)
+            .expect("the production resize path must accept the output-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the output state");
+        let output_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
+                .accordion
+                .component_region_at(output_point.0, output_point.1)
+                .as_ref(),
+            Some(&target),
+            "output repaint must retain the same action identity"
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        let keyboard_open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(keyboard_open.iter().any(|line| {
+            line.text == "(say \"hello\")" && line.row_id.as_ref() == Some(&target)
+        }));
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&keyboard_open, 0, 80);
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        let closed_again = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(closed_again.iter().any(|line| {
+            line.text == "assistant answer" && line.row_id.as_ref() == Some(&target)
+        }));
+        assert!(
+            !closed_again
+                .iter()
+                .any(|line| exact_source.lines().any(|source| line.text == source)),
+            "keyboard activation swaps exact source back to output; lines={closed_again:?}"
+        );
+        assert_eq!(
+            output.complete_transcript(&colors),
+            canonical_before,
+            "presentation toggles must not mutate canonical transcript bytes"
+        );
+
+        let mut canonical_bytes = Vec::new();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("the swapped turn must commit to native history");
+        let committed = String::from_utf8(canonical_bytes.clone()).expect("canonical UTF-8");
+        for expected in ["Program output", "assistant answer"] {
+            assert_eq!(
+                committed.matches(expected).count(),
+                1,
+                "native history keeps each canonical line exactly once; \
+                 expected={expected:?} committed={committed:?}"
+            );
+        }
+        assert!(
+            exact_source
+                .lines()
+                .all(|source| !committed.contains(source)),
+            "the interactive source projection must not replace or duplicate the canonical \
+             output record in native history; committed={committed:?}"
+        );
+        let committed_len = canonical_bytes.len();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("a repeated native-history pass remains idempotent");
+        assert_eq!(
+            canonical_bytes.len(),
+            committed_len,
+            "the completed turn must not append duplicate native-history bytes"
+        );
+
+        renderer.pending_viewport_size = Some((80, 24));
+        renderer.viewport_invalidated = true;
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("post-commit reconstruction must repaint the retained say target");
+        let retained_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
+                .accordion
+                .component_region_at(retained_point.0, retained_point.1)
+                .as_ref(),
+            Some(&target),
+            "native-history reconstruction retains the same in-place action identity"
+        );
+        assert_eq!(
+            output.complete_transcript(&colors),
+            canonical_before,
+            "native-history reconstruction must not mutate canonical source/output bytes"
         );
     }
 
@@ -9291,7 +9415,7 @@ mod tests {
     /// `TranscriptHitRegion`/`component_region_at` hit-testing plus
     /// `dispatch_component_disclosure` -- rather than calling
     /// `MemoryRecalledMessage`'s handle directly. Mirrors
-    /// `say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps`:
+    /// `say_card_content_is_the_stable_in_place_toggle_target`:
     /// same component-owned mechanism (#882), different message type.
     #[test]
     fn test_memory_recall_row_collapsed_by_default_click_expands_click_again_collapses() {
