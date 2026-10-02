@@ -22,7 +22,7 @@ use ts_rs::TS;
 
 /// The manifest contract version. Bump on any shape change and update
 /// `docs/UI_MANIFEST.md` in the same commit; consumers read this first.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// One node of the serializable UI manifest: an element type (the registry
 /// key the JSX side maps to a component), a derived stable id, JSON-valued
@@ -240,23 +240,23 @@ pub fn component_manifest(view: &ComponentView) -> DynamicUiNode {
 }
 
 /// The say-turn card's manifest: the VM fields a GUI card component reads.
-/// Completed cards lower in terminal order: answer, explicit labelled
-/// disclosure control, then exact source only while open. The control alone
-/// carries semantic path `#1`; answer and source content are not action
-/// targets. Running cards retain their inline source/output representation.
+/// Completed cards lower exactly one content child: output or exact source.
+/// That displayed child carries semantic path `#1` plus a truthful alternate
+/// action label; there is no separate visible control node. Running cards
+/// retain their inline non-actionable source/output representation.
 pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
     let status = match view.vm.status {
         SayTurnStatus::Running => "running",
         SayTurnStatus::Completed => "completed",
     };
-    let program = || {
-        DynamicUiNode::leaf("ProgramSource", "")
+    let program = |id: String| {
+        DynamicUiNode::leaf("ProgramSource", id)
             .with_prop("language", view.vm.program.language.clone())
             .with_prop("lines", view.vm.program.lines.clone())
     };
-    let output = || {
+    let output = |id: String| {
         view.vm.output.as_ref().map(|output| {
-            DynamicUiNode::leaf("Output", "").with_prop("lines", output.lines.clone())
+            DynamicUiNode::leaf("Output", id).with_prop("lines", output.lines.clone())
         })
     };
     let mut card = DynamicUiNode::leaf("SayTurnCard", manifest_id(&view.message_id))
@@ -265,33 +265,24 @@ pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
         .with_prop("showProgram", view.vm.show_program);
 
     if view.vm.status == SayTurnStatus::Running {
-        card = card.with_child(program());
-        if let Some(output) = output() {
+        card = card.with_child(program(String::new()));
+        if let Some(output) = output(String::new()) {
             card = card.with_child(output);
         }
         return card;
     }
 
-    if let Some(output) = output() {
-        card = card.with_child(output);
-    }
-    let label = if view.vm.show_program {
-        "Hide program"
+    let target_id = manifest_path_id(&view.message_id, &[1]);
+    let content = if view.vm.show_program {
+        program(target_id).with_prop("actionLabel", "Show output")
     } else {
-        "Show program"
+        output(target_id.clone())
+            .unwrap_or_else(|| {
+                DynamicUiNode::leaf("Output", target_id).with_prop("lines", Vec::<String>::new())
+            })
+            .with_prop("actionLabel", "Show program")
     };
-    card = card.with_child(
-        DynamicUiNode::leaf(
-            "ProgramDisclosureControl",
-            manifest_path_id(&view.message_id, &[1]),
-        )
-        .with_prop("label", label)
-        .with_prop("expanded", view.vm.show_program),
-    );
-    if view.vm.show_program {
-        card = card.with_child(program());
-    }
-    card
+    card.with_child(content)
 }
 
 /// A static text message's manifest: kind + content lines.

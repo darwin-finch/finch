@@ -1,5 +1,5 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "root": {
     "element_type": "SayTurnCard",
     "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -11,20 +11,12 @@
     "children": [
       {
         "element_type": "Output",
-        "id": "",
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7#1",
         "props": {
+          "actionLabel": "Show program",
           "lines": [
             "Hi, Shammah! What would you like to work on?"
           ]
-        },
-        "children": []
-      },
-      {
-        "element_type": "ProgramDisclosureControl",
-        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7#1",
-        "props": {
-          "expanded": false,
-          "label": "Show program"
         },
         "children": []
       }
