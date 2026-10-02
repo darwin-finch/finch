@@ -10,4 +10,5 @@ repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]
 unicode-width = "0.2"
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }

@@ -126,6 +126,9 @@ pub(crate) struct LiveViewModel<'a> {
     /// [`super::scroll_view::TranscriptScrollView::hidden_rows`] and
     /// [`super::scroll_view::scroll_position_hint`]).
     pub scroll_hint: Option<&'a str>,
+    pub hovered_row: Option<&'a finch_ui_model::RowId>,
+    pub hover_bg: Option<finch_ui_model::SpanColor>,
+
     pub dialog: Option<&'a super::Dialog>,
     /// Lines of the focused expanded tool-result surface (#656), pre-rendered
     /// by the caller so the planner stays a pure function of its inputs.

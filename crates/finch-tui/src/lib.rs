@@ -1294,7 +1294,7 @@ pub(crate) fn plan_live_frame(
     // span-free lines keep their legacy bytes.
     for line in &viewport_content {
         frame.push(
-            span_render::lower_rendered_line(line)
+            span_render::lower_rendered_line(line, None)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -1532,6 +1532,8 @@ pub struct TuiRenderer {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: Option<String>,
 
+    pub hovered_row: Option<finch_ui_model::RowId>,
+
     // How many rows the live area currently occupies at the bottom of the
     // terminal (WorkUnit + separator + input + status).  Cleared before each
     // redraw.
@@ -1754,6 +1756,7 @@ impl TuiRenderer {
             command_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            hovered_row: None,
             active_rows: 0,
             pending_viewport_size: None,
             last_live_frame_rows: 0,
@@ -1845,6 +1848,7 @@ impl TuiRenderer {
             command_history,
             history_index: None,
             history_draft: None,
+            hovered_row: None,
 
             active_rows: 0,
             pending_viewport_size: None,
@@ -2241,13 +2245,15 @@ impl TuiRenderer {
         // focused reader are field borrows disjoint from the autocomplete
         // state the planner mutates.
         let frame = {
-            let vm = live_view_model(
+            let mut vm = live_view_model(
                 &sources,
                 term_width,
                 term_h,
                 active_dialog.as_ref(),
                 expanded_lines.as_deref(),
             );
+            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
@@ -2346,7 +2352,7 @@ impl TuiRenderer {
             if !prefix.is_empty() {
                 execute!(out, Print(&prefix))?;
             }
-            let span = finch_ui_model::Span::styled(highlighted, style);
+            let span = finch_ui_model::Span::styled(highlighted, style.clone());
             execute!(out, Print(span_render::lower_span(&span)))?;
             if !suffix.is_empty() {
                 execute!(out, Print(&suffix))?;
@@ -2859,6 +2865,8 @@ fn live_view_model<'a>(
         scroll_hint: sources.scroll_hint.as_deref(),
         dialog,
         expanded_lines,
+        hovered_row: None,
+        hover_bg: None,
         render_error: sources.render_error,
         task_rows: &sources.task_rows,
         tracked_rows: &sources.tracked_rows,
@@ -3745,8 +3753,28 @@ impl TuiRenderer {
                 MouseEventKind::Down(MouseButton::Left) => self.handle_left_press(mouse),
                 MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(mouse),
                 MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(mouse),
+                MouseEventKind::Moved => self.handle_mouse_moved(mouse),
                 _ => self.handle_accordion_mouse(mouse),
             }
+        }
+    }
+
+    fn handle_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let hover_row = if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
+            Some(region)
+        } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
+            Some(region.row_id.clone())
+        } else {
+            None
+        };
+
+        if self.hovered_row != hover_row {
+            self.hovered_row = hover_row;
+            self.live_area_dirty = true;
+            self.viewport_invalidated = true; // force full repaint to ensure hover is visible / cleared
+            true
+        } else {
+            false
         }
     }
 
@@ -4253,7 +4281,9 @@ impl TuiRenderer {
             let draw_width = usize::from(width).max(1);
             let sources = self.live_frame_sources(draw_width);
             let mut autocomplete = self.autocomplete_state.clone();
-            let vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
@@ -4276,13 +4306,15 @@ impl TuiRenderer {
         // planner, two consumers.
         let mut autocomplete = self.autocomplete_state.clone();
         let expanded_lines = self.focused_reader_lines(&sources, draw_width, draw_height, None);
-        let vm = live_view_model(
+        let mut vm = live_view_model(
             &sources,
             draw_width,
             draw_height,
             None,
             expanded_lines.as_deref(),
         );
+        vm.hovered_row = self.hovered_row.as_ref();
+        vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
@@ -4347,7 +4379,7 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
         let painted_transcript = transcript
             .iter()
-            .map(span_render::lower_rendered_line)
+            .map(|l| span_render::lower_rendered_line(l, if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref() { Some(finch_ui_model::SpanColor::DARK_GREY) } else { None }))
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
@@ -8382,13 +8414,13 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0]) == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0]).contains(&original_header),
+                && span_render::lower_rendered_line(&literal_state[0], None) == literal_state[0].text
+                && !span_render::lower_rendered_line(&literal_state[0], None).contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
             literal_state[0],
-            span_render::lower_rendered_line(&literal_state[0])
+            span_render::lower_rendered_line(&literal_state[0], None)
         );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
@@ -10511,7 +10543,7 @@ mod tests {
         );
         // The scroll-window source is the projection itself; the lowering the
         // full-viewport paint applies renders the same bytes as the seam.
-        let lowered = span_render::lower_rendered_line(&styled[0]);
+        let lowered = span_render::lower_rendered_line(&styled[0], None);
         assert_eq!(
             lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
             "the scrolled paint shows the styled row; got {lowered:?}"
@@ -10641,10 +10673,12 @@ mod tests {
     }
 
     /// DEFECT REGRESSION: user turn continuation lines retain foreground color
-    /// even when scrolled down past line 0.
+    /// and theme-aware greyish background across all themes, even when scrolled
+    /// down past line 0.
     #[test]
-    fn test_user_turn_continuation_lines_retain_color_when_scrolled_down() {
+    fn test_user_turn_continuation_lines_retain_color_and_theme_background() {
         use finch_messages::UserQueryMessage;
+        use finch_theme::ColorTheme;
         let mut renderer = headless_renderer();
         let user = Arc::new(UserQueryMessage::new("first line\nsecond line\nthird line"));
         let message: MessageRef = Arc::clone(&user) as MessageRef;
@@ -10658,15 +10692,33 @@ mod tests {
         assert!(!lines[1].spans.is_empty(), "line 1 must carry spans");
         assert!(!lines[2].spans.is_empty(), "line 2 must carry spans");
 
-        // When line 0 rolls off-screen, lines 1 and 2 are lowered independently.
-        // Each lowered continuation line MUST carry ANSI color escape sequences.
-        let lowered_line1 = span_render::lower_rendered_line(&lines[1]);
-        let lowered_line2 = span_render::lower_rendered_line(&lines[2]);
+        // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
+        // Even when lowered in isolation (without line 0 having been painted),
+        // continuation lines MUST contain ANSI foreground and background escape sequences!
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None);
 
         assert_ne!(lowered_line1, "second line");
         assert_ne!(lowered_line2, "third line");
         assert!(lowered_line1.contains("\x1b["));
         assert!(lowered_line2.contains("\x1b["));
+
+        for theme in ColorTheme::all() {
+            let scheme = theme.to_scheme();
+            let palette = span_render::component_style_palette(&scheme);
+            let view = message
+                .component_view()
+                .expect("user query must have a component view");
+            let rendered = finch_ui_model::component_lines(&view, &palette);
+            let expected_band = scheme.message_band_style(finch_theme::MessageBand::LocalUser);
+            let expected_bg = match expected_band.bg.unwrap() {
+                ratatui::style::Color::Rgb(r, g, b) => finch_ui_model::SpanColor::Rgb(r, g, b),
+                _ => panic!("unexpected background color"),
+            };
+            for line in &rendered {
+                assert_eq!(line.spans[0].style.bg, Some(expected_bg));
+            }
+        }
     }
 
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
