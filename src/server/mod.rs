@@ -1784,7 +1784,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let replacement = hook_store
+            hook_store
                 .create_schedule(
                     NAME,
                     &replacement_attachment.subject,
@@ -1793,12 +1793,11 @@ mod tests {
                     "(say \"replacement\")",
                     crate::vm::EffectSet::pure(),
                     0,
-                    Some(1_000),
+                    None,
                     crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
                 )
                 .unwrap();
             *hook_fixture.lock().unwrap() = Some((
-                replacement.schedule_id,
                 replacement_attachment.attachment_id,
                 replacement_attachment.subject,
             ));
@@ -1819,12 +1818,28 @@ mod tests {
             2,
             "replacement success after capture-to-queue recreation must not recover the retired predecessor"
         );
-        let (replacement_id, replacement_attachment_id, replacement_subject) =
+        let (replacement_attachment_id, replacement_subject) =
             replacement_fixture.lock().unwrap().clone().unwrap();
+        let replacement_lock = store.execution_lock(NAME).unwrap();
+        let replacement_turn = replacement_lock.lock_owned().await;
+        let replacement_id = store
+            .create_schedule(
+                NAME,
+                &replacement_subject,
+                replacement_attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"replacement later\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap()
+            .schedule_id;
         let replacement_healthy = std::fs::read(&journal).unwrap();
         assert!(store.evict_resident_brain_for_tests(NAME));
         corrupt_brain_journal(&brain_root, NAME);
-        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        drop(replacement_turn);
         wait_for_schedule_events(&captured, FAILURE, 5).await;
 
         // Now cross the awaited failure itself with another cancel-last and
