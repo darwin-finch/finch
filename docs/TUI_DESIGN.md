@@ -5,12 +5,11 @@ contract TUI work is reviewed against. It supersedes the 805 centralization *as 
 the migration keeps main green at every stage.
 
 **Stage-1 outcome (#882, 2026-09-18): landed.** The say turn is component-owned as specified:
-`WorkUnitViewModel` on the say WorkUnit behind its own lock; chrome (glyph + elapsed + an
-arrow that renders only while the program source can be shown) and the `ProgramSource` /
-`Output` subwidgets now live with the pure projection in
+`WorkUnitViewModel` on the say WorkUnit behind its own lock; `ProgramSource` / `Output`
+subwidgets and elapsed metadata now live with the pure projection in
 `crates/finch-ui-model/src/say_turn.rs`; the vocabulary lives behind the crate's flat
 `lib.rs` facade; clicks route through opaque component actions to
-`handle_transcript_action`; the renderer's RowId-keyed maps hold no say-turn disclosure; and
+`handle_transcript_action`; the renderer's RowId-keyed maps hold no say-turn toggle state; and
 the say-turn suppression is deleted (the canonical record keeps its exactly-once semantics
 and pinned invariant).
 
@@ -150,20 +149,18 @@ WorkUnitViewModel {
     status: Running | Completed,          // set once, exactly-once, by the completion path
     program:  ProgramSourceVm,            // the (say "…") text
     output:   Option<OutputVm>,           // set when the program executes successfully
-    show_program: bool,                   // toggled by click on the disclosure hitbox
+    show_program: bool,                   // toggled by click on displayed output/source
 }
 ```
 
 - The component constructs **two subwidgets** from the outer ViewModel: `ProgramSource` and
-  `Output`. `ProgramSource` renders only when `show_program` (default hidden for say turns —
-  #350's prose ruling); `Output` renders when the output part is set. During streaming both
-  are live: the VM is updated as the turn streams and every frame repaints from it.
+  `Output`. A completed turn renders exactly one: source when `show_program`, otherwise output.
+  During streaming the VM is updated as the turn streams and every frame repaints from it.
 - When the program executes successfully the run is marked complete and the output part is
   set — the `status — running` residue (#820) cannot survive because the status field is
   owned and transitioned here.
-- Chrome: status glyph + elapsed + the disclosure arrow; the arrow exists only while
-  `ProgramSource` can be shown. Click → hitbox → `(RowId, ToggleProgram)` → `vm.show_program
-  ^= true`.
+- The displayed output or source owns the stable `[1]` hit target. Click → hitbox →
+  `(RowId, ToggleProgram)` → `vm.show_program ^= true`; there is no separate control row.
 - The canonical record is unchanged: the settled turn spools once into native scrollback
   with the raw program and output text; the live card is the reader.
 
