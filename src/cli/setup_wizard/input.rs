@@ -2701,6 +2701,11 @@ fn open_browser_silently(url: &str) {
         .arg("--")
         .arg(url)
         .status();
-    #[cfg(all(not(test), not(target_os = "macos")))]
+    #[cfg(all(not(test), target_os = "linux"))]
     let _ = std::process::Command::new("xdg-open").arg(url).status();
+    #[cfg(all(not(test), target_os = "windows"))]
+    let _ = std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status();
 }
