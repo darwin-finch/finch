@@ -1635,7 +1635,10 @@ mod tests {
         )
         .remove(0);
         assert_eq!(
-            (started.spans[0].style.is_plain(), started.spans[1].style.clone()),
+            (
+                started.spans[0].style.is_plain(),
+                started.spans[1].style.clone()
+            ),
             (true, SpanStyle::fg(SpanColor::DARK_GREY).with_dim(true)),
             "header plain + dimmed running ellipsis; got {started:?}"
         );

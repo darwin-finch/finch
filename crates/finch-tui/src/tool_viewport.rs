@@ -389,7 +389,7 @@ pub fn expanded_surface_lines(
         end += 1;
     }
     let end = end.min(body.len());
-    
+
     let mut lines = Vec::new();
     lines.push(truncate_body_line(&format!("── {} ", title), width));
     for line in &body[start..end] {

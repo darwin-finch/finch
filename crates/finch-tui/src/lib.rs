@@ -6466,7 +6466,9 @@ mod tests {
         live: &[RenderedTranscriptLine],
     ) -> LiveFrame {
         let draft = vec![String::new()];
-        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &draft,
@@ -7921,17 +7923,32 @@ mod tests {
 
         // 2. Assert text is correctly bounded in physical rows
         let sources_during = renderer.live_frame_sources(20); // Narrow width to force wrap
-        let lines_during = renderer.focused_reader_lines(&sources_during, 20, 10, None).expect("Reader active");
-        
-        let physical_rows_used: usize = lines_during.iter().map(|l| shadow_buffer::physical_rows(l, 20)).sum();
-        assert!(physical_rows_used <= 10, "Text is correctly bounded in physical rows");
+        let lines_during = renderer
+            .focused_reader_lines(&sources_during, 20, 10, None)
+            .expect("Reader active");
+
+        let physical_rows_used: usize = lines_during
+            .iter()
+            .map(|l| shadow_buffer::physical_rows(l, 20))
+            .sum();
+        assert!(
+            physical_rows_used <= 10,
+            "Text is correctly bounded in physical rows"
+        );
 
         // 3. Assert closing restores transcript view fully
         renderer.close_expanded_tool();
         let sources_after = renderer.live_frame_sources(80);
         let transcript_after = renderer.focused_reader_lines(&sources_after, 80, 24, None);
-        assert!(transcript_after.is_none(), "Transcript view fully restored upon closing");
-        assert_eq!(renderer.tool_viewports.child_scroll(&output_row_all), 5, "Compact scroll restored");
+        assert!(
+            transcript_after.is_none(),
+            "Transcript view fully restored upon closing"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row_all),
+            5,
+            "Compact scroll restored"
+        );
     }
 
     #[test]
@@ -11603,7 +11620,9 @@ mod tests {
         input_lines: &'a [String],
         status: &'a str,
     ) -> view_model::LiveViewModel<'a> {
-        view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -11682,7 +11701,9 @@ mod tests {
                     ..RenderedTranscriptLine::default()
                 })
                 .collect();
-            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+            let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
                 input_lines: &input_lines,
@@ -11857,7 +11878,9 @@ mod tests {
         let plan_at = |w: usize, h: usize| {
             let draft = vec![String::new()];
             let status = "ready";
-            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+            let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
                 input_lines: &draft,
@@ -11948,7 +11971,9 @@ mod tests {
         let width = 80;
         let draft = vec![String::new()];
         let status = "ready";
-        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
             input_lines: &draft,

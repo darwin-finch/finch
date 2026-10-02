@@ -2175,7 +2175,9 @@ mod tests {
     ) -> super::super::LiveFrame {
         let input = vec!["draft stays hidden".to_string()];
         let mut autocomplete = super::super::AutocompleteState::new();
-        let inputs = super::super::view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let inputs = super::super::view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &input,
@@ -2210,7 +2212,9 @@ mod tests {
             .collect();
         let input = vec![String::new()];
         let mut autocomplete = super::super::AutocompleteState::new();
-        let inputs = super::super::view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let inputs = super::super::view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &input,
