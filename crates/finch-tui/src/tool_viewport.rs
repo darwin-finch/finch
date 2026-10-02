@@ -328,10 +328,7 @@ fn status_text(start: usize, end: usize, total: usize) -> String {
         return String::new();
     }
     if start >= end {
-        return format!(
-            "… 0 lines visible of {} — ↑/↓ scroll · Enter expand",
-            total
-        );
+        return format!("… 0 lines visible of {} — ↑/↓ scroll · Enter expand", total);
     }
     format!(
         "… lines {}–{} of {} — ↑/↓ scroll · Enter expand",
@@ -359,10 +356,7 @@ pub fn expanded_status_text(start: usize, end: usize, total: usize) -> String {
         return "empty — Esc close".to_string();
     }
     if start >= end {
-        return format!(
-            "0 lines visible of {} — ↑/↓ scroll · Esc close",
-            total
-        );
+        return format!("0 lines visible of {} — ↑/↓ scroll · Esc close", total);
     }
     format!(
         "lines {}–{} of {} — ↑/↓ scroll · Esc close",
@@ -1022,7 +1016,7 @@ mod tests {
         let (row_id, projected) = projected_tool_group(2);
         // Force the budget to 1 row.
         let bounded = state.project(projected, 80, 1);
-        
+
         let status = body_lines_of(&bounded)
             .last()
             .map(|line| line.text.clone())
