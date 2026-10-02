@@ -4138,7 +4138,7 @@ impl TuiRenderer {
             row_id: row_id.clone(),
             title,
             saved_scroll,
-            scroll: 0,
+            scroll: saved_scroll,
             body_lines: body.len(),
         });
         self.viewport_invalidated = true;
@@ -7536,7 +7536,7 @@ mod tests {
         }
         assert_eq!(
             renderer.expanded_tool.as_ref().map(|view| view.scroll),
-            Some(7),
+            Some(9),
             "the expanded surface scrolled on its own"
         );
         assert!(
@@ -7957,10 +7957,10 @@ mod tests {
         let transcript_before = renderer.focused_reader_lines(&sources_before, 80, 24, None);
         assert!(transcript_before.is_none());
 
-        // 1. Open expanded view and assert it initializes scroll offset appropriately (starts at top)
+        // 1. Open expanded view and assert it initializes scroll offset appropriately
         renderer.open_expanded_tool(&output_row_all);
         let view = renderer.expanded_tool.as_ref().unwrap();
-        assert_eq!(view.scroll, 0, "Tool view scroll starts at top");
+        assert_eq!(view.scroll, 5, "Tool view scroll inherits compact scroll");
         assert_eq!(view.saved_scroll, 5, "Saved scroll is preserved");
 
         // 2. Assert text is correctly bounded in physical rows
