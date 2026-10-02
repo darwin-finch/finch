@@ -25,6 +25,7 @@ mod apply;
 mod catalog;
 mod chatgpt_recovery;
 mod driver;
+mod gemini_recovery;
 mod grok_recovery;
 mod input;
 mod render;

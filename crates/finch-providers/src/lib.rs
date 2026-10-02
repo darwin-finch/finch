@@ -25,6 +25,9 @@ mod endpoints;
 mod fallback_chain;
 #[cfg(feature = "gemini")]
 mod gemini;
+mod gemini_oauth;
+#[cfg(feature = "gemini_subscription")]
+mod gemini_subscription;
 #[cfg(feature = "grok_subscription")]
 mod grok_jwks;
 mod grok_oauth;
@@ -81,6 +84,15 @@ pub use endpoints::ProviderEndpoints;
 pub use fallback_chain::FallbackChain;
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiProvider;
+pub use gemini_oauth::{
+    gemini_required_scopes, GeminiAuthStageError, GeminiDeviceEndpointError,
+    GeminiSubscriptionService, GeminiTokenVerifier, GeminiTokenVerifierProduction,
+    GoogleGeminiOAuthDialect, VerifiedGeminiClaims, GEMINI_DEVICE_WIRE_SCOPES,
+    GEMINI_OAUTH_PROTOCOL_REVISION, GEMINI_SUBSCRIPTION_BASE_URL,
+    GEMINI_SUBSCRIPTION_SERVICE_REVISION, GOOGLE_PUBLIC_CLIENT_ID, GOOGLE_REQUIRED_TOKEN_ISSUER,
+};
+#[cfg(feature = "gemini_subscription")]
+pub use gemini_subscription::{GeminiSubscriptionProvider, DEFAULT_GEMINI_SUB_MODEL};
 #[cfg(feature = "grok_subscription")]
 pub use grok_jwks::GrokJwksVerifier;
 pub use grok_oauth::{

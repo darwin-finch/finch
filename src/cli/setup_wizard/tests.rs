@@ -5544,6 +5544,10 @@ fn test_provider_editor_identity_table_matches_catalog() {
         ),
         (crate::config::CredentialProvider::Xai, "grok"),
         (crate::config::CredentialProvider::GeminiAiStudio, "gemini"),
+        (
+            crate::config::CredentialProvider::GeminiSubscription,
+            "gemini-sub",
+        ),
         (crate::config::CredentialProvider::Mistral, "mistral"),
         (crate::config::CredentialProvider::Groq, "groq"),
         (crate::config::CredentialProvider::Openrouter, "openrouter"),
@@ -5567,6 +5571,27 @@ fn test_provider_editor_identity_table_matches_catalog() {
             && api.1.contains("API")
             && api.3.contains("billed separately"),
         "wizard copy must name SuperGrok entitlement versus Console billing: sub={sub:?} api={api:?}"
+    );
+
+    assert!(
+        !provider_requires_inline_api_key("gemini-sub")
+            && provider_requires_inline_api_key("gemini"),
+        "Gemini subscription and Google AI Studio API-key auth must remain separate wizard choices"
+    );
+    let gemini_sub = CLOUD_PROVIDERS
+        .iter()
+        .find(|(id, _, _, _)| *id == "gemini-sub")
+        .expect("gemini-sub wizard choice");
+    let gemini_api = CLOUD_PROVIDERS
+        .iter()
+        .find(|(id, _, _, _)| *id == "gemini")
+        .expect("gemini API-key wizard choice");
+    assert!(
+        gemini_sub.1.contains("subscription")
+            && gemini_sub.3.contains("not an AI Studio API key")
+            && gemini_api.1.contains("Gemini (Google)")
+            && gemini_api.3.contains("aistudio.google.com"),
+        "wizard copy must name Gemini subscription versus AI Studio key billing: sub={gemini_sub:?} api={gemini_api:?}"
     );
 
     for (credential_provider, expected_editor) in cases {
@@ -7900,6 +7925,201 @@ fn confirming_a_grok_sub_provider_runs_the_device_exchange_in_the_dialog() {
     assert_eq!(
         state.credentials[0].provider,
         crate::config::CredentialProvider::GrokSubscription
+    );
+}
+
+struct ScriptedGeminiAddTimeAuthenticator {
+    begin: std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<crate::cli::gemini_auth::GeminiNamedCredentialStart, anyhow::Error>,
+        >,
+    >,
+    finish: std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<crate::cli::gemini_auth::EnsuredGeminiCredential, anyhow::Error>,
+        >,
+    >,
+    begins: std::sync::atomic::AtomicUsize,
+    finishes: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedGeminiAddTimeAuthenticator {
+    fn new(
+        begin: impl IntoIterator<
+            Item = Result<crate::cli::gemini_auth::GeminiNamedCredentialStart, anyhow::Error>,
+        >,
+        finish: impl IntoIterator<
+            Item = Result<crate::cli::gemini_auth::EnsuredGeminiCredential, anyhow::Error>,
+        >,
+    ) -> Self {
+        Self {
+            begin: std::sync::Mutex::new(begin.into_iter().collect()),
+            finish: std::sync::Mutex::new(finish.into_iter().collect()),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            finishes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::cli::gemini_auth::GeminiCredentialAuthenticator for ScriptedGeminiAddTimeAuthenticator {
+    async fn ensure_named_credential(
+        &self,
+        _reference: &str,
+        _presentation: crate::cli::gemini_auth::DeviceLoginPresentation,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::gemini_auth::EnsuredGeminiCredential> {
+        anyhow::bail!("the add-time dialog must drive the phased ceremony, not the combined one")
+    }
+
+    async fn begin_named_credential(
+        &self,
+        _reference: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::gemini_auth::GeminiNamedCredentialStart> {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.begin
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted begin outcome")
+    }
+
+    async fn finish_named_credential(
+        &self,
+        _reference: &str,
+        _pending: &crate::oauth::DeviceAuthorization,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::gemini_auth::EnsuredGeminiCredential> {
+        self.finishes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.finish
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted finish outcome")
+    }
+}
+
+fn gemini_sub_provider_idx() -> usize {
+    CLOUD_PROVIDERS
+        .iter()
+        .position(|(id, ..)| *id == "gemini-sub")
+        .unwrap()
+}
+
+fn gemini_setup_credential(reference: &str, account: &str) -> crate::config::ProviderCredential {
+    crate::config::ProviderCredential {
+        name: reference.into(),
+        kind: crate::config::CredentialKind::OauthDevice,
+        provider: crate::config::CredentialProvider::GeminiSubscription,
+        issuer: "google-gemini".into(),
+        audience: crate::config::AudienceBinding::standard(
+            crate::config::EndpointFamily::GeminiSubscription,
+        ),
+        tenant: None,
+        project: None,
+        account: Some(account.into()),
+        scopes: crate::providers::gemini_required_scopes(),
+        secret_ref: format!("oauth-store:{reference}"),
+        lifecycle: crate::config::CredentialLifecycle::Active {
+            expires_at: Some(Utc::now() + chrono::TimeDelta::hours(1)),
+            refreshable: true,
+        },
+        revocation: Default::default(),
+    }
+}
+
+fn gemini_ensured_for(
+    reference: &str,
+    account: &str,
+) -> crate::cli::gemini_auth::EnsuredGeminiCredential {
+    crate::cli::gemini_auth::EnsuredGeminiCredential {
+        credential: gemini_setup_credential(reference, account),
+        compensation: Some(crate::cli::gemini_auth::GeminiCompensationHandle::issued(
+            reference,
+            "generation-1".into(),
+        )),
+    }
+}
+
+fn gemini_add_time_device_authorization(user_code: &str) -> crate::oauth::DeviceAuthorization {
+    crate::oauth::DeviceAuthorization::issued(
+        "device-code-secret".into(),
+        user_code.into(),
+        "https://www.google.com/device".into(),
+        None,
+        Duration::from_secs(600),
+        Duration::from_secs(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn confirming_a_gemini_sub_provider_runs_the_device_exchange_in_the_dialog() {
+    let fake = Arc::new(ScriptedGeminiAddTimeAuthenticator::new(
+        [Ok(
+            crate::cli::gemini_auth::GeminiNamedCredentialStart::AuthorizationRequired(
+                gemini_add_time_device_authorization("GEMINI-1234"),
+            ),
+        )],
+        [Ok(gemini_ensured_for(
+            "gemini-sub:default",
+            "user@gmail.com",
+        ))],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: gemini_sub_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.gemini_authenticator = Some(fake);
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(get_step(&state), Some(AddProviderStep::DeviceAuth { .. })),
+        "confirming Gemini subscription must open the device dialog instead of adding the row silently; step={:?}",
+        get_step(&state)
+    );
+
+    let presented = wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+            _ => None,
+        },
+        "the Gemini one-time code",
+    );
+    assert_eq!(presented.user_code, "GEMINI-1234");
+    assert_eq!(presented.verification_uri, "https://www.google.com/device");
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the Gemini terminal outcome",
+    );
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Gemini subscription device sign-in")
+            && rendered.contains("Signed in as user@gmail.com"),
+        "the dialog must name Gemini subscription, not ChatGPT or Grok; rendered={rendered}"
+    );
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let primary = get_primary(&state).expect("the models section must survive the Gemini ceremony");
+    assert!(
+        matches!(primary, ModelConfig::Remote { provider, .. } if provider == "gemini-sub"),
+        "the gemini-sub lane must be added after a successful exchange; got {primary:?}"
+    );
+    assert_eq!(state.credentials.len(), 1);
+    assert_eq!(state.credentials[0].name, "gemini-sub:default");
+    assert_eq!(
+        state.credentials[0].provider,
+        crate::config::CredentialProvider::GeminiSubscription
     );
 }
 
