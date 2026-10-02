@@ -280,7 +280,103 @@ pub(crate) fn selected_text(index: &SelectionIndex, selection: &TranscriptSelect
         out.push_str(&piece);
         first = false;
     }
-    strip_ansi(&out)
+    clean_copied_text(&strip_ansi(&out))
+}
+
+/// Clean copied transcript text by stripping leading prompt markers (`❯ `, `> `),
+/// bullet points (`• `), disclosure tree glyphs (`⎿ `), and common leading
+/// indentation or tabs across lines.
+pub fn clean_copied_text(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let has_trailing_newline = raw.ends_with('\n');
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    if raw_lines.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: Strip leading prompt/bullet/disclosure markers while preserving
+    // indentation before the marker.
+    const MARKERS: &[&str] = &[
+        "❯ ", "❯\t", "❯", "• ", "•\t", "•", "> ", ">\t", "⎿ ", "⎿\t", "⎿",
+    ];
+    let stripped_lines: Vec<String> = raw_lines
+        .into_iter()
+        .map(|line| {
+            // Find leading whitespace
+            let leading_len = line
+                .char_indices()
+                .find(|(_, ch)| *ch != ' ' && *ch != '\t')
+                .map(|(idx, _)| idx)
+                .unwrap_or(line.len());
+            let (leading, rest) = line.split_at(leading_len);
+
+            for marker in MARKERS {
+                if let Some(after) = rest.strip_prefix(marker) {
+                    return format!("{leading}{after}");
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+
+    // Step 2: Calculate common leading indentation across all non-empty lines.
+    // Determine the longest common prefix of ' ' and '\t' among non-empty lines.
+    let non_empty: Vec<&str> = stripped_lines
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    let common_prefix: String = if let Some(first) = non_empty.first() {
+        let first_indent: &str = {
+            let len = first
+                .char_indices()
+                .find(|(_, ch)| *ch != ' ' && *ch != '\t')
+                .map(|(idx, _)| idx)
+                .unwrap_or(first.len());
+            &first[..len]
+        };
+
+        let mut common = first_indent;
+        for line in &non_empty[1..] {
+            let mut matched = 0;
+            for (c1, c2) in common.chars().zip(line.chars()) {
+                if c1 == c2 && (c1 == ' ' || c1 == '\t') {
+                    matched += c1.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            common = &common[..matched];
+            if common.is_empty() {
+                break;
+            }
+        }
+        common.to_string()
+    } else {
+        String::new()
+    };
+
+    // Step 3: Strip common prefix from every line
+    let mut cleaned_lines = Vec::with_capacity(stripped_lines.len());
+    for line in stripped_lines {
+        if line.trim().is_empty() {
+            cleaned_lines.push(String::new());
+        } else if let Some(stripped) = line.strip_prefix(&common_prefix) {
+            cleaned_lines.push(stripped.to_string());
+        } else {
+            cleaned_lines.push(line);
+        }
+    }
+
+    let mut result = cleaned_lines.join("\n");
+    if has_trailing_newline {
+        result.push('\n');
+    }
+    result
 }
 
 /// Rows to paint with the highlight background for the current selection:
@@ -592,5 +688,31 @@ mod tests {
             index.row(6).map(|r| r.text.as_str()),
             Some("b".repeat(20).as_str())
         );
+    }
+
+    #[test]
+    fn test_clean_copied_text_strips_markers_and_dedents() {
+        // Prompt markers:
+        assert_eq!(clean_copied_text(" ❯ cargo test"), "cargo test");
+        assert_eq!(clean_copied_text("> echo hello"), "echo hello");
+        assert_eq!(clean_copied_text("   ⎿ result finished"), "result finished");
+
+        // Bullet points:
+        assert_eq!(clean_copied_text("• bullet point"), "bullet point");
+
+        // Nested lists preserve relative indentation:
+        let list = "  • first\n    • nested subitem";
+        assert_eq!(clean_copied_text(list), "first\n  nested subitem");
+
+        // Common tabs and spaces dedenting:
+        let tabs = "\t\tfn foo() {\n\t\t\tbar();\n\t\t}";
+        assert_eq!(clean_copied_text(tabs), "fn foo() {\n\tbar();\n}");
+
+        let spaces = "    let x = 1;\n    let y = 2;";
+        assert_eq!(clean_copied_text(spaces), "let x = 1;\nlet y = 2;");
+
+        // Empty lines survive without breaking dedent:
+        let with_blank = "    let a = 1;\n\n    let b = 2;";
+        assert_eq!(clean_copied_text(with_blank), "let a = 1;\n\nlet b = 2;");
     }
 }

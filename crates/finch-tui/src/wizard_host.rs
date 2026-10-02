@@ -2258,10 +2258,10 @@ mod test_wizard {
     fn test_wizard_visible_length_vs_wrap_mismatch() {
         let text = "\x1b(Btest";
         let len = wizard_visible_length(text);
-        
+
         let line = WizardLine::plain(text);
         let wrapped = wizard_wrap(&line, len);
-        
+
         assert_eq!(len, 4);
         assert_eq!(wrapped.len(), 1);
         assert_eq!(wrapped[0].plain_text(), text);
@@ -2276,13 +2276,15 @@ mod osc8_tests {
         // OSC 8 link with spaces
         let text = "\x1b]8;;http://example.com/a b c\x1b\\Link\x1b]8;;\x1b\\";
         let line = WizardLine::plain(text);
-        
+
         // Wrapping at a small width should wrap "Link", not the URL contents
         let wrapped = wizard_wrap(&line, 2);
-        
+
         assert_eq!(wrapped.len(), 2);
         // The first wrap should contain the entire start of the ANSI sequence plus some of Link
-        assert!(wrapped[0].plain_text().contains("\x1b]8;;http://example.com/a b c\x1b\\"));
+        assert!(wrapped[0]
+            .plain_text()
+            .contains("\x1b]8;;http://example.com/a b c\x1b\\"));
     }
     #[test]
     fn test_wizard_url_renders_osc8() {
