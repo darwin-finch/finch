@@ -1,0 +1,7 @@
+interface:
+  display_name: "Review"
+  short_description: "Review the landing candidate with independent verification"
+  default_prompt: "Use $review to review this exact candidate from risk-derived perspectives and verify each finding independently."
+
+policy:
+  allow_implicit_invocation: true

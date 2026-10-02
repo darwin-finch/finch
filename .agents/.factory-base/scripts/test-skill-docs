@@ -1,0 +1,204 @@
+#!/bin/sh
+# Mechanical lint for the kernel docs. Humans retain authority.
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DEFAULT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+case $# in
+    0) ROOT=$DEFAULT_ROOT ;;
+    1) ROOT=$1 ;;
+    *) printf 'ERROR: usage: %s [repository-root]\n' "$0" >&2; exit 2 ;;
+esac
+
+REFS="$ROOT/.agents/references"
+CLAIMS="$REFS/work-claims.md"
+PACKET="$REFS/task-packet.md"
+SKILLS="$ROOT/.agents/skills"
+checks=0 failures=0
+
+pass() { checks=$((checks + 1)); printf 'ok %s - %s\n' "$checks" "$1"; }
+fail() { checks=$((checks + 1)); failures=$((failures + 1)); printf 'not ok %s - %s\n' "$checks" "$1" >&2; }
+require_file() { test -f "$2" && pass "$1" || fail "$1: missing $2"; }
+normalized() { tr '\n' ' ' | tr -s '[:space:]' ' '; }
+matches() { printf '%s\n' "$2" | normalized | grep -E -i -q -- "$1"; }
+require_pattern() { matches "$2" "$3" && pass "$1" || fail "$1: required structure absent"; }
+forbid_pattern() { matches "$2" "$3" && fail "$1: harmful rule matched" || pass "$1"; }
+reject_fixture() { matches "$2" "$3" && pass "$1" || fail "$1: harmful fixture was accepted"; }
+accept_fixture() { matches "$2" "$3" && fail "$1: harmless fixture was rejected" || pass "$1"; }
+
+for path in \
+    .agents/skills/ticket-creation/SKILL.md \
+    .agents/skills/backlog-grooming/SKILL.md \
+    .agents/skills/backlog-loop/SKILL.md \
+    .agents/skills/implement/SKILL.md \
+    .agents/skills/coordinate/SKILL.md \
+    .agents/skills/review/SKILL.md \
+    .agents/skills/codebase-audit/SKILL.md \
+    .agents/references/review-protocol.md \
+    .agents/references/solution-contract.md \
+    .agents/references/issue-readiness.md \
+    .agents/references/execution-efficiency.md \
+    .agents/references/task-packet.md \
+    .agents/references/work-claims.md \
+    .agents/references/local-workspace-state.md \
+    .agents/references/engineering-judgment.md \
+    .agents/references/factory-rationale.md \
+    .agents/references/load-binding.md \
+    .agents/references/queue.md \
+    .agents/references/parallel-coordination.md \
+    .agents/references/boundary-load.md \
+    .agents/binding \
+    .agents/bindings/github.md \
+    .agents/bindings/pyramid.md \
+    .agents/bindings/linear.md \
+    .agents/harnesses/claude-code.md \
+    .agents/harnesses/codex.md \
+    .agents/harnesses/grok-build.md \
+    .agents/schemas/subsystem-manifest.v1.schema.json \
+    .agents/schemas/boundary-load-evidence.v1.schema.json \
+    .agents/schemas/local-workspace-state.v1.schema.json \
+    .agents/scripts/boundary_load.py \
+    .agents/scripts/boundary_path_hook.py \
+    .agents/scripts/codex_boundary_hook.py \
+    .agents/scripts/test_local_workspace_state.py \
+    .agents/scripts/ticket_poset.py \
+    .agents/scripts/ticket_triage.py
+do
+    require_file "required process file exists: $path" "$ROOT/$path"
+done
+
+if test -d "$SKILLS/implement-ticket" || test -f "$SKILLS/backlog/SKILL.md"; then
+    fail "legacy all-in-one backlog skill must not be present"
+else
+    pass "legacy all-in-one backlog skill is absent"
+fi
+
+DOCS=$(for file in "$SKILLS"/*/SKILL.md "$REFS"/*.md "$ROOT/.agents/bindings"/*.md "$ROOT/.agents/harnesses"/*.md; do
+    normalized < "$file"
+    printf ' '
+done)
+
+require_pattern "direct requests bypass backlog ceremony" 'direct[^.]{0,160}(skip|without|is the contract)[^.]{0,160}(issue|claim)' "$DOCS"
+require_pattern "simplest coherent architecture rather than diff size" 'simplest coherent (resulting )?architecture[^.]{0,160}(not|rather than)[^.]{0,100}(fewest changed lines|diff)' "$DOCS"
+require_pattern "replacement sequence creates, integrates, then deletes" 'create / switch / delete|replacement[^.]{0,200}(integration points|production integration)[^.]{0,200}(predecessor|old implementation)[^.]{0,80}(delete|deleted)' "$DOCS"
+require_pattern "temporary coexistence has an owner and removal trigger" 'temporary coexistence[^.]{0,160}owner[^.]{0,160}removal trigger' "$DOCS"
+require_pattern "refactor proof covers equivalence and integration" 'refactor(ing|s)?[^.]{0,100}equivalence[^.]{0,100}integration' "$DOCS"
+require_pattern "deletion proof covers reachability and tests" 'deletion[^.]{0,100}(reference/reachability|reachability)[^.]{0,100}tests' "$DOCS"
+require_pattern "enabling work proves a downstream seam" 'enabling work[^.]{0,100}(usable )?downstream seam' "$DOCS"
+require_pattern "architectural boundaries support local reasoning" 'narrow deliberate facade[^.]{0,180}dependency direction' "$DOCS"
+require_pattern "cost of reversal is the shape test" 'cost of reversal' "$DOCS"
+require_pattern "shape perspective is selected for models" 'Shape[^.]{0,80}cost of reversal|shape questions' "$DOCS"
+require_pattern "review is the only skill that lands" 'only skill that lands' "$DOCS"
+require_pattern "packets name a model lane" 'model lane' "$DOCS"
+require_pattern "cost does not pick a model lane" 'cost does not pick' "$DOCS"
+require_pattern "do not silently substitute the model" 'silently substitut' "$DOCS"
+require_pattern "kernel never chooses a vendor model" 'never (names?|chooses?)[^.]{0,80}vendor model' "$DOCS"
+require_pattern "poset script is invoked from .agents/scripts" '\.agents/scripts/ticket_poset' "$DOCS"
+require_pattern "skills load the tracker from .agents/binding" 'load-binding' "$DOCS"
+require_pattern "Linear binding names the community CLI" 'schpet/linear-cli' "$DOCS"
+require_pattern "subsystems are explicit architectural identities" 'architectural identities[^.]{0,160}(never discovers|not infer)' "$DOCS"
+require_pattern "missing inspection is not zero" 'not_observed[^.]{0,160}(not a zero|never counted as zero|not zero)' "$DOCS"
+require_pattern "escape denominator requires complete inspection" 'only[^.]{0,120}complete[^.]{0,160}(denominator|enter)' "$DOCS"
+require_pattern "boundary reports remain advisory" 'audit candidate[^.]{0,100}not a (root cause|diagnosis)' "$DOCS"
+require_pattern "boundary evidence stays outside work claims" 'not part of `?work-claim:v1|Do not (place|embed) it (inside|in) `?work-claim:v1' "$DOCS"
+require_pattern "ordinal cost is not maintenance currency" 'cost axis is ordinal[^.]{0,100}not additive[^.]{0,100}(currency|token bucket)' "$DOCS"
+require_pattern "all supported harnesses have partial path capture" 'Codex.{0,80}Claude Code.{0,80}Grok Build' "$DOCS"
+require_pattern "partial path adapters never enter the denominator" 'adapter[^.]{0,160}(partial|never)[^.]{0,160}(never supplies|do not enter|denominator)' "$DOCS"
+require_pattern "audit checkpoint is a reachable annotated tag" 'latest reachable annotated[^.]{0,160}boundary-load-audit/v1' "$DOCS"
+require_pattern "audit checkpoint preserves historical baselines" 'full history[^.]{0,160}(baseline|rolling)' "$DOCS"
+require_pattern "filing audit tickets does not complete the pass" '(filing findings|filed tickets|batch of filed tickets)[^.]{0,120}(does not|do not)[^.]{0,80}(advance|complete)' "$DOCS"
+require_pattern "explicit audit invocation can authorize batch filing" 'explicitly invokes?[^.]{0,100}`?\$codebase-audit[^.]{0,160}(batch publication authority|file or publish)' "$DOCS"
+require_pattern "audit findings do not become ready automatically" 'batch publication authority[^.]{0,200}(not authorize unrelated|does not authorize unrelated)[^.]{0,100}(READY|ready)' "$DOCS"
+
+GH_BIND=$(normalized < "$ROOT/.agents/bindings/github.md")
+require_pattern "github binding names blocked-by write path" 'blocked-by|add-blocked-by' "$GH_BIND"
+
+GROOM=$(normalized < "$SKILLS/backlog-grooming/SKILL.md")
+forbid_pattern "grooming does not dispatch the pool" 'replenishing worker pool' "$GROOM"
+COORD=$(normalized < "$SKILLS/coordinate/SKILL.md")
+forbid_pattern "coordinate does not land" 'Land per the binding' "$COORD"
+require_pattern "coordinator remains responsible after review lands" 'After `?\$review`? lands it, the coordinator completes the \[post-integration synchronization and cleanup\]' "$COORD"
+require_pattern "coordination ends only after cleanup" 'before reporting the parent outcome complete' "$COORD"
+
+COUNT_CANCEL='(auto|automatic(ally)?)[- ]*(cancel|close|waive)[^.]{0,100}(count|severity)|(count|severity)[^.]{0,100}(auto|automatic(ally)?)[- ]*(cancel|close|waive)'
+FIXED_REVIEW='(require(d)?|exactly|fixed)[^.]{0,80}(two|three|[2-9])[^.]{0,50}(review(er)?s?|rounds?|passes?)'
+TOOL_AUTH='(script|linter|tool)[^.]{0,100}(grants|authorizes|declares)[^.]{0,80}(ready|ownership|merge|approval)'
+INDEFINITE_DUAL='(allow|leave|permit)[^.]{0,100}(indefinite|permanent)[^.]{0,80}(dual architecture|coexistence|compatibility)'
+SMALLEST_DIFF='(always|must|should)[^.]{0,80}(smallest|fewest)[^.]{0,60}(diff|changed lines)'
+forbid_pattern "count or severity cannot auto-cancel" "$COUNT_CANCEL" "$DOCS"
+forbid_pattern "fixed review counts are absent" "$FIXED_REVIEW" "$DOCS"
+forbid_pattern "tooling cannot confer authority" "$TOOL_AUTH" "$DOCS"
+forbid_pattern "indefinite dual architecture is forbidden" "$INDEFINITE_DUAL" "$DOCS"
+forbid_pattern "smallest diff is not the architectural objective" "$SMALLEST_DIFF" "$DOCS"
+reject_fixture "automatic count cancellation is rejected" "$COUNT_CANCEL" 'Automatically cancel review when finding count is high.'
+reject_fixture "fixed review count is rejected" "$FIXED_REVIEW" 'Require three review rounds for every patch.'
+reject_fixture "tool authority is rejected" "$TOOL_AUTH" 'The linter grants READY status.'
+accept_fixture "equivalent advisory wording remains valid" "$TOOL_AUTH" 'People decide readiness; a checker only reports documentation gaps.'
+reject_fixture "indefinite coexistence is rejected" "$INDEFINITE_DUAL" 'Allow indefinite coexistence of both architectures.'
+reject_fixture "smallest-diff mandate is rejected" "$SMALLEST_DIFF" 'Always choose the smallest diff even when it preserves competing representations.'
+
+extract_block() {
+    awk -v wanted="$1" '
+        /<!-- work-claim:v1/ { number++; active=(number == wanted) }
+        active { print }
+        active && /-->/ { exit }
+    ' "$CLAIMS"
+}
+expected_claim=$(printf '%s\n' '<!-- work-claim:v1' 'event: claim' 'claim-id: <globally unique stable id>' 'worker: <tool/person and stable session or agent identity>' 'github-actor: <responsible @user or none>' 'branch: <working branch>' 'worktree: <absolute path, non-secret machine-id/workspace-id, or remote environment id>' 'base: <full commit SHA>' 'scope: <single-line bounded scope>' 'timestamp: <UTC RFC 3339>' '-->')
+expected_terminal=$(printf '%s\n' '<!-- work-claim:v1' 'event: <release|complete|supersede>' 'claim-id: <the original claim id>' 'worker: <the exact worker value from the original claim>' 'timestamp: <UTC RFC 3339>' 'replacement-claim: <claim id or none>' 'authority-comment: <none or immutable prior tracker authority locator>' '-->')
+test "$(extract_block 1)" = "$expected_claim" && pass "v1 claim schema is preserved" || fail "v1 claim schema changed"
+test "$(extract_block 2)" = "$expected_terminal" && pass "v1 terminal schema is preserved" || fail "v1 terminal schema changed"
+claim_markers=$(grep -F -c '<!-- work-claim:v1' "$CLAIMS" || true)
+test "$claim_markers" = 2 && pass "v1 has exactly claim and terminal examples" || fail "v1 marker count expected=2 actual=$claim_markers"
+expected_recovery=$(printf '%s\n' '<!-- work-claim-recovery:v1' 'claim-id: <the active claim id>' 'worker: <the exact worker value from the active claim>' 'observer: <coordinator or responsible observer>' 'observed-at: <UTC RFC 3339>' 'workspace-reachable: <true|false|unknown>' 'durable-ref: <remote-name:full-ref or none>' 'durable-commit: <full commit or none>' 'disposition-owner: <person who can authorize recovery or none>' '-->')
+actual_recovery=$(awk '/<!-- work-claim-recovery:v1/ { active=1 } active { print } active && /-->/ { exit }' "$CLAIMS")
+test "$actual_recovery" = "$expected_recovery" && pass "recovery v1 schema is preserved" || fail "recovery v1 schema changed"
+CLAIM_TEXT=$(normalized < "$CLAIMS")
+LOCAL_STATE_TEXT=$(normalized < "$REFS/local-workspace-state.md")
+require_pattern "v1 is the sole backlog ownership record" 'sole recorded ownership mechanism' "$CLAIM_TEXT"
+require_pattern "claim collision winner is deterministic" 'earlier tracker timestamp wins[^.]*equal[^.]*lower durable record id wins' "$CLAIM_TEXT"
+require_pattern "claims recover without heartbeats or expiry" 'Claims do not expire[^.]{0,120}do not post periodic heartbeats' "$CLAIM_TEXT"
+require_pattern "claims reconcile across harnesses" 'active claim records are the cross-harness source of truth[^.]{0,180}registry is complete' "$CLAIM_TEXT"
+require_pattern "dispatch checks repository-wide claims" 'Do not limit the search to the tickets assigned to this machine, harness, or coordinator' "$CLAIM_TEXT"
+require_pattern "unreachable claims become recovery-needed" 'worker is unreachable[^.]{0,180}nonterminal recovery record' "$CLAIM_TEXT"
+require_pattern "recovery-needed leaves ownership active" 'Ownership remains active' "$CLAIM_TEXT"
+require_pattern "recovery requires authorized supersession" 'Recover any reachable commits[^.]{0,240}(original issuer|authorized coordinator)[^.]{0,160}supersede' "$CLAIM_TEXT"
+PACKET_TEXT=$(normalized < "$PACKET")
+require_pattern "backlog packets state a recovery locator" 'For a backlog wrapper[^.]{0,160}recovery locator' "$PACKET_TEXT"
+require_pattern "backlog packets state checkpoint push authority" 'checkpoint-push authority' "$PACKET_TEXT"
+require_pattern "lost machines recover only durable work" 'lost machine[^.]{0,160}local-only changes are unrecoverable[^.]{0,180}last durable remote commit' "$CLAIM_TEXT"
+require_pattern "local workspace state uses git common dir" "Resolve Git's common directory and keep records under" "$LOCAL_STATE_TEXT"
+require_pattern "local workspace state stays outside commits" 'Git never includes it in a commit' "$LOCAL_STATE_TEXT"
+require_pattern "local state is shared across worktrees and harnesses" 'All linked worktrees and harnesses for that clone share this directory' "$LOCAL_STATE_TEXT"
+require_pattern "local state records process identity" '"pid": 12345[^}]{0,160}"started_at"' "$LOCAL_STATE_TEXT"
+require_pattern "local state records resume context" '"resume"[^}]{0,240}"next_action"' "$LOCAL_STATE_TEXT"
+require_pattern "local state is event-driven, not heartbeat" 'event-driven writes, not heartbeats' "$LOCAL_STATE_TEXT"
+require_pattern "local state cannot recover a destroyed laptop" 'cannot make a destroyed laptop recoverable' "$LOCAL_STATE_TEXT"
+require_pattern "destroyed laptops recover only remote commits" 'Only commits pushed to the authorized remote recovery ref can do that' "$LOCAL_STATE_TEXT"
+require_pattern "local state names its closed schema" 'local-workspace-state\.v1\.schema\.json' "$LOCAL_STATE_TEXT"
+require_pattern "local state validates before writes" 'Writers validate before atomic replacement' "$LOCAL_STATE_TEXT"
+require_pattern "local state supports claimless workspaces" 'detached or claimless direct, review, verification, mutant, or probe workspace[^.]{0,180}`branch`, `item`, `claim_id`, and `claim_url`' "$LOCAL_STATE_TEXT"
+require_pattern "local state uses absolute workspace paths" 'process working-directory paths are absolute' "$LOCAL_STATE_TEXT"
+require_pattern "local state confines dirty paths" 'resume\.dirty_paths[^.]{0,120}repository-relative[^.]{0,100}cannot traverse through' "$LOCAL_STATE_TEXT"
+require_pattern "local state rejects root cleanup targets" 'absolute, lexically normalized, and never a filesystem or drive root' "$LOCAL_STATE_TEXT"
+require_pattern "recovery refs are unambiguous locators" 'recovery ref is the unambiguous portable ASCII locator `remote-name:refs/\.\.\.`' "$LOCAL_STATE_TEXT"
+require_pattern "null recovery refs cannot have authority" 'null `remote_recovery_ref`[^.]{0,160}authority to be false' "$LOCAL_STATE_TEXT"
+require_pattern "cleanup fetches without pruning" 'Fetch that remote without pruning[^.]{0,180}fast-forward the corresponding local default branch' "$CLAIM_TEXT"
+require_pattern "cleanup inventories refs before fetch" 'Before any fetch[^.]{0,180}inventory the workspace.s current local, recovery, and remote-tracking tips' "$CLAIM_TEXT"
+require_pattern "cleanup anchors unique tips" 'Anchor every potentially unique tip under a globally unique `refs/salvage/' "$CLAIM_TEXT"
+require_pattern "salvage refs are create-only" 'compare-and-swap creation against the zero object id[^.]{0,100}never reuse or overwrite a salvage ref' "$CLAIM_TEXT"
+require_pattern "accepted cleanup verifies the fetched landed branch" 'For accepted work[^.]{0,100}verify the change on the fetched landed branch' "$CLAIM_TEXT"
+require_pattern "cleanup precedes completion" 'complete these steps before declaring[^.]{0,100}complete' "$CLAIM_TEXT"
+require_pattern "cleanup quiesces resources before worktrees" 'verify its immutable instance identity[^.]{0,180}stop it[^.]{0,100}verify it stopped' "$CLAIM_TEXT"
+require_pattern "cleanup removes disposable resource instances" 'Remove or drop each workspace-owned disposable container or database[^.]{0,180}verify the exact instance is absent' "$CLAIM_TEXT"
+require_pattern "cleanup preserves future-unreachable commits" 'calculate reachability as it will exist after every planned worktree, local branch, recovery ref, and stale remote-tracking ref is removed' "$CLAIM_TEXT"
+require_pattern "every disposable worktree is removed" 'remove every verification, mutant, probe, worker, and integration worktree' "$CLAIM_TEXT"
+require_pattern "workspace cleanup removes build products" 'Removing a worktree must remove its entire directory, including ignored and untracked build/object products' "$CLAIM_TEXT"
+require_pattern "non-integrated work has a disposal path" 'rejected, abandoned, or disposable work has an authorized terminal verdict[^.]{0,180}intentional work preserved' "$CLAIM_TEXT"
+require_pattern "recovery refs receive terminal disposition" 'Give every dedicated recovery ref a terminal disposition' "$CLAIM_TEXT"
+require_pattern "checkpoint push does not authorize deletion" 'checkpoint-push authority does not imply delete authority' "$CLAIM_TEXT"
+
+require_pattern "github cleanup link uses the current anchor" 'work-claims\.md#post-integration-synchronization-and-cleanup' "$GH_BIND"
+
+test "$failures" -eq 0 || { printf 'FAILED: %s of %s mechanical checks failed\n' "$failures" "$checks" >&2; exit 1; }
+printf 'PASS: %s mechanical documentation checks; no authority decisions made\n' "$checks"

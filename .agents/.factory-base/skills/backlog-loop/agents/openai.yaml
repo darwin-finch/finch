@@ -1,0 +1,7 @@
+interface:
+  display_name: "Backlog Loop"
+  short_description: "Keep a bounded worker pool replenished"
+  default_prompt: "Use $backlog-loop to triage the backlog and keep N safe ticket workers busy until the queue is exhausted or blocked."
+
+policy:
+  allow_implicit_invocation: true

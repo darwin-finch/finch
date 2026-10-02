@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Software Factory subsystem manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "subsystems"],
+  "properties": {
+    "schema": { "const": "software-factory/subsystem-manifest/v1" },
+    "subsystems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "contract_roots", "implementation_roots", "dependencies"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+          "contract_roots": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "implementation_roots": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "dependencies": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+            "uniqueItems": true
+          }
+        }
+      }
+    }
+  }
+}
