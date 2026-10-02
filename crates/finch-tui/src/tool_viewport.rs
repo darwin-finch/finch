@@ -395,9 +395,6 @@ pub fn expanded_surface_lines(
         let indented = format!("      {}", body[i]);
         let rows = shadow_buffer::physical_rows(&indented, width);
         if available_budget < rows {
-            if max_start == body.len() {
-                max_start = i;
-            }
             break;
         }
         available_budget -= rows;
