@@ -2699,7 +2699,7 @@ pub(super) fn handle_review_input(
     }
 }
 
-fn open_browser_silently(url: &str) {
+pub(super) fn open_browser_silently(url: &str) {
     #[cfg(test)]
     {
         let _ = url; // used

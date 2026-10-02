@@ -1376,7 +1376,7 @@ fn device_auth_card(
                 body.push(wizard_url(
                     &format!("Open: {}", presentation.verification_uri),
                     &presentation.verification_uri,
-                    None,
+                    Some(Color::Cyan),
                 ));
                 if !presentation.user_code.is_empty() {
                     body.push(wizard_line(
@@ -1397,7 +1397,10 @@ fn device_auth_card(
                         "Complete sign-in in your browser; this dialog finishes automatically.",
                     ));
                 }
-                controls = wizard_line("Esc: Cancel", Color::Yellow);
+                controls = wizard_line(
+                    "O / Enter / Click: Open in browser | Esc: Cancel",
+                    Color::Yellow,
+                );
             }
             None => {
                 body.push(wizard_plain("Starting the device sign-in…"));
