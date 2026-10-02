@@ -9880,7 +9880,8 @@ async fn peer_ipc_diagnostics_after_completed_turn_stay_off_transcript_scenario(
             || recovery.contains("event watch reconnecting")
             || recovery.contains("disconnected")
             || recovery.contains("daemon IPC")
-            || recovery.contains("runner unavailable"),
+            || recovery.contains("runner unavailable")
+            || recovery.contains("workspace mismatch"),
         "header/status must still show a compact runner/home recovery hint; header={header:?} status={status:?} haystack={haystack:?}"
     );
 }
