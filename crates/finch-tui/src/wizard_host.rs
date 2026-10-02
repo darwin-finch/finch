@@ -744,6 +744,7 @@ mod wizard_keys {
     pub const SECTION: u16 = 21;
     pub const CARD: u16 = 22;
     pub const HELP: u16 = 23;
+    pub const BANNER: u16 = 24;
 }
 
 /// The section content: full logical lines plus how the host should window
@@ -823,6 +824,20 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
     ]
 }
 
+fn wizard_welcome_banner(width: usize) -> Vec<String> {
+    wizard_boxed(
+        "Welcome to Finch",
+        &[wizard_plain(
+            "Finch is an AI coding assistant that helps you write code, run commands, and build software directly in your terminal.",
+        )],
+        WizardColor::Cyan,
+        width,
+    )
+    .into_iter()
+    .map(|l| lower_wizard_line(&l))
+    .collect()
+}
+
 /// Project the wizard view into the standard claiming tree: a column whose
 /// tab row and help claim their natural extent, the section claims the
 /// leftover, and an open card claims its natural extent as an inline
@@ -832,26 +847,38 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
 /// and the paint read the same bytes.
 fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<String>>) -> Widget {
     let lowered_section: Vec<String> = view.section.lines.iter().map(lower_wizard_line).collect();
-    let mut children: Vec<(Track, Widget)> = vec![
-        (
+    let mut children: Vec<(Track, Widget)> = Vec::new();
+
+    if view.title == " Finch Setup " && view.selected_tab == 0 {
+        children.push((
             Track::Natural,
             Widget::Marked(
-                wizard_keys::TAB_ROW,
+                wizard_keys::BANNER,
                 Box::new(Widget::Text {
-                    lines: tab_row_lines(view, width),
+                    lines: wizard_welcome_banner(width),
                 }),
             ),
+        ));
+    }
+
+    children.push((
+        Track::Natural,
+        Widget::Marked(
+            wizard_keys::TAB_ROW,
+            Box::new(Widget::Text {
+                lines: tab_row_lines(view, width),
+            }),
         ),
-        (
-            Track::Flex { weight: 1, min: 1 },
-            Widget::Marked(
-                wizard_keys::SECTION,
-                Box::new(Widget::Text {
-                    lines: lowered_section,
-                }),
-            ),
+    ));
+    children.push((
+        Track::Flex { weight: 1, min: 1 },
+        Widget::Marked(
+            wizard_keys::SECTION,
+            Box::new(Widget::Text {
+                lines: lowered_section,
+            }),
         ),
-    ];
+    ));
     if let Some(lines) = card_lines {
         children.push((
             Track::Natural,
@@ -880,6 +907,7 @@ fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<S
 /// The claimed regions of one wizard frame, in the frame's own coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WizardRects {
+    pub banner: Rect,
     pub tab_row: Rect,
     pub section: Rect,
     /// The open overlay card (#807). Empty when no card is open or it was
@@ -1005,6 +1033,7 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
     });
     let layout = widgets::layout(&project_wizard_root(view, width, card_natural_lines), frame);
     let rects = WizardRects {
+        banner: layout.keyed(wizard_keys::BANNER).unwrap_or_default(),
         tab_row: layout.keyed(wizard_keys::TAB_ROW).unwrap_or_default(),
         section: layout.keyed(wizard_keys::SECTION).unwrap_or_default(),
         card: layout.keyed(wizard_keys::CARD).unwrap_or_default(),
@@ -1028,6 +1057,18 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
             *row += rows;
         }
     };
+
+    // Banner: clip to the claimed rows on tiny frames.
+    if rects.banner.height > 0 {
+        let banner_lines = wizard_welcome_banner(width);
+        let claim = rects.banner.height.min(banner_lines.len());
+        push(
+            &mut lines,
+            &mut row_spans,
+            &mut row,
+            banner_lines[..claim].to_vec(),
+        );
+    }
 
     // Tab row: clip to the claimed rows on tiny frames.
     {
@@ -1191,7 +1232,7 @@ mod tests {
 
     fn plain_view(section_lines: Vec<&str>) -> WizardView {
         WizardView {
-            title: " Finch Setup ".to_string(),
+            title: " Test Setup ".to_string(),
             tab_titles: vec!["Alpha ✓".to_string(), "Beta".to_string()],
             selected_tab: 1,
             section: WizardSectionContent::plain(
@@ -1476,7 +1517,7 @@ mod tests {
         // row-diff blit, not just `plan_wizard_frame`'s span construction.
         fn view_with_active_tab(selected_tab: usize) -> WizardView {
             WizardView {
-                title: " Finch Setup ".to_string(),
+                title: " Test Setup ".to_string(),
                 tab_titles: vec!["Alpha".to_string(), "Beta".to_string()],
                 selected_tab,
                 section: WizardSectionContent::plain(vec![WizardLine::plain("same content")]),
@@ -1780,7 +1821,7 @@ mod tests {
 
     fn emoji_section_view(section_lines: Vec<WizardLine>) -> WizardView {
         WizardView {
-            title: " Finch Setup ".to_string(),
+            title: " Test Setup ".to_string(),
             tab_titles: vec![
                 "Look & Feel".to_string(),
                 "Model Setup".to_string(),
@@ -2030,6 +2071,43 @@ mod tests {
         assert!(
             !tabs.contains("\x1b[1;35;40m\u{1b}[0m\u{1b}[1;35;40m"),
             "exactly one tab wears the active marking; got {tabs:?}"
+        );
+    }
+
+    #[test]
+    fn test_welcome_banner_displayed_at_start_of_setup_wizard() {
+        let view = WizardView {
+            title: " Finch Setup ".to_string(),
+            tab_titles: vec!["Welcome".to_string(), "Next".to_string()],
+            selected_tab: 0,
+            section: WizardSectionContent::plain(vec![WizardLine::plain("content")]),
+            help: None,
+            card: None,
+        };
+        let frame = plan_wizard_frame(&view, 80, 24);
+        assert!(
+            frame.rects.banner.height > 0,
+            "banner must claim rows on the first tab of Finch Setup"
+        );
+        let rows = frame.to_shadow_buffer(80, 24).rows_as_text();
+        assert!(
+            rows.iter().any(|row| row.contains("Welcome to Finch")),
+            "the welcome banner text must be rendered"
+        );
+        assert!(
+            frame.rects.tab_row.y >= frame.rects.banner.height,
+            "the tab row must be pushed below the banner"
+        );
+
+        // Advancing to the next tab removes the banner
+        let view_next = WizardView {
+            selected_tab: 1,
+            ..view
+        };
+        let frame_next = plan_wizard_frame(&view_next, 80, 24);
+        assert_eq!(
+            frame_next.rects.banner.height, 0,
+            "banner must yield when advancing past the first tab"
         );
     }
 }
