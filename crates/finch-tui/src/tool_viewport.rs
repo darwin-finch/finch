@@ -388,20 +388,36 @@ pub fn expanded_surface_lines(
 ) -> Vec<String> {
     let width = width.max(1);
     let max_rows = max_rows.max(2);
-    let mut body_budget = max_rows.saturating_sub(2);
-    let start = scroll.min(body.len().saturating_sub(1));
+    let body_budget = max_rows.saturating_sub(2);
+    let mut max_start = body.len();
+    let mut available_budget = body_budget;
+    for i in (0..body.len()).rev() {
+        let indented = format!("      {}", body[i]);
+        let rows = shadow_buffer::physical_rows(&indented, width);
+        if available_budget < rows {
+            break;
+        }
+        available_budget -= rows;
+        max_start = i;
+    }
+    if max_start == body.len() {
+        max_start = max_start.saturating_sub(1);
+    }
+    
+    let start = scroll.min(max_start);
     let mut end = start;
+    let mut forward_budget = body_budget;
     for line in &body[start..] {
         let indented = format!("      {}", line);
         let rows = shadow_buffer::physical_rows(&indented, width);
-        if body_budget < rows {
+        if forward_budget < rows {
             if end == start {
                 // Must show at least one line even if it exceeds the window bounds
                 end += 1;
             }
             break;
         }
-        body_budget -= rows;
+        forward_budget -= rows;
         end += 1;
     }
     let end = end.min(body.len());
@@ -1046,10 +1062,30 @@ mod tests {
         let body: Vec<String> = (0..5).map(|n| format!("line {n}")).collect();
         let lines = expanded_surface_lines("bash", &body, 100, 80, 20);
         assert!(
-            lines[1].contains("line 4"),
-            "an out-of-range scroll clamps to the last line instead of showing a blank \
-             surface; surface was:\n{}",
+            lines.iter().any(|l| l.contains("line 4")),
+            "an out-of-range scroll clamps to the last full page, showing the last line; \
+             surface was:\n{}",
             lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_expanded_surface_maintains_height_when_scrolled_to_bottom() {
+        let body: Vec<String> = (0..20).map(|n| format!("line {n}")).collect();
+        let lines_start = expanded_surface_lines("bash", &body, 0, 80, 6);
+        assert_eq!(lines_start.len(), 6, "surface should occupy full allotted height at top");
+
+        let lines_bottom = expanded_surface_lines("bash", &body, 100, 80, 6);
+        assert_eq!(
+            lines_bottom.len(), 6,
+            "INVARIANT: the expanded surface must maintain its full allotted height \
+             even when scrolled past the end, rather than shrinking; surface was:\n{}",
+            lines_bottom.join("\n")
+        );
+        assert!(
+            lines_bottom[4].contains("line 19"),
+            "should display the end of the content; surface was:\n{}",
+            lines_bottom.join("\n")
         );
     }
 }
