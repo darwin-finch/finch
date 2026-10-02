@@ -3433,9 +3433,33 @@ impl TuiRenderer {
     /// the offset against content growth while scrolled.
     fn scroll_window_committed_source(&mut self, width: usize) -> Vec<RenderedTranscriptLine> {
         let (union, live_start) = self.projected_scroll_union(width);
-        let (split, _skipped) = self.transcript_scroll.derive_window(&union, width);
+        let (split, skipped) = self.transcript_scroll.derive_window(&union, width);
         let committed_end = split.min(live_start);
-        union[..committed_end].to_vec()
+        let mut source = union[..committed_end].to_vec();
+
+        if skipped > 0 && split <= live_start && !source.is_empty() {
+            let width = width.max(1);
+            let omitted_rows: usize = union[split..]
+                .iter()
+                .map(|line| shadow_buffer::physical_rows(&line.text, width))
+                .sum();
+            
+            let to_chop = skipped.saturating_sub(omitted_rows);
+            if to_chop > 0 {
+                if let Some(last) = source.last_mut() {
+                    let total = shadow_buffer::physical_rows(&last.text, width);
+                    if total > to_chop {
+                        let keep = total - to_chop;
+                        last.text = visible_prefix(&last.text, keep * width);
+                        last.spans.clear();
+                    } else {
+                        source.pop();
+                    }
+                }
+            }
+        }
+
+        source
     }
 
     fn rebuild_transcript_hit_regions(
