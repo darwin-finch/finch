@@ -5378,6 +5378,142 @@ async fn locally_initiated_run_does_not_project_group_from_started_event() {
          projected={}",
         projections.len()
     );
+
+    // DEFECT REGRESSION (#1492): A locally initiated run's subsequent RunStatusChanged
+    // event must not project a Brain run UUID group.
+    let mut local_completed = brain_event(
+        4,
+        "daemon",
+        BrainEventKind::RunStatusChanged {
+            run_id: local_run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    );
+    local_completed.run_id = Some(local_run_id);
+    let mut say_projected = std::collections::HashSet::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &local_started,
+        &super::LocallyRenderedRuns::default(),
+        &mut say_projected,
+        Some(my_attachment),
+    ));
+    assert!(
+        say_projected.contains(&local_run_id),
+        "locally initiated run must be recorded in say_projected"
+    );
+    let locally_rendered = super::LocallyRenderedRuns {
+        say_completed: say_projected.clone(),
+        in_flight: std::collections::HashSet::new(),
+    };
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &local_completed,
+        &locally_rendered,
+        &mut say_projected,
+        Some(my_attachment),
+    ));
+    assert!(
+        projections.get(&local_run_id).is_none(),
+        "INVARIANT: a locally initiated run's RunStatusChanged paints no run group (#1492)"
+    );
+}
+
+/// DEFECT REGRESSION (#1492): A tool-bearing delegated turn suppresses its
+/// terminal RunStatusChanged event so no Brain run UUID row renders beside it.
+#[tokio::test]
+async fn delegated_tool_bearing_turn_does_not_paint_run_group_from_daemon_events() {
+    use crate::brain::{BrainEventKind, BrainRunStatus, RunId};
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    let mut say_projected = std::collections::HashSet::new();
+
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let mut tool_ids = std::collections::HashSet::new();
+    tool_ids.insert("tool-1".to_string());
+    local_projections.push_back(super::LocalBrainProjection {
+        run_id,
+        source: "(bash \"echo hi\")".into(),
+        output: "hi\n".into(),
+        tool_ids,
+        approval_ids: std::collections::HashSet::new(),
+        program_seq: Some(1),
+        transient_output_unit: None,
+        failed: false,
+    });
+
+    let mut result_event = brain_event(
+        2,
+        "daemon",
+        BrainEventKind::Result {
+            request_seq: 1,
+            output: "hi\n".into(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+    );
+    result_event.run_id = Some(run_id);
+
+    let locally_rendered = super::LocallyRenderedRuns {
+        say_completed: say_projected.clone(),
+        in_flight: [run_id].into_iter().collect(),
+    };
+
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &result_event,
+        &locally_rendered,
+        &mut say_projected,
+        None,
+    ));
+    assert!(
+        say_projected.contains(&run_id),
+        "tool-bearing turn must mark say_projected on SuppressAndComplete"
+    );
+
+    let mut status_event = brain_event(
+        3,
+        "daemon",
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    );
+    status_event.run_id = Some(run_id);
+
+    let locally_rendered_after = super::LocallyRenderedRuns {
+        say_completed: say_projected.clone(),
+        in_flight: std::collections::HashSet::new(),
+    };
+
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &status_event,
+        &locally_rendered_after,
+        &mut say_projected,
+        None,
+    ));
+    assert!(
+        projections.get(&run_id).is_none(),
+        "INVARIANT: tool-bearing turn must not project Brain run UUID group (#1492)"
+    );
 }
 
 /// #978 regression at the push boundary: the daemon echoes this frontend's
