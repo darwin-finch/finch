@@ -8804,3 +8804,27 @@ fn test_pressing_e_or_enter_on_unconfigured_provider_focuses_api_key_field() {
         panic!("missing Models section state");
     }
 }
+
+#[test]
+fn test_settings_screen_avoids_technical_jargon() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Features;
+    let view = wizard_view_with_permission_target(&state, "", 160, 40);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, 160, 40)
+        .lines
+        .join("\n");
+
+    assert!(
+        !frame.contains("debug.log"),
+        "must avoid 'debug.log': {frame}"
+    );
+    assert!(
+        !frame.contains("HuggingFace"),
+        "must avoid 'HuggingFace': {frame}"
+    );
+    assert!(
+        !frame.contains("Daemon-only"),
+        "must avoid 'Daemon-only': {frame}"
+    );
+    assert!(!frame.contains("REPL"), "must avoid 'REPL': {frame}");
+}
