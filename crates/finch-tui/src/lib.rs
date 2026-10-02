@@ -7885,7 +7885,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_expanded_tool_view_initializes_and_restores() {
         let (mut renderer, _output_row) = committed_tool_result_renderer(40);
         let output_row_all = renderer
@@ -7924,6 +7923,7 @@ mod tests {
         assert_eq!(renderer.tool_viewports.child_scroll(&output_row_all), 5, "Compact scroll restored");
     }
 
+    #[test]
     fn test_expanded_tool_reader_renders_above_chrome_and_claims_wheel() {
         let (mut renderer, _output_row) = committed_tool_result_renderer(40);
         let output_row_all = renderer
