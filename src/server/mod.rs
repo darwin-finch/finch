@@ -300,20 +300,21 @@ pub(crate) mod schedule_delivery {
 
     #[cfg(test)]
     thread_local! {
-        static BEFORE_ATTEMPT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_OBSERVATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
         static AFTER_ATTEMPT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_RESULT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
 
     #[cfg(test)]
-    pub(crate) fn set_before_attempt_hook(hook: Box<dyn FnOnce()>) {
-        BEFORE_ATTEMPT_HOOK.with(|slot| {
+    pub(crate) fn set_after_observation_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_OBSERVATION_HOOK.with(|slot| {
             assert!(slot.borrow_mut().replace(hook).is_none());
         });
     }
 
     #[cfg(test)]
-    pub(crate) fn run_before_attempt_hook() {
-        if let Some(hook) = BEFORE_ATTEMPT_HOOK.with(|slot| slot.borrow_mut().take()) {
+    pub(crate) fn run_after_observation_hook() {
+        if let Some(hook) = AFTER_OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
     }
@@ -328,6 +329,20 @@ pub(crate) mod schedule_delivery {
     #[cfg(test)]
     pub(crate) fn run_after_attempt_hook() {
         if let Some(hook) = AFTER_ATTEMPT_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_result_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_RESULT_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_result_hook() {
+        if let Some(hook) = AFTER_RESULT_HOOK.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
     }
@@ -878,13 +893,13 @@ impl AgentServer {
                 // Brains that actually have work, without hydrating any.
                 let names = schedule_store.due_schedule_brains(now);
                 for name in names {
-                    #[cfg(test)]
-                    schedule_delivery::run_before_attempt_hook();
-
                     let Some((brain_id, epoch)) = schedule_store.active_schedule_observation(&name)
                     else {
                         continue;
                     };
+                    #[cfg(test)]
+                    schedule_delivery::run_after_observation_hook();
+
                     let identity = (brain_id, name.clone());
                     let result = handlers::deliver_due_named_brain_schedules(
                         schedule_store.clone(),
@@ -913,6 +928,7 @@ impl AgentServer {
                         Err(_) => {}
                         Ok(attempt)
                             if attempt.delivered > 0
+                                && attempt.started == Some((brain_id, epoch))
                                 && attempt.completion.is_some_and(|(completion_id, _, _)| {
                                     completion_id == brain_id
                                 })
@@ -928,6 +944,9 @@ impl AgentServer {
                         }
                         Ok(_) => {}
                     }
+
+                    #[cfg(test)]
+                    schedule_delivery::run_after_result_hook();
                 }
 
                 // If the head did not move, nothing advanced -- typically a due
@@ -1707,9 +1726,10 @@ mod tests {
             "the repaired one-shot must have delivered and retired its final active slot"
         );
 
-        // Recreate active work under the same BrainId in the window after
-        // reconciliation but before the attempt captures its observation.
-        // The predecessor episode must not suppress the replacement's WARN.
+        // Recreate active work under the same BrainId after the delivery loop
+        // samples the predecessor but before queueing acquires the Brain
+        // guard. A successful replacement queue must not falsely recover the
+        // retired predecessor; the replacement's later failure must WARN.
         let aba_lock = store.execution_lock(NAME).unwrap();
         let aba_turn = aba_lock.lock_owned().await;
         let aba_attachment = store
@@ -1741,7 +1761,12 @@ mod tests {
         let hook_healthy = aba_healthy.clone();
         let aba_attachment_id = aba_attachment.attachment_id;
         let aba_subject = aba_attachment.subject.clone();
-        schedule_delivery::set_before_attempt_hook(Box::new(move || {
+        let capture_to_queue_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_finished = Arc::clone(&capture_to_queue_finished);
+        schedule_delivery::set_after_result_hook(Box::new(move || {
+            hook_finished.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        schedule_delivery::set_after_observation_hook(Box::new(move || {
             std::fs::write(hook_root.join(NAME).join("events.jsonl"), hook_healthy).unwrap();
             hook_store
                 .cancel_schedule(
@@ -1772,24 +1797,39 @@ mod tests {
                     crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
                 )
                 .unwrap();
-            let healthy = std::fs::read(hook_root.join(NAME).join("events.jsonl")).unwrap();
-            assert!(hook_store.evict_resident_brain_for_tests(NAME));
-            corrupt_brain_journal(&hook_root, NAME);
             *hook_fixture.lock().unwrap() = Some((
                 replacement.schedule_id,
                 replacement_attachment.attachment_id,
                 replacement_attachment.subject,
-                healthy,
             ));
         }));
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        for _ in 0..200 {
+            if capture_to_queue_finished.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            capture_to_queue_finished.load(std::sync::atomic::Ordering::Acquire),
+            "the real delivery loop must finish processing the capture-to-queue replacement attempt"
+        );
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "replacement success after capture-to-queue recreation must not recover the retired predecessor"
+        );
+        let (replacement_id, replacement_attachment_id, replacement_subject) =
+            replacement_fixture.lock().unwrap().clone().unwrap();
+        let replacement_healthy = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
         tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
         wait_for_schedule_events(&captured, FAILURE, 5).await;
 
         // Now cross the awaited failure itself with another cancel-last and
         // recreation under the same durable identity. The stale Err must not
         // populate the successor epoch or suppress its first real WARN.
-        let (replacement_id, replacement_attachment_id, replacement_subject, replacement_healthy) =
-            replacement_fixture.lock().unwrap().clone().unwrap();
         let awaited_successor_fixture = Arc::new(std::sync::Mutex::new(None));
         let hook_successor_fixture = Arc::clone(&awaited_successor_fixture);
         let hook_store = store.clone();

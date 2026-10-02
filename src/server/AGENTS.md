@@ -39,8 +39,10 @@ Archive, unused removal, external absence, and schedule retirement silently reco
 and a completion that crossed one of those boundaries cannot reinsert it. A successful one-shot
 captures its completion observation while the execution lane is still held, so its natural final
 retirement does not hide the real recovery. That observation comes from the atomic schedule-queue
-commit before runner dispatch awaits; a later external cancellation therefore cannot masquerade
-as the delivery's own retirement. Restart deliberately
+commit together with the in-lock entry observation; recovery requires that entry to match the
+loop's sampled generation, so cancel-last/recreate before queueing cannot substitute successor
+work, while a later external cancellation cannot masquerade as the delivery's own retirement.
+Restart deliberately
 starts empty, so the first real post-restart failure may warn again but never invents recovery.
 
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and

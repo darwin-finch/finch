@@ -961,10 +961,11 @@ pub(crate) async fn resume_queued_named_brain_runs_in_lane(
     Ok(resumed)
 }
 
-/// Result plus the schedule lifecycle observed before releasing its execution lane.
+/// Result plus the schedule lineage observed while queueing held the Brain guard.
 #[derive(Debug)]
 pub(crate) struct ScheduleDeliveryAttempt {
     pub(crate) delivered: usize,
+    pub(crate) started: Option<(crate::brain::BrainId, u64)>,
     pub(crate) completion: Option<(crate::brain::BrainId, u64, bool)>,
 }
 
@@ -980,10 +981,11 @@ pub(crate) async fn deliver_due_named_brain_schedules(
 
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
-    let (queued, completion) = store.queue_due_schedules_observed(&name, now_ms)?;
+    let (queued, started, completion) = store.queue_due_schedules_observed(&name, now_ms)?;
     if queued.is_empty() || !named_brain_runner_is_ready(&store, &runners, &name)? {
         return Ok(ScheduleDeliveryAttempt {
             delivered: queued.len(),
+            started,
             completion,
         });
     }
@@ -1004,6 +1006,7 @@ pub(crate) async fn deliver_due_named_brain_schedules(
     }
     Ok(ScheduleDeliveryAttempt {
         delivered: dispatched,
+        started,
         completion,
     })
 }

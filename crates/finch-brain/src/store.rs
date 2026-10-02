@@ -2625,30 +2625,42 @@ impl BrainStore {
     /// returns and are safe for the runner broker to dispatch immediately.
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
         self.queue_due_schedules_observed(name, now_ms)
-            .map(|(queued, _)| queued)
+            .map(|(queued, _, _)| queued)
     }
 
-    /// Queue due runs and atomically return the resulting schedule lifecycle.
+    /// Queue due runs and atomically return the entry and resulting lifecycles.
     ///
-    /// The observation is sampled while the Brain write guard is still held,
-    /// before runner dispatch can await. Callers use it to distinguish the
-    /// delivery's own one-shot retirement from a later external cancellation.
+    /// Both observations are sampled while the Brain write guard is held.
+    /// Callers use the entry observation to prove that queueing began from the
+    /// lifecycle they selected, and the completion observation to distinguish
+    /// the delivery's own one-shot retirement from a later external
+    /// cancellation.
+    #[doc(hidden)]
     pub fn queue_due_schedules_observed(
         &self,
         name: &str,
         now_ms: u64,
-    ) -> Result<(Vec<BrainRun>, Option<(BrainId, u64, bool)>)> {
+    ) -> Result<(
+        Vec<BrainRun>,
+        Option<(BrainId, u64)>,
+        Option<(BrainId, u64, bool)>,
+    )> {
         let name = Self::validate_name(name)?;
         // Before the load, not after a failed one: a Brain that is gone is
         // pruned, a Brain that is merely unreadable is reported (#383).
         if self.prune_schedules_if_brain_is_absent(name) {
-            return Ok((Vec::new(), self.schedule_lifecycle_observation(name)));
+            return Ok((Vec::new(), None, self.schedule_lifecycle_observation(name)));
         }
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
             .context("Brain was removed concurrently")?;
+        // External schedule mutation also requires `brains.write()`. Sampling
+        // after this guard is acquired makes `started` the exact lineage from
+        // which every event below is committed, rather than a pre-lock hint
+        // vulnerable to cancel-last/recreate ABA.
+        let started = self.active_schedule_observation(name);
         let mut schedules = state
             .schedules
             .values()
@@ -2785,7 +2797,7 @@ impl BrainStore {
             }
         }
         let lifecycle = self.schedule_lifecycle_observation(name);
-        Ok((queued, lifecycle))
+        Ok((queued, started, lifecycle))
     }
 
     pub fn inspect_schedule(
