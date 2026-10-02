@@ -1282,14 +1282,8 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
 pub(super) fn validation_error_card(error: &str) -> WizardCard {
     WizardCard {
         title: "Validation Error".to_string(),
-        body: vec![
-            wizard_plain(error),
-            WizardLine::blank(),
-        ],
-        controls: Some(wizard_line(
-            "Enter / Esc: Back to setup",
-            Color::Yellow,
-        )),
+        body: vec![wizard_plain(error), WizardLine::blank()],
+        controls: Some(wizard_line("Enter / Esc: Back to setup", Color::Yellow)),
         accent: Color::Red,
     }
 }

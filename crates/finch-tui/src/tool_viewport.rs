@@ -246,7 +246,10 @@ impl ToolViewportState {
         }));
         if truncated {
             windowed.push(RenderedTranscriptLine {
-                text: truncate_body_line(&format!("      {}", status_text(scroll, end, body.len())), width),
+                text: truncate_body_line(
+                    &format!("      {}", status_text(scroll, end, body.len())),
+                    width,
+                ),
                 body_of: Some(row_id),
                 role: Some(NodeRole::ToolOutput),
                 ..RenderedTranscriptLine::default()
@@ -397,7 +400,7 @@ pub fn expanded_surface_lines(
     if max_start == body.len() {
         max_start = max_start.saturating_sub(1);
     }
-    
+
     let start = scroll.min(max_start);
     let mut end = start;
     let mut forward_budget = body_budget;
@@ -1067,11 +1070,16 @@ mod tests {
     fn test_expanded_surface_maintains_height_when_scrolled_to_bottom() {
         let body: Vec<String> = (0..20).map(|n| format!("line {n}")).collect();
         let lines_start = expanded_surface_lines("bash", &body, 0, 80, 6);
-        assert_eq!(lines_start.len(), 6, "surface should occupy full allotted height at top");
+        assert_eq!(
+            lines_start.len(),
+            6,
+            "surface should occupy full allotted height at top"
+        );
 
         let lines_bottom = expanded_surface_lines("bash", &body, 100, 80, 6);
         assert_eq!(
-            lines_bottom.len(), 6,
+            lines_bottom.len(),
+            6,
             "INVARIANT: the expanded surface must maintain its full allotted height \
              even when scrolled past the end, rather than shrinking; surface was:\n{}",
             lines_bottom.join("\n")

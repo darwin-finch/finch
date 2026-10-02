@@ -8698,10 +8698,9 @@ fn test_wizard_checkboxes_use_one_glyph_convention_across_tabs() {
 fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
     let mut state = WizardState::new(None);
     // Set an invalid cloud provider (OpenAI with empty key)
-    if let Some(SectionState::Models {
-        primary_model,
-        ..
-    }) = state.sections.get_mut(&WizardSection::Models) {
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
         *primary_model = ModelConfig::Remote {
             provider: "openai".into(),
             name: "openai".into(),
@@ -8714,7 +8713,7 @@ fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
 
     // Try to save
     let result = handle_save_action(&mut state).unwrap();
-    
+
     // It should return None because validation failed, and set the error
     assert!(result.is_none());
     assert!(state.save_error.is_some());

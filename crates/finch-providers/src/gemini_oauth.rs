@@ -790,9 +790,12 @@ mod tests {
         let scopes = gemini_required_scopes();
         assert!(scopes.contains("https://www.googleapis.com/auth/cloud-platform"));
         assert!(!scopes.contains("https://www.googleapis.com/auth/generative-language"));
-        
-        assert!(GEMINI_DEVICE_WIRE_SCOPES.contains("https://www.googleapis.com/auth/cloud-platform"));
-        assert!(!GEMINI_DEVICE_WIRE_SCOPES.contains("https://www.googleapis.com/auth/generative-language"));
+
+        assert!(
+            GEMINI_DEVICE_WIRE_SCOPES.contains("https://www.googleapis.com/auth/cloud-platform")
+        );
+        assert!(!GEMINI_DEVICE_WIRE_SCOPES
+            .contains("https://www.googleapis.com/auth/generative-language"));
     }
 
     #[test]
