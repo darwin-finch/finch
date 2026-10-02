@@ -501,7 +501,44 @@ pub fn wizard_wrap(line: &WizardLine, width: usize) -> Vec<WizardLine> {
                     close_row(&mut current, &mut lines_out);
                     column = 0;
                 }
-                for ch in word.chars() {
+                let mut chars = word.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '\x1b' {
+                        append_char(&mut current, span, ch);
+                        if chars.peek() == Some(&'[') {
+                            append_char(&mut current, span, chars.next().unwrap());
+                            while let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                                if c.is_ascii_alphabetic() {
+                                    break;
+                                }
+                            }
+                        } else if chars.peek() == Some(&']') {
+                            append_char(&mut current, span, chars.next().unwrap());
+                            while let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                                if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
+                                    if c == '\x1b' {
+                                        if let Some(slash) = chars.next() {
+                                            append_char(&mut current, span, slash);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            if let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if ch == '\r' || ch == '\x08' || ch == '\x7f' {
+                        append_char(&mut current, span, ch);
+                        continue;
+                    }
+
                     let char_width = wizard_char_width(ch);
                     if column + char_width > width {
                         close_row(&mut current, &mut lines_out);
@@ -2142,6 +2179,18 @@ mod tests {
 }
 
 #[cfg(test)]
+mod test_wizard {
+    use super::*;
+
+    #[test]
+    fn test_wizard_visible_length_vs_wrap_mismatch() {
+        let text = "\x1b(Btest";
+        let len = wizard_visible_length(text);
+        
+        let line = WizardLine::plain(text);
+        let wrapped = wizard_wrap(&line, len);
+        
+        panic!("len = {}, wrapped len = {}. wrapped[0] text: {:?}", len, wrapped.len(), wrapped[0].plain_text());
 mod osc8_tests {
     use super::*;
 
