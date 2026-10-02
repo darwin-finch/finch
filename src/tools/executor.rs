@@ -17,6 +17,73 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
+pub(crate) fn sensitive_env_values() -> Vec<String> {
+    std::env::vars()
+        .filter_map(|(k, v)| {
+            let k_upper = k.to_uppercase();
+            let is_sensitive = k_upper.contains("API_KEY")
+                || k_upper.contains("TOKEN")
+                || k_upper.contains("SECRET")
+                || k_upper.contains("PASSWORD")
+                || k_upper.contains("CREDENTIAL");
+            if is_sensitive && !v.trim().is_empty() && v.len() >= 4 {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn redact_text(mut text: String, patterns: &[String]) -> String {
+    for val in patterns {
+        text = text.replace(val, "[REDACTED]");
+    }
+    text
+}
+
+pub(crate) struct RedactingLiveOutput {
+    pub(crate) inner: Arc<dyn crate::tools::types::LiveOutputSink>,
+    pub(crate) patterns: Vec<String>,
+}
+
+impl crate::tools::types::LiveOutputSink for RedactingLiveOutput {
+    fn line(&self, text: String) {
+        self.inner.line(redact_text(text, &self.patterns));
+    }
+
+    fn vm_side_effect(&self, mut effect: finch_vm::VmSideEffect) {
+        match &mut effect.event {
+            finch_vm::HostSideEffect::Emit { text } => {
+                *text = redact_text(text.clone(), &self.patterns);
+            }
+            finch_vm::HostSideEffect::Ui { text: Some(ui_text), .. } => {
+                *ui_text = redact_text(ui_text.clone(), &self.patterns);
+            }
+            _ => {}
+        }
+        self.inner.vm_side_effect(effect);
+    }
+
+    fn vm_effect_envelope(&self, mut envelope: finch_tools_api::VmEffectEnvelope) {
+        match &mut envelope.effect.event {
+            finch_vm::HostSideEffect::Emit { text } => {
+                *text = redact_text(text.clone(), &self.patterns);
+            }
+            finch_vm::HostSideEffect::Ui { text: Some(ui_text), .. } => {
+                *ui_text = redact_text(ui_text.clone(), &self.patterns);
+            }
+            _ => {}
+        }
+        self.inner.vm_effect_envelope(envelope);
+    }
+
+    fn defer_program_effects(&self) -> bool {
+        self.inner.defer_program_effects()
+    }
+}
+
+
 // ─── Co-Forth trace helpers ───────────────────────────────────────────────────
 
 /// Build a compact human-readable label for a tool call.
@@ -475,6 +542,15 @@ impl ToolExecutor {
     {
         info!("Executing tool: {}", tool_use.name);
 
+
+        let patterns = sensitive_env_values();
+        let live_output = live_output.map(|inner| {
+            Arc::new(RedactingLiveOutput {
+                inner,
+                patterns: patterns.clone(),
+            }) as Arc<dyn crate::tools::types::LiveOutputSink>
+        });
+
         // 1. Check if it's an MCP tool
         if tool_use.name.starts_with("mcp_") {
             if let PermissionCheck::Deny(reason) = self
@@ -581,6 +657,7 @@ impl ToolExecutor {
         match tool.execute(tool_use.input.clone(), &context).await {
             Ok(mut output) => {
                 info!("Tool executed successfully");
+                output = redact_text(output, &patterns);
                 self.maybe_annotate_post_edit_diagnostics(
                     tool.name(),
                     &tool_use.input,
@@ -1026,6 +1103,37 @@ mod tests {
                 .map(|duration| duration.as_secs()),
             Some(30)
         );
+    }
+
+
+    #[tokio::test]
+    async fn test_execute_tool_redacts_sensitive_env_vars_in_output() {
+        let executor = create_test_executor(true, false);
+        std::env::set_var("MOCK_API_KEY", "sensitive-secret-token");
+        let tool_use = ToolUse {
+            id: "test-redact-1".to_string(),
+            name: "mock".to_string(),
+            input: serde_json::json!({
+                "param": "Found sensitive-secret-token here"
+            }),
+        };
+
+        let result = executor
+            .execute_tool(
+                &tool_use,
+                None::<fn() -> Result<()>>,
+                None, // repl_mode
+                None, // plan_content
+                None, // live_output
+                None, // effect_audit
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_use_id, tool_use.id);
+        assert!(!result.is_error);
+        assert!(result.content.contains("[REDACTED]"));
+        assert!(!result.content.contains("sensitive-secret-token"));
     }
 
     #[tokio::test]
