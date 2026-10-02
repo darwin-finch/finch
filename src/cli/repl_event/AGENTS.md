@@ -150,7 +150,10 @@ command confirms that the conversation is starting fresh, it terminalizes and re
 old active query and discards only input queued before the reset boundary. A post-confirmation
 prompt can therefore claim the active slot immediately; late invalidation, completion, and tool
 events carrying the old query id are idempotent and cannot release the new owner, delete its
-queue, overwrite its status, or repopulate the cleared cache.
+queue, overwrite its status, or repopulate the cleared cache. Query processing checks that same
+query-owned cancellation/state fence immediately after a non-streaming provider returns and at
+each streaming receive boundary, before response bytes can mutate a WorkUnit, publish statistics,
+stage or execute tools, run wire source, or emit a visible failure.
 `test_clear_and_reset_commands_remove_committed_and_staged_provider_context`
 pins the raw/staged boundary; `test_clear_and_reset_commands_invalidate_summary_before_actual_generator_request`
 drives both spellings through the real `LlmLoop` and captures the assembled generator request;
@@ -158,6 +161,9 @@ drives both spellings through the real `LlmLoop` and captures the assembled gene
 summarizer across both commands, starts and settles a fresh provider turn before releasing it, and
 proves the late invalidation/tool events have no provider, cache, active-query, queue, status, or
 transcript effect;
+`test_clear_and_reset_fence_late_non_streaming_provider_success_and_failure` blocks a real main
+provider across both commands and proves both a rich success and a failure are fenced before any
+post-reset projection or execution;
 `test_unrelated_help_command_preserves_provider_context_and_staged_round` keeps raw, staged, and
 summary context non-destructive for unrelated slash commands.
 

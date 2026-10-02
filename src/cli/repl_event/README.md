@@ -10,7 +10,9 @@ to commit a round, generate a summary, and admit a continuation. `EventLoop` and
 worker share the session's committed-summary cache so a conversation reset invalidates both the
 raw history and the derived provider prefix before another request is assembled. Reset completion
 also releases the exact pre-reset query; late events retain that old query identity and cannot
-disturb the first fresh turn or anything queued behind it.
+disturb the first fresh turn or anything queued behind it. Provider-return handling consults the
+same query-owned fence before projecting response text, usage, tools, wire execution, or errors,
+so an uncancellable provider cannot write into the fresh generation after returning late.
 
 Two callers illustrate the boundary:
 

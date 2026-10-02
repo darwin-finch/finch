@@ -1073,7 +1073,9 @@ async fn execute_wire_with_single_repair(
 }
 
 use super::events::ReplEvent;
-use super::query_state::{QueryState, QueryStateManager};
+#[cfg(test)]
+use super::query_state::QueryState;
+use super::query_state::QueryStateManager;
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Shared map of active tool calls keyed by tool_id.
@@ -2055,14 +2057,20 @@ pub(crate) async fn process_query_with_tools(
             .await
             .map(|metadata| metadata.cancellation_token)
             .unwrap_or_default();
-        match generator
+        let stream_result = generator
             .generate_stream_cancellable(
                 messages.clone(),
                 Some((*tool_definitions).clone()),
-                stream_cancellation,
+                stream_cancellation.clone(),
             )
-            .await
+            .await;
+        if stream_cancellation.is_cancelled()
+            || !query_states.accepts_provider_projection(query_id).await
         {
+            let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+            return;
+        }
+        match stream_result {
             Ok(Some(mut rx)) => {
                 tracing::debug!("[EVENT_LOOP] Streaming started, entering receive loop");
                 tracing::debug!("Streaming started successfully");
@@ -2086,6 +2094,12 @@ pub(crate) async fn process_query_with_tools(
                 );
 
                 while let Some(result) = rx.recv().await {
+                    if stream_cancellation.is_cancelled()
+                        || !query_states.accepts_provider_projection(query_id).await
+                    {
+                        let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+                        return;
+                    }
                     match result {
                         Ok(StreamChunk::Usage {
                             input_tokens,
@@ -2191,6 +2205,13 @@ pub(crate) async fn process_query_with_tools(
                     blocks.len()
                 );
                 tracing::debug!("Stream receive loop ended");
+
+                if stream_cancellation.is_cancelled()
+                    || !query_states.accepts_provider_projection(query_id).await
+                {
+                    let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+                    return;
+                }
 
                 if text.is_empty() {
                     text.clone_from(&completed_text);
@@ -2461,10 +2482,14 @@ pub(crate) async fn process_query_with_tools(
     // created above -- shared with the streaming attempt this query already
     // made -- instead of starting a second one; see the comment at its
     // creation for why that sharing matters.
-    match generator
+    let provider_result = generator
         .generate(messages.clone(), Some((*tool_definitions).clone()))
-        .await
-    {
+        .await;
+    if !query_states.accepts_provider_projection(query_id).await {
+        let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+        return;
+    }
+    match provider_result {
         Ok(response) => {
             query_states
                 .set_invocation_metadata(

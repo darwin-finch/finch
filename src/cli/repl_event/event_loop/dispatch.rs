@@ -343,9 +343,6 @@ impl EventLoop {
                 error,
                 generator_name,
             } => {
-                // A terminal provider failure closes publication immediately;
-                // detached #163 effects may still finish their durable audit.
-                self.conversation.write().await.abort_staged(query_id);
                 if let Some(turn) = self.pending_named_brain_turns.get(&query_id) {
                     if turn.cancellation_requested {
                         // A cancelled provider may report its terminal error
@@ -362,6 +359,15 @@ impl EventLoop {
                         return Ok(());
                     }
                 }
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    return Ok(());
+                }
+                // A terminal provider failure closes publication immediately;
+                // detached #163 effects may still finish their durable audit.
+                self.conversation.write().await.abort_staged(query_id);
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 

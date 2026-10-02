@@ -7439,6 +7439,161 @@ struct BlockingSummaryRequestRecorder {
     release_newer_request: tokio::sync::Notify,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LateProviderOutcome {
+    Success,
+    Failure,
+}
+
+struct BlockingLateProvider {
+    outcome: LateProviderOutcome,
+    old_started: tokio::sync::Notify,
+    release_old: tokio::sync::Notify,
+    newer_started: tokio::sync::Notify,
+    release_newer: tokio::sync::Notify,
+}
+
+impl BlockingLateProvider {
+    fn new(outcome: LateProviderOutcome) -> Self {
+        Self {
+            outcome,
+            old_started: tokio::sync::Notify::new(),
+            release_old: tokio::sync::Notify::new(),
+            newer_started: tokio::sync::Notify::new(),
+            release_newer: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn response(text: &str) -> crate::generators::GeneratorResponse {
+        crate::generators::GeneratorResponse {
+            text: text.into(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "blocking-late-provider".into(),
+                model: "blocking-late-provider-model".into(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+                latency_ms: Some(5),
+                primary_allowance_used_percent: Some(6.0),
+                secondary_allowance_used_percent: Some(7.0),
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for BlockingLateProvider {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let query = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(crate::providers::Message::text_content)
+            .unwrap_or_default();
+        match query.as_str() {
+            "old provider request" => {
+                self.old_started.notify_one();
+                self.release_old.notified().await;
+                match self.outcome {
+                    LateProviderOutcome::Success => {
+                        let tool = crate::tools::ToolUse {
+                            id: "late-provider-tool".into(),
+                            name: "late_probe".into(),
+                            input: serde_json::json!({}),
+                        };
+                        let mut response = Self::response("(say \"stale provider text\")");
+                        response
+                            .content_blocks
+                            .push(crate::providers::ContentBlock::ToolUse {
+                                id: tool.id.clone(),
+                                name: tool.name.clone(),
+                                input: tool.input.clone(),
+                            });
+                        response.tool_uses.push(tool);
+                        response.metadata.input_tokens = Some(901);
+                        response.metadata.output_tokens = Some(902);
+                        Ok(response)
+                    }
+                    LateProviderOutcome::Failure => {
+                        anyhow::bail!("stale provider failure after reset")
+                    }
+                }
+            }
+            "new active request" => {
+                self.newer_started.notify_one();
+                self.release_newer.notified().await;
+                Ok(Self::response("(say \"new active response\")"))
+            }
+            _ => Ok(Self::response("(say \"fresh provider response\")")),
+        }
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "blocking-late-provider"
+    }
+}
+
+struct LateProviderProbe {
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for LateProviderProbe {
+    fn name(&self) -> &str {
+        "late_probe"
+    }
+
+    fn effect(&self) -> finch_programs::ExecutionEffect {
+        finch_programs::ExecutionEffect::WorkspaceRead
+    }
+
+    fn description(&self) -> &str {
+        "records whether stale provider output launched a tool"
+    }
+
+    fn input_schema(&self) -> crate::tools::ToolInputSchema {
+        crate::tools::ToolInputSchema::simple(Vec::new())
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _context: &crate::tools::ToolContext<'_>,
+    ) -> anyhow::Result<String> {
+        self.executions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("stale tool executed".into())
+    }
+}
+
 impl BlockingSummaryRequestRecorder {
     fn new() -> Self {
         Self {
@@ -7897,6 +8052,234 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
         "{command} must produce no late old-generation provider effect after terminal invalidation"
     );
     recorder.release_newer_request.notify_one();
+}
+
+async fn assert_reset_fences_late_main_provider_result(
+    command: &str,
+    outcome: LateProviderOutcome,
+) {
+    use crate::cli::repl_event::query_state::QueryState;
+    use std::sync::atomic::Ordering;
+
+    let provider = Arc::new(BlockingLateProvider::new(outcome));
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry.register(Box::new(LateProviderProbe {
+        executions: Arc::clone(&executions),
+    }));
+    let definitions = registry.definitions();
+    let patterns = tempfile::tempdir()
+        .expect("isolated late-provider tool state")
+        .path()
+        .join("patterns.json");
+    let executor =
+        crate::tools::ToolExecutor::new(registry, crate::tools::PermissionManager::new(), patterns)
+            .expect("construct late-provider tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&provider) as Arc<dyn crate::generators::Generator>,
+        definitions,
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::new(crate::runtime::ProgramRuntime::new()),
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.start_llm_worker();
+
+    event_loop
+        .handle_user_input("old provider request".into())
+        .await
+        .expect("the old real provider request must start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.old_started.notified(),
+    )
+    .await
+    .expect("the old request must block inside the real provider");
+    let old_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the blocked old provider request must own the active slot");
+
+    event_loop
+        .handle_user_input(command.into())
+        .await
+        .expect("the reset command must complete while the old provider is blocked");
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(old_query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "{command} must terminalize the blocked provider query before confirming"
+    );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "{command} must release the old provider query before confirming"
+    );
+
+    const FRESH: &str = "fresh request after provider reset";
+    event_loop
+        .handle_user_input(FRESH.into())
+        .await
+        .expect("the first fresh query must start immediately");
+    let fresh_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the first fresh query must own the released slot");
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the fresh query must settle while the old provider stays blocked")
+        .expect("the event channel must remain open");
+        let complete = matches!(event, ReplEvent::StreamingComplete { query_id, .. } if query_id == fresh_query_id);
+        event_loop
+            .handle_event(event)
+            .await
+            .expect("fresh-query events must dispatch");
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "the fresh query must settle before the old provider returns"
+    );
+
+    const NEW_ACTIVE: &str = "new active request";
+    const NEW_QUEUED: &str = "new queued request";
+    event_loop
+        .handle_user_input(NEW_ACTIVE.into())
+        .await
+        .expect("a newer query must start after the fresh turn settles");
+    let new_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the newer query must own the active slot");
+    event_loop
+        .handle_user_input(NEW_QUEUED.into())
+        .await
+        .expect("a following prompt must queue behind the newer query");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.newer_started.notified(),
+    )
+    .await
+    .expect("the newer query must block at the provider boundary");
+    {
+        let tui = event_loop.tui_renderer.lock().await;
+        tui.set_operation_status("new generation owns the frontend");
+    }
+    use crate::cli::tui::TuiStatusPort;
+    let status_before = event_loop.status_bar.status_without_session();
+    let transcript_before = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect::<Vec<_>>();
+    let conversation_before = event_loop.conversation.read().await.get_messages();
+
+    provider.release_old.notify_one();
+    let terminal = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.event_rx.recv(),
+    )
+    .await
+    .expect("the late provider result must reach its fenced terminal boundary")
+    .expect("the event channel must remain open");
+    assert!(
+        matches!(terminal, ReplEvent::QueryContextInvalidated { query_id } if query_id == old_query_id),
+        "late {outcome:?} must become an idempotent invalidation, not a result-derived event; got {terminal:?}"
+    );
+    event_loop
+        .handle_event(terminal)
+        .await
+        .expect("the old invalidation event must dispatch idempotently");
+
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(old_query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "late {outcome:?} must not overwrite the old query's cancelled terminal state"
+    );
+    assert!(
+        event_loop
+            .query_states
+            .get_metadata(old_query_id)
+            .await
+            .is_some_and(|metadata| metadata.invocation_metadata.is_none()),
+        "late {outcome:?} statistics must not be recorded after {command}"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "late {outcome:?} provider tools must never execute after {command}"
+    );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_query_id),
+        "late {outcome:?} must preserve the newer active owner"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "late {outcome:?} must preserve the newer queued prompt"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before,
+        "late {outcome:?} must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.content())
+            .collect::<Vec<_>>(),
+        transcript_before,
+        "late {outcome:?} must not mutate the post-reset transcript"
+    );
+    assert_eq!(
+        event_loop.conversation.read().await.get_messages(),
+        conversation_before,
+        "late {outcome:?} must not mutate provider-visible conversation history"
+    );
+    let cache_probe = crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&provider) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    );
+    assert!(
+        matches!(
+            cache_probe.plan_summary(&summary_reuse_fixture("post-provider-reset"), 4),
+            crate::cli::conversation_compactor::SummaryPlan::Summarize { .. }
+        ),
+        "late {outcome:?} must not repopulate the reset summary cache"
+    );
+    provider.release_newer.notify_one();
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_fence_late_non_streaming_provider_success_and_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                for outcome in [LateProviderOutcome::Success, LateProviderOutcome::Failure] {
+                    assert_reset_fences_late_main_provider_result(command, outcome).await;
+                }
+            }
+        })
+        .await;
 }
 
 fn summary_reuse_fixture(prefix: &str) -> Vec<crate::providers::Message> {
