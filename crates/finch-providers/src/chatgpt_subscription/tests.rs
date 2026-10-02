@@ -2740,15 +2740,16 @@ fn test_terminal_output_rejects_semantic_drift_after_passive_normalization() {
 fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
     let mut accumulator = StreamAccumulator::default();
     let unknown = json!({"type":"response.future","sequence_number":1});
-    let error = parse_event(
+    let error = match parse_event(
         unknown,
         DEFAULT_MODEL,
         None,
         &empty_tool_bindings(),
         &mut accumulator,
-    )
-    .unwrap_err()
-    .to_string();
+    ) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("unknown event type must fail"),
+    };
     assert!(
         error.contains("unknown event type: response.future"),
         "unknown event error must name the event type, got {error}"
