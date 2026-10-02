@@ -4284,7 +4284,7 @@ impl EventLoop {
         let position = self
             .locally_pushed_programs
             .iter()
-            .position(|pushed| pushed == source);
+            .position(|pushed| pushed == source || pushed.trim() == source.trim());
         let Some(position) = position else {
             return false;
         };

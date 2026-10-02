@@ -2539,24 +2539,55 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
 /// The canonical record keeps the raw program exactly once:
 /// `commit_complete_messages` iterates messages without neighbour context and
 /// is untouched by this rule.
+fn programs_match(response_text: &str, program_lines: &[String]) -> bool {
+    let resp_trimmed = response_text.trim();
+    if resp_trimmed.is_empty() {
+        return program_lines.is_empty() || program_lines.iter().all(|line| line.trim().is_empty());
+    }
+    let resp_lines = response_text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'));
+    let prog_lines = program_lines.iter().map(|line| line.trim_end_matches('\r'));
+    resp_lines.eq(prog_lines)
+}
+
+/// The viewport source-group row a component-owned say turn consolidates away
+/// (stage 2 of docs/TUI_DESIGN.md, #882): the Program-source unit
+/// preceding a say-VM unit whose response text matches the turn's program.
+/// The search looks backward from each say turn to the nearest preceding
+/// matching ProgramSource unit (across any intervening non-say messages such
+/// as notices, runner events, or memory recalls).
+/// Empty programs pair the same way (#1185): a degenerate wire turn whose
+/// source trims to "" leaves both sides empty, so both match and the legacy
+/// row for that same empty source never co-renders.
+/// The canonical record keeps the raw program exactly once:
+/// `commit_complete_messages` iterates messages without neighbour context and
+/// is untouched by this rule.
 fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
     let mut suppressed = HashSet::new();
-    for pair in messages.windows(2) {
-        let Some(view) = pair[1].say_turn_view() else {
+    for (i, message) in messages.iter().enumerate() {
+        let Some(view) = message.say_turn_view() else {
             continue;
         };
-        let program = view.vm.program.lines.join("\n");
-        let Some(head) = pair[0].work_unit_head() else {
-            continue;
-        };
-        if pair[0].status() == MessageStatus::Complete
-            && matches!(
+        for prev in messages[..i].iter().rev() {
+            if prev.say_turn_view().is_some() {
+                // Do not search across another say turn boundary
+                break;
+            }
+            if suppressed.contains(&prev.id()) {
+                continue;
+            }
+            let Some(head) = prev.work_unit_head() else {
+                continue;
+            };
+            if matches!(
                 head.presentation,
                 WorkUnitPresentation::ProgramSource { .. }
-            )
-            && head.response_text == program
-        {
-            suppressed.insert(pair[0].id());
+            ) && programs_match(&head.response_text, &view.vm.program.lines)
+            {
+                suppressed.insert(prev.id());
+                break;
+            }
         }
     }
     suppressed
@@ -8900,6 +8931,72 @@ mod tests {
                 .map(|message| message.id().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+    }
+
+    #[test]
+    fn say_turn_consolidates_program_source_across_intervening_messages_and_newlines() {
+        // INVARIANT (#1499): A completed say turn consolidates its preceding
+        // ProgramSource unit even when:
+        // 1. Intervening messages (daemon notice, info message, recall notice)
+        //    are present between the source unit and the say card.
+        // 2. The source unit's response text contains trailing newlines or CRLF
+        //    while the say card program lines were trimmed by `lines()`.
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("wire program source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"type-4 answer\")\r\n");
+        source.set_complete();
+
+        // An intervening message (e.g. brain notice or participant message)
+        let notice = Arc::new(StaticMessage::plain("daemon lease confirmed"));
+
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"type-4 answer\")");
+        output.append_response("type-4 answer");
+        output.set_complete();
+
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+
+        let messages: Vec<MessageRef> = vec![
+            source.clone() as MessageRef,
+            notice.clone() as MessageRef,
+            output.clone() as MessageRef,
+        ];
+        let projected = renderer.projected_lines(messages.clone(), 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+
+        assert!(
+            !rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT (#1499): the legacy Program source row must not render even \
+             with intervening messages and trailing newlines; rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("type-4 answer")),
+            "INVARIANT: the card prose renders; rendered={rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("daemon lease confirmed")),
+            "INVARIANT: the intervening notice still renders; rendered={rendered:?}"
+        );
+
+        // Also verify projected_scroll_union consolidates the source row
+        renderer.output_manager.add_trait_message(source.clone());
+        renderer.output_manager.add_trait_message(notice.clone());
+        renderer.output_manager.add_trait_message(output.clone());
+        let (union, _) = renderer.projected_scroll_union(80);
+        let union_text: Vec<&str> = union.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !union_text.iter().any(|line| line.contains("Program source")),
+            "INVARIANT (#1499): the scroll union must consolidate the Program source row; union={union_text:?}"
         );
     }
 
