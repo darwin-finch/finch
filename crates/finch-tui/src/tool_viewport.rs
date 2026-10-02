@@ -392,7 +392,8 @@ pub fn expanded_surface_lines(
     let start = scroll.min(body.len().saturating_sub(1));
     let mut end = start;
     for line in &body[start..] {
-        let rows = shadow_buffer::physical_rows(line, width);
+        let indented = format!("      {}", line);
+        let rows = shadow_buffer::physical_rows(&indented, width);
         if body_budget < rows {
             if end == start {
                 // Must show at least one line even if it exceeds the window bounds
@@ -406,12 +407,12 @@ pub fn expanded_surface_lines(
     let end = end.min(body.len());
     
     let mut lines = Vec::new();
-    lines.push(truncate_body_line(&format!("── {} ", title), width));
+    lines.push(truncate_body_line(&format!("      ── {} ", title), width));
     for line in &body[start..end] {
-        lines.push(line.clone());
+        lines.push(format!("      {}", line));
     }
     lines.push(truncate_body_line(
-        &expanded_status_text(start, end, body.len()),
+        &format!("      {}", expanded_status_text(start, end, body.len())),
         width,
     ));
     lines
