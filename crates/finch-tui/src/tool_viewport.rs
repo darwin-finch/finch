@@ -327,6 +327,12 @@ fn status_text(start: usize, end: usize, total: usize) -> String {
     if total == 0 {
         return String::new();
     }
+    if start >= end {
+        return format!(
+            "… 0 lines visible of {} — ↑/↓ scroll · Enter expand",
+            total
+        );
+    }
     format!(
         "… lines {}–{} of {} — ↑/↓ scroll · Enter expand",
         start + 1,
@@ -349,6 +355,15 @@ fn truncate_body_line(line: &str, width: usize) -> String {
 
 /// Plain-text state line for the expanded surface footer.
 pub fn expanded_status_text(start: usize, end: usize, total: usize) -> String {
+    if total == 0 {
+        return "empty — Esc close".to_string();
+    }
+    if start >= end {
+        return format!(
+            "0 lines visible of {} — ↑/↓ scroll · Esc close",
+            total
+        );
+    }
     format!(
         "lines {}–{} of {} — ↑/↓ scroll · Esc close",
         start + 1,
@@ -979,6 +994,49 @@ mod tests {
             "INVARIANT: the footer reports the scroll position, total, and how to close; \
              footer was {:?}",
             lines.last()
+        );
+    }
+
+    #[test]
+    fn test_empty_expanded_surface_shows_sensible_status() {
+        let body: Vec<String> = Vec::new();
+        let lines = expanded_surface_lines("bash(true)", &body, 0, 80, 20);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("empty — Esc close"),
+            "INVARIANT: an empty expanded surface shows a sensible empty status, not \
+             a negative range like 'lines 1-0'; surface was:\n{joined}"
+        );
+        assert!(
+            !joined.contains("1–0"),
+            "INVARIANT: negative line ranges must not be displayed; surface was:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_zero_visible_lines_shows_sensible_status() {
+        // When the window truncates but the budget is so small (e.g. 1 row) that only
+        // the status text is visible, the status row must say 0 lines visible instead of a negative range.
+        let body: Vec<String> = (0..2).map(|n| format!("line {n}")).collect();
+        let mut state = ToolViewportState::default();
+        let (row_id, projected) = projected_tool_group(2);
+        // Force the budget to 1 row.
+        let bounded = state.project(projected, 80, 1);
+        
+        let status = body_lines_of(&bounded)
+            .last()
+            .map(|line| line.text.clone())
+            .unwrap_or_default();
+        assert!(
+            status.contains("0 lines visible of 2"),
+            "INVARIANT: a viewport with 0 visible body lines shows 0 lines visible instead \
+             of a negative range; status was {:?}",
+            status
+        );
+        assert!(
+            !status.contains("1–0"),
+            "INVARIANT: negative line ranges must not be displayed; status was {:?}",
+            status
         );
     }
 
