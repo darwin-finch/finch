@@ -1088,6 +1088,52 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_approval_shortcuts() {
+        // Non-mutating tool (e.g. Read)
+        // 0: "1. Yes"
+        // 1: "2. Yes, and don't ask again for: Read:*"
+        // 2: "3. Yes, and always allow Read:*"
+        // 3: "4. No"
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y'))),
+            Some(DialogResult::Selected(0))
+        );
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a'))),
+            Some(DialogResult::Selected(2))
+        );
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('n'))),
+            Some(DialogResult::Selected(3))
+        );
+
+        // Mutating tool (e.g. Write)
+        // 0: "1. Yes"
+        // 1: "2. Edit in $EDITOR"
+        // 2: "3. Yes, and don't ask again for: Write:*"
+        // 3: "4. Yes, and always allow Write:*"
+        // 4: "5. No"
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y'))),
+            Some(DialogResult::Selected(0))
+        );
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a'))),
+            Some(DialogResult::Selected(3))
+        );
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('n'))),
+            Some(DialogResult::Selected(4))
+        );
+    }
+
+    #[test]
     fn test_multiselect_toggle() {
         let mut dialog =
             Dialog::multiselect("Test", vec![DialogOption::new("A"), DialogOption::new("B")]);
