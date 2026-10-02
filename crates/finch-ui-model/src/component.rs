@@ -1617,7 +1617,11 @@ mod tests {
         let view = UserTurnView {
             marker: '❯',
             subject: None,
-            content_lines: vec!["first line".into(), "second line".into(), "third line".into()],
+            content_lines: vec![
+                "first line".into(),
+                "second line".into(),
+                "third line".into(),
+            ],
             participant_index: None,
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
@@ -1629,7 +1633,10 @@ mod tests {
         let expected_style = SpanStyle::fg(PALETTE.user_foreground);
         for (i, line) in lines.iter().enumerate() {
             assert_eq!(line.spans.len(), 1, "line {i} must have 1 span");
-            assert_eq!(line.spans[0].style, expected_style, "line {i} must wear expected style");
+            assert_eq!(
+                line.spans[0].style, expected_style,
+                "line {i} must wear expected style"
+            );
             assert_eq!(crate::spans_text(&line.spans), line.text);
         }
     }
