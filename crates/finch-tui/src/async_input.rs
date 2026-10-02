@@ -242,7 +242,7 @@ const COMPOSER_DELETE_CHAR: KeyboardShortcut = KeyboardShortcut {
     code: KeyCode::Char('d'),
     requires: KeyModifiers::CONTROL,
     label: "Ctrl+D",
-    description: "Delete the character under the cursor",
+    description: "Delete the character under the cursor (or exit if empty)",
     submit: None,
     authority: ShortcutAuthority::ComposerShortcut,
 };
@@ -431,10 +431,13 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
         (false, COMPOSER_POP.submit.map(str::to_string))
     } else if COMPOSER_DELETE_CHAR.owns(&key) {
         // Readline/Emacs semantics: delete the character under the cursor. On
-        // an empty buffer this is a no-op; Finch exits only through the
-        // explicit `/quit` command.
-        tui.input_textarea.delete_next_char();
-        (true, None)
+        // an empty buffer this acts as EOF and exits Finch.
+        if tui.input_textarea.is_empty() {
+            (false, Some("/quit".to_string()))
+        } else {
+            tui.input_textarea.delete_next_char();
+            (true, None)
+        }
     } else if COMPOSER_HELP.owns(&key) {
         // Ctrl+/: Show help (send as command)
         (false, COMPOSER_HELP.submit.map(str::to_string))
@@ -1248,6 +1251,15 @@ mod tests {
                 ("Ctrl+D", ShortcutAuthority::ComposerShortcut) => {
                     covered += 1;
                     let mut renderer = headless_renderer();
+
+                    // Empty buffer test: submits /quit
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert_eq!(
+                        (modified, submitted),
+                        (false, Some("/quit".to_string())),
+                        "{why}: Ctrl+D on an empty buffer must submit /quit"
+                    );
+
                     renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("abc");
                     // Compose a draft: the cursor lands after the last typed
                     // character, where Readline semantics make Ctrl+D a no-op.
