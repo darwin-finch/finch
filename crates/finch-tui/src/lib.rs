@@ -10639,6 +10639,36 @@ mod tests {
             "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
         );
     }
+
+    /// DEFECT REGRESSION: user turn continuation lines retain foreground color
+    /// even when scrolled down past line 0.
+    #[test]
+    fn test_user_turn_continuation_lines_retain_color_when_scrolled_down() {
+        use finch_messages::UserQueryMessage;
+        let mut renderer = headless_renderer();
+        let user = Arc::new(UserQueryMessage::new("first line\nsecond line\nthird line"));
+        let message: MessageRef = Arc::clone(&user) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let lines = renderer.projected_message_lines(&message, 80);
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].spans.is_empty(), "line 0 must carry spans");
+        assert!(!lines[1].spans.is_empty(), "line 1 must carry spans");
+        assert!(!lines[2].spans.is_empty(), "line 2 must carry spans");
+
+        // When line 0 rolls off-screen, lines 1 and 2 are lowered independently.
+        // Each lowered continuation line MUST carry ANSI color escape sequences.
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1]);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2]);
+
+        assert_ne!(lowered_line1, "second line");
+        assert_ne!(lowered_line2, "third line");
+        assert!(lowered_line1.contains("\x1b["));
+        assert!(lowered_line2.contains("\x1b["));
+    }
+
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);

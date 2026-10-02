@@ -128,6 +128,7 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette.static_error = SpanStyle::fg(span_color_from_spec(&colors.messages.error));
     palette.static_success = palette.static_info;
     palette.static_warning = SpanStyle::fg(span_color_from_spec(&colors.status.operation));
+    palette.user_foreground = span_color_from_spec(&colors.messages.user);
     palette
 }
 
@@ -262,6 +263,11 @@ mod tests {
             palette.operation_summary,
             SpanStyle::fg(SpanColor::DARK_GREY).with_dim(true),
             "summaries keep the dimmed dark grey"
+        );
+        assert_eq!(
+            palette.user_foreground,
+            SpanColor::DARK_CYAN,
+            "messages.user maps to dark cyan in the default scheme"
         );
     }
 }

@@ -15,7 +15,7 @@
 use finch_ui_model::{
     Axis, ComponentView, LiveToolView, MemoryRecalledView, MessageId, MessageStatus, OperationView,
     ProgressView, RowId, SayTurnStatus, SayTurnView, Span, SpanColor, SpanStyle, StaticTextKind,
-    StaticTextView, Track, Widget, WorkRowStatus,
+    StaticTextView, Track, UserTurnView, Widget, WorkRowStatus,
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -236,6 +236,7 @@ pub fn component_manifest(view: &ComponentView) -> DynamicUiNode {
         ComponentView::LiveTool(live_tool) => live_tool_manifest(live_tool),
         ComponentView::Operation(operation) => operation_manifest(operation),
         ComponentView::MemoryRecalled(memory) => memory_recalled_manifest(memory),
+        ComponentView::UserTurn(user_turn) => user_turn_manifest(user_turn),
     }
 }
 
@@ -350,6 +351,16 @@ pub fn memory_recalled_manifest(view: &MemoryRecalledView) -> DynamicUiNode {
     DynamicUiNode::leaf("MemoryRecalled", "")
         .with_prop("header", view.header.clone())
         .with_children(rows)
+}
+
+/// A user turn message's manifest: marker, optional subject, content lines,
+/// and optional participant index.
+pub fn user_turn_manifest(view: &UserTurnView) -> DynamicUiNode {
+    DynamicUiNode::leaf("UserTurn", "")
+        .with_prop("marker", view.marker.to_string())
+        .with_prop("subject", view.subject.clone())
+        .with_prop("lines", view.content_lines.clone())
+        .with_prop("participantIndex", view.participant_index)
 }
 
 fn manifest_status(status: &MessageStatus) -> &'static str {
