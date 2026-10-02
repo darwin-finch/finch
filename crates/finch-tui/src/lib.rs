@@ -3760,13 +3760,14 @@ impl TuiRenderer {
     }
 
     fn handle_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
-        let hover_row = if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
-            Some(region)
-        } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
-            Some(region.row_id.clone())
-        } else {
-            None
-        };
+        let hover_row =
+            if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
+                Some(region)
+            } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
+                Some(region.row_id.clone())
+            } else {
+                None
+            };
 
         if self.hovered_row != hover_row {
             self.hovered_row = hover_row;
@@ -4379,7 +4380,17 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
         let painted_transcript = transcript
             .iter()
-            .map(|l| span_render::lower_rendered_line(l, if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref() { Some(finch_ui_model::SpanColor::DARK_GREY) } else { None }))
+            .map(|l| {
+                span_render::lower_rendered_line(
+                    l,
+                    if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
+                    {
+                        Some(finch_ui_model::SpanColor::DARK_GREY)
+                    } else {
+                        None
+                    },
+                )
+            })
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
@@ -8414,8 +8425,10 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0], None) == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0], None).contains(&original_header),
+                && span_render::lower_rendered_line(&literal_state[0], None)
+                    == literal_state[0].text
+                && !span_render::lower_rendered_line(&literal_state[0], None)
+                    .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
