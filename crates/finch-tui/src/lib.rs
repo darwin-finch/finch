@@ -2536,15 +2536,12 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
 fn programs_match(response_text: &str, program_lines: &[String]) -> bool {
     let resp_trimmed = response_text.trim();
     if resp_trimmed.is_empty() {
-        return program_lines.is_empty()
-            || program_lines.iter().all(|line| line.trim().is_empty());
+        return program_lines.is_empty() || program_lines.iter().all(|line| line.trim().is_empty());
     }
     let resp_lines = response_text
         .lines()
         .map(|line| line.trim_end_matches('\r'));
-    let prog_lines = program_lines
-        .iter()
-        .map(|line| line.trim_end_matches('\r'));
+    let prog_lines = program_lines.iter().map(|line| line.trim_end_matches('\r'));
     resp_lines.eq(prog_lines)
 }
 
@@ -8914,7 +8911,9 @@ mod tests {
             "INVARIANT: the card prose renders; rendered={rendered:?}"
         );
         assert!(
-            rendered.iter().any(|line| line.contains("daemon lease confirmed")),
+            rendered
+                .iter()
+                .any(|line| line.contains("daemon lease confirmed")),
             "INVARIANT: the intervening notice still renders; rendered={rendered:?}"
         );
 
