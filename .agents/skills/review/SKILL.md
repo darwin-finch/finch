@@ -7,6 +7,9 @@ description: Independently review the candidate that will land from risk-derived
 
 Review the exact candidate that will land, not a moving branch. This is the only skill that lands. Derive perspectives from the actual diff. Open [review-protocol](../../references/review-protocol.md) sections as needed (findings, convergence, land), not as a preamble. Open [engineering judgment](../../references/engineering-judgment.md) only for the shape perspective. Load the tracker from [`.agents/binding`](../../references/load-binding.md) before applying a land rule. Handoff: verdict, findings, reviewed tip. No recap.
 
+For Finch, load the repository's [execution adapter](../../references/finch-execution.md) before
+running or reporting gates and before post-integration generated-output cleanup.
+
 Do not use this skill for lightweight prose edits that carry no behavioral claim.
 
 ## Required inputs

@@ -37,5 +37,5 @@ injected through `ProviderPorts`.
 ## Focused tests
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-providers --lib -- oauth::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-providers --lib -- oauth::
 ```

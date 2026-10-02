@@ -1,4 +1,4 @@
-CARGO_SLOT := .agents/skills/finch-backlog/scripts/with-cargo-slot
+CARGO_SLOT := scripts/factory/with-cargo-slot
 CARGO_INSTALL_FLAGS ?=
 
 .PHONY: all build install test clean

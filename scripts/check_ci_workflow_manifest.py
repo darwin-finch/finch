@@ -64,7 +64,7 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
     "ci.yml": None,
     "docs.yml": (
         "**.md", "scripts/check_docs.py",
-        ".agents/skills/finch-backlog/scripts/test-review-protocol",
+        ".agents/scripts/test-skill-docs",
         ".github/workflows/docs.yml",
     ),
     "issue-201-chatgpt-auth.yml": (
@@ -1126,19 +1126,21 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Verify shared skill discovery",
         "matrix.feature_name == 'default'", "bash", (
-            "test -L .claude/skills/finch-backlog",
-            'test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"',
+            "for skill in backlog-grooming backlog-loop codebase-audit coordinate implement review ticket-creation; do",
+            'test -L ".claude/skills/$skill"',
+            'test "$(cd ".agents/skills/$skill" && pwd -P)" = "$(cd ".claude/skills/$skill" && pwd -P)"',
+            "done",
         ),
     ))
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Check and exercise the Cargo slot",
         "matrix.feature_name == 'default'", "bash", (
-            "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot "
-            ".agents/skills/finch-backlog/scripts/test-with-cargo-slot "
-            ".agents/skills/finch-backlog/scripts/reclaim-cargo-targets "
-            ".agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets",
-            ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
-            ".agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets",
+            "bash -n scripts/factory/with-cargo-slot "
+            "scripts/factory/test-with-cargo-slot "
+            "scripts/factory/reclaim-cargo-targets "
+            "scripts/factory/test-reclaim-cargo-targets",
+            "scripts/factory/test-with-cargo-slot",
+            "scripts/factory/test-reclaim-cargo-targets",
         ),
     ))
     errors.extend(step_order_errors(

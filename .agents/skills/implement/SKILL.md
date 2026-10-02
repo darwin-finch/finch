@@ -35,6 +35,8 @@ A tier is blast radius, not diff size. When two look defensible, pick the lower 
 
 ## Implement, prove, compress
 
+- DO load Finch's [execution adapter](../../references/finch-execution.md) before running or
+  reporting gates and before reclaiming generated worktree output.
 - DO implement the accepted outcome only.
 - DO add outcome-appropriate proof: fail-before/pass-after at the visible boundary for a defect; equivalence, integration, and dependency-boundary proof for a refactor; reachability plus tests for a deletion; a usable downstream seam for enabling work.
 - DO follow [execution efficiency](../../references/execution-efficiency.md): short handoffs, no recap, do not open the review protocol.

@@ -4,16 +4,18 @@ Thank you for improving Finch. The project accepts focused fixes, tests, documen
 discussion. Before starting a large change, open or join an issue so implementation and conformance
 work can be coordinated.
 
-Codex contributors can invoke `$finch-implement-ticket` for an accepted ticket, or
-`$finch-backlog-autonomous` to triage and replenish multiple workers. Claude Code contributors can
-invoke the corresponding slash commands. The implementation workflow carries an issue through an
-isolated worktree, regression, review, CI, merge evidence, and cleanup. The canonical skill lives in
-`.agents/skills/finch-backlog`; `.claude/skills/finch-backlog` links to the same directory so both
-tools use one reviewable workflow rather than private or duplicated assistant configuration.
-Before editing an issue, the workflow requires a versioned `finch-work-claim:v1` GitHub comment
-with the worker, branch, worktree, base commit, and bounded scope. That comment is the sole ownership
-record; assignees, labels, branches, and pull requests do not substitute for it. This gives every
-tool and person the same deterministic collision rule even when they share a GitHub account.
+Finch vendors the Software Factory workflow under `.agents/`. Use `$ticket-creation` for intake,
+`$backlog-grooming` to prepare ready work, `$backlog-loop` for a bounded queue, `$implement` for one
+accepted unit, `$coordinate` for sibling workstreams, `$review` to decide and perform integration,
+and `$codebase-audit` for periodic whole-tree findings. Codex reads the canonical `.agents/skills`
+tree directly, Claude Code discovers it through `.claude/skills` symlinks, and supported harnesses
+resolve model lanes through `.agents/harnesses`; none carries a private workflow copy.
+
+Before editing a shared backlog item, the workflow requires a versioned `work-claim:v1` tracker
+record with the worker, branch, workspace identity, base commit, and bounded scope. That record is
+the cross-harness ownership source of truth; assignees, labels, branches, pull requests, and one
+harness's live-worker list do not substitute for it. Local worktree/process inventory is private to
+the clone under Git's common directory, as described in `.agents/references/local-workspace-state.md`.
 
 ## Development setup
 
@@ -28,7 +30,7 @@ python3 scripts/check_docs.py
 ```
 
 `make build`, `make test`, and `make install` do the same through
-`.agents/skills/finch-backlog/scripts/with-cargo-slot`, which gives the build a
+`scripts/factory/with-cargo-slot`, which gives the build a
 worktree-isolated `CARGO_TARGET_DIR` and the shared, cross-worktree sccache cache
 instead of an unshared default -- useful once more than one worktree of this repo
 exists on the same machine.

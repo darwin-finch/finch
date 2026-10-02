@@ -211,6 +211,10 @@ cleanup. Trusted test code must not enable job control or call `setsid`,
 supervised launchers and daemon paths for these escape APIs. Isolated tests
 reject daemon discovery, reuse, and auto-spawn.
 
+The vendored Software Factory kernel is harness-neutral. Its Finch-specific
+[execution adapter](.agents/references/finch-execution.md) defines the shared gate, Cargo isolation,
+test-supervision, and generated-output cleanup entry points used by every harness.
+
 ### Logging
 
 ```rust
@@ -262,7 +266,7 @@ an existing issue or pull request instead of repeating it in conversation. Final
 only the change, verification, remaining risk, ownership, and next action.
 
 For multi-step or delegated work, follow
-[efficient execution and evidence](.agents/skills/finch-backlog/references/execution-efficiency.md).
+[efficient execution and evidence](.agents/references/execution-efficiency.md).
 Parallelism and token efficiency never reduce required proof, testing, review, safety, or user
 value, and hard token budgets must not truncate work or evidence.
 

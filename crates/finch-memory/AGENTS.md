@@ -402,10 +402,10 @@ modules, including `memory_status`, are private.
 ## Focused proof
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --test gate_observability_test
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --test memory_integration_test
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --test gate_observability_test
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test --test memory_integration_test
 ```
 
 The gate's log-observability proof lives in its own integration binary

@@ -80,8 +80,8 @@ crate exists and traces two callers. [`src/lib.rs`](src/lib.rs) is its flat faca
 ## Focused proof
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-programs --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib program_registry::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-programs --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib program_registry::
 ```
 
 If a public contract, script envelope, or corpus format changes, run the supervised workspace

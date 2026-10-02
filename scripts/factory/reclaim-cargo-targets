@@ -6,7 +6,7 @@ usage() {
 usage: reclaim-cargo-targets [--apply] [--repo <path>]
 
 Reclaims generated Cargo target leaves under the shared cache
-(.agents/skills/finch-backlog/scripts/with-cargo-slot's
+(scripts/factory/with-cargo-slot's
 $cache/cargo-target/<repository-namespace>/<worktree-namespace> layout) that
 belong to a worktree Git no longer registers for the given repository.
 

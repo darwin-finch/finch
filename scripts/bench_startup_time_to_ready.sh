@@ -66,9 +66,9 @@ brains="${2:-113}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-slot="$repo_root/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+slot="$repo_root/scripts/factory/with-cargo-slot"
 if [[ ! -x "$slot" ]]; then
-  slot="$(cd "$repo_root/.." && pwd)/finch/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+  slot="$(cd "$repo_root/.." && pwd)/finch/scripts/factory/with-cargo-slot"
 fi
 if [[ ! -x "$slot" ]]; then
   echo "cargo slot wrapper not found; refusing to build unlocked" >&2

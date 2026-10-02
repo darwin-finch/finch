@@ -82,9 +82,9 @@ contracts without opening those implementations. Root callers may use the
 Run tests through the repository supervisor and Cargo slot:
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-runtime --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-brain --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib cli::repl_event::query_processor::tests::direct_wire_text_is_a_lisp_or_forth_submission_not_display_prose -- --exact
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-runtime --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-brain --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib cli::repl_event::query_processor::tests::direct_wire_text_is_a_lisp_or_forth_submission_not_display_prose -- --exact
 ```
 
 If the facade or host-effect behavior changes, also run the supervised workspace suite and the

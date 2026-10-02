@@ -144,9 +144,9 @@ Nested persistence contracts: [attachment](src/attachment/AGENTS.md),
 Run tests through the repository supervisor and Cargo slot:
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-brain --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib server::brain_service::
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib cli::repl_event::event_loop::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-brain --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib server::brain_service::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib cli::repl_event::event_loop::
 ```
 
 For persistence or authority changes, also run the supervised Brain integration inventory. The

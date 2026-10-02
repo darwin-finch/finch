@@ -5,14 +5,14 @@ on:
     paths:
       - "**.md"
       - "scripts/check_docs.py"
-      - ".agents/skills/finch-backlog/scripts/test-review-protocol"
+      - ".agents/scripts/test-skill-docs"
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
     paths:
       - "**.md"
       - "scripts/check_docs.py"
-      - ".agents/skills/finch-backlog/scripts/test-review-protocol"
+      - ".agents/scripts/test-skill-docs"
       - ".github/workflows/docs.yml"
 
 permissions:
@@ -28,4 +28,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 scripts/check_docs.py
-      - run: .agents/skills/finch-backlog/scripts/test-review-protocol "$GITHUB_WORKSPACE"
+      - run: .agents/scripts/test-skill-docs

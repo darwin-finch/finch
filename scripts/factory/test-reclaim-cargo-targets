@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Regression coverage for Finch's repository-specific Cargo target reclaimer.
 set -euo pipefail
 
 # with-cargo-slot only derives/creates CARGO_TARGET_DIR (and writes ownership

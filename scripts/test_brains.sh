@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-slot_wrapper="$repo_root/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+slot_wrapper="$repo_root/scripts/factory/with-cargo-slot"
 # shellcheck source=scripts/lib/brain_test_isolation.sh
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
 

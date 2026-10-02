@@ -44,6 +44,9 @@ This skill emits packets. It does not dispatch workers. `$backlog-loop` owns the
 
 ## Portable dispatch
 
+Before naming Finch gate stages in a packet, load the repository's
+[execution adapter](../../references/finch-execution.md).
+
 Emit a packet from [task-packet.md](../../references/task-packet.md): ticket, outcome, tier, model lane, base revision, worktree, allowed and prohibited scope, required proof, and handoff format. The active harness translates that packet to its native worker API. Lane selection and substitution rules live in the packet.
 
 Mechanical output is advisory. Human authority remains required for readiness, claims, scope changes, provider credentials, review, merge, and closure.

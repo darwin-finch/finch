@@ -1,7 +1,0 @@
-interface:
-  display_name: "Finch Ticket Implementer"
-  short_description: "Implement one Finch ticket through verified merge"
-  default_prompt: "Use $finch-implement-ticket to implement this accepted Finch ticket through verified merge."
-
-policy:
-  allow_implicit_invocation: true

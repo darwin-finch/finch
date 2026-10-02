@@ -8,7 +8,7 @@ unset CI
 
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 source_wrapper="${FINCH_CARGO_SLOT_WRAPPER_UNDER_TEST:-$script_dir/with-cargo-slot}"
-source_root="$(cd "$script_dir/../../../.." && pwd -P)"
+source_root="$(cd "$script_dir/../.." && pwd -P)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
 holder_pid=''
 holder_descendant_pid=''
@@ -141,10 +141,10 @@ assert_no_file() {
 repo="$fixture_root/repo"
 worktree="$fixture_root/worktree"
 newline_worktree="$fixture_root/worktree"$'\n'
-mkdir -p "$repo/.agents/skills/finch-backlog/scripts" "$repo/scripts/lib" "$repo/src/bin"
-cp "$source_wrapper" "$repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
-cp "$source_root/.agents/skills/finch-backlog/scripts/test-with-cargo-slot" \
-    "$repo/.agents/skills/finch-backlog/scripts/test-with-cargo-slot"
+mkdir -p "$repo/scripts/factory" "$repo/scripts/lib" "$repo/src/bin"
+cp "$source_wrapper" "$repo/scripts/factory/with-cargo-slot"
+cp "$source_root/scripts/factory/test-with-cargo-slot" \
+    "$repo/scripts/factory/test-with-cargo-slot"
 cp "$source_root/scripts/test_brains.sh" "$repo/scripts/test_brains.sh"
 cp "$source_root/scripts/lib/brain_test_isolation.sh" "$repo/scripts/lib/brain_test_isolation.sh"
 cat >"$repo/Cargo.toml" <<'REAL_CARGO_MANIFEST'
@@ -185,7 +185,7 @@ git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm
 git -C "$repo" worktree add -q "$worktree" -b second-worktree
 git -C "$repo" worktree add -q "$newline_worktree" -b newline-worktree
 
-wrapper="$repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+wrapper="$repo/scripts/factory/with-cargo-slot"
 launcher="$repo/scripts/test_brains.sh"
 worktree_launcher="$worktree/scripts/test_brains.sh"
 common_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
@@ -289,7 +289,7 @@ ci_identity="$(cd "$repo" && CI=true XDG_CACHE_HOME="$ci_cache_root" \
 # artifacts and lock must not collide with this repository's worktrees.
 separate_repo="$fixture_root/separate-repo"
 git clone -q "$repo" "$separate_repo"
-separate_wrapper="$separate_repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+separate_wrapper="$separate_repo/scripts/factory/with-cargo-slot"
 separate_identity="$(cd "$separate_repo" && env -u CARGO_TARGET_DIR "$separate_wrapper" sh -c \
     'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
 [[ "$separate_identity" != "$default_identity" ]] || fail \

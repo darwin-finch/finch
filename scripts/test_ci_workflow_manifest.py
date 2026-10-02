@@ -253,13 +253,13 @@ class WorkflowContractTests(unittest.TestCase):
                 "Run release-mode atomic history regression", "commands changed",
             ),
             (
-                "      if: matrix.feature_name == 'default'\n      shell: bash\n      run: |\n        test -L",
-                "      if: false\n      shell: bash\n      run: |\n        test -L",
+                "      if: matrix.feature_name == 'default'\n      shell: bash\n      run: |\n        for skill in",
+                "      if: false\n      shell: bash\n      run: |\n        for skill in",
                 "Verify shared skill discovery", "condition changed",
             ),
             (
-                "        .agents/skills/finch-backlog/scripts/test-with-cargo-slot\n",
-                "        .agents/skills/finch-backlog/scripts/with-cargo-slot\n",
+                "        scripts/factory/test-with-cargo-slot\n",
+                "        scripts/factory/with-cargo-slot\n",
                 "Check and exercise the Cargo slot", "commands changed",
             ),
         )

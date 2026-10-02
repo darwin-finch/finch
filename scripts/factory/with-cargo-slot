@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Finch-specific Cargo serialization; not part of the vendored Software Factory kernel.
 set -euo pipefail
 
 usage() {

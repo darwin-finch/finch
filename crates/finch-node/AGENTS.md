@@ -53,9 +53,9 @@ Its public contract is the facade in `src/lib.rs`; callers must not name child m
 Run through the repository supervisor and Cargo slot:
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-node --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --lib brain::
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --lib server::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-node --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test --lib brain::
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test --lib server::
 ```
 
 Use the smallest matching filter first. The [README](README.md) traces Brain and server callers;

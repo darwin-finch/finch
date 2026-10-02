@@ -184,7 +184,7 @@ FINCH_LIVE_CHATGPT_ACCEPTANCE=1 \
 FINCH_LIVE_CHATGPT_CONFIG="$HOME/.finch/config.toml" \
 FINCH_LIVE_CHATGPT_OAUTH_ROOT="$HOME/.finch/oauth" \
 CARGO_BUILD_JOBS=2 \
-./.agents/skills/finch-backlog/scripts/with-cargo-slot \
+./scripts/factory/with-cargo-slot \
   ./scripts/test_brains.sh cargo test --lib \
   providers::chatgpt_subscription::tests::live_chatgpt_subscription_acceptance_is_explicitly_opt_in \
   -- --ignored --exact
@@ -209,7 +209,7 @@ FINCH_LIVE_CHATGPT_ACCEPTANCE=1 \
 FINCH_LIVE_CHATGPT_CONFIG="$HOME/.finch/config.toml" \
 FINCH_LIVE_CHATGPT_OAUTH_ROOT="$HOME/.finch/oauth" \
 CARGO_BUILD_JOBS=2 \
-./.agents/skills/finch-backlog/scripts/with-cargo-slot \
+./scripts/factory/with-cargo-slot \
   ./scripts/test_brains.sh cargo test --lib \
   providers::chatgpt_subscription::tests::live_chatgpt_subscription_collaboration_tool_is_explicitly_opt_in \
   -- --ignored --exact

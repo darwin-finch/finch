@@ -29,6 +29,9 @@ Prefer cohesive subsystems with narrow facades, private internals, explicit depe
 
 Workers implement via `$implement`. This skill does not write the feature and does not land.
 
+Load Finch's [execution adapter](../../references/finch-execution.md) for combined-candidate gates,
+Cargo isolation, and generated-output cleanup.
+
 The integration owner verifies interface compatibility, combines handoffs in dependency order into a clean workspace without merge commits, resolves conflicts with the relevant subsystem owner, and runs affected unit and boundary tests on the combined revision. Worker commits are transport artifacts: squash each accepted feature or fix into its own commit and apply those commits linearly. The combined tip is the candidate. `$review` is the only skill that lands it. Parallel workers finishing their local scopes is not completion by itself.
 
 Handing the candidate to review does not end coordination. After `$review` lands it, the coordinator completes the [post-integration synchronization and cleanup](../../references/work-claims.md#post-integration-synchronization-and-cleanup) before reporting the parent outcome complete. If review does not land the candidate, preserve or release each workspace according to its recorded next action; do not discard recoverable work.

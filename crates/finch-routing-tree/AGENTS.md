@@ -156,6 +156,6 @@ modules — the tree implementation and its `routing_tree/persistence.rs` codec 
 ## Focused proof
 
 ```bash
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib
-.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib routing_tree
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib
+scripts/factory/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-routing-tree --lib routing_tree
 ```

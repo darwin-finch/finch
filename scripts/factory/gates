@@ -19,7 +19,7 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$root" || exit 1
-slot=".agents/skills/finch-backlog/scripts/with-cargo-slot"
+slot="scripts/factory/with-cargo-slot"
 
 stage="${1:-}"
 shift || true
@@ -44,7 +44,7 @@ gate() {
 run_docs() {
   gate "docs links and claims" python3 scripts/check_docs.py
   gate "docs checker self-test" python3 scripts/check_docs.py --self-test
-  gate "process references" .agents/skills/finch-backlog/scripts/test-review-protocol "$root"
+  gate "software factory kernel" .agents/scripts/test-skill-docs
 }
 
 run_arch() {
