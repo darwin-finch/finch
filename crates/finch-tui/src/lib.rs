@@ -4083,7 +4083,7 @@ impl TuiRenderer {
             row_id: row_id.clone(),
             title,
             saved_scroll,
-            scroll: saved_scroll.min(body.len().saturating_sub(1)),
+            scroll: 0,
             body_lines: body.len(),
         });
         self.viewport_invalidated = true;
@@ -6455,7 +6455,7 @@ mod tests {
         live: &[RenderedTranscriptLine],
     ) -> LiveFrame {
         let draft = vec![String::new()];
-        let vm = view_model::LiveViewModel {
+        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &draft,
@@ -7481,7 +7481,7 @@ mod tests {
         }
         assert_eq!(
             renderer.expanded_tool.as_ref().map(|view| view.scroll),
-            Some(9),
+            Some(7),
             "the expanded surface scrolled on its own"
         );
         assert!(
@@ -7885,6 +7885,45 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_expanded_tool_view_initializes_and_restores() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .map(|region| region.row_id.clone())
+            .expect("a painted tool-result region exists");
+
+        // Scroll the compact view
+        renderer.tool_viewports.scroll_child(&output_row_all, 5);
+
+        // Capture transcript before
+        let sources_before = renderer.live_frame_sources(80);
+        let transcript_before = renderer.focused_reader_lines(&sources_before, 80, 24, None);
+        assert!(transcript_before.is_none());
+
+        // 1. Open expanded view and assert it initializes scroll offset appropriately (starts at top)
+        renderer.open_expanded_tool(&output_row_all);
+        let view = renderer.expanded_tool.as_ref().unwrap();
+        assert_eq!(view.scroll, 0, "Tool view scroll starts at top");
+        assert_eq!(view.saved_scroll, 5, "Saved scroll is preserved");
+
+        // 2. Assert text is correctly bounded in physical rows
+        let sources_during = renderer.live_frame_sources(20); // Narrow width to force wrap
+        let lines_during = renderer.focused_reader_lines(&sources_during, 20, 10, None).expect("Reader active");
+        
+        let physical_rows_used: usize = lines_during.iter().map(|l| shadow_buffer::physical_rows(l, 20)).sum();
+        assert!(physical_rows_used <= 10, "Text is correctly bounded in physical rows");
+
+        // 3. Assert closing restores transcript view fully
+        renderer.close_expanded_tool();
+        let sources_after = renderer.live_frame_sources(80);
+        let transcript_after = renderer.focused_reader_lines(&sources_after, 80, 24, None);
+        assert!(transcript_after.is_none(), "Transcript view fully restored upon closing");
+        assert_eq!(renderer.tool_viewports.child_scroll(&output_row_all), 5, "Compact scroll restored");
+    }
+
     fn test_expanded_tool_reader_renders_above_chrome_and_claims_wheel() {
         let (mut renderer, _output_row) = committed_tool_result_renderer(40);
         let output_row_all = renderer
@@ -10716,7 +10755,7 @@ mod tests {
                 _ => panic!("unexpected background color"),
             };
             for line in &rendered {
-                assert_eq!(line.spans[0].style.bg, Some(expected_bg));
+                assert_eq!(line.spans[0].style.bg, Some(expected_bg.clone()));
             }
         }
     }
@@ -11551,7 +11590,7 @@ mod tests {
         input_lines: &'a [String],
         status: &'a str,
     ) -> view_model::LiveViewModel<'a> {
-        view_model::LiveViewModel {
+        view_model::LiveViewModel { hover_bg: None, hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -11630,7 +11669,7 @@ mod tests {
                     ..RenderedTranscriptLine::default()
                 })
                 .collect();
-            let vm = view_model::LiveViewModel {
+            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
                 input_lines: &input_lines,
@@ -11805,7 +11844,7 @@ mod tests {
         let plan_at = |w: usize, h: usize| {
             let draft = vec![String::new()];
             let status = "ready";
-            let vm = view_model::LiveViewModel {
+            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
                 input_lines: &draft,
@@ -11896,7 +11935,7 @@ mod tests {
         let width = 80;
         let draft = vec![String::new()];
         let status = "ready";
-        let vm = view_model::LiveViewModel {
+        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
             input_lines: &draft,

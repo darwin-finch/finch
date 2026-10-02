@@ -346,12 +346,6 @@ fn truncate_body_line(line: &str, width: usize) -> String {
 }
 
 /// The visible line window for a fully expanded (focused) surface.
-pub fn expanded_window(scroll: usize, total: usize, max_rows: usize) -> (usize, usize) {
-    let max_rows = max_rows.max(1);
-    let start = scroll.min(total.saturating_sub(1));
-    let end = (start + max_rows).min(total);
-    (start, end)
-}
 
 /// Plain-text state line for the expanded surface footer.
 pub fn expanded_status_text(start: usize, end: usize, total: usize) -> String {
@@ -379,8 +373,23 @@ pub fn expanded_surface_lines(
 ) -> Vec<String> {
     let width = width.max(1);
     let max_rows = max_rows.max(2);
-    let body_budget = max_rows.saturating_sub(2);
-    let (start, end) = expanded_window(scroll, body.len(), body_budget);
+    let mut body_budget = max_rows.saturating_sub(2);
+    let start = scroll.min(body.len().saturating_sub(1));
+    let mut end = start;
+    for line in &body[start..] {
+        let rows = shadow_buffer::physical_rows(line, width);
+        if body_budget < rows {
+            if end == start {
+                // Must show at least one line even if it exceeds the window bounds
+                end += 1;
+            }
+            break;
+        }
+        body_budget -= rows;
+        end += 1;
+    }
+    let end = end.min(body.len());
+    
     let mut lines = Vec::new();
     lines.push(truncate_body_line(&format!("── {} ", title), width));
     for line in &body[start..end] {
