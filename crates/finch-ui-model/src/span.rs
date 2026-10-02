@@ -107,7 +107,11 @@ impl SpanStyle {
 
     /// True when the style changes nothing about how text renders.
     pub fn is_plain(&self) -> bool {
-        self.fg.is_none() && self.bg.is_none() && !self.bold && !self.dim && self.hyperlink.is_none()
+        self.fg.is_none()
+            && self.bg.is_none()
+            && !self.bold
+            && !self.dim
+            && self.hyperlink.is_none()
     }
 }
 

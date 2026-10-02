@@ -58,7 +58,7 @@ const SGR_RESET: &str = "\x1b[0m";
 /// reaches the terminal exactly as the legacy paths wrote it.
 pub fn lower_span(span: &Span) -> String {
     let codes = style_codes(&span.style);
-    
+
     let mut out = String::new();
     if let Some(url) = &span.style.hyperlink {
         out.push_str(&format!("\x1b]8;;{}\x1b\\", url));
@@ -73,7 +73,7 @@ pub fn lower_span(span: &Span) -> String {
     if span.style.hyperlink.is_some() {
         out.push_str("\x1b]8;;\x1b\\");
     }
-    
+
     // Fallback if plain (but still check if we added links, in which case it wasn't fully plain)
     if out == span.text {
         span.text.clone()
@@ -106,16 +106,17 @@ pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanC
         }
     } else {
         if let Some(bg) = force_bg {
-            let spans = line.spans.iter().map(|s| {
-                Span::styled(&s.text, s.style.clone().with_bg(bg.clone()))
-            }).collect::<Vec<_>>();
+            let spans = line
+                .spans
+                .iter()
+                .map(|s| Span::styled(&s.text, s.style.clone().with_bg(bg.clone())))
+                .collect::<Vec<_>>();
             lower_spans(&spans)
         } else {
             lower_spans(&line.spans)
         }
     }
 }
-
 
 /// Map a `ColorSpec` (the ColorScheme's serializable colour) to the span
 /// vocabulary's colour, with the same named-colour table the retired
@@ -273,7 +274,10 @@ mod tests {
             Span::styled("⏺", SpanStyle::fg(SpanColor::CYAN)),
             Span::plain(" Generating"),
         ]);
-        assert_eq!(lower_rendered_line(&styled, None), "\x1b[96m⏺\x1b[0m Generating");
+        assert_eq!(
+            lower_rendered_line(&styled, None),
+            "\x1b[96m⏺\x1b[0m Generating"
+        );
     }
 
     /// The selection highlight lowers through the same span path as any
