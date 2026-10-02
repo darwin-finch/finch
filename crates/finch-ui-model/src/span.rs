@@ -13,7 +13,7 @@
 /// `Indexed` is the xterm 16-colour set (0–15, the crossterm table: 0–7 the
 /// normal set, 8–15 the bright set). Render engines lower it to their own
 /// codes; the DOM maps it to CSS colours. `Rgb` carries a truecolour triple.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanColor {
     /// xterm palette index 0–15.
     Indexed(u8),
@@ -76,25 +76,25 @@ impl SpanStyle {
     }
 
     /// Set the foreground colour, keeping the other attributes.
-    pub fn with_fg(mut self, color: SpanColor) -> SpanStyle {
+    pub const fn with_fg(mut self, color: SpanColor) -> SpanStyle {
         self.fg = Some(color);
         self
     }
 
     /// Set the background colour, keeping the other attributes.
-    pub fn with_bg(mut self, color: SpanColor) -> SpanStyle {
+    pub const fn with_bg(mut self, color: SpanColor) -> SpanStyle {
         self.bg = Some(color);
         self
     }
 
     /// Set or clear bold, keeping the other attributes.
-    pub fn with_bold(mut self, bold: bool) -> SpanStyle {
+    pub const fn with_bold(mut self, bold: bool) -> SpanStyle {
         self.bold = bold;
         self
     }
 
     /// Set or clear dim, keeping the other attributes.
-    pub fn with_dim(mut self, dim: bool) -> SpanStyle {
+    pub const fn with_dim(mut self, dim: bool) -> SpanStyle {
         self.dim = dim;
         self
     }
