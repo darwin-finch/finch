@@ -246,7 +246,7 @@ impl ToolViewportState {
         }));
         if truncated {
             windowed.push(RenderedTranscriptLine {
-                text: truncate_body_line(&status_text(scroll, end, body.len()), width),
+                text: truncate_body_line(&format!("      {}", status_text(scroll, end, body.len())), width),
                 body_of: Some(row_id),
                 role: Some(NodeRole::ToolOutput),
                 ..RenderedTranscriptLine::default()
