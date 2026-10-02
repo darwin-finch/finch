@@ -268,33 +268,37 @@ fn exit_with_safe_cli_error(mut error: clap::Error) -> ! {
 enum AuthCommand {
     /// Show local, secret-free authentication status without network access
     Status {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
-    /// Start Finch-native ChatGPT, SuperGrok, or Claude subscription sign-in
+    /// Start Finch-native ChatGPT, SuperGrok, Claude, or Google Gemini subscription sign-in
     ///
     /// Claude subscription sign-in is disabled by default; see
     /// `claude_subscription_oauth_enabled` under `[features]` in config.toml.
     Login {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
-        /// Copy the one-time code to the clipboard (chatgpt/grok-sub device
+        /// Copy the one-time code to the clipboard (chatgpt/grok-sub/gemini device
         /// codes only; has no effect for claude, whose browser flow has no
         /// one-time code to copy)
         #[arg(long)]
@@ -305,26 +309,30 @@ enum AuthCommand {
     },
     /// Revoke a named subscription credential and retain a local tombstone
     Logout {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
     /// Recover an interrupted local mutation as a signed-out tombstone
     Recover {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
@@ -3111,6 +3119,7 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
         "chatgpt" => run_chatgpt_auth(command).await,
         "grok-sub" => run_grok_auth(command).await,
         "claude" => run_claude_auth(command).await,
+        "gemini" | "gemini-sub" => run_gemini_auth(command).await,
         other => anyhow::bail!("unsupported auth provider {other}"),
     }
 }
@@ -3289,6 +3298,54 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
             let config = load_config()?;
             save_grok_named_credential(config, metadata)?;
             println!("Recovered Grok credential {credential} as signed_out; run `finch auth login grok-sub --credential {credential}` to sign in again.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_gemini_auth(command: AuthCommand) -> Result<()> {
+    use finch::cli::{
+        render_gemini_auth_status_line, save_gemini_named_credential, GeminiAuthService,
+        GeminiBrowserLoginPresentation,
+    };
+
+    let service = GeminiAuthService::production()?;
+    match command {
+        AuthCommand::Status { credential, .. } => {
+            let status = service.status(&credential)?;
+            println!("{}", render_gemini_auth_status_line(&status)?);
+        }
+        AuthCommand::Login {
+            credential, open, ..
+        } => {
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    GeminiBrowserLoginPresentation {
+                        open_browser: if open { true } else { true },
+                    },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "Gemini login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Gemini login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout { credential, .. } => {
+            let metadata = service.logout(&credential, command_cancellation()).await?;
+            let config = load_config()?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Gemini credential {credential} was revoked and signed out.");
+        }
+        AuthCommand::Recover { credential, .. } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Recovered Gemini credential {credential} as signed_out; run `finch auth login gemini-sub --credential {credential}` to sign in again.");
         }
     }
     Ok(())
@@ -4223,6 +4280,30 @@ mod tests {
                 }
             }) if provider == "grok-sub" && credential == "grok-sub:default"
         ));
+
+        let gemini_sub = Args::try_parse_from(["finch", "auth", "login", "gemini-sub"]).unwrap();
+        assert!(matches!(
+            gemini_sub.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    ..
+                }
+            }) if provider == "gemini-sub" && credential == "gemini-sub:default"
+        ));
+
+        let gemini = Args::try_parse_from(["finch", "auth", "login", "gemini"]).unwrap();
+        assert!(matches!(
+            gemini.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    ..
+                }
+            }) if provider == "gemini" && credential == "gemini-sub:default"
+        ));
     }
 
     #[test]
@@ -4270,6 +4351,55 @@ mod tests {
             Some(Command::Auth {
                 auth_command: AuthCommand::Recover { credential, .. }
             }) if credential == "claude:work"
+        ));
+    }
+
+    #[test]
+    fn gemini_auth_cli_parses_default_credential_for_every_subcommand() {
+        let login =
+            Args::try_parse_from(["finch", "auth", "login", "gemini-sub", "--open"]).unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    open: true,
+                    ..
+                }
+            }) if provider == "gemini-sub" && credential == "gemini-sub:default"
+        ));
+
+        let status = Args::try_parse_from(["finch", "auth", "status", "gemini"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Status { credential, .. }
+            }) if credential == "gemini-sub:default"
+        ));
+
+        let logout = Args::try_parse_from(["finch", "auth", "logout", "gemini-sub"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Logout { credential, .. }
+            }) if credential == "gemini-sub:default"
+        ));
+
+        let recover = Args::try_parse_from([
+            "finch",
+            "auth",
+            "recover",
+            "gemini",
+            "--credential",
+            "gemini-sub:personal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Recover { credential, .. }
+            }) if credential == "gemini-sub:personal"
         ));
     }
 

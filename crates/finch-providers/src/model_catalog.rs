@@ -116,7 +116,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         // Official Meta Model API overview and model page, reviewed 2026-10-01.
         "meta_model_api" => &["muse-spark-1.3"],
         "grok" | "grok-sub" => &["grok-4.6"],
-        "gemini" => &["gemini-2.5-flash"],
+        "gemini" | "gemini-sub" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
         "groq" => &["openai/gpt-oss-120b"],
         "openrouter" => &["z-ai/glm-5.3-flash"],

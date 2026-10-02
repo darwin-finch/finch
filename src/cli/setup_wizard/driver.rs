@@ -321,6 +321,21 @@ pub(super) fn run_tabbed_wizard(
             None
         }
     };
+    state.gemini_authenticator = match crate::cli::gemini_auth::GeminiAuthService::production() {
+        Ok(service) => {
+            Some(Arc::new(service)
+                as Arc<
+                    dyn crate::cli::gemini_auth::GeminiCredentialAuthenticator,
+                >)
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "Gemini subscription device sign-in is unavailable in setup; the exchange will run when setup is saved"
+            );
+            None
+        }
+    };
 
     let mut host = crate::cli::tui::WizardHost::new();
 
