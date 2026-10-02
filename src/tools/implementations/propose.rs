@@ -1438,7 +1438,11 @@ pub fn build_review_artifact(description: &str, body: &str) -> String {
 pub async fn run_script_async(script: &str) -> Result<String> {
     const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
     let mut command = tokio::process::Command::new("bash");
-    command.arg("-c").arg(script).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    command
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     let output = tokio::time::timeout(SCRIPT_TIMEOUT, command.output())
         .await
         .map_err(|_| anyhow::anyhow!("approved script timed out after 30 seconds"))??;
