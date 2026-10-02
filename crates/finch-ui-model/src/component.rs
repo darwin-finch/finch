@@ -211,6 +211,8 @@ pub struct ComponentStylePalette {
     pub user_background: SpanColor,
     /// Participant background colours (indexed 0..7).
     pub participant_backgrounds: [SpanColor; 8],
+    /// Hover background colour for interactive transcript elements.
+    pub hover_background: SpanColor,
 }
 
 impl Default for ComponentStylePalette {
@@ -229,7 +231,7 @@ impl Default for ComponentStylePalette {
             static_success: SpanStyle::fg(SpanColor::DARK_GREY),
             static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
             user_foreground: SpanColor::CYAN,
-            user_background: SpanColor::Rgb(28, 45, 64),
+            user_background: SpanColor::Rgb(38, 38, 42),
             participant_backgrounds: [
                 SpanColor::Rgb(24, 49, 70),
                 SpanColor::Rgb(27, 55, 42),
@@ -240,6 +242,7 @@ impl Default for ComponentStylePalette {
                 SpanColor::Rgb(54, 52, 27),
                 SpanColor::Rgb(42, 47, 58),
             ],
+            hover_background: SpanColor::Rgb(52, 54, 60),
         }
     }
 }
@@ -609,7 +612,7 @@ mod tests {
         static_success: SpanStyle::fg(SpanColor::DARK_GREY),
         static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
         user_foreground: SpanColor::CYAN,
-        user_background: SpanColor::Rgb(28, 45, 64),
+        user_background: SpanColor::Rgb(38, 38, 42),
         participant_backgrounds: [
             SpanColor::Rgb(24, 49, 70),
             SpanColor::Rgb(27, 55, 42),
@@ -620,6 +623,7 @@ mod tests {
             SpanColor::Rgb(54, 52, 27),
             SpanColor::Rgb(42, 47, 58),
         ],
+        hover_background: SpanColor::Rgb(52, 54, 60),
     };
 
     /// The say component rides the generalized accessor end to end: a say

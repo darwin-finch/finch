@@ -170,6 +170,17 @@ const COMPOSER_CTRL_C: KeyboardShortcut = KeyboardShortcut {
     authority: ShortcutAuthority::ComposerShortcut,
 };
 
+/// Ctrl+Y: copy the most recent assistant response to the system clipboard,
+/// cleaned of prompt glyphs, disclosure markers, and common tabs/indentation (#1557).
+const COMPOSER_COPY_LAST: KeyboardShortcut = KeyboardShortcut {
+    code: KeyCode::Char('y'),
+    requires: KeyModifiers::CONTROL,
+    label: "Ctrl+Y",
+    description: "Copy the last assistant response cleanly",
+    submit: None,
+    authority: ShortcutAuthority::ComposerShortcut,
+};
+
 /// Escape: clear the draft (single press, immediate, unchanged). When it is
 /// already empty, this crate cannot tell "cancel the active query" apart
 /// from "exit Finch" — both are the same idle composer state, and only the
@@ -345,6 +356,7 @@ const COMPOSER_PAGE_DOWN: KeyboardShortcut = KeyboardShortcut {
 /// pinned to their real dispatchers by tests in this module and in `lib.rs`.
 pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
     COMPOSER_CTRL_C,
+    COMPOSER_COPY_LAST,
     COMPOSER_ESCAPE,
     COMPOSER_PASTE_IMAGE,
     COMPOSER_FEEDBACK_GOOD,
@@ -371,7 +383,10 @@ pub const KEYBOARD_SHORTCUTS: &[KeyboardShortcut] = &[
 /// input task's `first_event_modified_input` flag; `submitted_line` carries
 /// the entry's `submit` command for the input task to submit.
 fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Option<String>) {
-    if COMPOSER_CTRL_C.owns(&key) {
+    if COMPOSER_COPY_LAST.owns(&key) {
+        tui.copy_last_response_to_clipboard();
+        (false, None)
+    } else if COMPOSER_CTRL_C.owns(&key) {
         // Ctrl+C: copy the active transcript selection; never touches the
         // draft or the running query (Escape owns both, immediately below).
         // A no-op with nothing selected.
@@ -1163,6 +1178,42 @@ mod tests {
                          the status line, success or failure; status={status:?}"
                     );
                 }
+                ("Ctrl+Y", ShortcutAuthority::ComposerShortcut) => {
+                    covered += 1;
+                    let mut renderer = headless_renderer();
+                    renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("hello");
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(
+                        !modified && submitted.is_none(),
+                        "{why}: Ctrl+Y must never modify or submit the draft"
+                    );
+                    assert_eq!(
+                        renderer.input_textarea.lines(),
+                        ["hello"],
+                        "{why}: Ctrl+Y must never clear the draft"
+                    );
+
+                    // With no assistant response, reports "No assistant response to copy"
+                    let status = renderer.status_text_for_test();
+                    assert!(
+                        status.contains("No assistant response"),
+                        "{why}: with no response, Ctrl+Y must report so; status={status:?}"
+                    );
+
+                    // With an assistant message, attempts copy and reports on status line
+                    let mut renderer = headless_renderer();
+                    use finch_messages::StreamingResponseMessage;
+                    let msg = Arc::new(StreamingResponseMessage::new());
+                    msg.append_chunk("assistant answer");
+                    renderer.output_manager.add_trait_message(msg);
+                    let (modified, submitted) = handle_composer_shortcuts(&mut renderer, event);
+                    assert!(!modified && submitted.is_none());
+                    let status = renderer.status_text_for_test();
+                    assert!(
+                        status.contains("Copied last response") || status.contains("Copy failed"),
+                        "{why}: copying last response must report on status line; status={status:?}"
+                    );
+                }
                 ("Ctrl+V", ShortcutAuthority::ComposerShortcut) => {
                     covered += 1;
                     let mut renderer = headless_renderer();
@@ -1448,6 +1499,7 @@ mod tests {
     fn test_composer_shortcut_guards_match_the_pre_refactor_match_arms() {
         let cases: &[(KeyEvent, &[&str])] = &[
             (ctrl(KeyCode::Char('c')), &["Ctrl+C"]),
+            (ctrl(KeyCode::Char('y')), &["Ctrl+Y"]),
             (key(KeyCode::Char('c')), &[]),
             (ctrl(KeyCode::Char('v')), &["Ctrl+V"]),
             (

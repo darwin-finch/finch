@@ -641,7 +641,10 @@ impl Dialog {
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                if let Some(idx) = options.iter().position(|o| o.label.contains("always allow")) {
+                if let Some(idx) = options
+                    .iter()
+                    .position(|o| o.label.contains("always allow"))
+                {
                     Some(DialogResult::Selected(idx))
                 } else {
                     None

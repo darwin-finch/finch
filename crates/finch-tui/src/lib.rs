@@ -1293,8 +1293,13 @@ pub(crate) fn plan_live_frame(
     // SGR here, at paint. The plain text stays what every measurement reads;
     // span-free lines keep their legacy bytes.
     for line in &viewport_content {
+        let hover_bg = if vm.hovered_row.is_some() && line.row_id.as_ref() == vm.hovered_row {
+            vm.hover_bg.clone()
+        } else {
+            None
+        };
         frame.push(
-            span_render::lower_rendered_line(line, None)
+            span_render::lower_rendered_line(line, hover_bg)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -2253,7 +2258,8 @@ impl TuiRenderer {
                 expanded_lines.as_deref(),
             );
             vm.hovered_row = self.hovered_row.as_ref();
-            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
+            let hover_bg = span_render::component_style_palette(&self.colors).hover_background;
+            vm.hover_bg = Some(hover_bg);
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
@@ -3822,6 +3828,8 @@ impl TuiRenderer {
         let hover_row =
             if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
                 Some(region)
+            } else if let Some(region) = self.accordion.hit_region_at(mouse.column, mouse.row) {
+                Some(region.row_id.clone())
             } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
                 Some(region.row_id.clone())
             } else {
@@ -4437,6 +4445,7 @@ impl TuiRenderer {
             .map(|line| shadow_buffer::physical_rows(&line.text, term_width))
             .sum();
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
+        let hover_bg = span_render::component_style_palette(&self.colors).hover_background;
         let painted_transcript = transcript
             .iter()
             .map(|l| {
@@ -4444,7 +4453,7 @@ impl TuiRenderer {
                     l,
                     if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
                     {
-                        Some(finch_ui_model::SpanColor::DARK_GREY)
+                        Some(hover_bg.clone())
                     } else {
                         None
                     },
@@ -4518,6 +4527,76 @@ impl TuiRenderer {
             }
         }
         true
+    }
+
+    /// Extract the text of the most recent assistant response in the conversation,
+    /// cleaned of prompt glyphs, disclosure markers, and common tabs/indentation.
+    pub(crate) fn last_assistant_response_text(&self) -> Option<String> {
+        let messages = self.output_manager.get_messages();
+        for msg in messages.iter().rev() {
+            // Check if this message is a say turn (migrated component)
+            if let Some(say) = msg.say_turn_view() {
+                if let Some(output) = say.vm.output {
+                    if !output.lines.is_empty() {
+                        let raw = output.lines.join("\n");
+                        let cleaned = selection::clean_copied_text(&raw);
+                        if !cleaned.trim().is_empty() {
+                            return Some(cleaned);
+                        }
+                    }
+                }
+            }
+            if let Some(finch_ui_model::ComponentView::Say(say)) = msg.component_view() {
+                if let Some(output) = say.vm.output {
+                    if !output.lines.is_empty() {
+                        let raw = output.lines.join("\n");
+                        let cleaned = selection::clean_copied_text(&raw);
+                        if !cleaned.trim().is_empty() {
+                            return Some(cleaned);
+                        }
+                    }
+                }
+            }
+            // Skip non-assistant components (UserTurn, StaticText, Progress, LiveTool, etc.)
+            if let Some(view) = msg.component_view() {
+                match view {
+                    finch_ui_model::ComponentView::Say(_) => {}
+                    _ => continue,
+                }
+            }
+            // Fallback to msg.content() for unmigrated streaming responses
+            let content = msg.content();
+            if !content.trim().is_empty() {
+                let cleaned = selection::clean_copied_text(&content);
+                if !cleaned.trim().is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+        None
+    }
+
+    /// Copy the last assistant response to the system clipboard, cleaned of
+    /// prompt markers, bullets, and common indentation (#1557).
+    ///
+    /// Reports success or failure on the status line via [`Self::set_operation_status`].
+    /// Returns whether there was a response to copy.
+    pub(crate) fn copy_last_response_to_clipboard(&mut self) -> bool {
+        let Some(text) = self.last_assistant_response_text() else {
+            self.set_operation_status("No assistant response to copy");
+            return false;
+        };
+        match self.copy_selection_to_clipboard(&text) {
+            Ok(()) => {
+                self.set_operation_status("Copied last response to clipboard");
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%error, "Copy last response failed");
+                self.set_operation_status(format!("Copy failed: {error}"));
+                false
+            }
+        }
     }
 }
 
@@ -15986,5 +16065,46 @@ mod selection_tests {
         let text = selection::selected_text(&renderer.selection_index, released);
         assert_eq!(text, "Grep(Typ");
         assert!(!text.contains(";5;8m") && !text.contains('\x1b'));
+    }
+
+    fn empty_renderer() -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        TuiRenderer::new_headless(Arc::clone(&output), Arc::new(StatusBar::new()), colors)
+    }
+
+    #[test]
+    fn test_copy_last_assistant_response_finds_and_cleans_last_response() {
+        let mut renderer = empty_renderer();
+        // With no messages, returns None
+        assert!(renderer.last_assistant_response_text().is_none());
+        assert!(!renderer.copy_last_response_to_clipboard());
+        assert_eq!(
+            renderer.status_text_for_test(),
+            "No assistant response to copy"
+        );
+
+        // Add a user query, still no assistant response
+        let user = Arc::new(finch_messages::UserQueryMessage::new("user prompt"));
+        renderer.output_manager.add_trait_message(user);
+        assert!(renderer.last_assistant_response_text().is_none());
+
+        // Add an assistant response with leading bullets and tabs
+        let assistant = Arc::new(finch_messages::StreamingResponseMessage::new());
+        assistant.append_chunk("  • item 1\n  • item 2\n    • subitem");
+        renderer.output_manager.add_trait_message(assistant);
+
+        let cleaned = renderer
+            .last_assistant_response_text()
+            .expect("must find assistant response");
+        assert_eq!(cleaned, "item 1\nitem 2\n  subitem");
+
+        // Copy reports success or failure on status line
+        renderer.copy_last_response_to_clipboard();
+        let status = renderer.status_text_for_test();
+        assert!(
+            status.contains("Copied last response") || status.contains("Copy failed"),
+            "status was {status:?}"
+        );
     }
 }

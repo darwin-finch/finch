@@ -53,19 +53,36 @@ impl MouseTracking {
     pub(super) const DEFAULT: Self = Self::Held;
 }
 
-/// Crossterm `EnableMouseCapture` bytes, used to assert their presence.
+/// Terminal escape sequences for any-event mouse tracking (mode 1003).
+/// Crossterm's EnableMouseCapture only enables modes 1000/1002 (button press and
+/// drag movement). Emitting 1003h enables mouse motion events without buttons held,
+/// allowing the TUI to report hover positions for interactive transcript rows.
+const ENABLE_ANY_EVENT_TRACKING: &str = "\x1b[?1003h";
+const DISABLE_ANY_EVENT_TRACKING: &str = "\x1b[?1003l";
+
+/// Crossterm `EnableMouseCapture` and any-event hover bytes, used to assert their presence.
 #[cfg(test)]
 pub(super) fn enable_mouse_capture_bytes() -> Vec<u8> {
     let mut out = Vec::new();
-    execute!(&mut out, EnableMouseCapture).expect("encode EnableMouseCapture");
+    execute!(
+        &mut out,
+        EnableMouseCapture,
+        Print(ENABLE_ANY_EVENT_TRACKING)
+    )
+    .expect("encode EnableMouseCapture");
     out
 }
 
-/// Crossterm `DisableMouseCapture` bytes, used to assert restore symmetry.
+/// Crossterm `DisableMouseCapture` and hover restore bytes, used to assert restore symmetry.
 #[cfg(test)]
 pub(super) fn disable_mouse_capture_bytes() -> Vec<u8> {
     let mut out = Vec::new();
-    execute!(&mut out, DisableMouseCapture).expect("encode DisableMouseCapture");
+    execute!(
+        &mut out,
+        Print(DISABLE_ANY_EVENT_TRACKING),
+        DisableMouseCapture
+    )
+    .expect("encode DisableMouseCapture");
     out
 }
 
@@ -93,7 +110,12 @@ pub(super) fn contains_disable_mouse_capture(bytes: &[u8]) -> bool {
 /// hitboxes (#806); the wheel scrolls the conversation, never native history.
 pub(super) fn write_startup_terminal_modes(out: &mut impl Write) -> io::Result<()> {
     // Bracketed paste cannot corrupt the terminal on unclean exit.
-    let _ = execute!(out, EnableBracketedPaste, EnableMouseCapture);
+    let _ = execute!(
+        out,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+        Print(ENABLE_ANY_EVENT_TRACKING),
+    );
     let _ = execute!(
         out,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -103,7 +125,7 @@ pub(super) fn write_startup_terminal_modes(out: &mut impl Write) -> io::Result<(
 
 fn write_enable_if_held(out: &mut impl Write, tracking: MouseTracking) {
     if tracking == MouseTracking::Held {
-        let _ = execute!(out, EnableMouseCapture);
+        let _ = execute!(out, EnableMouseCapture, Print(ENABLE_ANY_EVENT_TRACKING));
     }
 }
 
@@ -138,6 +160,7 @@ pub(super) fn write_shutdown_terminal_modes(out: &mut impl Write) -> io::Result<
     execute!(
         out,
         PopKeyboardEnhancementFlags,
+        Print(DISABLE_ANY_EVENT_TRACKING),
         DisableMouseCapture,
         DisableBracketedPaste,
         cursor::Show,
@@ -146,13 +169,14 @@ pub(super) fn write_shutdown_terminal_modes(out: &mut impl Write) -> io::Result<
 }
 
 pub(super) fn write_suspend_terminal_modes(out: &mut impl Write) -> io::Result<()> {
-    execute!(out, DisableMouseCapture)
+    execute!(out, Print(DISABLE_ANY_EVENT_TRACKING), DisableMouseCapture)
 }
 
 pub(super) fn write_emergency_restore_modes(out: &mut impl Write) -> io::Result<()> {
     execute!(
         out,
         LeaveAlternateScreen,
+        Print(DISABLE_ANY_EVENT_TRACKING),
         DisableMouseCapture,
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
@@ -163,7 +187,12 @@ pub(super) fn write_emergency_restore_modes(out: &mut impl Write) -> io::Result<
 }
 
 pub(super) fn write_panic_restore_modes(out: &mut impl Write) -> io::Result<()> {
-    execute!(out, DisableMouseCapture, PopKeyboardEnhancementFlags,)
+    execute!(
+        out,
+        Print(DISABLE_ANY_EVENT_TRACKING),
+        DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
+    )
 }
 
 pub(super) fn is_wheel(kind: MouseEventKind) -> bool {

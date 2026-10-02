@@ -231,6 +231,11 @@ impl Default for ColorScheme {
 }
 
 impl ColorScheme {
+    /// Returns true if this color scheme represents a dark terminal palette.
+    pub fn is_dark(&self) -> bool {
+        color_luminance(&self.messages.assistant) >= 0.5
+    }
+
     /// Return a subtle, contrast-safe full-row style for a transcript role.
     /// A light assistant foreground indicates a dark terminal palette (and
     /// vice versa), so custom schemes need no second theme discriminator.
@@ -256,10 +261,10 @@ impl ColorScheme {
             (42, 47, 58),
         ];
 
-        let dark_terminal = color_luminance(&self.messages.assistant) >= 0.5;
+        let dark_terminal = self.is_dark();
         let (foreground, background) = if dark_terminal {
             let background = match band {
-                MessageBand::LocalUser => (28, 45, 64),
+                MessageBand::LocalUser => (38, 38, 42),
                 MessageBand::Participant(index) => {
                     DARK_PARTICIPANTS[index % DARK_PARTICIPANTS.len()]
                 }
@@ -271,7 +276,7 @@ impl ColorScheme {
             (Color::Rgb(245, 247, 250), background)
         } else {
             let background = match band {
-                MessageBand::LocalUser => (226, 238, 255),
+                MessageBand::LocalUser => (238, 238, 242),
                 MessageBand::Participant(index) => {
                     LIGHT_PARTICIPANTS[index % LIGHT_PARTICIPANTS.len()]
                 }
