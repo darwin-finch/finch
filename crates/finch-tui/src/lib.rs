@@ -220,8 +220,8 @@ pub use dom_manifest::{
 pub use wizard_host::{
     lower_wizard_line, lower_wizard_span, plan_wizard_frame, wizard_bold, wizard_boxed,
     wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_plain,
-    wizard_selected, wizard_visible_length, wizard_wrap, WizardCard, WizardColor, WizardFrame,
-    WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
+    wizard_selected, wizard_url, wizard_visible_length, wizard_wrap, WizardCard, WizardColor,
+    WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
@@ -3447,7 +3447,7 @@ impl TuiRenderer {
                 .iter()
                 .map(|line| shadow_buffer::physical_rows(&line.text, width))
                 .sum();
-            
+
             let to_chop = skipped.saturating_sub(omitted_rows);
             if to_chop > 0 {
                 if let Some(last) = source.last_mut() {
@@ -8087,11 +8087,17 @@ mod tests {
         // Pass the key to the expanded tool handler directly, as it normally
         // gets routed there by the main event loop when the view is open.
         let handled = renderer.handle_expanded_tool_key(space_key);
-        assert!(handled, "Space key must be consumed by the expanded tool view");
+        assert!(
+            handled,
+            "Space key must be consumed by the expanded tool view"
+        );
 
         // The viewport must scroll
         let view = renderer.expanded_tool.as_ref().unwrap();
-        assert!(view.scroll > 0, "Space key must page down the expanded tool view");
+        assert!(
+            view.scroll > 0,
+            "Space key must page down the expanded tool view"
+        );
 
         renderer.is_active = false;
     }

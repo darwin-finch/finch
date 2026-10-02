@@ -19,7 +19,8 @@ use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
     wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_plain,
-    wizard_selected, wizard_wrap, WizardCard, WizardLine, WizardSectionContent, WizardView,
+    wizard_selected, wizard_url, wizard_wrap, WizardCard, WizardLine, WizardSectionContent,
+    WizardView,
 };
 
 // ─── Small shared helpers ────────────────────────────────────────────────────
@@ -89,7 +90,7 @@ pub(super) fn format_catalog_label(
         CatalogSource::Discovered => "provider discovery".to_string(),
         CatalogSource::Cache => "local cache".to_string(),
         CatalogSource::StaticFallback => format!(
-            "bundled fallback snapshot (as of {}; incomplete)",
+            "built-in list (as of {}; incomplete)",
             STATIC_FALLBACK_AS_OF
         ),
     };
@@ -100,7 +101,7 @@ pub(super) fn format_catalog_label(
             .map(|refreshed| format!(" · {}", format_catalog_refresh_time(refreshed, now)))
             .unwrap_or_default()
     };
-    format!("Models: {source}{refreshed} · Ctrl+R refresh · model ID remains editable")
+    format!("Models: {source}{refreshed} · Ctrl+R refresh · model name remains editable")
 }
 
 /// Skip the first `skip` wrapped rows of `lines`, by whole logical lines.
@@ -271,16 +272,16 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
 
     let checkbox = if use_neural_embeddings { "☑" } else { "☐" };
     let item = wizard_selected(format!(
-        ">>> {checkbox} Memory embeddings: use the neural model <<<"
+        ">>> {checkbox} Smart memory: enable enhanced search <<<"
     ));
     lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
 
-    const ON_DETAIL: &str = "On: bge-small-en-v1.5 (GGUF, via llama.cpp), downloaded once on \
-         first use, then runs locally with no further network calls. Better \
-         recall quality than the fallback below.";
+    const ON_DETAIL: &str = "On: Downloaded once on first use, then runs locally on your computer \
+         with no further internet access needed. Understands related concepts \
+         and finds past context more accurately.";
     const OFF_DETAIL: &str =
-        "Off: built-in hashed n-gram embeddings. No download, no network access, \
-         ever -- at lower recall quality than the neural model.";
+        "Off: Uses basic keyword matching. No download and no internet access \
+         required, but search results may be less accurate.";
     let detail = if use_neural_embeddings {
         ON_DETAIL
     } else {
@@ -407,7 +408,8 @@ fn models_section_lines(
     const GEMINI_SUB_DETAIL: &str = "Gemini subscription uses Google Gemini via device sign-in; AI Studio API keys are a separate provider and are never used automatically.";
     const GROK_SUB_DETAIL: &str = "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically.";
     const CHATGPT_DETAIL: &str = "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate.";
-    const NO_KEY_DETAIL: &str = "Paste your API key below (E), or add a provider with A.\n\
+    const NO_KEY_DETAIL: &str =
+        "Press Enter or E to Paste your API key, or add a provider with A.\n\
          No key yet? Get one at console.anthropic.com/keys";
     let has_key_detail = format!(
         "Primary provider configured. Press A to add more providers ({} total).",
@@ -710,7 +712,7 @@ fn feature_toggle_states(
             ("Skip permission prompts", auto_approve),
             ("Debug logging", debug),
             ("GUI automation", gui_automation),
-            ("Daemon-only mode", daemon_only_mode),
+            ("Background mode only", daemon_only_mode),
             ("Advertise on network", mdns_discovery),
             ("Discover peers on LAN", auto_discover),
         ]
@@ -721,7 +723,7 @@ fn feature_toggle_states(
             ("Live responses", streaming),
             ("Skip permission prompts", auto_approve),
             ("Debug logging", debug),
-            ("Daemon-only mode", daemon_only_mode),
+            ("Background mode only", daemon_only_mode),
             ("Advertise on network", mdns_discovery),
             ("Discover peers on LAN", auto_discover),
         ]
@@ -871,9 +873,9 @@ fn features_section_content(
     let descriptions: [&str; 7] = [
         "See Finch's answer as it types, word by word",
         "Let Finch run tools without asking each time",
-        "Write verbose logs to ~/.finch/debug.log",
+        "Write detailed diagnostic logs to help troubleshoot issues",
         &gui_automation_description,
-        "Run as background server, no interactive REPL",
+        "Run silently in the background without opening the chat window",
         "Broadcast this Finch instance via mDNS so others can discover it",
         "Find and connect to other Finch instances at startup",
     ];
@@ -881,8 +883,8 @@ fn features_section_content(
     let descriptions: [&str; 6] = [
         "See Finch's answer as it types, word by word",
         "Let Finch run tools without asking each time",
-        "Write verbose logs to ~/.finch/debug.log",
-        "Run as background server, no interactive REPL",
+        "Write detailed diagnostic logs to help troubleshoot issues",
+        "Run silently in the background without opening the chat window",
         "Broadcast this Finch instance via mDNS so others can discover it",
         "Find and connect to other Finch instances at startup",
     ];
@@ -908,17 +910,20 @@ fn features_section_content(
             ("    ", "")
         };
         let line = if editing_hf_token {
-            format!("{prefix}HF Token: {hf_token}{suffix}")
+            format!("{prefix}Community model token: {hf_token}{suffix}")
         } else if hf_token.is_empty() {
-            format!("{prefix}HF Token: [not set — press E to enter]{suffix}")
+            format!("{prefix}Community model token: [not set — press E to enter]{suffix}")
         } else {
-            format!("{prefix}HF Token: {}{suffix}", mask_secret(hf_token, 4, 4))
+            format!(
+                "{prefix}Community model token: {}{suffix}",
+                mask_secret(hf_token, 4, 4)
+            )
         };
         if selected {
             vec![
                 wizard_selected(&line),
                 wizard_line(
-                    "        For model downloads from HuggingFace",
+                    "        Optional access token for downloading community models",
                     Color::DarkGray,
                 ),
             ]
@@ -926,7 +931,7 @@ fn features_section_content(
             vec![
                 wizard_line(&line, Color::Cyan),
                 wizard_line(
-                    "        For model downloads from HuggingFace",
+                    "        Optional access token for downloading community models",
                     Color::DarkGray,
                 ),
             ]
@@ -1136,7 +1141,7 @@ fn features_section_content(
         ));
     }
     let instructions_text = if editing_hf_token {
-        "Type HuggingFace token | Enter/Esc: Done"
+        "Type model download token | Enter/Esc: Done"
     } else if editing_finch_api_key {
         "Type Finch client key | Enter/Esc: Done"
     } else {
@@ -1280,16 +1285,11 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
 }
 
 pub(super) fn validation_error_card(error: &str) -> WizardCard {
+    let clean_error = finch_ui_model::strip_ansi(error);
     WizardCard {
         title: "Validation Error".to_string(),
-        body: vec![
-            wizard_plain(error),
-            WizardLine::blank(),
-        ],
-        controls: Some(wizard_line(
-            "Enter / Esc: Back to setup",
-            Color::Yellow,
-        )),
+        body: vec![wizard_plain(&clean_error), WizardLine::blank()],
+        controls: Some(wizard_line("Enter / Esc: Back to setup", Color::Yellow)),
         accent: Color::Red,
     }
 }
@@ -1373,10 +1373,11 @@ fn device_auth_card(
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
-                body.push(wizard_plain(&format!(
-                    "Open: {}",
-                    presentation.verification_uri
-                )));
+                body.push(wizard_url(
+                    &format!("Open: {}", presentation.verification_uri),
+                    &presentation.verification_uri,
+                    Some(Color::Cyan),
+                ));
                 if !presentation.user_code.is_empty() {
                     body.push(wizard_line(
                         &format!("One-time code: {}", presentation.user_code),
@@ -1396,7 +1397,10 @@ fn device_auth_card(
                         "Complete sign-in in your browser; this dialog finishes automatically.",
                     ));
                 }
-                controls = wizard_line("Esc: Cancel", Color::Yellow);
+                controls = wizard_line(
+                    "O / Enter / Click: Open in browser | Esc: Cancel",
+                    Color::Yellow,
+                );
             }
             None => {
                 body.push(wizard_plain("Starting the device sign-in…"));

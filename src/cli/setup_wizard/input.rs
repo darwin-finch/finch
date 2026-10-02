@@ -962,6 +962,15 @@ pub(super) fn handle_models_input(
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
+                    if let Some(AddProviderStep::DeviceAuth { pending, .. }) =
+                        adding_provider.as_ref()
+                    {
+                        if c == 'o' || c == 'O' {
+                            if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                open_browser_silently(&presentation.verification_uri);
+                            }
+                        }
+                    }
                     if let Some(AddProviderStep::ConfigureCompatibleConnection {
                         draft,
                         focused_field,
@@ -1639,17 +1648,22 @@ pub(super) fn handle_models_input(
                                         cancel: retry_cancel,
                                     })
                                 }
-                                // Still running: ignore Enter.
-                                None => Some(AddProviderStep::DeviceAuth {
-                                    provider_idx,
-                                    name,
-                                    model,
-                                    reference,
-                                    editing_idx,
-                                    pending,
-                                    outcome,
-                                    cancel,
-                                }),
+                                // Still running: attempt to open the URL in the browser on Enter.
+                                None => {
+                                    if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                        open_browser_silently(&presentation.verification_uri);
+                                    }
+                                    Some(AddProviderStep::DeviceAuth {
+                                        provider_idx,
+                                        name,
+                                        model,
+                                        reference,
+                                        editing_idx,
+                                        pending,
+                                        outcome,
+                                        cancel,
+                                    })
+                                }
                             }
                         }
                         // ── single-screen local dialog — confirm ─────────────────────
@@ -2030,7 +2044,16 @@ pub(super) fn handle_models_input(
                             } else {
                                 None
                             },
-                            focused_field: 1,
+                            focused_field: if (matches!(
+                                key.code,
+                                KeyCode::Char('e') | KeyCode::Char('E')
+                            ) || api_key.is_empty())
+                                && provider_requires_inline_api_key(provider)
+                            {
+                                3
+                            } else {
+                                1
+                            },
                             editing_idx: Some(*selected_idx),
                         });
                     } else if let Some(ModelConfig::Local {
@@ -2674,4 +2697,24 @@ pub(super) fn handle_review_input(
         }
         _ => Ok(false),
     }
+}
+
+pub(super) fn open_browser_silently(url: &str) {
+    #[cfg(test)]
+    {
+        let _ = url; // used
+        return;
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    let _ = std::process::Command::new("open")
+        .arg("--")
+        .arg(url)
+        .status();
+    #[cfg(all(not(test), target_os = "linux"))]
+    let _ = std::process::Command::new("xdg-open").arg(url).status();
+    #[cfg(all(not(test), target_os = "windows"))]
+    let _ = std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status();
 }

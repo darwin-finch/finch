@@ -543,7 +543,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
         terminal
             .rows()
             .iter()
-            .any(|row| row.contains("recall quality than the fallback below.")),
+            .any(|row| row.contains("concepts and finds past context more accurately.")),
         "sanity check: the ON description's second wrapped row must actually \
          reach the terminal before the toggle flips, or this test proves \
          nothing; screen:\n{}",
@@ -566,7 +566,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
     assert!(
         screen
             .iter()
-            .any(|row| row.contains("Off: built-in hashed n-gram embeddings")),
+            .any(|row| row.contains("Off: Uses basic keyword matching")),
         "the OFF description must reach the terminal after the toggle; \
          screen:\n{}",
         screen.join("\n")
@@ -574,7 +574,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
     assert!(
         !screen
             .iter()
-            .any(|row| row.contains("recall quality than the fallback below.")),
+            .any(|row| row.contains("concepts and finds past context more accurately.")),
         "REGRESSION (#1297): the ON description's stale second wrapped row \
          must not survive after toggling to the shorter OFF description; \
          full screen contents:\n{}",
@@ -2797,10 +2797,12 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         misleading_runtime_time,
     );
 
-    assert!(label.contains("bundled fallback snapshot"), "{label}");
+    assert!(label.contains("built-in list"), "{label}");
     assert!(label.contains(STATIC_FALLBACK_AS_OF), "{label}");
     assert!(label.contains("incomplete"), "{label}");
-    assert!(label.contains("model ID remains editable"), "{label}");
+    assert!(label.contains("model name remains editable"), "{label}");
+    assert!(!label.contains("bundled fallback snapshot"), "{label}");
+    assert!(!label.contains("model ID"), "{label}");
     assert!(!label.contains("provider discovery"), "{label}");
     assert!(!label.contains("local cache"), "{label}");
     assert!(!label.contains("UTC"), "{label}");
@@ -2831,9 +2833,13 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         180,
         50,
     );
-    assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+    assert!(rendered.contains("built-in list"), "{rendered}");
     assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
+    assert!(
+        !rendered.contains("bundled fallback snapshot"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("provider discovery"), "{rendered}");
     assert!(!rendered.contains("local cache"), "{rendered}");
     assert!(!rendered.contains("UTC"), "{rendered}");
@@ -3034,7 +3040,7 @@ fn failed_refresh_with_static_fallback_renders_snapshot_warning_and_preserves_ma
         }) if error == "fake provider unavailable"
     ));
     let rendered = render_wizard_text(&state);
-    assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+    assert!(rendered.contains("built-in list"), "{rendered}");
     assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
     assert!(
@@ -8396,16 +8402,54 @@ fn test_local_helpers_memory_checkbox_carries_selection_contrast() {
     state.current_section = WizardSection::LocalHelpers;
     let bytes = wizard_frame_bytes(&state, 100, 30);
     assert!(
-        bytes.contains("Memory embeddings: use the neural model"),
+        bytes.contains("Smart memory: enable enhanced search"),
         "the checkbox text itself must be present in the rendered frame: {bytes:?}"
     );
-    let active_run = "\x1b[1;97;40m>>> ☑ Memory embeddings: use the neural model <<<";
+    let active_run = "\x1b[1;97;40m>>> ☑ Smart memory: enable enhanced search <<<";
     assert!(
         bytes.contains(active_run),
         "the memory-embeddings checkbox must paint bold bright-white on \
          black (the #1140 selection style), not a bare foreground colour \
          invisible on a light terminal; frame: {bytes:?}"
     );
+}
+
+#[test]
+fn test_local_helpers_screen_avoids_technical_jargon() {
+    let state = WizardState::new(None);
+    let view_on = wizard_view_with_permission_target(&state, "", 100, 30);
+    let frame_on = crate::cli::tui::plan_wizard_frame(&view_on, 100, 30)
+        .lines
+        .join("\n");
+
+    let mut state_off = WizardState::new(None);
+    if let Some(SectionState::LocalHelpers {
+        use_neural_embeddings,
+    }) = state_off.sections.get_mut(&WizardSection::LocalHelpers)
+    {
+        *use_neural_embeddings = false;
+    }
+    let view_off = wizard_view_with_permission_target(&state_off, "", 100, 30);
+    let frame_off = crate::cli::tui::plan_wizard_frame(&view_off, 100, 30)
+        .lines
+        .join("\n");
+
+    for frame in [&frame_on, &frame_off] {
+        assert!(
+            !frame.contains("embeddings"),
+            "must avoid 'embeddings': {frame}"
+        );
+        assert!(
+            !frame.contains("neural model"),
+            "must avoid 'neural model': {frame}"
+        );
+        assert!(!frame.contains("GGUF"), "must avoid 'GGUF': {frame}");
+        assert!(
+            !frame.contains("llama.cpp"),
+            "must avoid 'llama.cpp': {frame}"
+        );
+        assert!(!frame.contains("n-gram"), "must avoid 'n-gram': {frame}");
+    }
 }
 
 /// REGRESSION (#1140, tab highlight): the `selected_tab` prop decides which
@@ -8698,10 +8742,9 @@ fn test_wizard_checkboxes_use_one_glyph_convention_across_tabs() {
 fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
     let mut state = WizardState::new(None);
     // Set an invalid cloud provider (OpenAI with empty key)
-    if let Some(SectionState::Models {
-        primary_model,
-        ..
-    }) = state.sections.get_mut(&WizardSection::Models) {
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
         *primary_model = ModelConfig::Remote {
             provider: "openai".into(),
             name: "openai".into(),
@@ -8714,7 +8757,7 @@ fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
 
     // Try to save
     let result = handle_save_action(&mut state).unwrap();
-    
+
     // It should return None because validation failed, and set the error
     assert!(result.is_none());
     assert!(state.save_error.is_some());
@@ -8732,4 +8775,172 @@ fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
     let action_dismiss = handle_wizard_key(&mut state, enter_event).unwrap();
     assert_eq!(action_dismiss, WizardAction::Continue);
     assert!(state.save_error.is_none());
+}
+
+#[test]
+fn test_o_key_on_device_dialog_does_not_panic() {
+    let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
+    let mut state = state_with_step(device_auth_step(outcome));
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_mut() {
+            *pending.lock().unwrap() = Some(DeviceAuthPresentation {
+                verification_uri: "https://auth.openai.com/activate".into(),
+                user_code: "CODE-1234".into(),
+                expires_in: std::time::Duration::from_secs(600),
+            });
+        }
+    }
+
+    // Pressing 'o' or 'O' must not panic and must be handled.
+    handle_models_input(&mut state, key(KeyCode::Char('o'))).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Char('O'))).unwrap();
+    // Pressing Enter must not panic and must be handled.
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+}
+
+#[test]
+fn test_pressing_e_or_enter_on_unconfigured_provider_focuses_api_key_field() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+
+    // Press 'E' on the default unconfigured provider
+    handle_models_input(&mut state, key(KeyCode::Char('E'))).unwrap();
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
+    {
+        match adding_provider {
+            Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                assert_eq!(
+                    *focused_field, 3,
+                    "pressing 'E' must focus the API Key field (field 3)"
+                );
+            }
+            other => panic!("expected ConfigureRemote step, got {other:?}"),
+        }
+    } else {
+        panic!("missing Models section state");
+    }
+
+    // Dismiss overlay
+    handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
+
+    // Press Enter on the unconfigured provider
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
+    {
+        match adding_provider {
+            Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                assert_eq!(
+                    *focused_field, 3,
+                    "pressing Enter on empty key must focus API Key field (field 3)"
+                );
+            }
+            other => panic!("expected ConfigureRemote step, got {other:?}"),
+        }
+    } else {
+        panic!("missing Models section state");
+    }
+}
+
+#[test]
+fn test_settings_screen_avoids_technical_jargon() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Features;
+    let view = wizard_view_with_permission_target(&state, "", 160, 40);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, 160, 40)
+        .lines
+        .join("\n");
+
+    assert!(
+        !frame.contains("debug.log"),
+        "must avoid 'debug.log': {frame}"
+    );
+    assert!(
+        !frame.contains("HuggingFace"),
+        "must avoid 'HuggingFace': {frame}"
+    );
+    assert!(
+        !frame.contains("Daemon-only"),
+        "must avoid 'Daemon-only': {frame}"
+    );
+    assert!(!frame.contains("REPL"), "must avoid 'REPL': {frame}");
+}
+
+#[test]
+fn test_device_dialog_advertises_browser_open_controls() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+        verification_uri: "https://auth.openai.com/activate".into(),
+        user_code: "CODE-1234".into(),
+        expires_in: Duration::from_secs(600),
+    })));
+    let outcome = Arc::new(Mutex::new(None));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = Some(AddProviderStep::DeviceAuth {
+            provider_idx: 0,
+            name: "test".into(),
+            model: "test-model".into(),
+            reference: "test:ref".into(),
+            editing_idx: None,
+            pending,
+            outcome,
+            cancel,
+        });
+    }
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("O / Enter / Click: Open in browser | Esc: Cancel"),
+        "the dialog must advertise browser open and cancellation keys; rendered={rendered}"
+    );
+}
+
+#[test]
+fn test_wizard_mouse_click_handles_device_auth_url() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+        verification_uri: "https://example.com/oauth".into(),
+        user_code: "123".into(),
+        expires_in: Duration::from_secs(300),
+    })));
+    let outcome = Arc::new(Mutex::new(None));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = Some(AddProviderStep::DeviceAuth {
+            provider_idx: 0,
+            name: "test".into(),
+            model: "test-model".into(),
+            reference: "test:ref".into(),
+            editing_idx: None,
+            pending,
+            outcome,
+            cancel,
+        });
+    }
+
+    let mouse_down = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 5,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+    handle_wizard_mouse(&mut state, mouse_down);
 }

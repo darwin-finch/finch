@@ -93,6 +93,7 @@ impl EventHandler {
             ReplEvent::VmApprovalNeeded { .. } => {}
             ReplEvent::TypedProgramComplete { .. } => {}
             ReplEvent::StreamingComplete { .. } => {}
+            ReplEvent::QueryContextInvalidated { .. } => {}
             ReplEvent::CancelQuery => {}
             ReplEvent::Shutdown => {}
             ReplEvent::ShowDialog { .. } => {}

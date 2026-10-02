@@ -74,6 +74,7 @@ pub struct WizardSpan {
     pub bg: Option<WizardColor>,
     pub bold: bool,
     pub dim: bool,
+    pub osc8_url: Option<String>,
 }
 
 impl WizardSpan {
@@ -85,6 +86,7 @@ impl WizardSpan {
             bg: None,
             bold: false,
             dim: false,
+            osc8_url: None,
         }
     }
 
@@ -96,6 +98,7 @@ impl WizardSpan {
             bg: None,
             bold,
             dim: false,
+            osc8_url: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl WizardSpan {
             bg: Some(bg),
             bold: true,
             dim: false,
+            osc8_url: None,
         }
     }
 }
@@ -383,11 +387,19 @@ fn span_sgr_codes(span: &WizardSpan) -> String {
 /// escape codes; view builders construct spans, never bytes.
 pub fn lower_wizard_span(span: &WizardSpan) -> String {
     let codes = span_sgr_codes(span);
-    if codes.is_empty() {
-        span.text.clone()
-    } else {
-        format!("\x1b[{codes}m{}{WIZ_RESET}", span.text)
+    let mut out = String::new();
+    if let Some(url) = &span.osc8_url {
+        out.push_str(&format!("\x1b]8;;{}\x1b\\", url));
     }
+    if codes.is_empty() {
+        out.push_str(&span.text);
+    } else {
+        out.push_str(&format!("\x1b[{codes}m{}{WIZ_RESET}", span.text));
+    }
+    if span.osc8_url.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
+    out
 }
 
 /// Lower one logical line to its painted bytes.
@@ -430,6 +442,18 @@ pub fn wizard_line(text: &str, fg: WizardColor) -> WizardLine {
 /// A coloured, bold wizard span.
 pub fn wizard_bold(text: &str, fg: WizardColor) -> WizardLine {
     WizardLine::bold(text, fg)
+}
+
+/// A wizard URL span (OSC 8 link).
+pub fn wizard_url(text: &str, url: &str, fg: Option<WizardColor>) -> WizardLine {
+    WizardLine(vec![WizardSpan {
+        text: text.into(),
+        fg,
+        bg: None,
+        bold: false,
+        dim: false,
+        osc8_url: Some(url.into()),
+    }])
 }
 
 /// A plain wizard span.
@@ -557,7 +581,7 @@ fn wizard_word_width(word: &str) -> usize {
 }
 
 fn same_style(a: &WizardSpan, b: &WizardSpan) -> bool {
-    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.dim == b.dim
+    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.dim == b.dim && a.osc8_url == b.osc8_url
 }
 
 /// Append one character to the line, merging with the previous span when the
@@ -571,6 +595,7 @@ fn append_char(current: &mut Vec<WizardSpan>, style_of: &WizardSpan, ch: char) {
             bg: style_of.bg,
             bold: style_of.bold,
             dim: style_of.dim,
+            osc8_url: style_of.osc8_url.clone(),
         }),
     }
 }
@@ -865,7 +890,7 @@ fn wizard_welcome_banner(width: usize) -> Vec<String> {
     wizard_boxed(
         "Welcome to Finch",
         &[wizard_plain(
-            "Finch is an AI assistant that helps you build and change your software projects directly on your computer.",
+            "Finch is an AI assistant that helps you get work done, answer questions, and solve problems directly on your computer.",
         )],
         WizardColor::Cyan,
         width,
@@ -2132,6 +2157,10 @@ mod tests {
             "the welcome banner text must be rendered"
         );
         assert!(
+            !rows.iter().any(|row| row.contains("software projects")),
+            "the welcome banner must not contain 'software projects' jargon"
+        );
+        assert!(
             frame.rects.tab_row.y >= frame.rects.banner.height,
             "the tab row must be pushed below the banner"
         );
@@ -2162,5 +2191,44 @@ mod test_wizard {
         let wrapped = wizard_wrap(&line, len);
         
         panic!("len = {}, wrapped len = {}. wrapped[0] text: {:?}", len, wrapped.len(), wrapped[0].plain_text());
+mod osc8_tests {
+    use super::*;
+
+    #[test]
+    fn test_wizard_url_renders_osc8() {
+        let span = WizardSpan {
+            text: "Click me".to_string(),
+            fg: None,
+            bg: None,
+            bold: false,
+            dim: false,
+            osc8_url: Some("https://example.com".to_string()),
+        };
+        let lowered = lower_wizard_span(&span);
+        assert!(lowered.contains("\x1b]8;;https://example.com\x1b\\"));
+        assert!(lowered.contains("Click me"));
+        assert!(lowered.ends_with("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn test_card_with_ansi_text_maintains_straight_borders() {
+        let card = WizardCard::new(
+            "Validation Error",
+            vec![
+                wizard_plain("\x1b[33m\x1b[1mPossible causes:\x1b[0m empty API key"),
+                wizard_plain("Plain line without any escape codes"),
+            ],
+            Some(wizard_line("Enter / Esc: Back", WizardColor::Yellow)),
+        );
+        let lines = card.chrome_lines(80);
+        for line in &lines {
+            assert_eq!(
+                line.display_length(),
+                80,
+                "boxed line has visible length {} != 80: {:?}",
+                line.display_length(),
+                line.plain_text()
+            );
+        }
     }
 }
