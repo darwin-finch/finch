@@ -1038,17 +1038,49 @@ mod tests {
             &key_pair,
             json!(XAI_PUBLIC_CLIENT_ID),
             None,
-            "acct-work",
+            "subject-A",
             3600,
-            None,
+            Some("acct-work"),
         );
-        let substituted_identity = signed_token_fixture(
+        let substituted_subject_identity = signed_token_fixture(
             &key_pair,
             json!(XAI_PUBLIC_CLIENT_ID),
             None,
-            "acct-other",
+            "subject-B",
             3600,
+            Some("acct-work"),
+        );
+        let substituted_signed_access = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
             None,
+            "subject-B",
+            120,
+            Some("acct-work"),
+        );
+        let different_account_identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "subject-A",
+            3600,
+            Some("acct-other"),
+        );
+        let valid_new_identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "subject-A",
+            3600,
+            Some("acct-work"),
+        );
+        let valid_signed_access = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "subject-A",
+            120,
+            Some("acct-work"),
         );
         let (origin, server) = verification_server(jwk).await;
         let verifier = Arc::new(
@@ -1085,6 +1117,7 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(initial.account, "acct-work");
         let retained_identity = initial.id_token.clone();
         let before = Utc::now();
         let refreshed = dialect
@@ -1117,12 +1150,60 @@ mod tests {
             refreshed.expires_at
         );
 
-        let substitution = dialect
+        // GSK-05 regression 1: same-account, substituted-subject new-ID/opaque-access refresh must be rejected.
+        let subject_substitution = dialect
             .validate_token_response(
                 StatusCode::OK,
                 &serde_json::to_vec(&json!({
                     "access_token": "substituted-opaque-access",
-                    "id_token": substituted_identity,
+                    "id_token": substituted_subject_identity,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("refresh must reject same-account subject substitution in new ID token");
+        assert!(matches!(
+            subject_substitution.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::AccountEntitlement)
+        ));
+        assert!(
+            !format!("{subject_substitution:#}").contains("substituted-opaque-access"),
+            "refresh identity diagnostics must remain secret-free: {subject_substitution:#}"
+        );
+
+        // GSK-05 regression 2: same-account, substituted-subject signed-access refresh shape must be rejected.
+        let signed_access_substitution = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": substituted_signed_access,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err(
+                "refresh must reject same-account subject substitution in signed access token",
+            );
+        assert!(matches!(
+            signed_access_substitution.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::AccountEntitlement)
+        ));
+
+        // Different account must also be rejected.
+        let different_account = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "different-account-access",
+                    "id_token": different_account_identity,
                     "expires_in": 120,
                 }))
                 .unwrap(),
@@ -1132,15 +1213,75 @@ mod tests {
             )
             .await
             .expect_err("refresh must reject a newly asserted different account identity");
-        server.abort();
         assert!(matches!(
-            substitution.downcast_ref::<GrokAuthStageError>(),
+            different_account.downcast_ref::<GrokAuthStageError>(),
             Some(GrokAuthStageError::AccountEntitlement)
         ));
-        assert!(
-            !format!("{substitution:#}").contains("substituted-opaque-access"),
-            "refresh identity diagnostics must remain secret-free: {substitution:#}"
+
+        // Unprovable prior subject lineage must fail closed for identity-bearing refresh.
+        let mut unprovable_previous = initial.clone();
+        unprovable_previous.id_token = None;
+        unprovable_previous.access_token = "purely-opaque-access".into();
+        let unprovable_refresh = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "refreshed-opaque-access",
+                    "id_token": valid_new_identity,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&unprovable_previous),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("refresh must fail closed when prior record cannot prove subject lineage");
+        assert!(matches!(
+            unprovable_refresh.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::AccountEntitlement)
+        ));
+
+        // Valid refresh with matching subject and account must succeed.
+        let matching_new_id = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "matching-opaque-access",
+                    "id_token": valid_new_identity,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("refresh must accept matching subject and account");
+        assert_eq!(matching_new_id.account, initial.account);
+        assert_eq!(
+            matching_new_id.id_token.as_deref(),
+            Some(valid_new_identity.as_str())
         );
+
+        // Valid refresh with matching signed access token must succeed.
+        let matching_signed = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": valid_signed_access,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("refresh must accept matching signed access token");
+        assert_eq!(matching_signed.account, initial.account);
+
+        server.abort();
     }
 
     #[tokio::test]

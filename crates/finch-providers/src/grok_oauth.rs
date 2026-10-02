@@ -470,7 +470,26 @@ where
                 .await
                 .map_err(preserve_or_mark_verifier_stage)?;
             validate_verified_claims(&claims, &self.descriptor, context, now)?;
-            if let Some(previous) = previous {
+            if matches!(context, TokenValidationContext::Refresh) {
+                let previous = previous.ok_or(GrokAuthStageError::ClientBinding)?;
+                validate_refresh_lineage(previous, &self.descriptor)?;
+                if previous.account != claims.account_id {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+                let previous_has_signed_identity =
+                    previous.id_token.is_some() || is_compact_jws_candidate(&previous.access_token);
+                if !previous_has_signed_identity {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+                let previous_claims = self
+                    .verifier
+                    .verify(previous.id_token.as_deref(), &previous.access_token, cancel)
+                    .await
+                    .map_err(preserve_or_mark_verifier_stage)?;
+                if previous_claims.subject != claims.subject {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+            } else if let Some(previous) = previous {
                 if previous.account != claims.account_id {
                     return Err(GrokAuthStageError::AccountEntitlement.into());
                 }
