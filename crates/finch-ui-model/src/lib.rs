@@ -22,7 +22,7 @@ mod work_unit;
 pub use component::{
     component_lines, ComponentStylePalette, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
-    StaticTextView,
+    StaticTextView, UserTurnView,
 };
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
