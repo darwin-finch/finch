@@ -57,7 +57,10 @@ impl crate::tools::types::LiveOutputSink for RedactingLiveOutput {
             finch_vm::HostSideEffect::Emit { text } => {
                 *text = redact_text(text.clone(), &self.patterns);
             }
-            finch_vm::HostSideEffect::Ui { text: Some(ui_text), .. } => {
+            finch_vm::HostSideEffect::Ui {
+                text: Some(ui_text),
+                ..
+            } => {
                 *ui_text = redact_text(ui_text.clone(), &self.patterns);
             }
             _ => {}
@@ -70,7 +73,10 @@ impl crate::tools::types::LiveOutputSink for RedactingLiveOutput {
             finch_vm::HostSideEffect::Emit { text } => {
                 *text = redact_text(text.clone(), &self.patterns);
             }
-            finch_vm::HostSideEffect::Ui { text: Some(ui_text), .. } => {
+            finch_vm::HostSideEffect::Ui {
+                text: Some(ui_text),
+                ..
+            } => {
                 *ui_text = redact_text(ui_text.clone(), &self.patterns);
             }
             _ => {}
@@ -82,7 +88,6 @@ impl crate::tools::types::LiveOutputSink for RedactingLiveOutput {
         self.inner.defer_program_effects()
     }
 }
-
 
 // ─── Co-Forth trace helpers ───────────────────────────────────────────────────
 
@@ -542,7 +547,6 @@ impl ToolExecutor {
     {
         info!("Executing tool: {}", tool_use.name);
 
-
         let patterns = sensitive_env_values();
         let live_output = live_output.map(|inner| {
             Arc::new(RedactingLiveOutput {
@@ -674,10 +678,7 @@ impl ToolExecutor {
                 let err_msg = format!("Execution error: {}", e);
                 let redacted_err = redact_text(err_msg, &patterns);
                 error!("Tool execution failed: {}", redacted_err);
-                Ok(ToolResult::error(
-                    tool_use.id.clone(),
-                    redacted_err,
-                ))
+                Ok(ToolResult::error(tool_use.id.clone(), redacted_err))
             }
         }
     }
@@ -1109,7 +1110,6 @@ mod tests {
             Some(30)
         );
     }
-
 
     #[tokio::test]
     async fn test_execute_tool_redacts_sensitive_env_vars_in_output() {
