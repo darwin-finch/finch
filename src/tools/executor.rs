@@ -1068,6 +1068,9 @@ mod tests {
 
         async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
             if self.should_fail {
+                if let Some(err_msg) = input.get("error").and_then(|e| e.as_str()) {
+                    anyhow::bail!("{}", err_msg);
+                }
                 anyhow::bail!("Mock failure");
             }
             Ok(format!("Mock result: {}", input))
@@ -1140,7 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_tool_redacts_sensitive_env_vars_in_error_message() {
-        let executor = create_test_executor(true, false);
+        let executor = create_test_executor(true, true);
         std::env::set_var("MOCK_API_KEY", "sensitive-secret-token");
         let tool_use = ToolUse {
             id: "test-redact-2".to_string(),
