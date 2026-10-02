@@ -396,7 +396,7 @@ pub(super) fn handle_wizard_mouse(state: &mut WizardState, mouse: crossterm::eve
         mouse.kind,
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
     ) {
-        if let Some(WizardSectionState::Models {
+        if let Some(SectionState::Models {
             adding_provider, ..
         }) = state.sections.get_mut(&WizardSection::Models)
         {

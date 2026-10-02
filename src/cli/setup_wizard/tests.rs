@@ -8885,7 +8885,7 @@ fn test_device_dialog_advertises_browser_open_controls() {
     let outcome = Arc::new(Mutex::new(None));
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    if let Some(WizardSectionState::Models {
+    if let Some(SectionState::Models {
         adding_provider, ..
     }) = state.sections.get_mut(&WizardSection::Models)
     {
@@ -8920,7 +8920,7 @@ fn test_wizard_mouse_click_handles_device_auth_url() {
     let outcome = Arc::new(Mutex::new(None));
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    if let Some(WizardSectionState::Models {
+    if let Some(SectionState::Models {
         adding_provider, ..
     }) = state.sections.get_mut(&WizardSection::Models)
     {
