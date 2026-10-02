@@ -13,7 +13,7 @@
 /// `Indexed` is the xterm 16-colour set (0–15, the crossterm table: 0–7 the
 /// normal set, 8–15 the bright set). Render engines lower it to their own
 /// codes; the DOM maps it to CSS colours. `Rgb` carries a truecolour triple.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SpanColor {
     /// xterm palette index 0–15.
     Indexed(u8),
@@ -42,7 +42,7 @@ impl SpanColor {
 
 /// The style of one [`Span`]: optional colours plus modifiers. A plain
 /// (default) style carries no colour and no modifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct SpanStyle {
     pub fg: Option<SpanColor>,
     pub bg: Option<SpanColor>,
@@ -50,6 +50,8 @@ pub struct SpanStyle {
     /// SGR 2 dim — the faded modifier the retired `format()` paths used for
     /// running ellipses and summaries.
     pub dim: bool,
+    /// Target URL for terminal hyperlinks (OSC 8).
+    pub hyperlink: Option<String>,
 }
 
 impl SpanStyle {
@@ -59,6 +61,7 @@ impl SpanStyle {
         bg: None,
         bold: false,
         dim: false,
+        hyperlink: None,
     };
 
     /// Foreground colour only.
@@ -68,43 +71,50 @@ impl SpanStyle {
             bg: None,
             bold: false,
             dim: false,
+            hyperlink: None,
         }
     }
 
     /// Set the foreground colour, keeping the other attributes.
-    pub const fn with_fg(mut self, color: SpanColor) -> SpanStyle {
+    pub fn with_fg(mut self, color: SpanColor) -> SpanStyle {
         self.fg = Some(color);
         self
     }
 
     /// Set the background colour, keeping the other attributes.
-    pub const fn with_bg(mut self, color: SpanColor) -> SpanStyle {
+    pub fn with_bg(mut self, color: SpanColor) -> SpanStyle {
         self.bg = Some(color);
         self
     }
 
     /// Set or clear bold, keeping the other attributes.
-    pub const fn with_bold(mut self, bold: bool) -> SpanStyle {
+    pub fn with_bold(mut self, bold: bool) -> SpanStyle {
         self.bold = bold;
         self
     }
 
     /// Set or clear dim, keeping the other attributes.
-    pub const fn with_dim(mut self, dim: bool) -> SpanStyle {
+    pub fn with_dim(mut self, dim: bool) -> SpanStyle {
         self.dim = dim;
         self
     }
 
+    /// Set the hyperlink, keeping the other attributes.
+    pub fn with_hyperlink(mut self, url: impl Into<String>) -> SpanStyle {
+        self.hyperlink = Some(url.into());
+        self
+    }
+
     /// True when the style changes nothing about how text renders.
-    pub const fn is_plain(&self) -> bool {
-        self.fg.is_none() && self.bg.is_none() && !self.bold && !self.dim
+    pub fn is_plain(&self) -> bool {
+        self.fg.is_none() && self.bg.is_none() && !self.bold && !self.dim && self.hyperlink.is_none()
     }
 }
 
 /// One (text, style) segment of a rendered line. Adjacent plain-text
 /// neighbours stay separate spans; render engines may merge for paint
 /// efficiency but must not change the visible text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Span {
     pub text: String,
     pub style: SpanStyle,
@@ -182,6 +192,7 @@ mod tests {
                 bg: Some(SpanColor::BLACK),
                 bold: true,
                 dim: false,
+                hyperlink: None,
             },
             "fg + bold + bg must compose; got {style:?}"
         );

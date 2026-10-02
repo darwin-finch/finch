@@ -383,6 +383,7 @@ impl BackgroundTaskManager {
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(command)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // Bounded-lifecycle safety net: if the manager drops without

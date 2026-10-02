@@ -7,7 +7,7 @@
 use crate::{markdown, MessageId, NodeRole, RowId};
 
 /// Status of a retained application message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageStatus {
     InProgress,
     Complete,
@@ -15,7 +15,7 @@ pub enum MessageStatus {
 }
 
 /// How one WorkUnit is presented in the transcript.
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub enum WorkUnitPresentation {
     #[default]
     Assistant,
@@ -34,7 +34,7 @@ pub enum WorkUnitPresentation {
 }
 
 /// Status of an individual tool or activity row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum WorkRowStatus {
     Running,
     Complete(String),
@@ -42,14 +42,14 @@ pub enum WorkRowStatus {
 }
 
 /// Whether a row is a model tool call or internal lifecycle activity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkRowPresentation {
     Tool,
     Activity,
 }
 
 /// Lightweight snapshot for consumers that classify or filter WorkUnits.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct WorkUnitHead {
     pub message_id: MessageId,
     pub status: MessageStatus,
@@ -79,7 +79,7 @@ impl WorkUnitHead {
 }
 
 /// One tool or activity row, with diffs already rendered to display lines.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct WorkRowView {
     pub label: String,
     pub status: WorkRowStatus,
@@ -99,7 +99,7 @@ impl WorkRowView {
 }
 
 /// One child-agent lifecycle row.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct AgentActivityView {
     pub owner_row: Option<usize>,
     pub agent_id: uuid::Uuid,
@@ -111,14 +111,14 @@ pub struct AgentActivityView {
 }
 
 /// One tool run inside an agent lifecycle row.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct AgentToolView {
     pub name: String,
     pub status: WorkRowStatus,
 }
 
 /// Full blit-time domain snapshot of one WorkUnit run.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct WorkUnitView {
     pub head: WorkUnitHead,
     pub verb: String,
@@ -127,7 +127,7 @@ pub struct WorkUnitView {
 }
 
 /// Widget props for one transcript row, projected from domain data.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TranscriptNode {
     pub id: RowId,
     pub role: NodeRole,

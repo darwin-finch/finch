@@ -66,6 +66,7 @@ impl Tool for BashTool {
         command
             .arg("-c")
             .arg(&script)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // The outer coordinator deliberately does not time the editor

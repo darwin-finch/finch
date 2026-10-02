@@ -22,7 +22,7 @@ mod work_unit;
 pub use component::{
     component_lines, ComponentStylePalette, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
-    StaticTextView,
+    StaticTextView, UserTurnView,
 };
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
@@ -35,7 +35,7 @@ pub use work_unit::{
 };
 
 /// Stable identity for one retained application message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageId(Uuid);
 
 impl MessageId {
@@ -66,7 +66,7 @@ impl fmt::Display for MessageId {
 ///
 /// `path` is append-only semantic ancestry (unit, call index, input/output),
 /// so streamed appends and terminal reflow never change an existing row's key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowId {
     pub message_id: MessageId,
     pub path: Vec<u32>,
@@ -75,7 +75,7 @@ pub struct RowId {
 /// Renderer-facing role of one transcript node. The ViewModel derives it from
 /// domain data at projection time; the renderer uses it to route disclosure,
 /// focus, and bounded tool viewports — never as a widget kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Response,
     Activity,
@@ -96,7 +96,7 @@ pub enum NodeRole {
 /// and `spans` carries the styling the render modes lower. An empty `spans`
 /// means the plain `text` is the whole story, which keeps the legacy
 /// projection paths byte-identical.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {
     pub text: String,
     /// The styled segments of the line when it carries styling; empty for
@@ -351,7 +351,7 @@ pub fn input_line_physical_rows_with_ghost(
 
 /// A rectangle in the live frame's own coordinate space (row 0 is the top of
 /// the live area, column 0 the left terminal edge).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
     pub x: usize,
     pub y: usize,
@@ -382,7 +382,7 @@ impl Rect {
 /// `Side` exist for width-conditional and capped tracks the GUI roots
 /// (#809/#810) and the layout-boundary tests construct.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum Track {
     /// The child's natural content extent, clamped to the space left. Natural
     /// tracks claim after flexible floors, from the end of the stack inward,
@@ -406,7 +406,7 @@ pub enum Track {
 /// side by side; they do not flatten to lines. The TUI root is a `Column`
 /// today; `Row` is what a GUI host and the layout-boundary tests construct.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
     Column,
     Row,
@@ -449,7 +449,7 @@ pub enum Widget {
 }
 
 /// One laid-out node, in depth-first paint order.
-#[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct NodeLayout {
     /// Key from the enclosing [`Widget::Marked`], if any.
     pub key: Option<u16>,
@@ -461,7 +461,7 @@ pub struct NodeLayout {
 }
 
 /// The result of one claiming pass.
-#[derive(Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct Layout {
     pub nodes: Vec<NodeLayout>,
 }

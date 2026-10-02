@@ -15,8 +15,8 @@ pub use finch_ui_model::{
     AgentActivityView, AgentToolView, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, MessageId, MessageStatus, OperationRowView, OperationView, OutputVm,
     ProgramSourceVm, ProgressView, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
-    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
-    WorkUnitView, WorkUnitViewModel,
+    UserTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
+    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
 mod concrete;

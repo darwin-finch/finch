@@ -8,7 +8,7 @@ use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
 use finch_ui_model::{
     LiveToolView, MemoryRecallRowView, MemoryRecalledView, OperationRowView, OperationView,
-    ProgressView, StaticTextKind, StaticTextView, WorkRowStatus,
+    ProgressView, StaticTextKind, StaticTextView, UserTurnView, WorkRowStatus,
 };
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -82,13 +82,27 @@ impl Message for UserQueryMessage {
         self.id
     }
 
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::UserTurn(UserTurnView {
+            marker: '❯',
+            subject: None,
+            content_lines: self.content.lines().map(str::to_owned).collect(),
+            participant_index: None,
+        }))
+    }
+
     fn format(&self, colors: &ColorScheme) -> String {
-        format!(
-            "{} ❯ {}{}",
-            color_to_ansi(&colors.messages.user),
-            self.content,
-            RESET
-        )
+        let user_color = color_to_ansi(&colors.messages.user);
+        let lines: Vec<&str> = self.content.lines().collect();
+        if lines.is_empty() {
+            return format!("{user_color} ❯ {RESET}");
+        }
+        let mut out = Vec::with_capacity(lines.len());
+        out.push(format!("{user_color} ❯ {}{RESET}", lines[0]));
+        for line in &lines[1..] {
+            out.push(format!("{user_color}{line}{RESET}"));
+        }
+        out.join("\n")
     }
 
     fn status(&self) -> MessageStatus {
@@ -154,15 +168,32 @@ impl Message for BrainParticipantMessage {
         self.id
     }
 
+    fn component_view(&self) -> Option<ComponentView> {
+        let marker = if self.invokes_model { '❯' } else { '◆' };
+        Some(ComponentView::UserTurn(UserTurnView {
+            marker,
+            subject: Some(self.subject.clone()),
+            content_lines: self.content.lines().map(str::to_owned).collect(),
+            participant_index: Some(self.palette_index()),
+        }))
+    }
+
     fn format(&self, colors: &ColorScheme) -> String {
         let marker = if self.invokes_model { '❯' } else { '◆' };
-        format!(
-            "{} {marker} {}: {}{}",
-            color_to_ansi(&colors.messages.user),
-            self.subject,
-            self.content,
-            RESET
-        )
+        let user_color = color_to_ansi(&colors.messages.user);
+        let lines: Vec<&str> = self.content.lines().collect();
+        if lines.is_empty() {
+            return format!("{user_color} {marker} {}: {RESET}", self.subject);
+        }
+        let mut out = Vec::with_capacity(lines.len());
+        out.push(format!(
+            "{user_color} {marker} {}: {}{RESET}",
+            self.subject, lines[0]
+        ));
+        for line in &lines[1..] {
+            out.push(format!("{user_color}{line}{RESET}"));
+        }
+        out.join("\n")
     }
 
     fn status(&self) -> MessageStatus {
@@ -1423,6 +1454,62 @@ mod tests {
             BrainParticipantMessage::new("bob@box", "hello", false).background_style(&colors)
         );
         assert_eq!(prompt.content(), "alice@box: please inspect");
+    }
+
+    #[test]
+    fn test_user_query_message_multiline_format_and_component_view() {
+        let colors = finch_theme::ColorScheme::default();
+        let user = UserQueryMessage::new("first line\nsecond line\nthird line");
+
+        let user_color = color_to_ansi(&colors.messages.user);
+        let formatted = user.format(&colors);
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], format!("{user_color} ❯ first line{RESET}"));
+        assert_eq!(lines[1], format!("{user_color}second line{RESET}"));
+        assert_eq!(lines[2], format!("{user_color}third line{RESET}"));
+
+        let component = user
+            .component_view()
+            .expect("user query has component view");
+        let ComponentView::UserTurn(view) = component else {
+            panic!("expected UserTurn variant");
+        };
+        assert_eq!(view.marker, '❯');
+        assert_eq!(view.subject, None);
+        assert_eq!(
+            view.content_lines,
+            vec!["first line", "second line", "third line"]
+        );
+        assert_eq!(view.participant_index, None);
+    }
+
+    #[test]
+    fn test_brain_participant_message_multiline_format_and_component_view() {
+        let colors = finch_theme::ColorScheme::default();
+        let participant =
+            BrainParticipantMessage::new("alice@box", "first line\nsecond line", true);
+
+        let user_color = color_to_ansi(&colors.messages.user);
+        let formatted = participant.format(&colors);
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            format!("{user_color} ❯ alice@box: first line{RESET}")
+        );
+        assert_eq!(lines[1], format!("{user_color}second line{RESET}"));
+
+        let component = participant
+            .component_view()
+            .expect("brain participant has component view");
+        let ComponentView::UserTurn(view) = component else {
+            panic!("expected UserTurn variant");
+        };
+        assert_eq!(view.marker, '❯');
+        assert_eq!(view.subject, Some("alice@box".into()));
+        assert_eq!(view.content_lines, vec!["first line", "second line"]);
+        assert!(view.participant_index.is_some());
     }
 
     #[test]
