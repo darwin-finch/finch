@@ -349,6 +349,7 @@ impl GrokTokenVerifier for GrokJwksVerifier {
                 .verify_compact(access_token, cancel)
                 .await
                 .map_err(mark_identity_error)?;
+            validate_client_binding(&claims, &self.client_id)?;
             if claims.subject != identity.subject {
                 return Err(GrokAuthStageError::IdentitySignature.into());
             }
@@ -374,15 +375,15 @@ impl GrokTokenVerifier for GrokJwksVerifier {
         }
         let principal_type = authority.principal_type.clone();
         Ok(VerifiedGrokClaims {
-            issuer: identity.issuer,
-            audiences: identity.audiences,
-            authorized_party: identity.authorized_party,
-            subject: identity.subject,
+            issuer: authority.issuer.clone(),
+            audiences: authority.audiences.clone(),
+            authorized_party: authority.authorized_party.clone(),
+            subject: identity.subject.clone(),
             account_id,
             principal_type,
-            nonce: identity.nonce,
-            expires_at: identity.expires_at,
-            not_before: identity.not_before,
+            nonce: identity.nonce.clone(),
+            expires_at: authority.expires_at,
+            not_before: authority.not_before,
         })
     }
 }
@@ -691,11 +692,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grok_oauth::XaiGrokOAuthDialect;
+    use crate::oauth::{OAuthDialect, TokenValidationContext};
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     use serde_json::json;
 
-    fn signed_identity_fixture() -> (String, Value) {
+    fn signing_fixture() -> (EcdsaKeyPair, Value) {
         let rng = SystemRandom::new();
         let key_document =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
@@ -720,36 +723,63 @@ mod tests {
             "x": URL_SAFE_NO_PAD.encode(&public_key[1..33]),
             "y": URL_SAFE_NO_PAD.encode(&public_key[33..65]),
         });
+        (key_pair, jwk)
+    }
+
+    fn signed_token_fixture(
+        key_pair: &EcdsaKeyPair,
+        audience: Value,
+        authorized_party: Option<&str>,
+        subject: &str,
+        expires_in_seconds: i64,
+        principal_id: Option<&str>,
+    ) -> String {
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({"alg":"ES256", "kid":"fixture-key", "typ":"JWT"})).unwrap(),
         );
         let now = Utc::now().timestamp();
-        let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&json!({
-                "iss": GROK_REQUIRED_TOKEN_ISSUER,
-                "aud": XAI_PUBLIC_CLIENT_ID,
-                "sub": "acct-work",
-                "iat": now,
-                "exp": now + 3600,
-            }))
-            .unwrap(),
-        );
+        let mut claims = json!({
+            "iss": GROK_REQUIRED_TOKEN_ISSUER,
+            "aud": audience,
+            "sub": subject,
+            "iat": now,
+            "exp": now + expires_in_seconds,
+        });
+        if let Some(authorized_party) = authorized_party {
+            claims["azp"] = Value::String(authorized_party.into());
+        }
+        if let Some(principal_id) = principal_id {
+            claims["principal_id"] = Value::String(principal_id.into());
+        }
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         let signing_input = format!("{header}.{claims}");
-        let signature = key_pair.sign(&rng, signing_input.as_bytes()).unwrap();
+        let signature = key_pair
+            .sign(&SystemRandom::new(), signing_input.as_bytes())
+            .unwrap();
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    fn signed_identity_fixture() -> (String, Value) {
+        let (key_pair, jwk) = signing_fixture();
         (
-            format!(
-                "{signing_input}.{}",
-                URL_SAFE_NO_PAD.encode(signature.as_ref())
+            signed_token_fixture(
+                &key_pair,
+                json!(XAI_PUBLIC_CLIENT_ID),
+                None,
+                "acct-work",
+                3600,
+                None,
             ),
             jwk,
         )
     }
 
-    #[tokio::test]
-    async fn signed_identity_token_authorizes_opaque_access_token_without_trusting_access_bytes() {
+    async fn verification_server(jwk: Value) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let (identity_token, jwk) = signed_identity_fixture();
         let discovery = Arc::new(json!({
             "issuer": GROK_REQUIRED_TOKEN_ISSUER,
             "jwks_uri": format!("{origin}{JWKS_PATH}"),
@@ -777,6 +807,13 @@ mod tests {
                 }),
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (origin, server)
+    }
+
+    #[tokio::test]
+    async fn signed_identity_token_authorizes_opaque_access_token_without_trusting_access_bytes() {
+        let (identity_token, jwk) = signed_identity_fixture();
+        let (origin, server) = verification_server(jwk).await;
         let verifier = GrokJwksVerifier::new(
             &origin,
             GROK_REQUIRED_TOKEN_ISSUER,
@@ -801,6 +838,220 @@ mod tests {
         assert_eq!(
             verified.audiences,
             BTreeSet::from([XAI_PUBLIC_CLIENT_ID.into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_access_token_requires_its_own_client_binding_and_subject_match() {
+        let (key_pair, jwk) = signing_fixture();
+        let identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            3600,
+            None,
+        );
+        let wrong_client_access = signed_token_fixture(
+            &key_pair,
+            json!("another-client"),
+            None,
+            "acct-work",
+            900,
+            Some("wrong-client-account"),
+        );
+        let wrong_subject_access = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "another-subject",
+            900,
+            None,
+        );
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let wrong_client = verifier
+            .verify(
+                Some(&identity),
+                &wrong_client_access,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a signed access bearer for another client must fail closed");
+        assert!(matches!(
+            wrong_client.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::ClientBinding)
+        ));
+
+        let wrong_subject = verifier
+            .verify(
+                Some(&identity),
+                &wrong_subject_access,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("signed identity and access tokens must name the same subject");
+        server.abort();
+        assert!(matches!(
+            wrong_subject.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::IdentitySignature)
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_access_token_bounds_account_and_expiry_to_bearer_authority() {
+        let (key_pair, jwk) = signing_fixture();
+        let identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            3600,
+            Some("identity-account"),
+        );
+        let access = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            300,
+            Some("access-account"),
+        );
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let before = Utc::now();
+        let verified = verifier
+            .verify(Some(&identity), &access, &CancellationToken::new())
+            .await
+            .expect("a correctly bound signed access bearer must verify");
+        server.abort();
+
+        assert_eq!(
+            verified.account_id, "access-account",
+            "stored account authority must come from the independently bound access bearer"
+        );
+        assert!(
+            verified.expires_at <= before + TimeDelta::seconds(301),
+            "stored lifetime must not outlive the shorter signed access bearer: {}",
+            verified.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn dialect_preserves_real_verifier_client_binding_stage_without_secret_copy() {
+        let (key_pair, jwk) = signing_fixture();
+        let identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            3600,
+            None,
+        );
+        let access = signed_token_fixture(
+            &key_pair,
+            json!("wrong-client"),
+            None,
+            "acct-work",
+            300,
+            None,
+        );
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let dialect = XaiGrokOAuthDialect::for_test(&origin, Arc::new(verifier)).unwrap();
+        let marker = "refresh-secret-stage-sentinel";
+        let body = serde_json::to_vec(&json!({
+            "access_token": access,
+            "id_token": identity,
+            "refresh_token": marker,
+        }))
+        .unwrap();
+
+        let error = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &body,
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("wrong-client signed access must retain its verifier stage");
+        server.abort();
+
+        assert!(matches!(
+            error.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::ClientBinding)
+        ));
+        assert!(
+            !format!("{error:#}").contains(marker),
+            "client-binding diagnostics must not reflect token response secrets: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialect_preserves_real_jwks_transport_stage_without_secret_copy() {
+        let (identity, jwk) = signed_identity_fixture();
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = GrokJwksVerifier::new(
+            &origin,
+            GROK_REQUIRED_TOKEN_ISSUER,
+            XAI_PUBLIC_CLIENT_ID,
+            true,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let dialect = XaiGrokOAuthDialect::for_test(&origin, Arc::new(verifier)).unwrap();
+        server.abort();
+        let _ = server.await;
+        let marker = "opaque-access-stage-sentinel";
+        let body = serde_json::to_vec(&json!({
+            "access_token": marker,
+            "id_token": identity,
+        }))
+        .unwrap();
+
+        let error = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &body,
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("unavailable pinned JWKS authority must retain its verifier stage");
+
+        assert!(matches!(
+            error.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::JwksTransport)
+        ));
+        assert!(
+            !format!("{error:#}").contains(marker),
+            "JWKS diagnostics must not reflect access bearer bytes: {error:#}"
         );
     }
 

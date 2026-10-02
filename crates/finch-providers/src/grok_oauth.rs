@@ -456,7 +456,7 @@ where
             .verifier
             .verify(id_token.as_deref(), &access_token, cancel)
             .await
-            .context(GrokAuthStageError::IdentityVerification)?;
+            .map_err(preserve_or_mark_verifier_stage)?;
         let now = Utc::now();
         if claims.issuer != GROK_REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
@@ -535,6 +535,18 @@ where
             serde_json::from_slice(body).context(GrokAuthStageError::TokenExchangeContract)?;
         self.validate_tokens(status, body, previous, context, cancel)
             .await
+    }
+}
+
+fn preserve_or_mark_verifier_stage(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
+        .is_some()
+        || error.downcast_ref::<GrokAuthStageError>().is_some()
+    {
+        error
+    } else {
+        error.context(GrokAuthStageError::IdentityVerification)
     }
 }
 
