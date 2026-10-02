@@ -716,7 +716,7 @@ impl WizardCard {
         if clipped > 0 {
             lines.push(self.boxed_fragment(
                 width,
-                &wizard_plain(&format!("… {clipped} more lines — grow the terminal")),
+                &wizard_plain(&format!("… {clipped} more lines — resize window")),
             ));
         }
         for fragment in &controls_fragment {
