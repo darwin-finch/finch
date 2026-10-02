@@ -633,6 +633,27 @@ impl Dialog {
                     None
                 }
             }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(idx) = options.iter().position(|o| o.label.ends_with(" Yes")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if let Some(idx) = options.iter().position(|o| o.label.contains("always allow")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(idx) = options.iter().position(|o| o.label.ends_with(" No")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
             KeyCode::Enter => {
                 // Defensive guard: only emit Selected for real option indices.
                 // The "Other" row intercept in handle_key_event fires before we
@@ -1064,6 +1085,52 @@ mod tests {
         // Press '2' for second option
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
         assert_eq!(result, Some(DialogResult::Selected(1)));
+    }
+
+    #[test]
+    fn test_tool_approval_shortcuts() {
+        // Non-mutating tool (e.g. Read)
+        // 0: "1. Yes"
+        // 1: "2. Yes, and don't ask again for: Read:*"
+        // 2: "3. Yes, and always allow Read:*"
+        // 3: "4. No"
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y'))),
+            Some(DialogResult::Selected(0))
+        );
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a'))),
+            Some(DialogResult::Selected(2))
+        );
+        let mut dialog = Dialog::tool_approval("Read", "read file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('n'))),
+            Some(DialogResult::Selected(3))
+        );
+
+        // Mutating tool (e.g. Write)
+        // 0: "1. Yes"
+        // 1: "2. Edit in $EDITOR"
+        // 2: "3. Yes, and don't ask again for: Write:*"
+        // 3: "4. Yes, and always allow Write:*"
+        // 4: "5. No"
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y'))),
+            Some(DialogResult::Selected(0))
+        );
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a'))),
+            Some(DialogResult::Selected(3))
+        );
+        let mut dialog = Dialog::tool_approval("Write", "write file");
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char('n'))),
+            Some(DialogResult::Selected(4))
+        );
     }
 
     #[test]
