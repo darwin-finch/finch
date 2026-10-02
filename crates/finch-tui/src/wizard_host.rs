@@ -828,7 +828,7 @@ fn wizard_welcome_banner(width: usize) -> Vec<String> {
     wizard_boxed(
         "Welcome to Finch",
         &[wizard_plain(
-            "Finch is an AI coding assistant that helps you write code, run commands, and build software directly in your terminal.",
+            "Finch is an AI assistant that helps you build and change your software projects directly on your computer.",
         )],
         WizardColor::Cyan,
         width,
