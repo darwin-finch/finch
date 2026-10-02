@@ -1995,7 +1995,7 @@ mod tests {
         let lease = store
             .acquire_runner_lease(NAME, "runner", store.environment().generation, None, 60_000)
             .unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registration = server.brain_runners().register(NAME, lease.lease_id, tx);
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_dropped = Arc::clone(&dropped);
