@@ -657,13 +657,13 @@ impl ToolExecutor {
         match tool.execute(tool_use.input.clone(), &context).await {
             Ok(mut output) => {
                 info!("Tool executed successfully");
-                output = redact_text(output, &patterns);
                 self.maybe_annotate_post_edit_diagnostics(
                     tool.name(),
                     &tool_use.input,
                     &mut output,
                 )
                 .await;
+                output = redact_text(output, &patterns);
                 // Auto-push a node into the poset so the execution trace
                 // becomes the Co-Forth vocabulary.
                 self.poset_record_tool(&tool_use.name, &tool_use.input)
@@ -671,10 +671,12 @@ impl ToolExecutor {
                 Ok(ToolResult::success(tool_use.id.clone(), output))
             }
             Err(e) => {
-                error!("Tool execution failed: {}", e);
+                let err_msg = format!("Execution error: {}", e);
+                let redacted_err = redact_text(err_msg, &patterns);
+                error!("Tool execution failed: {}", redacted_err);
                 Ok(ToolResult::error(
                     tool_use.id.clone(),
-                    format!("Execution error: {}", e),
+                    redacted_err,
                 ))
             }
         }
@@ -1136,6 +1138,35 @@ mod tests {
         assert!(!result.content.contains("sensitive-secret-token"));
     }
 
+    #[tokio::test]
+    async fn test_execute_tool_redacts_sensitive_env_vars_in_error_message() {
+        let executor = create_test_executor(true, false);
+        std::env::set_var("MOCK_API_KEY", "sensitive-secret-token");
+        let tool_use = ToolUse {
+            id: "test-redact-2".to_string(),
+            name: "mock".to_string(),
+            input: serde_json::json!({
+                "error": "Error: leaked sensitive-secret-token"
+            }),
+        };
+
+        let result = executor
+            .execute_tool(
+                &tool_use,
+                None::<fn() -> Result<()>>,
+                None, // repl_mode
+                None, // plan_content
+                None, // live_output
+                None, // effect_audit
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_use_id, tool_use.id);
+        assert!(result.is_error);
+        assert!(result.content.contains("[REDACTED]"));
+        assert!(!result.content.contains("sensitive-secret-token"));
+    }
     #[tokio::test]
     async fn test_execute_tool_success() {
         let executor = create_test_executor(true, false);
