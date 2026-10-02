@@ -39,11 +39,22 @@ silently does something Claude Code doesn't, without explaining why. When filing
 Code (or another mainstream agent CLI) does differently, so a reviewer can tell "objectively
 broken" from "deliberate, undocumented divergence."
 
+#### Scenarios (Daily Dev & Self-Hosting Code Navigation)
+- **Scenario D1 (Tree-sitter Code Inspection)**: Launch Finch in `~/repos/finch`. Run `code_outline` on `crates/finch-tui/src/scroll_view.rs` and `src/tools/implementations/code_outline.rs`. Verify that structural nodes (functions, structs, traits, impls) are returned deterministically and rendered cleanly without clipping.
+- **Scenario D2 (Symbol Definition & References with `code_hop`)**: Ask Finch to find where `ScrollView` or `ToolViewport` is defined and all places it is referenced across crates. Verify Tree-sitter symbol hops resolve accurately to exact line spans.
+- **Scenario D3 (Muscle-Memory Interrupts & Stream Cancellation)**: Start a long explanation or code generation and press `Ctrl+C` or `Esc`. Verify streaming immediately aborts, cursor restores to input prompt, and no zombie tasks remain.
+- **Scenario D4 (Diff Inspection & Inline Edits)**: Ask Finch to make a targeted docstring or comment improvement in a Finch source file. Verify diff highlights additions in green and deletions in red, and that tool expansion (`F6`) starts at line 0 without clearing the screen.
+
 ### Marcus — coming from Codex CLI
 Used to Codex's approval modes, sandboxing prompts, and its own copy/paste split (Ctrl+C = copy
 since Codex can't override that key; Ctrl+V reserved exclusively for image paste; Cmd+V for text —
 an accepted-but-annoying split). Tests whether Finch's conventions feel familiar or jarring,
 specifically copy/paste behavior and approval/permission prompts. (Not yet run as of 2026-09-28.)
+
+#### Scenarios (Approvals, Pasting & Sandboxing)
+- **Scenario M1 (Multiline Paste & Indentation)**: Paste a 25-line nested Rust match expression into the composer. Verify that indentation, brackets, and newlines are preserved verbatim without triggering premature execution or cursor desync.
+- **Scenario M2 (Tool Approval Prompts)**: Trigger a file modification in Finch. When the approval dialog appears, test `y` (once), `a` (always/session), `n` (reject), and `Esc` (dismiss). Verify keyboard focus lands squarely on the dialog and the final decision renders cleanly inline on the tool row without orphan UUID lines.
+- **Scenario M3 (ANSI Selection & Clipboard)**: Highlight colored compiler output or diff lines in the TUI. Copy to clipboard and verify pasted text is sanitized of raw ANSI escape codes (`\x1b[...]`).
 
 ### Priya — first-time agentic-CLI user, non-engineer
 Product manager or technical writer, has never used a coding-agent CLI before, no prior tool
@@ -52,16 +63,32 @@ setup wizard clear without assuming prior context, are error messages jargon-fre
 Stresses the accessible-interfaces principle generally, not just the GUI-automation invariants
 Sam covers. (Not yet run as of 2026-09-28.)
 
+#### Scenarios (Cold Onboarding & Setup Wizard)
+- **Scenario P1 (First Launch in Empty Workspace)**: Launch `finch` in a fresh, empty directory without `~/.finch/config.toml`. Verify the welcome flow and setup wizard guide the user through provider selection, daemon connection, and workspace initialization without technical jargon.
+- **Scenario P2 (Wizard Keyboard Navigation & Abort)**: Navigate wizard steps using `Tab`, `Shift+Tab`, `Arrow` keys, and `Enter`. At step 2, abort via `Ctrl+C` or `Esc` and verify the terminal returns to cooked mode without broken cursor visibility or echo.
+- **Scenario P3 (First Natural Question)**: Ask a beginner question like `"What does this project do?"` in a new workspace and verify the initial greeting and explanation are reassuring, clear, and actionable.
+
 ### Ollie — offline/local-model enthusiast
 Wants to run Finch fully local for privacy/cost reasons. Tests local model routing, the setup
 wizard's model selection, and local generation quality/latency. CLAUDE.md already flags local
 routing as experimental (#74, #98), so this persona is expected to surface real rough edges — good
 stress test precisely because it's not solid ground yet. (Not yet run as of 2026-09-28.)
 
+#### Scenarios (Local Models & Hybrid Routing)
+- **Scenario O1 (Local Model Selection)**: Switch to a local model (Ollama / local Gemma) via the wizard or `/model`. Verify the switch registers without crashing.
+- **Scenario O2 (Graceful Degradation on Tool Calls)**: Ask the local model to perform a file edit. When the continuation round is reached, verify it displays the clean, documented notice (`#1228`) instead of crashing, leaking raw JSON, or emitting unhandled 500 errors.
+- **Scenario O3 (Seamless Cloud Switch)**: Switch back to a cloud provider mid-session and verify conversation history is preserved and subsequent tool calls succeed.
+
 ### Chen — power user, marathon sessions
 Runs multi-hour sessions, uses named Brains, subagents (`spawn_task`), memory/recall, background
 bash tasks. Tests session persistence, Brain switching, context compaction, memory-recall UX, and
 whether long sessions degrade. (Not yet run as of 2026-09-28.)
+
+#### Scenarios (Marathon Sessions & Finch-on-Finch Self-Hosting)
+- **Scenario C1 (Named Brain Lifecycle)**: Create and attach to a named Brain: `finch attach finch-self-host`. Run multiple turns across hours, detach, and reattach. Verify history and workspace context persist accurately.
+- **Scenario C2 (Background Build & Check)**: Ask Finch to run `./scripts/test_brains.sh cargo check --all-targets` via `background_bash`. Continue conversing while the check runs; verify the background task completes, logs to its descriptor, and reports its exit status cleanly without interrupting the composer.
+- **Scenario C3 (Context Compaction & Recall)**: After a heavy session with multiple large file reads and tool runs, trigger `/compact`. Verify context is summarized without losing key architecture decisions or working memory.
+- **Scenario C4 (End-to-End Self-Hosting Edit & Test)**: Ask Finch to navigate to a specific helper function in `src/tools/implementations/`, propose a clean enhancement, apply the edit via `edit`, and run the test suite to verify the change. Finch working on and improving Finch!
 
 ### Sam — blind developer, accessibility
 Relies on GUI automation entirely through text; visual rendering is irrelevant, only what comes
@@ -73,6 +100,11 @@ Companion to open issue #1182 ("accessibility invariants enforced by tests but n
 against reality") — file specific new issues for gaps found, or comment on #1182 directly when
 that's the more useful home for a given finding.
 
+#### Scenarios (Accessibility & Text-Only Interface)
+- **Scenario S1 (Screen Reader Readability)**: Run Finch with raw/piped text output or pipe the TUI through a terminal screen reader. Verify tool invocations, status messages, and model responses read as continuous, speakable English without relying on visual ASCII art.
+- **Scenario S2 (Actionable Error Messaging)**: Deliberately trigger file access errors or missing binaries. Verify the resulting error explicitly names the target path, command, and exact remedy.
+- **Scenario S3 (Semantic Tool Identification)**: When querying or using tools, verify that all actions are identified by semantic names rather than cryptic codes or spatial screen coordinates.
+
 ### Rin — UI designer
 Cares only about visual/rendering correctness: alignment, spacing, color/theme consistency,
 truncation/wrapping, spinner/status feedback, dialog and wizard layout, and specifically what
@@ -83,6 +115,12 @@ redraws only rows it thinks changed instead of fully clearing the region first. 
 widths (narrow ~80col, wide ~220col) and with live mid-flow resizes, especially across the wizard
 tabs and any place content height changes between two adjacent states.
 
+#### Scenarios (UI Layout, Sizing & Row-Diff-Blit Robustness)
+- **Scenario R1 (Terminal Size Extremes)**: Test Finch at `80x24` (compact standard), `120x35` (default dev), and `220x50` (ultra-wide). Verify prompt line, status bars, and borders fit without wrap-tearing or clipping.
+- **Scenario R2 (Mid-Stream Window Resizes)**: During active streaming or while a tool output viewport is open, trigger live window resizes (`tmux resize-window`). Verify the canvas repaints without duplicate text, ghost lines, or corrupted borders.
+- **Scenario R3 (Tool Expansion / Collapse Stale-Row Checks)**: Expand a tool output (`F6`), scroll through lines, and collapse it. Verify that every row of the expanded view is fully wiped and that paint code does not leave stale artifact rows.
+- **Scenario R4 (Scrollback Hint & Physical Line Navigation)**: Scroll up into long multi-turn history. Verify the scroll position hint (`↑ X more above · ↓ Y more below`) renders cleanly, survives resizing, and physical line scrolling does not skip long wrapped lines.
+
 ### Jordan — UX designer
 Cares about interaction flow, mental models, discoverability, error recovery — not pixels (that's
 Rin). Does a cold, first-principles walkthrough: fresh install, first launch, the setup wizard as
@@ -92,6 +130,11 @@ mid-operation cancel, asking for something Finch can't do) to check whether reco
 a skim of `README.md` against what actually happens. Doesn't file model-accuracy complaints
 (already tracked: #74, #98, #120, #147) — the value-add is specifically flow and self-consistency
 of terminology (is "Brain" used consistently, do error messages explain what to do next, etc.).
+
+#### Scenarios (UX Mental Models & Error Recovery)
+- **Scenario J1 (Command Discoverability & Autocomplete)**: Type `/` and navigate the command popup. Verify parameter hints (`/model <name>`, `/attach <name>`, `/compact`) guide the user on syntax.
+- **Scenario J2 (Recovery from Invalid Commands & Inputs)**: Enter malformed commands (`/model`, `/bogus`). Verify Finch provides clear correction suggestions rather than silent failure or raw stack traces.
+- **Scenario J3 (Terminology & Boundary Clarity)**: Verify that the TUI consistently uses clear terminology for "Workspace" (client cwd), "Daemon" (background service), and "Brain" (conversation/run identity) across all status indicators, headers, and exit messages.
 
 ## Run log
 

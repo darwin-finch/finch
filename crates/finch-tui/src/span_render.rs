@@ -11,7 +11,7 @@
 //! The DOM mode (#808) lowers the same spans to styled elements instead; this
 //! file never runs in that path.
 
-use finch_theme::ColorScheme;
+use finch_theme::{ColorScheme, MessageBand};
 use finch_ui_model::{ComponentStylePalette, RenderedTranscriptLine, Span, SpanColor, SpanStyle};
 
 /// SGR parameter for one colour: foreground position.
@@ -114,8 +114,33 @@ fn span_color_from_spec(spec: &finch_theme::ColorSpec) -> SpanColor {
     }
 }
 
+/// Map a ratatui `Color` to a `SpanColor`.
+fn span_color_from_ratatui_color(color: ratatui::style::Color) -> SpanColor {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => SpanColor::Rgb(r, g, b),
+        ratatui::style::Color::Indexed(index) => SpanColor::Indexed(index),
+        ratatui::style::Color::Black => SpanColor::BLACK,
+        ratatui::style::Color::Red => SpanColor::DARK_RED,
+        ratatui::style::Color::Green => SpanColor::DARK_GREEN,
+        ratatui::style::Color::Yellow => SpanColor::DARK_YELLOW,
+        ratatui::style::Color::Blue => SpanColor::DARK_BLUE,
+        ratatui::style::Color::Magenta => SpanColor::DARK_MAGENTA,
+        ratatui::style::Color::Cyan => SpanColor::DARK_CYAN,
+        ratatui::style::Color::Gray => SpanColor::GREY,
+        ratatui::style::Color::DarkGray => SpanColor::DARK_GREY,
+        ratatui::style::Color::LightRed => SpanColor::RED,
+        ratatui::style::Color::LightGreen => SpanColor::GREEN,
+        ratatui::style::Color::LightYellow => SpanColor::YELLOW,
+        ratatui::style::Color::LightBlue => SpanColor::BLUE,
+        ratatui::style::Color::LightMagenta => SpanColor::MAGENTA,
+        ratatui::style::Color::LightCyan => SpanColor::CYAN,
+        ratatui::style::Color::White => SpanColor::WHITE,
+        _ => SpanColor::BLACK,
+    }
+}
+
 /// Build the component palette from the user's scheme: the roles the scheme
-/// owns (progress and static-row colours) come from it; the glyph vocabulary
+/// owns (progress, static-row, and user-turn colours) come from it; the glyph vocabulary
 /// (⏺ ⎿ dim summaries) keeps the pre-migration fixed colours. This is the one
 /// place the conversation pipeline meets `ColorScheme` — component renderers
 /// stay scheme-free.
@@ -129,6 +154,14 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette.static_success = palette.static_info;
     palette.static_warning = SpanStyle::fg(span_color_from_spec(&colors.status.operation));
     palette.user_foreground = span_color_from_spec(&colors.messages.user);
+    if let Some(bg) = colors.message_band_style(MessageBand::LocalUser).bg {
+        palette.user_background = span_color_from_ratatui_color(bg);
+    }
+    for i in 0..8 {
+        if let Some(bg) = colors.message_band_style(MessageBand::Participant(i)).bg {
+            palette.participant_backgrounds[i] = span_color_from_ratatui_color(bg);
+        }
+    }
     palette
 }
 
@@ -269,5 +302,36 @@ mod tests {
             SpanColor::DARK_CYAN,
             "messages.user maps to dark cyan in the default scheme"
         );
+        assert_eq!(
+            palette.user_background,
+            SpanColor::Rgb(28, 45, 64),
+            "local user band maps to (28, 45, 64) in the dark scheme"
+        );
+    }
+
+    /// User turn foreground and background bridge correctly across all themes.
+    #[test]
+    fn test_component_style_palette_maps_user_roles_across_themes() {
+        use finch_theme::ColorTheme;
+        for theme in ColorTheme::all() {
+            let scheme = theme.to_scheme();
+            let palette = component_style_palette(&scheme);
+
+            let expected_band = scheme.message_band_style(MessageBand::LocalUser);
+            let expected_bg = match expected_band.bg.unwrap() {
+                ratatui::style::Color::Rgb(r, g, b) => SpanColor::Rgb(r, g, b),
+                _ => panic!("expected RGB background"),
+            };
+            assert_eq!(palette.user_background, expected_bg);
+
+            for i in 0..8 {
+                let expected_part_band = scheme.message_band_style(MessageBand::Participant(i));
+                let expected_part_bg = match expected_part_band.bg.unwrap() {
+                    ratatui::style::Color::Rgb(r, g, b) => SpanColor::Rgb(r, g, b),
+                    _ => panic!("expected RGB background"),
+                };
+                assert_eq!(palette.participant_backgrounds[i], expected_part_bg);
+            }
+        }
     }
 }
