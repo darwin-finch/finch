@@ -272,16 +272,16 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
 
     let checkbox = if use_neural_embeddings { "☑" } else { "☐" };
     let item = wizard_selected(format!(
-        ">>> {checkbox} Memory embeddings: use the neural model <<<"
+        ">>> {checkbox} Smart memory: enable enhanced search <<<"
     ));
     lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
 
-    const ON_DETAIL: &str = "On: bge-small-en-v1.5 (GGUF, via llama.cpp), downloaded once on \
-         first use, then runs locally with no further network calls. Better \
-         recall quality than the fallback below.";
+    const ON_DETAIL: &str = "On: Downloaded once on first use, then runs locally on your computer \
+         with no further internet access needed. Understands related concepts \
+         and finds past context more accurately.";
     const OFF_DETAIL: &str =
-        "Off: built-in hashed n-gram embeddings. No download, no network access, \
-         ever -- at lower recall quality than the neural model.";
+        "Off: Uses basic keyword matching. No download and no internet access \
+         required, but search results may be less accurate.";
     let detail = if use_neural_embeddings {
         ON_DETAIL
     } else {
