@@ -937,6 +937,21 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     Ok(frame.lines.len())
 }
 
+fn reanchor_shrinking_live_frame(
+    out: &mut impl Write,
+    previous_rows: usize,
+    next_rows: usize,
+    terminal_rows: usize,
+) -> Result<()> {
+    if next_rows < previous_rows {
+        execute!(
+            out,
+            cursor::MoveTo(0, terminal_rows.saturating_sub(next_rows) as u16)
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Live-area frame ──────────────────────────────────────────────────────────
 
 /// Columns the input prompt (`❯ `) and its continuation (`  `) both occupy.
@@ -2195,6 +2210,8 @@ impl TuiRenderer {
                 term_h,
                 term_width,
             );
+            let rows = frame.lines.len();
+            reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
             let rows = write_tiny_live_frame(out, &frame)?;
             execute!(out, EndSynchronizedUpdate)?;
             self.flush_attention_bell(out)?;
@@ -2234,54 +2251,21 @@ impl TuiRenderer {
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
-        // A shrinking live area (#1293) invalidates any active selection
-        // instead of repositioning the write to compensate for it.
-        //
-        // `rebuild_transcript_hit_regions` (below) builds `SelectionIndex`
-        // assuming the live area's absolute rows are always
-        // `term_height - this_frame's_row_count .. term_height` — true
-        // immediately after a full `redraw_full_viewport_inner` repaint
-        // (which does an explicit `cursor::MoveTo(0, plan.transcript_top)`),
-        // but never re-verified on an ordinary tick. `write_live_frame`
-        // otherwise just continues from wherever `erase_live_area` (based on
-        // the *previous* frame's own row count) left the terminal cursor: a
-        // growing frame overflows the bottom and a native terminal scroll
-        // happens to re-bottom-anchor everything for free, but a shrinking
-        // frame (e.g. the "/" completion pane closing) simply lands higher
-        // on the physical screen than the formula assumes, and nothing ever
-        // notices or corrects the resulting drift. From that tick on,
-        // `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`
-        // would target whatever `row` the (now physically wrong)
-        // `SelectionIndex` reports, stamping stale selected text onto
-        // unrelated content — typically the status line, once its row
-        // happens to fall where the drift says old transcript content still
-        // lives.
-        //
-        // An earlier version of this fix instead recomputed and reapplied a
-        // bottom-anchored `cursor::MoveTo` on every size-changing tick, so
-        // physical and assumed geometry could never diverge. That is
-        // correct in isolation, but a live-session regression (traced
-        // through a reconnect/replay production test, `named_brain_attach`)
-        // showed it corrupting the live area under rapid successive
-        // grow/shrink ticks — the interaction with `erase_live_area`'s own,
-        // separately-tracked relative bookkeeping was not fully understood
-        // and the risk of shipping a half-diagnosed repositioning fix
-        // outweighed fixing the narrower, better-understood problem: a
-        // selection surviving into geometry it no longer describes. Since
-        // growth always self-corrects (the paragraph above), only a
-        // detected *shrink* needs to act, and clearing the selection here
-        // is exactly the same invalidation `redraw_full_viewport_inner`
-        // already performs on every full repaint (any full repaint clears
-        // it) — extended to cover the one case a full repaint does not run
-        // for. `self.last_live_frame_rows` (not `self.active_rows`, which
-        // `erase_live_area` always zeroes just before this function runs as
-        // part of its own, unrelated bookkeeping) is the previous tick's
-        // row count.
+        // The erase ends at the previous frame's top. If the replacement is
+        // smaller, painting from there strands the whole frame above blank
+        // rows. Re-anchor only shrinking frames (#1472): growth must remain
+        // relative so overflowing the bottom scrolls retained terminal
+        // content upward. `last_live_frame_rows` survives erase bookkeeping;
+        // `active_rows` does not. A shrink also invalidates any selection
+        // whose absolute rows described the old geometry (#1293).
         let this_frame_rows = frame.physical_rows(term_width.max(1));
-        if this_frame_rows < self.last_live_frame_rows && self.selection.is_some() {
-            self.selection = None;
-            self.selection_press_candidate = None;
-            self.previous_highlighted_rows.clear();
+        reanchor_shrinking_live_frame(out, self.last_live_frame_rows, this_frame_rows, term_h)?;
+        if this_frame_rows < self.last_live_frame_rows {
+            if self.selection.is_some() {
+                self.selection = None;
+                self.selection_press_candidate = None;
+                self.previous_highlighted_rows.clear();
+            }
         }
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
@@ -14244,6 +14228,7 @@ mod attention_bell_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use crate::vt_oracle::VtOracle;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use finch_messages::{StaticMessage, WorkUnit};
     use std::sync::Arc;
@@ -14638,23 +14623,12 @@ mod selection_tests {
     /// longer has anything to do with what `write_live_frame` actually,
     /// physically painted there this tick.
     ///
-    /// The fix reacts to a detected shrink by clearing the selection
-    /// (`self.selection = None`, `self.previous_highlighted_rows.clear()`)
-    /// instead of forcing physical and assumed geometry to agree with an
-    /// explicit `cursor::MoveTo`. An earlier version of this fix took the
-    /// `MoveTo` approach; it was correct in isolation but, verified against
-    /// a live-session reconnect/replay production test
-    /// (`test_reconnected_completed_say_renders_the_component_card` in
-    /// `tests/named_brain_attach.rs`), corrupted the live area under rapid
-    /// successive grow/shrink ticks. Since growth always self-corrects (the
-    /// paragraph above), only a shrink needs to act, and dropping the
-    /// selection is exactly the same invalidation `redraw_full_viewport_inner`
-    /// already performs on every full repaint, extended to the one case a
-    /// full repaint does not cover. This means a selection does not survive
-    /// a shrinking live area with its highlight intact — a real UX
-    /// narrowing versus the `MoveTo` approach — but the row it pointed at is
-    /// never stamped with stale content, which is the actual invariant this
-    /// test (and the reported bug) cares about.
+    /// The completed fix reacts only to a detected shrink: it moves to the
+    /// smaller frame's absolute bottom-owned origin and clears the selection
+    /// whose rows described the old geometry. Growth remains relative so it
+    /// can scroll retained terminal content instead of overwriting it; that
+    /// distinction avoids the reconnect/replay corruption caused by an
+    /// earlier attempt to reposition every size change.
     ///
     /// This test drives the real `TuiRenderer` methods a live session uses —
     /// `handle_mouse`, `draw_live_area_to`, `update_ghost_text` (opening the
@@ -14809,13 +14783,8 @@ mod selection_tests {
              closes, not duplicated onto a stale row; occurrences={occurrences:?}\n{}",
             term.diagnostic()
         );
-        // The fix clears a survived selection on a detected shrink rather
-        // than forcing the live area to stay glued to the terminal's true
-        // bottom row (see this test's doc comment): a shrinking live area
-        // is free to end up higher on the physical screen than before,
-        // exactly as it already could pre-#1293, so the status line is
-        // located by its own content rather than assumed to sit at the
-        // last row.
+        // The shrink must both invalidate the old selection and put the
+        // smaller replacement frame at the physical bottom.
         let status_row = term.find_row("Tab complete").unwrap_or_else(|| {
             panic!(
                 "the idle status line must be on screen somewhere;\n{}",
@@ -14823,12 +14792,200 @@ mod selection_tests {
             )
         });
         assert_eq!(
+            status_row,
+            23,
+            "after the completion pane closes, the idle status line must be \
+             physically anchored to the terminal's final row; \
+             active_rows={} cursor_row_from_top={} last_live_frame_rows={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            renderer.last_live_frame_rows,
+            term.diagnostic()
+        );
+        assert_eq!(
             term.row(status_row),
             "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Esc cancel",
             "the idle status line must read its real content with no stale \
              selected-text prefix bleeding in from the row the selection used \
              to occupy before the completion pane opened and closed;\n{}",
             term.diagnostic()
+        );
+    }
+
+    fn paint_live_cycle_at(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        renderer
+            .erase_live_area_to(&mut bytes)
+            .expect("the production live-area erase must succeed");
+        renderer
+            .draw_live_area_to_at(&mut bytes, width, height, None)
+            .expect("the production live-area draw must succeed");
+        terminal.feed(&bytes);
+        bytes
+    }
+
+    fn seed_bottom_anchored_viewport(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) {
+        renderer.pending_viewport_size = Some((width as u16, height as u16));
+        let mut bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .expect("the production full-viewport repaint must succeed");
+        terminal.feed(&bytes);
+    }
+
+    fn assert_live_chrome_is_bottom_anchored(
+        label: &str,
+        renderer: &TuiRenderer,
+        terminal: &VtOracle,
+        transition_bytes: &[u8],
+        width: usize,
+        height: usize,
+    ) {
+        let live_top = height.saturating_sub(renderer.active_rows);
+        let expected_move = format!("\x1b[{};1H", live_top + 1);
+        assert!(
+            transition_bytes
+                .windows(expected_move.len())
+                .any(|window| window == expected_move.as_bytes()),
+            "{label}: a shrinking live-frame transition must explicitly move to its \
+             new bottom-anchored origin; expected_move={expected_move:?} \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(transition_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            live_top + renderer.cursor_row_from_top,
+            "{label}: the physical cursor row must agree with the renderer's claimed \
+             bottom-anchored live rect; width={width} height={height} \
+             live_top={live_top} active_rows={} cursor_row_from_top={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(height - 1),
+            "{label}: the final status row must occupy the terminal's final physical row; \
+             width={width} height={height} live_top={live_top} active_rows={}\n{}",
+            renderer.active_rows,
+            terminal.diagnostic()
+        );
+        if let Some((top, bottom)) = renderer.transcript_scroll.visible_row_bounds() {
+            assert!(
+                usize::from(top) <= live_top
+                    && live_top <= usize::from(bottom)
+                    && usize::from(bottom) < height,
+                "{label}: the transcript claim must contain the rendered transcript \
+                 tail at the top of the bottom-anchored live frame; claim={top}..={bottom} \
+                 live_top={live_top} height={height}\n{}",
+                terminal.diagnostic()
+            );
+        }
+    }
+
+    /// Production-boundary regression (#1472): every transient live surface
+    /// may grow the bottom-owned frame, but removing that surface must move
+    /// the smaller replacement frame down to the real terminal bottom. The
+    /// transition is exercised through the same renderer erase/draw methods
+    /// and VT byte stream as a live session, not through the pure planner.
+    #[test]
+    fn test_transient_live_surfaces_shrink_back_to_the_physical_terminal_bottom() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 24;
+
+        // Query/progress/retry status rows can disappear without changing the
+        // transcript. The fallback help status must return to the last row.
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.add_trait_message(Arc::new(StaticMessage::plain("retained transcript row")));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors);
+        let mut terminal = VtOracle::new(WIDTH, HEIGHT);
+        seed_bottom_anchored_viewport(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.set_operation_status("Analyzing…\nRetrying request…");
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.clear_operation_status();
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert_live_chrome_is_bottom_anchored(
+            "query/progress rows removed",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+        assert_eq!(
+            output.get_messages().len(),
+            1,
+            "removing transient status rows must not delete retained semantic components"
+        );
+
+        // Slash help is a completion pane. Enter submits the selected command,
+        // clears the composer, and removes the pane in the same transition.
+        renderer.input_textarea.insert_str("/");
+        renderer.update_ghost_text();
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        let submitted = renderer
+            .take_submitted_input()
+            .expect("Enter on slash help must submit its selected command");
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert!(
+            submitted.starts_with('/'),
+            "slash-help submission must remain a command; submitted={submitted:?}"
+        );
+        assert_live_chrome_is_bottom_anchored(
+            "slash help submitted",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+
+        // A terminal resize takes the absolute full-repaint path. It must
+        // retain the same bottom-row invariant after the preceding shrink.
+        const RESIZED_WIDTH: usize = 96;
+        const RESIZED_HEIGHT: usize = 30;
+        renderer
+            .handle_resize(RESIZED_WIDTH as u16, RESIZED_HEIGHT as u16)
+            .expect("resize invalidation must succeed");
+        terminal.resize(RESIZED_WIDTH, RESIZED_HEIGHT);
+        let mut resize_bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut resize_bytes, false)
+            .expect("resize full repaint must succeed");
+        terminal.feed(&resize_bytes);
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(RESIZED_HEIGHT - 1),
+            "resize must leave status on the new final physical row; \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            RESIZED_HEIGHT - renderer.active_rows + renderer.cursor_row_from_top,
+            "resize must leave the physical cursor inside the newly claimed \
+             bottom-owned live rect; bytes={:?}\n{}",
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
         );
     }
 
