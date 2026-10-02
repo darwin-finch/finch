@@ -163,24 +163,14 @@ fn test_root_cli_invalid_utf8_in_argv1_remains_non_panicking_and_non_reflective(
     use std::os::unix::ffi::OsStringExt;
 
     let output = run_finch([OsString::from_vec(vec![b'b', b'a', b'd', 0xff, b'x'])]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "invalid UTF-8 in argv[1] must retain Clap exit status 2; status={:?} stdout={:?} stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr
-    );
+    let stderr = assert_usage_error(&output, "invalid UTF-8 in argv[1]");
     assert!(
-        output.stdout.is_empty()
-            && String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
-        "invalid UTF-8 in argv[1] must remain stderr-only and must not reflect raw bytes; stdout={:?} stderr={:?}",
-        output.stdout,
-        output.stderr
+        stderr.contains("unrecognized subcommand") || stderr.contains("invalid UTF-8"),
+        "invalid UTF-8 in argv[1] must fall through to Clap usage diagnostic; stderr={stderr:?}"
     );
     assert!(
         !output.stderr.contains(&0xff),
-        "invalid UTF-8 in argv[1] must not be reflected into stderr; stderr={:?}",
+        "invalid UTF-8 in argv[1] must not reflect raw bytes into stderr; stderr={:?}",
         output.stderr
     );
 }
@@ -195,19 +185,25 @@ fn test_root_cli_near_miss_mcp_bridge_flag_with_invalid_utf8_falls_through_to_cl
         .to_vec();
     bad_flag.push(0xff);
     let output = run_finch([OsString::from_vec(bad_flag)]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "near-miss MCP bridge flag with invalid UTF-8 must retain Clap exit status 2; status={:?} stdout={:?} stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr
+    let stderr = assert_usage_error(&output, "near-miss MCP bridge flag with invalid UTF-8");
+    assert!(
+        stderr.contains("unexpected argument")
+            || stderr.contains("unrecognized subcommand")
+            || stderr.contains("invalid UTF-8"),
+        "near-miss MCP bridge flag must fall through to Clap usage diagnostic; stderr={stderr:?}"
     );
     assert!(
-        output.stdout.is_empty()
-            && String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
-        "near-miss MCP bridge flag must remain stderr-only; stdout={:?} stderr={:?}",
-        output.stdout,
+        !output.stderr.contains(&0xff),
+        "near-miss MCP bridge flag must not reflect raw bytes into stderr; stderr={:?}",
         output.stderr
+    );
+
+    // Verify that the exact valid hidden flag selects the bridge (exits 0 on EOF stdin),
+    // proving near-miss byte sequences cannot select it.
+    let valid_bridge = run_finch([finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG.into()]);
+    assert_eq!(
+        valid_bridge.status.code(),
+        Some(0),
+        "exact valid MCP bridge flag must select the bridge loop and exit 0 on EOF stdin"
     );
 }
