@@ -712,7 +712,7 @@ fn feature_toggle_states(
             ("Skip permission prompts", auto_approve),
             ("Debug logging", debug),
             ("GUI automation", gui_automation),
-            ("Daemon-only mode", daemon_only_mode),
+            ("Background mode only", daemon_only_mode),
             ("Advertise on network", mdns_discovery),
             ("Discover peers on LAN", auto_discover),
         ]
@@ -723,7 +723,7 @@ fn feature_toggle_states(
             ("Live responses", streaming),
             ("Skip permission prompts", auto_approve),
             ("Debug logging", debug),
-            ("Daemon-only mode", daemon_only_mode),
+            ("Background mode only", daemon_only_mode),
             ("Advertise on network", mdns_discovery),
             ("Discover peers on LAN", auto_discover),
         ]
@@ -873,9 +873,9 @@ fn features_section_content(
     let descriptions: [&str; 7] = [
         "See Finch's answer as it types, word by word",
         "Let Finch run tools without asking each time",
-        "Write verbose logs to ~/.finch/debug.log",
+        "Write detailed diagnostic logs to help troubleshoot issues",
         &gui_automation_description,
-        "Run as background server, no interactive REPL",
+        "Run silently in the background without opening the chat window",
         "Broadcast this Finch instance via mDNS so others can discover it",
         "Find and connect to other Finch instances at startup",
     ];
@@ -883,8 +883,8 @@ fn features_section_content(
     let descriptions: [&str; 6] = [
         "See Finch's answer as it types, word by word",
         "Let Finch run tools without asking each time",
-        "Write verbose logs to ~/.finch/debug.log",
-        "Run as background server, no interactive REPL",
+        "Write detailed diagnostic logs to help troubleshoot issues",
+        "Run silently in the background without opening the chat window",
         "Broadcast this Finch instance via mDNS so others can discover it",
         "Find and connect to other Finch instances at startup",
     ];
@@ -910,17 +910,20 @@ fn features_section_content(
             ("    ", "")
         };
         let line = if editing_hf_token {
-            format!("{prefix}HF Token: {hf_token}{suffix}")
+            format!("{prefix}Community model token: {hf_token}{suffix}")
         } else if hf_token.is_empty() {
-            format!("{prefix}HF Token: [not set — press E to enter]{suffix}")
+            format!("{prefix}Community model token: [not set — press E to enter]{suffix}")
         } else {
-            format!("{prefix}HF Token: {}{suffix}", mask_secret(hf_token, 4, 4))
+            format!(
+                "{prefix}Community model token: {}{suffix}",
+                mask_secret(hf_token, 4, 4)
+            )
         };
         if selected {
             vec![
                 wizard_selected(&line),
                 wizard_line(
-                    "        For model downloads from HuggingFace",
+                    "        Optional access token for downloading community models",
                     Color::DarkGray,
                 ),
             ]
@@ -928,7 +931,7 @@ fn features_section_content(
             vec![
                 wizard_line(&line, Color::Cyan),
                 wizard_line(
-                    "        For model downloads from HuggingFace",
+                    "        Optional access token for downloading community models",
                     Color::DarkGray,
                 ),
             ]
@@ -1138,7 +1141,7 @@ fn features_section_content(
         ));
     }
     let instructions_text = if editing_hf_token {
-        "Type HuggingFace token | Enter/Esc: Done"
+        "Type model download token | Enter/Esc: Done"
     } else if editing_finch_api_key {
         "Type Finch client key | Enter/Esc: Done"
     } else {
