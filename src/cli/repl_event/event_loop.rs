@@ -1873,23 +1873,16 @@ fn project_remote_brain_live_run_event(
     if event.run_id.is_none() {
         return false;
     }
+    if let crate::brain::BrainEventKind::RunStarted { run } = &event.kind {
+        if local_runner == Some(run.initiating_attachment_id) {
+            say_projected_runs.insert(run.run_id);
+        }
+    }
     let observed = selected_brain_is_home
         .then(|| local_projections.front_mut())
         .flatten()
-        .map(|projection| {
-            let matched = projection.observe(event);
-            // A pure say turn renders entirely through its local card, so its
-            // daemon lifecycle events are suppressed for good once the turn
-            // completes. A tool-bearing turn keeps its run-group rows.
-            let pure_say = matched != LocalProjectionMatch::None
-                && projection.tool_ids.is_empty()
-                && projection.approval_ids.is_empty();
-            (matched, pure_say)
-        });
-    let projection_match = observed
-        .map(|(matched, _)| matched)
-        .unwrap_or(LocalProjectionMatch::None);
-    let pure_say = observed.map(|(_, pure_say)| pure_say).unwrap_or(false);
+        .map(|projection| projection.observe(event));
+    let projection_match = observed.unwrap_or(LocalProjectionMatch::None);
     if projection_match != LocalProjectionMatch::None {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
@@ -1918,9 +1911,7 @@ fn project_remote_brain_live_run_event(
         local_runner,
     );
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
-        if pure_say {
-            say_projected_runs.insert(event.run_id.expect("checked above"));
-        }
+        say_projected_runs.insert(event.run_id.expect("checked above"));
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
                 // Successful untitled `say` is already assistant prose (#350/#804).
@@ -4284,7 +4275,7 @@ impl EventLoop {
         let position = self
             .locally_pushed_programs
             .iter()
-            .position(|pushed| pushed == source);
+            .position(|pushed| pushed == source || pushed.trim() == source.trim());
         let Some(position) = position else {
             return false;
         };
