@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Software Factory local workspace state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "workspace_id", "machine_id", "repository", "worktree", "branch", "base",
+    "item", "claim_id", "claim_url", "harness", "worker", "coordinator", "state",
+    "created_at", "updated_at", "remote_recovery_ref", "checkpoint_push_authorized",
+    "recovery_ref_delete_authorized", "recovery_ref_disposition_owner",
+    "recovery_ref_removal_trigger", "durable_commit", "cleanup_blocker", "cleanup_owner",
+    "task", "processes", "resources", "resume"
+  ],
+  "properties": {
+    "schema": { "const": "software-factory/local-workspace-state/v1" },
+    "workspace_id": { "$ref": "#/$defs/lowercaseUuid" },
+    "machine_id": { "type": "string", "minLength": 1 },
+    "repository": { "$ref": "#/$defs/absolutePath" },
+    "worktree": { "$ref": "#/$defs/absolutePath" },
+    "branch": { "type": ["string", "null"], "minLength": 1 },
+    "base": { "$ref": "#/$defs/fullCommit" },
+    "item": { "type": ["string", "null"], "minLength": 1 },
+    "claim_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/lowercaseUuid" },
+        { "type": "null" }
+      ]
+    },
+    "claim_url": { "type": ["string", "null"], "minLength": 1 },
+    "harness": { "type": "string", "minLength": 1 },
+    "worker": { "type": "string", "minLength": 1 },
+    "coordinator": { "type": "string", "minLength": 1 },
+    "state": {
+      "enum": ["creating", "active", "handoff_ready", "review", "landed", "recovery_needed", "cleanup_blocked", "retired"]
+    },
+    "created_at": { "$ref": "#/$defs/timestamp" },
+    "updated_at": { "$ref": "#/$defs/timestamp" },
+    "remote_recovery_ref": {
+      "oneOf": [
+        { "$ref": "#/$defs/gitRef" },
+        { "type": "null" }
+      ]
+    },
+    "checkpoint_push_authorized": { "type": "boolean" },
+    "recovery_ref_delete_authorized": { "type": "boolean" },
+    "recovery_ref_disposition_owner": { "type": "string", "minLength": 1 },
+    "recovery_ref_removal_trigger": { "type": "string", "minLength": 1 },
+    "durable_commit": {
+      "oneOf": [
+        { "$ref": "#/$defs/fullCommit" },
+        { "type": "null" }
+      ]
+    },
+    "cleanup_blocker": { "type": ["string", "null"], "minLength": 1 },
+    "cleanup_owner": { "type": ["string", "null"], "minLength": 1 },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "scope", "gates"],
+      "properties": {
+        "outcome": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "gates": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
+    "processes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pid", "started_at", "role", "cwd"],
+        "properties": {
+          "pid": { "type": "integer", "minimum": 1 },
+          "started_at": { "$ref": "#/$defs/timestamp" },
+          "role": { "type": "string", "minLength": 1 },
+          "cwd": { "$ref": "#/$defs/absolutePath" }
+        }
+      }
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "locator", "instance_id", "ownership_token"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "locator": { "type": "string", "minLength": 1 },
+          "instance_id": { "type": "string", "minLength": 1 },
+          "ownership_token": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "resume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["last_gate", "dirty_paths", "next_action"],
+      "properties": {
+        "last_gate": { "type": ["string", "null"], "minLength": 1 },
+        "dirty_paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/relativePath" },
+          "uniqueItems": true
+        },
+        "next_action": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "absolutePath": {
+      "type": "string",
+      "minLength": 2,
+      "pattern": "^(?!.*[\\\\/]$)(?!.*[\\\\/]\\.\\.?(?:[\\\\/]|$))(?:/(?!$)(?!.*//)[^\\x00-\\x1F\\x7F]+|[A-Za-z]:[\\\\/](?!$)(?!.*[\\\\/]{2})[^\\x00-\\x1F\\x7F]+|\\\\\\\\(?!.*[\\\\/]{2})[^\\\\/]+[\\\\/][^\\\\/]+[\\\\/][^\\x00-\\x1F\\x7F]+)$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!\\\\)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\x00-\\x1F\\x7F]+$"
+    },
+    "fullCommit": {
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "gitRef": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!none$)[A-Za-z0-9][A-Za-z0-9._-]*:refs/(?!.*//)(?!.*\\.\\.)(?!.*@\\{)(?!\\.)(?!.*/\\.)(?!.*\\.lock(?:/|$))(?!.*[/.]$)[A-Za-z0-9_@-][A-Za-z0-9._@/-]*$"
+    },
+    "lowercaseUuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "remote_recovery_ref": { "type": "null" } },
+        "required": ["remote_recovery_ref"]
+      },
+      "then": {
+        "properties": {
+          "checkpoint_push_authorized": { "const": false },
+          "recovery_ref_delete_authorized": { "const": false }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "cleanup_blocked" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "cleanup_blocker": { "type": "string", "minLength": 1 },
+          "cleanup_owner": { "type": "string", "minLength": 1 }
+        }
+      },
+      "else": {
+        "properties": {
+          "cleanup_blocker": { "type": "null" },
+          "cleanup_owner": { "type": "null" }
+        }
+      }
+    }
+  ]
+}

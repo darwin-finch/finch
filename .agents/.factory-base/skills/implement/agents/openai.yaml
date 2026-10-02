@@ -1,0 +1,7 @@
+interface:
+  display_name: "Implement"
+  short_description: "Implement one ready ticket through a reviewable candidate"
+  default_prompt: "Use $implement to implement this accepted ticket or specified request. Do not groom the queue or run review."
+
+policy:
+  allow_implicit_invocation: true

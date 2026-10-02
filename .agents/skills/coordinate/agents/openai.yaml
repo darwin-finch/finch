@@ -1,0 +1,7 @@
+interface:
+  display_name: "Coordinate"
+  short_description: "Contracts, claims, packets, and parallel workers"
+  default_prompt: "Use $coordinate to lock exclusive scope, write the solution contract, and dispatch isolated workers."
+
+policy:
+  allow_implicit_invocation: true

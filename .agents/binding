@@ -1,0 +1,3 @@
+# Which tracker this checkout uses. Every factory skill reads this file first.
+# github (default) | pyramid | linear
+tracker: github

@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Software Factory boundary-load evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "claim", "primary_subsystem", "scope_kind", "recorded_at", "manifest", "observations", "classifications"],
+  "properties": {
+    "schema": { "const": "software-factory/boundary-load-evidence/v1" },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item", "base", "candidate"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "item": { "type": "string", "minLength": 1 },
+        "base": { "type": "string", "minLength": 1 },
+        "candidate": { "type": "string", "minLength": 1 }
+      }
+    },
+    "primary_subsystem": { "type": "string", "minLength": 1 },
+    "scope_kind": { "enum": ["single_subsystem", "cross_subsystem"] },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "sha256"],
+      "properties": {
+        "schema": { "const": "software-factory/subsystem-manifest/v1" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modified_paths", "inspected_paths"],
+      "properties": {
+        "modified_paths": { "$ref": "#/$defs/pathObservation" },
+        "inspected_paths": { "$ref": "#/$defs/pathObservation" }
+      }
+    },
+    "classifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modified_paths", "inspected_paths", "dependency_implementation_escapes"],
+      "properties": {
+        "modified_paths": { "$ref": "#/$defs/classifiedPaths" },
+        "inspected_paths": { "$ref": "#/$defs/classifiedPaths" },
+        "dependency_implementation_escapes": { "$ref": "#/$defs/classifiedPaths" }
+      }
+    }
+  },
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collector", "collector_version", "harness", "source"],
+      "properties": {
+        "collector": { "type": "string", "minLength": 1 },
+        "collector_version": { "type": "string", "minLength": 1 },
+        "harness": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "pathObservation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coverage", "provenance"],
+          "properties": {
+            "coverage": { "const": "not_observed" },
+            "provenance": { "$ref": "#/$defs/provenance" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coverage", "provenance", "paths"],
+          "properties": {
+            "coverage": { "enum": ["partial", "complete"] },
+            "provenance": { "$ref": "#/$defs/provenance" },
+            "paths": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "classifiedPaths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "subsystem", "surface"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "subsystem": { "type": "string", "minLength": 1 },
+          "surface": { "enum": ["contract", "implementation"] }
+        }
+      }
+    }
+  }
+}
