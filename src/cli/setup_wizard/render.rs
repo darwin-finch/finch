@@ -19,7 +19,8 @@ use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
     wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_plain,
-    wizard_selected, wizard_wrap, WizardCard, WizardLine, WizardSectionContent, WizardView,
+    wizard_selected, wizard_url, wizard_wrap, WizardCard, WizardLine, WizardSectionContent,
+    WizardView,
 };
 
 // ─── Small shared helpers ────────────────────────────────────────────────────
@@ -1282,14 +1283,8 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
 pub(super) fn validation_error_card(error: &str) -> WizardCard {
     WizardCard {
         title: "Validation Error".to_string(),
-        body: vec![
-            wizard_plain(error),
-            WizardLine::blank(),
-        ],
-        controls: Some(wizard_line(
-            "Enter / Esc: Back to setup",
-            Color::Yellow,
-        )),
+        body: vec![wizard_plain(error), WizardLine::blank()],
+        controls: Some(wizard_line("Enter / Esc: Back to setup", Color::Yellow)),
         accent: Color::Red,
     }
 }
@@ -1373,10 +1368,11 @@ fn device_auth_card(
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
-                body.push(wizard_plain(&format!(
-                    "Open: {}",
-                    presentation.verification_uri
-                )));
+                body.push(wizard_url(
+                    &format!("Open: {}", presentation.verification_uri),
+                    &presentation.verification_uri,
+                    None,
+                ));
                 if !presentation.user_code.is_empty() {
                     body.push(wizard_line(
                         &format!("One-time code: {}", presentation.user_code),

@@ -8698,10 +8698,9 @@ fn test_wizard_checkboxes_use_one_glyph_convention_across_tabs() {
 fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
     let mut state = WizardState::new(None);
     // Set an invalid cloud provider (OpenAI with empty key)
-    if let Some(SectionState::Models {
-        primary_model,
-        ..
-    }) = state.sections.get_mut(&WizardSection::Models) {
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
         *primary_model = ModelConfig::Remote {
             provider: "openai".into(),
             name: "openai".into(),
@@ -8714,7 +8713,7 @@ fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
 
     // Try to save
     let result = handle_save_action(&mut state).unwrap();
-    
+
     // It should return None because validation failed, and set the error
     assert!(result.is_none());
     assert!(state.save_error.is_some());
@@ -8732,4 +8731,29 @@ fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
     let action_dismiss = handle_wizard_key(&mut state, enter_event).unwrap();
     assert_eq!(action_dismiss, WizardAction::Continue);
     assert!(state.save_error.is_none());
+}
+
+#[test]
+fn test_o_key_on_device_dialog_does_not_panic() {
+    let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
+    let mut state = state_with_step(device_auth_step(outcome));
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_mut() {
+            *pending.lock().unwrap() = Some(DeviceAuthPresentation {
+                verification_uri: "https://auth.openai.com/activate".into(),
+                user_code: "CODE-1234".into(),
+                expires_in: std::time::Duration::from_secs(600),
+            });
+        }
+    }
+
+    // Pressing 'o' or 'O' must not panic and must be handled.
+    handle_models_input(&mut state, key(KeyCode::Char('o'))).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Char('O'))).unwrap();
+    // Pressing Enter must not panic and must be handled.
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
 }
