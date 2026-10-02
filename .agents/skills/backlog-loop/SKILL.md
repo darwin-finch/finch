@@ -11,7 +11,12 @@ Contract-authoring is `strong` lane, not a label: before invoking `$backlog-groo
 
 Load the tracker from [`.agents/binding`](../../references/load-binding.md) before any tracker verb. Pool mechanics: [parallel coordination](../../references/parallel-coordination.md).
 
-Maintain a pool no larger than this machine can compile and test at once (cores, RAM, how heavy this repo's suite is). A user-stated count wins; otherwise use the consuming repo's `AGENTS.md` default if it has one. Dispatch [eligible](../../references/queue.md#eligible-work) tickets until that ceiling. As soon as any worker finishes, record its result, release or hand off its claim, refresh the item/poset state, and dispatch the next eligible ticket immediately. Dependency waves are ordering constraints, not barriers.
+Maintain a pool no larger than this machine can compile and test at once (cores, RAM, free disk,
+and how heavy this repo's suite is). A user-stated count wins; otherwise use the consuming repo's
+`AGENTS.md` default if it has one. Dispatch [eligible](../../references/queue.md#eligible-work)
+tickets until that ceiling. As soon as any worker finishes, record its result, release or hand off
+its claim, refresh the item/poset state, and dispatch the next eligible ticket immediately.
+Dependency waves are ordering constraints, not barriers.
 
 On GitHub, `.agents/scripts/ready_queue.py --workers N --format json` is the dispatchable set: READY items in dependency order, `NEEDS_SPECIFICATION` omitted. Do not intersect `ticket_poset.py` and `ticket_triage.py` by hand. On Pyramid, `pyr ready --json` is that report — do not invent scores. On Linear, `linear issue query --json` then `.agents/scripts/linear_ready.py --repo owner/name` ([linear.md](../../bindings/linear.md)). Isolate workers with `.agents/scripts/issue_worktree.sh`.
 
@@ -21,6 +26,14 @@ Machine-local constraints (serialized browser suites, one writer of a given stor
 
 For Finch gate execution, Cargo isolation, and generated-output cleanup, load the repository's
 [execution adapter](../../references/finch-execution.md) and preserve it in worker packets.
+
+The coordinator owns prompt disposal of terminal workspaces. After a ticket lands or is otherwise
+recorded as no longer needed, complete the work-claim cleanup protocol before treating that worker
+slot as fully retired. Remove its registered worktree, then use the Finch adapter's Cargo-target
+reclaimer in dry-run mode followed by `--apply` when authorized. Do not retain worktrees or target
+namespaces as history archives. Any intentional retention needs an owner and removal trigger and
+still counts against the pool's disk ceiling. Never reclaim an active, shared, or unverifiable
+namespace.
 
 Stop when the user-requested budget is exhausted, [no eligible work remains](../../references/queue.md#eligible-work), or authority, safety, claim, dependency, or scope decisions require the user. Do not merge or close items merely because a worker reports success. `$implement` produces the candidate; `$review` is the only skill that lands; this skill owns selection, dispatch, replenishment, and coordinator reporting.
 

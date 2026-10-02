@@ -28,3 +28,10 @@ Run the reclaimer without `--apply` to inventory candidates first. Use `--apply`
 authority and only after its ownership, worktree, dirty-state, live-process, and Cargo-slot checks
 identify the namespace as eligible. It never substitutes for removing a worktree, preserving a
 commit, ending a claim, or recording cleanup evidence.
+
+Run this cleanup promptly after each terminal worktree rather than batching stale targets until the
+end of a queue. On a disk-constrained machine, retained worktrees and target namespaces reduce the
+safe worker-pool ceiling. Retention is exceptional: record its owner and removal trigger. The
+reclaimer must fail closed for a registered worktree, a live Cargo slot, an ownership mismatch, or
+an otherwise ambiguous namespace; never compensate with a broad `rm` or `cargo clean` against a
+shared target root.

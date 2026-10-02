@@ -35,3 +35,10 @@ Cargo isolation, and generated-output cleanup.
 The integration owner verifies interface compatibility, combines handoffs in dependency order into a clean workspace without merge commits, resolves conflicts with the relevant subsystem owner, and runs affected unit and boundary tests on the combined revision. Worker commits are transport artifacts: squash each accepted feature or fix into its own commit and apply those commits linearly. The combined tip is the candidate. `$review` is the only skill that lands it. Parallel workers finishing their local scopes is not completion by itself.
 
 Handing the candidate to review does not end coordination. After `$review` lands it, the coordinator completes the [post-integration synchronization and cleanup](../../references/work-claims.md#post-integration-synchronization-and-cleanup) before reporting the parent outcome complete. If review does not land the candidate, preserve or release each workspace according to its recorded next action; do not discard recoverable work.
+
+Cleanup is part of the outcome, not deferred housekeeping. Retire each owned worker, probe, review,
+and integration worktree as soon as its disposition is durable. For Finch, remove the registered
+worktree first, then inventory and reclaim its orphaned Cargo target namespace through the
+[execution adapter](../../references/finch-execution.md). A deliberately retained workspace or
+cache needs a named owner and removal trigger. Never delete another coordinator's workspace or a
+cache whose ownership or live-process state cannot be proved.
