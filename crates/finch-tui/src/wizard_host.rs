@@ -178,7 +178,7 @@ impl WizardLine {
 
 /// Visible display-column width of one span's text.
 fn wizard_span_visible_length(span: &WizardSpan) -> usize {
-    span.text.chars().map(wizard_char_width).sum()
+    wizard_visible_length(&span.text)
 }
 
 /// SGR reset closing every styled wizard span.
@@ -540,7 +540,7 @@ fn close_row(current: &mut Vec<WizardSpan>, lines_out: &mut Vec<WizardLine>) {
 
 /// Greedy word width as a terminal renders it.
 fn wizard_word_width(word: &str) -> usize {
-    word.chars().map(wizard_char_width).sum()
+    wizard_visible_length(word)
 }
 
 fn same_style(a: &WizardSpan, b: &WizardSpan) -> bool {
@@ -2155,5 +2155,27 @@ mod osc8_tests {
         assert!(lowered.contains("\x1b]8;;https://example.com\x1b\\"));
         assert!(lowered.contains("Click me"));
         assert!(lowered.ends_with("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn test_card_with_ansi_text_maintains_straight_borders() {
+        let card = WizardCard::new(
+            "Validation Error",
+            vec![
+                wizard_plain("\x1b[33m\x1b[1mPossible causes:\x1b[0m empty API key"),
+                wizard_plain("Plain line without any escape codes"),
+            ],
+            Some(wizard_line("Enter / Esc: Back", WizardColor::Yellow)),
+        );
+        let lines = card.chrome_lines(80);
+        for line in &lines {
+            assert_eq!(
+                line.display_length(),
+                80,
+                "boxed line has visible length {} != 80: {:?}",
+                line.display_length(),
+                line.plain_text()
+            );
+        }
     }
 }

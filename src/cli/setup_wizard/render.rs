@@ -1281,9 +1281,10 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
 }
 
 pub(super) fn validation_error_card(error: &str) -> WizardCard {
+    let clean_error = finch_ui_model::strip_ansi(error);
     WizardCard {
         title: "Validation Error".to_string(),
-        body: vec![wizard_plain(error), WizardLine::blank()],
+        body: vec![wizard_plain(&clean_error), WizardLine::blank()],
         controls: Some(wizard_line("Enter / Esc: Back to setup", Color::Yellow)),
         accent: Color::Red,
     }
