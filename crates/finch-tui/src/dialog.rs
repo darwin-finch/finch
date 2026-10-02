@@ -633,6 +633,27 @@ impl Dialog {
                     None
                 }
             }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(idx) = options.iter().position(|o| o.label.ends_with(" Yes")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if let Some(idx) = options.iter().position(|o| o.label.contains("always allow")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(idx) = options.iter().position(|o| o.label.ends_with(" No")) {
+                    Some(DialogResult::Selected(idx))
+                } else {
+                    None
+                }
+            }
             KeyCode::Enter => {
                 // Defensive guard: only emit Selected for real option indices.
                 // The "Other" row intercept in handle_key_event fires before we
