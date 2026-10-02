@@ -251,7 +251,14 @@ pub fn wizard_visible_length(text: &str) -> usize {
                         }
                     }
                 } else {
-                    chars.next();
+                    let mut c = chars.next();
+                    while let Some(ch) = c {
+                        if ('\x20'..='\x2F').contains(&ch) {
+                            c = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
             '\r' | '\x08' | '\x7f' => {}
@@ -502,8 +509,14 @@ fn ansi_aware_split_words(text: &str) -> Vec<String> {
                     }
                 }
             } else {
-                if let Some(c) = chars.next() {
+                let mut c_opt = chars.next();
+                while let Some(c) = c_opt {
                     current_word.push(c);
+                    if ('\x20'..='\x2F').contains(&c) {
+                        c_opt = chars.next();
+                    } else {
+                        break;
+                    }
                 }
             }
         } else if ch == ' ' {
@@ -573,8 +586,14 @@ pub fn wizard_wrap(line: &WizardLine, width: usize) -> Vec<WizardLine> {
                                 }
                             }
                         } else {
-                            if let Some(c) = chars.next() {
+                            let mut c_opt = chars.next();
+                            while let Some(c) = c_opt {
                                 append_char(&mut current, span, c);
+                                if ('\x20'..='\x2F').contains(&c) {
+                                    c_opt = chars.next();
+                                } else {
+                                    break;
+                                }
                             }
                         }
                         continue;
@@ -1959,7 +1978,14 @@ mod tests {
                         }
                     }
                 } else {
-                    chars.next();
+                    let mut c = chars.next();
+                    while let Some(ch) = c {
+                        if ('\x20'..='\x2F').contains(&ch) {
+                            c = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
                 }
             } else {
                 out.push(c);
@@ -2236,7 +2262,7 @@ mod test_wizard {
         let line = WizardLine::plain(text);
         let wrapped = wizard_wrap(&line, len);
         
-        assert_eq!(len, 5);
+        assert_eq!(len, 4);
         assert_eq!(wrapped.len(), 1);
         assert_eq!(wrapped[0].plain_text(), text);
     }
