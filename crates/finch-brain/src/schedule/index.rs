@@ -214,13 +214,6 @@ impl ScheduleIndex {
         self.by_brain.contains_key(name)
     }
 
-    /// Exact identity of a Brain that currently owns active scheduled work.
-    pub fn active_identity(&self, name: &str) -> Option<BrainId> {
-        self.has_active(name)
-            .then(|| self.identities.get(name).copied())
-            .flatten()
-    }
-
     /// Exact active identity plus its process-local schedule-set generation.
     pub fn active_observation(&self, name: &str) -> Option<(BrainId, u64)> {
         if !self.has_active(name) {
@@ -239,33 +232,6 @@ impl ScheduleIndex {
             *self.activity_epochs.get(name)?,
             self.has_active(name),
         ))
-    }
-
-    /// Every exact Brain identity that currently owns active scheduled work.
-    pub fn active_identities(&self) -> Vec<(BrainId, String)> {
-        self.by_brain
-            .keys()
-            .filter_map(|name| {
-                self.identities
-                    .get(name)
-                    .copied()
-                    .map(|brain_id| (brain_id, name.clone()))
-            })
-            .collect()
-    }
-
-    /// Every active identity and its process-local schedule-set generation.
-    pub fn active_observations(&self) -> Vec<(BrainId, String, u64)> {
-        self.by_brain
-            .keys()
-            .filter_map(|name| {
-                Some((
-                    *self.identities.get(name)?,
-                    name.clone(),
-                    *self.activity_epochs.get(name)?,
-                ))
-            })
-            .collect()
     }
 
     /// Diagnostic snapshot of every due key, never a rebuild.

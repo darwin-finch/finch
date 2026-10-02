@@ -64,7 +64,12 @@ fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
         "later due times must not reorder earlier Brains ahead of their due instant"
     );
     assert_eq!(index.next_due_ms(), Some(10));
-    assert_eq!(index.active_identity("alpha"), Some(alpha_id));
+    assert_eq!(
+        index
+            .active_observation("alpha")
+            .map(|(brain_id, _)| brain_id),
+        Some(alpha_id)
+    );
 
     index.forget("alpha");
     assert_eq!(
@@ -77,7 +82,7 @@ fn test_schedule_index_orders_across_brains_and_forgets_on_archive() {
         !index.is_indexed("alpha"),
         "forget must mark the Brain unknown so the next warm can repair it"
     );
-    assert_eq!(index.active_identity("alpha"), None);
+    assert_eq!(index.active_observation("alpha"), None);
 }
 
 #[test]

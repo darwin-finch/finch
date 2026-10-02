@@ -283,13 +283,12 @@ fn supervised_state_root(
     Ok(SupervisedStateRoot { directory, path })
 }
 
-/// The two timing decisions the schedule delivery loop makes.
+/// Delivery-loop timing, failure-episode state, and deterministic race hooks.
 ///
-/// Extracted as free functions because the loop body lives inside a
-/// `tokio::spawn` closure and is otherwise unreachable from a test. Both are
-/// pure -- they take the clock as a parameter -- so their tests assert
-/// behaviour with no clock of their own (#374, and #242's lesson about
-/// wall-clock assertions).
+/// The timing decisions remain pure and take the clock as a parameter. The
+/// process-local episode registry bounds transition logs, while test-only
+/// hooks expose otherwise unreachable lifecycle windows inside the spawned
+/// loop and its queue boundary.
 pub(crate) mod schedule_delivery {
     #[cfg(test)]
     use std::cell::RefCell;
@@ -301,6 +300,7 @@ pub(crate) mod schedule_delivery {
     #[cfg(test)]
     thread_local! {
         static AFTER_OBSERVATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_QUEUE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
         static AFTER_ATTEMPT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
         static AFTER_RESULT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
@@ -315,6 +315,20 @@ pub(crate) mod schedule_delivery {
     #[cfg(test)]
     pub(crate) fn run_after_observation_hook() {
         if let Some(hook) = AFTER_OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_queue_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_QUEUE_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_queue_hook() {
+        if let Some(hook) = AFTER_QUEUE_HOOK.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
     }
@@ -355,10 +369,18 @@ pub(crate) mod schedule_delivery {
     }
 
     impl FailureEpisodes {
-        /// Drop identities that no longer own the same active schedule set.
-        pub(crate) fn reconcile(&mut self, active: &HashMap<(BrainId, String), u64>) {
-            self.failing
-                .retain(|identity, epoch| active.get(identity) == Some(epoch));
+        /// Drop entries that no longer own the same active schedule set.
+        ///
+        /// The caller resolves only names already in the failure registry, so
+        /// the idle path does no work and reconciliation is O(failures), not
+        /// O(all active scheduled Brains).
+        pub(crate) fn reconcile(
+            &mut self,
+            mut active_observation: impl FnMut(&str) -> Option<(BrainId, u64)>,
+        ) {
+            self.failing.retain(|(brain_id, name), epoch| {
+                active_observation(name) == Some((*brain_id, *epoch))
+            });
         }
 
         /// Returns `true` only for the first failure in this episode.
@@ -523,8 +545,7 @@ pub(crate) mod schedule_delivery {
                 "the same durable identity after an empty-to-active ABA must start fresh"
             );
 
-            let active = HashMap::from([(successor.clone(), 3)]);
-            episodes.reconcile(&active);
+            episodes.reconcile(|name| (name == successor.1.as_str()).then_some((successor.0, 3)));
             assert_eq!(
                 episodes.len(),
                 0,
@@ -536,7 +557,7 @@ pub(crate) mod schedule_delivery {
             );
             assert_eq!(
                 episodes.len(),
-                active.len(),
+                1,
                 "the registry must remain bounded by active indexed identities after reconciliation"
             );
         }
@@ -868,12 +889,7 @@ impl AgentServer {
                     last_warm = tokio::time::Instant::now();
                 }
 
-                let active_identities = schedule_store
-                    .active_schedule_observations()
-                    .into_iter()
-                    .map(|(brain_id, name, epoch)| ((brain_id, name), epoch))
-                    .collect::<std::collections::HashMap<_, _>>();
-                failure_episodes.reconcile(&active_identities);
+                failure_episodes.reconcile(|name| schedule_store.active_schedule_observation(name));
 
                 let now = crate::brain::unix_millis();
                 let sleep_for =
@@ -913,15 +929,24 @@ impl AgentServer {
                     schedule_delivery::run_after_attempt_hook();
 
                     match result {
-                        Err(error)
-                            if schedule_store.active_schedule_observation(&name)
-                                == Some((brain_id, epoch))
-                                && failure_episodes.record_failure(identity.clone(), epoch) =>
+                        Err(failure)
+                            if (match failure.started {
+                                Some(started) => {
+                                    started == (brain_id, epoch)
+                                        && failure.completion.is_some()
+                                        && schedule_store.schedule_lifecycle_observation(&name)
+                                            == failure.completion
+                                }
+                                None => {
+                                    schedule_store.active_schedule_observation(&name)
+                                        == Some((brain_id, epoch))
+                                }
+                            }) && failure_episodes.record_failure(identity.clone(), epoch) =>
                         {
                             tracing::warn!(
                                 brain_id = %brain_id.0,
                                 brain = %name,
-                                error = %format_args!("{error:#}"),
+                                error = %format_args!("{:#}", failure.error),
                                 "could not deliver due Brain schedule"
                             );
                         }
@@ -1539,6 +1564,86 @@ mod tests {
             .expect("isolated tests need an in-memory provider graph")
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_final_one_shot_post_queue_failure_is_logged_before_retirement() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const NAME: &str = "one-shot-post-queue-error";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([38; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let attachment = store
+            .attach(NAME, "one-shot", crate::brain::AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"once\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                None,
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let brain_id = store.snapshot(NAME).unwrap().brain_id;
+        let brain_root = temp.path().join("brains");
+
+        let hook_store = store.clone();
+        let hook_root = brain_root.clone();
+        schedule_delivery::set_after_queue_hook(Box::new(move || {
+            assert!(
+                hook_store.evict_resident_brain_for_tests(NAME),
+                "the post-queue probe must evict the resident one-shot before readiness reloads it"
+            );
+            corrupt_brain_journal(&hook_root, NAME);
+        }));
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        let failures = captured.schedule_events(FAILURE);
+        let brain_id_text = brain_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            1,
+            "a post-queue one-shot error must begin one failure episode; events={failures:?}"
+        );
+        assert_eq!(
+            failures[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the warning must retain the retired one-shot's durable identity; event={:?}",
+            failures[0]
+        );
+        assert!(
+            failures[0]
+                .fields
+                .get("error")
+                .is_some_and(|error| error.contains("duplicate or reordered")),
+            "the warning must preserve the post-queue readiness failure; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            store.active_schedule_observation(NAME),
+            None,
+            "the final one-shot must already be inactive, proving the warning used captured lineage"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
     /// Regression for #395 at the production boundary: the real
     /// `serve_on_listener` timer repeatedly selects an unreadable scheduled
     /// Brain. Structured events, not rendered substrings, prove the exact
@@ -1570,7 +1675,12 @@ mod tests {
             format!("{corruption:#}").contains("duplicate or reordered"),
             "fixture corruption must fail through the real journal integrity check: {corruption:#}"
         );
-        assert_eq!(store.active_schedule_identity(NAME), Some(first_id));
+        assert_eq!(
+            store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
+            Some(first_id)
+        );
 
         let captured = CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
@@ -1721,7 +1831,9 @@ mod tests {
         tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
         wait_for_schedule_events(&captured, RECOVERY, 2).await;
         assert_eq!(
-            store.active_schedule_identity(NAME),
+            store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
             None,
             "the repaired one-shot must have delivered and retired its final active slot"
         );
@@ -1943,12 +2055,12 @@ mod tests {
             .brain_runners
             .register(NAME, lease.lease_id, runner_tx);
         tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
-        let request = loop {
-            tokio::task::yield_now().await;
-            if let Ok(request) = runner_rx.try_recv() {
-                break request;
-            }
-        };
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), runner_rx.recv())
+            .await
+            .expect("scheduled delivery must reach the registered runner before the liveness bound")
+            .expect(
+                "the runner request channel must stay open until the scheduled dispatch arrives",
+            );
         let crate::server::RunnerRequest::Program(request) = request else {
             panic!("scheduled Lisp delivery must park on a program runner request")
         };
@@ -1985,6 +2097,10 @@ mod tests {
             .find(|snapshot| snapshot.revision == outcome.output_revision)
             .and_then(|snapshot| snapshot.checkpoint)
             .unwrap();
+        let (result_processed_tx, result_processed_rx) = tokio::sync::oneshot::channel();
+        schedule_delivery::set_after_result_hook(Box::new(move || {
+            let _ = result_processed_tx.send(());
+        }));
         request
             .response_tx
             .send(Ok(crate::server::RunnerProgramResult {
@@ -1994,9 +2110,10 @@ mod tests {
                 effect_journal: Vec::new(),
             }))
             .unwrap();
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), result_processed_rx)
+            .await
+            .expect("the parked delivery result must be classified before the liveness bound")
+            .expect("the delivery result hook must remain live until classification");
         assert_eq!(
             captured.schedule_events(RECOVERY).len(),
             2,
@@ -2093,7 +2210,7 @@ mod tests {
             failures[7].fields.get("brain_id").map(String::as_str),
             Some(final_id_text.as_str()),
             "the reused name must start a new identity-keyed episode; event={:?}",
-            failures[2]
+            failures[7]
         );
         assert_eq!(
             captured.schedule_events(RECOVERY).len(),
@@ -2107,12 +2224,12 @@ mod tests {
         std::fs::remove_dir_all(brain_root.join(NAME)).unwrap();
         tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
         for _ in 0..200 {
-            if store.active_schedule_identity(NAME).is_none() {
+            if store.active_schedule_observation(NAME).is_none() {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(store.active_schedule_identity(NAME), None);
+        assert_eq!(store.active_schedule_observation(NAME), None);
         assert_eq!(captured.schedule_events(FAILURE).len(), 8);
         assert_eq!(
             captured.schedule_events(RECOVERY).len(),
@@ -2165,13 +2282,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let restarted_serving = tokio::spawn(Arc::clone(&restarted).serve_on_listener(listener));
         for _ in 0..200 {
-            if restarted_store.active_schedule_identity(NAME) == Some(external_successor_id) {
+            if restarted_store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id)
+                == Some(external_successor_id)
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            restarted_store.active_schedule_identity(NAME),
+            restarted_store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
             Some(external_successor_id),
             "restart warm-up must index the same durable identity before the failure probe"
         );

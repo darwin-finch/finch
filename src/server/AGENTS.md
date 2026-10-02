@@ -42,6 +42,10 @@ retirement does not hide the real recovery. That observation comes from the atom
 commit together with the in-lock entry observation; recovery requires that entry to match the
 loop's sampled generation, so cancel-last/recreate before queueing cannot substitute successor
 work, while a later external cancellation cannot masquerade as the delivery's own retirement.
+Post-queue failures carry the same entry and completion observations: a final one-shot may retire
+before runner readiness or dispatch fails, and that genuine failure must still WARN when the
+captured completion remains the current lifecycle. Pre-queue failures retain the stricter active
+observation check.
 Restart deliberately
 starts empty, so the first real post-restart failure may warn again but never invents recovery.
 

@@ -2448,18 +2448,6 @@ impl BrainStore {
             .due_brains(now_ms)
     }
 
-    /// Exact identity currently owning active indexed schedules under `name`.
-    ///
-    /// The daemon uses this non-hydrating snapshot to fence process-ephemeral
-    /// delivery diagnostics against archive, removal, external absence, and
-    /// alias reuse. `None` means the identity is no longer delivery-eligible.
-    pub fn active_schedule_identity(&self, name: &str) -> Option<BrainId> {
-        self.schedule_index
-            .read()
-            .expect("schedule index lock poisoned")
-            .active_identity(name)
-    }
-
     /// Exact active identity plus its process-local schedule-set generation.
     pub fn active_schedule_observation(&self, name: &str) -> Option<(BrainId, u64)> {
         self.schedule_index
@@ -2474,25 +2462,6 @@ impl BrainStore {
             .read()
             .expect("schedule index lock poisoned")
             .lifecycle_observation(name)
-    }
-
-    /// Every exact Brain identity currently owning active indexed schedules.
-    ///
-    /// This is a bounded, non-hydrating reconciliation view for daemon-owned
-    /// ephemeral state; it does not expose schedule contents or due arithmetic.
-    pub fn active_schedule_identities(&self) -> Vec<(BrainId, String)> {
-        self.schedule_index
-            .read()
-            .expect("schedule index lock poisoned")
-            .active_identities()
-    }
-
-    /// Every active identity and its process-local schedule-set generation.
-    pub fn active_schedule_observations(&self) -> Vec<(BrainId, String, u64)> {
-        self.schedule_index
-            .read()
-            .expect("schedule index lock poisoned")
-            .active_observations()
     }
 
     /// Populate the due index from every Brain on disk, once.
