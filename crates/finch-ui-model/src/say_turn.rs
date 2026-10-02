@@ -34,7 +34,7 @@ use crate::{MessageId, NodeRole, RenderedTranscriptLine, RowId};
 
 /// Status of a component-owned say turn. The completion path transitions it
 /// exactly once; a finished turn therefore cannot keep wearing `running`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SayTurnStatus {
     #[default]
     Running,
@@ -43,7 +43,7 @@ pub enum SayTurnStatus {
 
 /// The program-source part of a say turn's ViewModel: the exact wire text the
 /// provider produced, retained so the reader can reveal it on demand.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgramSourceVm {
     pub language: String,
     pub lines: Vec<String>,
@@ -51,7 +51,7 @@ pub struct ProgramSourceVm {
 
 /// The output part of a say turn's ViewModel, set when the program produces
 /// output and updated live as `say` chunks stream.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct OutputVm {
     pub lines: Vec<String>,
 }
@@ -61,7 +61,7 @@ pub struct OutputVm {
 /// output) and the ephemeral UI state (`show_program`, default hidden for say
 /// turns — #350's prose ruling). Because it is retained, component state needs
 /// no renderer-side map.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkUnitViewModel {
     pub status: SayTurnStatus,
     pub program: ProgramSourceVm,
@@ -73,7 +73,7 @@ pub struct WorkUnitViewModel {
 /// timing, captured under the same lock read. The full-resolution elapsed
 /// drives the component's animated generating state; completed turns read the
 /// captured value, so the annotation is stable for scrollback.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SayTurnView {
     pub message_id: MessageId,
     pub vm: WorkUnitViewModel,
@@ -92,7 +92,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const SPINNER_TICK_MS: u64 = 80;
 
 /// Which single representation the turn renders this frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 enum SayTurnState {
     Generating,
     Running,

@@ -42,11 +42,11 @@ fn style_codes(style: &SpanStyle) -> String {
     if style.dim {
         codes.push("2".to_string());
     }
-    if let Some(fg) = style.fg {
-        codes.push(fg_code(fg));
+    if let Some(ref fg) = style.fg {
+        codes.push(fg_code(fg.clone()));
     }
-    if let Some(bg) = style.bg {
-        codes.push(bg_code(bg));
+    if let Some(ref bg) = style.bg {
+        codes.push(bg_code(bg.clone()));
     }
     codes.join(";")
 }
@@ -58,10 +58,27 @@ const SGR_RESET: &str = "\x1b[0m";
 /// reaches the terminal exactly as the legacy paths wrote it.
 pub fn lower_span(span: &Span) -> String {
     let codes = style_codes(&span.style);
-    if codes.is_empty() {
+    
+    let mut out = String::new();
+    if let Some(url) = &span.style.hyperlink {
+        out.push_str(&format!("\x1b]8;;{}\x1b\\", url));
+    }
+    if !codes.is_empty() {
+        out.push_str(&format!("\x1b[{codes}m"));
+    }
+    out.push_str(&span.text);
+    if !codes.is_empty() {
+        out.push_str(SGR_RESET);
+    }
+    if span.style.hyperlink.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
+    
+    // Fallback if plain (but still check if we added links, in which case it wasn't fully plain)
+    if out == span.text {
         span.text.clone()
     } else {
-        format!("\x1b[{codes}m{}{SGR_RESET}", span.text)
+        out
     }
 }
 
@@ -79,13 +96,26 @@ pub fn lower_spans(spans: &[Span]) -> String {
 /// itself carry SGR from an unmigrated projection — that path is unchanged).
 /// Measurement never runs on this string: SGR is zero-width and the plain
 /// `text` is what every row count reads.
-pub fn lower_rendered_line(line: &RenderedTranscriptLine) -> String {
+pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>) -> String {
     if line.spans.is_empty() {
-        line.text.clone()
+        if let Some(bg) = force_bg {
+            let span = Span::styled(&line.text, SpanStyle::default().with_bg(bg.clone()));
+            lower_span(&span)
+        } else {
+            line.text.clone()
+        }
     } else {
-        lower_spans(&line.spans)
+        if let Some(bg) = force_bg {
+            let spans = line.spans.iter().map(|s| {
+                Span::styled(&s.text, s.style.clone().with_bg(bg.clone()))
+            }).collect::<Vec<_>>();
+            lower_spans(&spans)
+        } else {
+            lower_spans(&line.spans)
+        }
     }
 }
+
 
 /// Map a `ColorSpec` (the ColorScheme's serializable colour) to the span
 /// vocabulary's colour, with the same named-colour table the retired
@@ -151,7 +181,7 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette.progress_failed = SpanStyle::fg(span_color_from_spec(&colors.messages.error));
     palette.static_info = SpanStyle::fg(span_color_from_spec(&colors.messages.system));
     palette.static_error = SpanStyle::fg(span_color_from_spec(&colors.messages.error));
-    palette.static_success = palette.static_info;
+    palette.static_success = palette.static_info.clone();
     palette.static_warning = SpanStyle::fg(span_color_from_spec(&colors.status.operation));
     palette.user_foreground = span_color_from_spec(&colors.messages.user);
     if let Some(bg) = colors.message_band_style(MessageBand::LocalUser).bg {
@@ -235,7 +265,7 @@ mod tests {
             ..RenderedTranscriptLine::default()
         };
         assert_eq!(
-            lower_rendered_line(&plain),
+            lower_rendered_line(&plain, None),
             "legacy \x1b[2mdim\x1b[0m",
             "span-free lines pass their bytes through untouched"
         );
@@ -243,7 +273,7 @@ mod tests {
             Span::styled("⏺", SpanStyle::fg(SpanColor::CYAN)),
             Span::plain(" Generating"),
         ]);
-        assert_eq!(lower_rendered_line(&styled), "\x1b[96m⏺\x1b[0m Generating");
+        assert_eq!(lower_rendered_line(&styled, None), "\x1b[96m⏺\x1b[0m Generating");
     }
 
     /// The selection highlight lowers through the same span path as any

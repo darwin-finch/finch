@@ -30,7 +30,7 @@ use crate::{
 /// The component snapshot of one migrated typed message. A message type
 /// constructs the variant that belongs to it from its retained ViewModel;
 /// `None`-returning rows have not migrated and keep the legacy projection.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub enum ComponentView {
     /// A component-owned say turn (#882, stages 1–2). Migrated to this
     /// accessor in stage 3 (#1120): the say component rides the same
@@ -68,7 +68,7 @@ pub enum ComponentView {
 /// has no mutable state to retain — the content itself is the ViewModel —
 /// and the message constructs the snapshot from its own immutable fields; no
 /// lock is involved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StaticTextView {
     pub kind: StaticTextKind,
     pub content_lines: Vec<String>,
@@ -77,7 +77,7 @@ pub struct StaticTextView {
 /// Which glyph a static text row wears. Byte-compatible with the retired
 /// `format()` presentation: `Plain` passes the content through with no
 /// prefix, so pre-formatted text reaches the record byte-exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StaticTextKind {
     Info,
     Error,
@@ -90,7 +90,7 @@ pub enum StaticTextKind {
 /// current/total byte counts, and the message status. The message constructs
 /// the snapshot under its existing locks; `current` is the live state the
 /// component re-renders every frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ProgressView {
     pub label: String,
     pub current: u64,
@@ -103,7 +103,7 @@ pub struct ProgressView {
 /// constructs the snapshot under its existing lock; `content_lines` is the
 /// live state that grows as the tool streams, and every frame re-renders
 /// from it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LiveToolView {
     pub header: String,
     pub content_lines: Vec<String>,
@@ -114,7 +114,7 @@ pub struct LiveToolView {
 /// header, the whole-operation status, and one row per tool call with its
 /// status. The message constructs the snapshot under its existing locks;
 /// `rows` is the live state that grows and transitions as calls run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OperationView {
     pub header: String,
     pub status: MessageStatus,
@@ -123,7 +123,7 @@ pub struct OperationView {
 
 /// One tool-call row of an [`OperationView`], with the shared row-status
 /// vocabulary: the per-row glyph is a pure function of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OperationRowView {
     pub label: String,
     pub status: WorkRowStatus,
@@ -137,7 +137,7 @@ pub struct OperationRowView {
 /// its own lock (#1235), read fresh into this snapshot every frame.
 /// `message_id` addresses the rows' `RowId`s the same way `SayTurnView`'s
 /// does.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecalledView {
     pub message_id: MessageId,
     pub header: String,
@@ -152,7 +152,7 @@ pub struct MemoryRecalledView {
 /// (#1235): the identity/summary line is always visible, and a click (or the
 /// keyboard disclosure path) reveals `body_lines`, mirroring the say turn's
 /// `show_program` toggle.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecallRowView {
     pub label: String,
     pub summary: String,
@@ -163,7 +163,7 @@ pub struct MemoryRecallRowView {
 /// The ViewModel of a [`ComponentView::UserTurn`] component: the prompt
 /// marker, optional subject (e.g. participant name), the content lines,
 /// and optional participant index for color palette selection.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UserTurnView {
     pub marker: char,
     pub subject: Option<String>,
@@ -179,7 +179,7 @@ pub struct UserTurnView {
 /// presentation — the exact colours the retired `format()` paths painted — so
 /// the migrated surfaces "regain" their styling and the default stays honest
 /// without a scheme at hand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ComponentStylePalette {
     /// Progress line while running — pre-migration: `colors.status.operation`.
     pub progress_running: SpanStyle,
@@ -295,9 +295,9 @@ fn progress_lines(
         MessageStatus::InProgress => format!("{} {bar} {percentage}%", view.label),
     };
     let style = match view.status {
-        MessageStatus::Complete => palette.progress_complete,
-        MessageStatus::Failed => palette.progress_failed,
-        MessageStatus::InProgress => palette.progress_running,
+        MessageStatus::Complete => palette.progress_complete.clone(),
+        MessageStatus::Failed => palette.progress_failed.clone(),
+        MessageStatus::InProgress => palette.progress_running.clone(),
     };
     vec![RenderedTranscriptLine::from_spans(vec![Span::styled(
         text, style,
@@ -317,7 +317,7 @@ fn live_tool_lines(
     let mut lines = Vec::with_capacity(1 + view.content_lines.len());
     let mut header_spans = vec![Span::plain(view.header.clone())];
     if view.content_lines.is_empty() && view.status == MessageStatus::InProgress {
-        header_spans.push(Span::styled("\u{2026}", palette.live_tool_ellipsis));
+        header_spans.push(Span::styled("\u{2026}", palette.live_tool_ellipsis.clone()));
     }
     lines.push(RenderedTranscriptLine::from_spans(header_spans));
     lines.extend(
@@ -366,7 +366,7 @@ fn operation_lines(
 ) -> Vec<RenderedTranscriptLine> {
     let mut lines = Vec::with_capacity(1 + view.rows.len());
     let mut chrome_spans = vec![
-        Span::styled("\u{23fa}", palette.operation_glyph),
+        Span::styled("\u{23fa}", palette.operation_glyph.clone()),
         Span::plain(format!(" {}", view.header)),
     ];
     if view.status == MessageStatus::InProgress {
@@ -402,21 +402,21 @@ impl<'a> OperationRows<'a> {
                 // the label; only the status suffix differs per state.
                 let mut spans = vec![
                     Span::plain("  "),
-                    Span::styled("\u{23bf}", palette.operation_row_glyph),
+                    Span::styled("\u{23bf}", palette.operation_row_glyph.clone()),
                     Span::plain(format!(" {}", row.label)),
                 ];
                 match &row.status {
                     WorkRowStatus::Running => {
-                        spans.push(Span::styled("\u{2026}", palette.operation_summary));
+                        spans.push(Span::styled("\u{2026}", palette.operation_summary.clone()));
                     }
                     WorkRowStatus::Complete(summary) if summary.is_empty() => {}
                     WorkRowStatus::Complete(summary) => {
                         spans.push(Span::plain(" "));
-                        spans.push(Span::styled(summary.clone(), palette.operation_summary));
+                        spans.push(Span::styled(summary.clone(), palette.operation_summary.clone()));
                     }
                     WorkRowStatus::Error(error) => {
                         spans.push(Span::plain(" "));
-                        spans.push(Span::styled("error:", palette.operation_error));
+                        spans.push(Span::styled("error:", palette.operation_error.clone()));
                         spans.push(Span::plain(format!(" {error}")));
                     }
                 }
@@ -436,10 +436,10 @@ fn static_text_lines(
     palette: &ComponentStylePalette,
 ) -> Vec<RenderedTranscriptLine> {
     let (prefix, style) = match view.kind {
-        StaticTextKind::Info => ("ℹ️  ", palette.static_info),
-        StaticTextKind::Error => ("❌ ", palette.static_error),
-        StaticTextKind::Success => ("✓ ", palette.static_success),
-        StaticTextKind::Warning => ("⚠️  ", palette.static_warning),
+        StaticTextKind::Info => ("ℹ️  ", palette.static_info.clone()),
+        StaticTextKind::Error => ("❌ ", palette.static_error.clone()),
+        StaticTextKind::Success => ("✓ ", palette.static_success.clone()),
+        StaticTextKind::Warning => ("⚠️  ", palette.static_warning.clone()),
         StaticTextKind::Plain => ("", SpanStyle::PLAIN),
     };
     let lines = if view.content_lines.is_empty() {
@@ -458,7 +458,7 @@ fn static_text_lines(
             } else {
                 RenderedTranscriptLine::from_spans(vec![Span::styled(
                     format!("{prefix}{line}"),
-                    style,
+                    style.clone(),
                 )])
             }
         })
@@ -491,7 +491,7 @@ fn memory_recalled_lines(
 ) -> Vec<RenderedTranscriptLine> {
     let mut lines = Vec::with_capacity(1 + view.rows.len());
     lines.push(RenderedTranscriptLine::from_spans(vec![
-        Span::styled("\u{23fa}", palette.operation_glyph),
+        Span::styled("\u{23fa}", palette.operation_glyph.clone()),
         Span::plain(format!(" {}", view.header)),
     ]));
     for (index, row) in view.rows.iter().enumerate() {
@@ -502,7 +502,7 @@ fn memory_recalled_lines(
         });
         let mut row_spans = vec![
             Span::plain("  "),
-            Span::styled("\u{23bf}", palette.operation_row_glyph),
+            Span::styled("\u{23bf}", palette.operation_row_glyph.clone()),
         ];
         // #1259: a static chevron affordance -- collapsed "▸"/expanded "▾" --
         // prefixes the label of every row that has something to disclose, so
@@ -513,7 +513,7 @@ fn memory_recalled_lines(
             let chevron = if row.expanded { '\u{25be}' } else { '\u{25b8}' };
             row_spans.push(Span::styled(
                 format!(" {chevron}"),
-                palette.operation_row_glyph,
+                palette.operation_row_glyph.clone(),
             ));
         }
         row_spans.push(Span::plain(format!(" {}", row.label)));
@@ -521,7 +521,7 @@ fn memory_recalled_lines(
             row_spans.push(Span::plain(" "));
             row_spans.push(Span::styled(
                 format!("— {}", row.summary),
-                palette.operation_summary,
+                palette.operation_summary.clone(),
             ));
         }
         lines.push(RenderedTranscriptLine {
@@ -558,11 +558,11 @@ fn user_turn_lines(
 ) -> Vec<RenderedTranscriptLine> {
     let bg = match view.participant_index {
         Some(index) => {
-            palette.participant_backgrounds[index % palette.participant_backgrounds.len()]
+            palette.participant_backgrounds[index % palette.participant_backgrounds.len()].clone()
         }
-        None => palette.user_background,
+        None => palette.user_background.clone(),
     };
-    let style = SpanStyle::fg(palette.user_foreground).with_bg(bg);
+    let style = SpanStyle::fg(palette.user_foreground.clone()).with_bg(bg);
 
     let first_line_content = view.content_lines.first().map(|s| s.as_str()).unwrap_or("");
     let first_line_text = match &view.subject {
@@ -573,14 +573,14 @@ fn user_turn_lines(
     let mut lines = Vec::with_capacity(view.content_lines.len().max(1));
     lines.push(RenderedTranscriptLine::from_spans(vec![Span::styled(
         first_line_text,
-        style,
+        style.clone(),
     )]));
 
     if view.content_lines.len() > 1 {
         for line in &view.content_lines[1..] {
             lines.push(RenderedTranscriptLine::from_spans(vec![Span::styled(
                 line.clone(),
-                style,
+                style.clone(),
             )]));
         }
     }
@@ -1432,7 +1432,7 @@ mod tests {
     // ── Stage 4 (#1141): styled spans, never SGR bytes ──────────────────────
 
     /// SCAN REGRESSION (#1141): component renderers construct no SGR bytes —
-    /// styling flows from the injected palette. This mirrors the stage-3
+    /// styling flows from the injected palette..clone() This mirrors the stage-3
     /// type-agnostic scan: the production half of this file (everything
     /// before the test module) may not contain an escape sequence or an SGR
     /// constant at all.
@@ -1675,7 +1675,7 @@ mod tests {
         }
     }
 
-    /// Participant turns use their assigned participant background from the palette.
+    /// Participant turns use their assigned participant background from the palette..clone()
     #[test]
     fn test_user_turn_lines_support_participant_background() {
         let view = UserTurnView {
