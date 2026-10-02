@@ -90,7 +90,7 @@ pub(super) fn format_catalog_label(
         CatalogSource::Discovered => "provider discovery".to_string(),
         CatalogSource::Cache => "local cache".to_string(),
         CatalogSource::StaticFallback => format!(
-            "bundled fallback snapshot (as of {}; incomplete)",
+            "built-in list (as of {}; incomplete)",
             STATIC_FALLBACK_AS_OF
         ),
     };
@@ -101,7 +101,7 @@ pub(super) fn format_catalog_label(
             .map(|refreshed| format!(" · {}", format_catalog_refresh_time(refreshed, now)))
             .unwrap_or_default()
     };
-    format!("Models: {source}{refreshed} · Ctrl+R refresh · model ID remains editable")
+    format!("Models: {source}{refreshed} · Ctrl+R refresh · model name remains editable")
 }
 
 /// Skip the first `skip` wrapped rows of `lines`, by whole logical lines.

@@ -2797,10 +2797,12 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         misleading_runtime_time,
     );
 
-    assert!(label.contains("bundled fallback snapshot"), "{label}");
+    assert!(label.contains("built-in list"), "{label}");
     assert!(label.contains(STATIC_FALLBACK_AS_OF), "{label}");
     assert!(label.contains("incomplete"), "{label}");
-    assert!(label.contains("model ID remains editable"), "{label}");
+    assert!(label.contains("model name remains editable"), "{label}");
+    assert!(!label.contains("bundled fallback snapshot"), "{label}");
+    assert!(!label.contains("model ID"), "{label}");
     assert!(!label.contains("provider discovery"), "{label}");
     assert!(!label.contains("local cache"), "{label}");
     assert!(!label.contains("UTC"), "{label}");
@@ -2831,9 +2833,13 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         180,
         50,
     );
-    assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+    assert!(rendered.contains("built-in list"), "{rendered}");
     assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
+    assert!(
+        !rendered.contains("bundled fallback snapshot"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("provider discovery"), "{rendered}");
     assert!(!rendered.contains("local cache"), "{rendered}");
     assert!(!rendered.contains("UTC"), "{rendered}");
@@ -3034,7 +3040,7 @@ fn failed_refresh_with_static_fallback_renders_snapshot_warning_and_preserves_ma
         }) if error == "fake provider unavailable"
     ));
     let rendered = render_wizard_text(&state);
-    assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+    assert!(rendered.contains("built-in list"), "{rendered}");
     assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
     assert!(
