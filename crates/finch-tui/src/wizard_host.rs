@@ -502,6 +502,10 @@ pub fn wizard_wrap(line: &WizardLine, width: usize) -> Vec<WizardLine> {
                                     break;
                                 }
                             }
+                        } else {
+                            if let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                            }
                         }
                         continue;
                     }
@@ -2142,5 +2146,21 @@ mod tests {
             frame_next.rects.banner.height, 0,
             "banner must yield when advancing past the first tab"
         );
+    }
+}
+
+#[cfg(test)]
+mod test_wizard {
+    use super::*;
+
+    #[test]
+    fn test_wizard_visible_length_vs_wrap_mismatch() {
+        let text = "\x1b(Btest";
+        let len = wizard_visible_length(text);
+        
+        let line = WizardLine::plain(text);
+        let wrapped = wizard_wrap(&line, len);
+        
+        panic!("len = {}, wrapped len = {}", len, wrapped.len());
     }
 }
