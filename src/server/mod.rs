@@ -945,20 +945,25 @@ impl AgentServer {
 
                     match result {
                         Err(failure) => {
-                            // A post-sample failure warns for the captured entry
-                            // epoch, which can differ from the loop sample when
-                            // cancel-last recreated the same BrainId before
-                            // queueing. Recovery below still requires the sample.
-                            // A pre-sample failure still requires the live active
-                            // set to be the one this pass selected.
+                            // A post-sample failure warns for the completion
+                            // epoch. An earlier one-shot in the same queue call
+                            // advances the activity epoch, and reconcile only
+                            // keeps the epoch still active. The entry epoch
+                            // would be dropped on the next pass, so the sibling
+                            // would warn again and its later success would not
+                            // count as recovery. Recovery below still requires
+                            // the loop sample, so a successor cannot clear a
+                            // predecessor. A pre-sample failure still requires
+                            // the live active set to be the one this pass selected.
                             let record_epoch = match failure.started {
-                                Some((started_id, started_epoch))
+                                Some((started_id, _))
                                     if started_id == brain_id
-                                        && failure.completion.is_some()
                                         && schedule_store.schedule_lifecycle_observation(&name)
                                             == failure.completion =>
                                 {
-                                    Some(started_epoch)
+                                    failure
+                                        .completion
+                                        .map(|(_, completion_epoch, _)| completion_epoch)
                                 }
                                 None if schedule_store.active_schedule_observation(&name)
                                     == Some((brain_id, epoch)) =>
@@ -1672,8 +1677,10 @@ mod tests {
     }
 
     /// A one-shot that commits inside `queue_due_schedules_observed`, then a
-    /// later sibling append in that same call, must still WARN. Classifying
-    /// the whole `Err` as pre-queue drops the moved epoch and the cause.
+    /// later sibling append in that same call, must still WARN once. The
+    /// episode has to follow the post-commit epoch: the sibling is still due,
+    /// the head has moved, and the next pass retries it immediately. That
+    /// retry is the recovery and must INFO exactly once.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_partial_queue_failure_after_one_shot_commit_warns_once() {
         const FAILURE: &str = "could not deliver due Brain schedule";
@@ -1766,12 +1773,39 @@ mod tests {
              schedules={:?}",
             snapshot.schedules
         );
+
+        const RECOVERY: &str = "due Brain schedule delivery recovered";
+        wait_for_schedule_events(&captured, RECOVERY, 1).await;
+        let failures = captured.schedule_events(FAILURE);
+        let recoveries = captured.schedule_events(RECOVERY);
         assert_eq!(
-            captured
-                .schedule_events("due Brain schedule delivery recovered")
-                .len(),
-            0,
-            "the partial failure is not a recovery"
+            failures.len(),
+            1,
+            "the sibling retry must not warn again; events={failures:?}"
+        );
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "the sibling queued on the immediate retry must recover the partial-queue episode; \
+             events={recoveries:?}"
+        );
+        assert_eq!(
+            recoveries[0].level,
+            tracing::Level::INFO,
+            "the partial-queue recovery must be info; event={:?}",
+            recoveries[0]
+        );
+        assert_eq!(
+            recoveries[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the recovery must name the same Brain as the warning; event={:?}",
+            recoveries[0]
+        );
+        assert!(
+            store.snapshot(NAME).unwrap().runs.iter().any(|run| {
+                run.status == crate::brain::BrainRunStatus::QueuedForEnvironment
+            }),
+            "the recurring sibling must have been queued once the injected append failure was spent"
         );
 
         serving.abort();

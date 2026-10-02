@@ -475,8 +475,10 @@ pub struct BrainStore {
     ///
     /// Both zero means the seam is idle. A queue that commits one schedule and
     /// then fails a later append uses this to hit that second append only.
+    /// Shared across `BrainStore` clones, like the other test seams: the
+    /// delivery task and the test hook are different clones of one store.
     #[cfg(any(test, feature = "test-support"))]
-    journal_append_fault: std::sync::Mutex<(usize, usize)>,
+    journal_append_fault: Arc<std::sync::Mutex<(usize, usize)>>,
     #[cfg(any(test, feature = "test-support"))]
     cancellation_reservation_pause:
         Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
@@ -742,7 +744,7 @@ impl BrainStore {
             #[cfg(any(test, feature = "test-support"))]
             fail_cancellation_terminal_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
-            journal_append_fault: std::sync::Mutex::new((0, 0)),
+            journal_append_fault: Arc::new(std::sync::Mutex::new((0, 0))),
             #[cfg(any(test, feature = "test-support"))]
             cancellation_reservation_pause: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -2601,9 +2603,11 @@ impl BrainStore {
 /// Queue error, with the lineage sampled after the Brain write guard when the
 /// failure happened after that sample.
 ///
-/// `Before` is a name, load, or absence failure. `After` is an error from a
-/// due schedule whose earlier siblings in the same call may already have
-/// committed, including a one-shot retirement that moved the activity epoch.
+/// `Before` is an invalid name, an unreadable load, or concurrent removal.
+/// A missing Brain is pruned and returned as an empty queue, not `Before`.
+/// `After` is an error from a due schedule whose earlier siblings in the same
+/// call may already have committed, including a one-shot retirement that moved
+/// the activity epoch.
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum ScheduleQueueError {

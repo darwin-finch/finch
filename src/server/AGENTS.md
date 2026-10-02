@@ -46,9 +46,12 @@ Post-queue failures carry the same entry and completion observations: a final on
 before runner readiness or dispatch fails, and that genuine failure must still WARN when the
 captured completion remains the current lifecycle. An error raised inside the queue call after
 the entry sample carries that same pair, so a one-shot committed earlier in the call cannot hide
-a later sibling's failure. A successor one-shot queued after cancel-last recreation warns on its
-captured entry epoch when that completion is still current; it does not recover the predecessor,
-because recovery still requires the loop's sampled epoch. A runner that is live for the first
+a later sibling's failure. The episode is stored at that completion epoch: the one-shot's
+retirement has already moved the activity epoch, and reconcile only keeps the epoch still
+active. The sibling's unchanged retries stay silent, and its later success emits the one INFO.
+A successor one-shot queued after cancel-last recreation warns when its captured completion is
+still current; it does not recover the predecessor, because recovery still requires the loop's
+sampled epoch. A runner that is live for the first
 readiness check and gone before dispatch reports the queued count, the same success as a runner
 that was already absent, so that retirement does not drop the recovery line. Pre-queue failures
 retain the stricter active observation check.
