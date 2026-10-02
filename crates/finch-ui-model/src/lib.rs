@@ -275,6 +275,14 @@ pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) {
     (visible_chars, ansi_positions)
 }
 
+/// Strip ANSI escape codes and non-printable control characters from `s`, returning plain text.
+pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') && !s.contains('\r') && !s.contains('\x08') && !s.contains('\x7f') {
+        return s.to_string();
+    }
+    extract_visible_chars(s).0.into_iter().collect()
+}
+
 /// Truncate `s` to at most `columns` display columns.
 ///
 /// Truncating with `chars().take(n)` is wrong wherever the result is then
@@ -1342,5 +1350,19 @@ mod tests {
             vec![(0usize, 0usize, 2usize)],
             "the component-owned emoji header claims both of its physical rows"
         );
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_sgr_and_osc_and_preserves_plain() {
+        assert_eq!(strip_ansi("plain text"), "plain text");
+        assert_eq!(
+            strip_ansi("\x1b[38;5;8mgrep(\"foo\")\x1b[0m"),
+            "grep(\"foo\")"
+        );
+        assert_eq!(
+            strip_ansi("\x1b[36m\x1b[1mGrep\x1b[0m\x1b[38;5;8m(Type[- ]4...)\x1b[0m"),
+            "Grep(Type[- ]4...)"
+        );
+        assert_eq!(strip_ansi("\x1b]0;title\x07hello"), "hello");
     }
 }

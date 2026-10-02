@@ -2338,8 +2338,12 @@ impl TuiRenderer {
         // highlighted background the logical selection no longer covers.
         for row in stale_rows {
             if let Some(entry) = self.selection_index.row(row) {
-                execute!(out, cursor::MoveTo(0, row))?;
-                execute!(out, Print(&entry.text))?;
+                execute!(
+                    out,
+                    cursor::MoveTo(0, row),
+                    Clear(ClearType::CurrentLine),
+                    Print(&entry.text)
+                )?;
             }
         }
         let style = span_render::selection_highlight_style();
@@ -2348,7 +2352,7 @@ impl TuiRenderer {
             let prefix: String = chars[..start].iter().collect();
             let highlighted: String = chars[start..end].iter().collect();
             let suffix: String = chars[end..].iter().collect();
-            execute!(out, cursor::MoveTo(0, row))?;
+            execute!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             if !prefix.is_empty() {
                 execute!(out, Print(&prefix))?;
             }
@@ -14852,7 +14856,7 @@ mod selection_tests {
             .draw_live_area_to(&mut retracted)
             .expect("live draw of the retracted drag must succeed");
         let retracted_bytes = String::from_utf8_lossy(&retracted).into_owned();
-        let restore = format!("{bottom_move_to}second line");
+        let restore = format!("{bottom_move_to}\x1b[2Ksecond line");
         assert!(
             retracted_bytes.contains(&restore),
             "the row that fell out of the selection must be repainted as \
@@ -15879,5 +15883,64 @@ mod selection_tests {
                 term.diagnostic()
             );
         }
+    }
+
+    /// #1493 regression: selecting over a line carrying ANSI SGR escape sequences
+    /// (such as tool summaries or styled output) must not slice escape sequences,
+    /// emit raw escape parameters (like `;5;8m`), or leave overprinted character
+    /// artifacts when highlighted or unhighlighted.
+    #[test]
+    fn test_selection_over_ansi_styled_line_avoids_escape_slicing_and_overprinting() {
+        let raw_line = "\x1b[36m\x1b[1mGrep\x1b[0m\x1b[38;5;8m(Type[- ]4...)\x1b[0m";
+        let mut renderer = renderer_with_plain_line(raw_line);
+        let row = row_of(&renderer, "Grep(Type[- ]4...)");
+
+        // Drag across "Grep(Typ" (cols 0..=7)
+        renderer.handle_mouse(left_down(row, 0));
+        renderer.handle_mouse(left_drag(row, 7));
+
+        let mut frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut frame)
+            .expect("live draw with selection must succeed");
+
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        term.feed(&frame);
+
+        // The terminal line must display "Grep(Type[- ]4...)" without raw escape text like ";5;8m"
+        let line_text: String = (0..18)
+            .map(|col| term.cell(row as usize, col).character)
+            .collect();
+        assert_eq!(
+            line_text,
+            "Grep(Type[- ]4...)",
+            "terminal line must display clean text without broken ANSI fragments; screen:\n{}",
+            term.diagnostic()
+        );
+
+        // Columns 0..=7 must carry the selection highlight style
+        let expected_style = vt_oracle::VtStyle {
+            foreground: vt_oracle::VtColor::Indexed(15),
+            background: vt_oracle::VtColor::Indexed(4),
+            bold: true,
+            reverse: false,
+        };
+        for col in 0..=7 {
+            assert_eq!(
+                term.cell(row as usize, col).style,
+                expected_style,
+                "column {col} must carry selection highlight style"
+            );
+        }
+
+        // Release and verify copied text
+        renderer.handle_mouse(left_up(row, 7));
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("selection must survive release");
+        let text = selection::selected_text(&renderer.selection_index, released);
+        assert_eq!(text, "Grep(Typ");
+        assert!(!text.contains(";5;8m") && !text.contains('\x1b'));
     }
 }
