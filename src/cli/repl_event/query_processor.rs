@@ -2009,16 +2009,16 @@ pub(crate) async fn process_query_with_tools(
     // This must stay a SINGLE WorkUnit for both paths. Streaming and
     // non-streaming used to each create their own via this same
     // `unwrap_or_else(|| ... start_work_unit(...))` pattern; when streaming
-    // was declined or failed to start (`generate_stream_cancellable`
-    // returning `Ok(None)` or `Err(_)`, e.g. because the daemon's local SSE
-    // handler drops `tools` for tool-using turns) the code fell through to
-    // the non-streaming path, which unconditionally started a *second*
-    // WorkUnit — abandoning the first mid-transcript with its spinner stuck
-    // "in progress" forever while the second one ran to completion. Two
-    // consecutive `random_spinner_verb()` words (e.g. "Analyzing…" then
-    // "Brainstorming…") both visible and one never completing was the
-    // symptom. Computing it once here and letting both branches complete or
-    // fail this same `work_unit` makes that impossible by construction.
+    // was declined (`generate_stream_cancellable` returning `Ok(None)`,
+    // e.g. because the daemon's local SSE handler drops `tools` for
+    // tool-using turns) the code fell through to the non-streaming path, which
+    // unconditionally started a *second* WorkUnit — abandoning the first
+    // mid-transcript with its spinner stuck "in progress" forever while the
+    // second one ran to completion. Two consecutive `random_spinner_verb()`
+    // words (e.g. "Analyzing…" then "Brainstorming…") both visible and one
+    // never completing was the symptom. Computing it once here and letting
+    // both branches complete or fail this same `work_unit` makes that
+    // impossible by construction.
     let named_brain_turn = query_states
         .get_metadata(query_id)
         .await
@@ -2472,8 +2472,23 @@ pub(crate) async fn process_query_with_tools(
                 }
                 return;
             }
-            Ok(None) | Err(_) => {
-                // Fall through to non-streaming
+            Ok(None) => {
+                // Generator explicitly declined streaming (e.g. unsupported model or
+                // DaemonLocalGenerator when tools are present). Fall through to non-streaming.
+            }
+            Err(e) => {
+                tracing::error!("Provider streaming request failed: {}", e);
+                if !query_states.accepts_provider_projection(query_id).await {
+                    let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+                    return;
+                }
+                work_unit.set_failed();
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: e.to_string(),
+                    generator_name: Some(generator.name().to_string()),
+                });
+                return;
             }
         }
     }
@@ -2736,6 +2751,7 @@ pub(crate) async fn process_query_with_tools(
             }
         }
         Err(e) => {
+            work_unit.set_failed();
             let _ = event_tx.send(ReplEvent::QueryFailed {
                 query_id,
                 error: format!("{}", e),
@@ -10595,6 +10611,348 @@ mod tests {
                 .all(|line| !line.contains("E-FORTH") && !line.contains("VM wire error")),
             "the failure text must never reach the Lisp/Forth compiler; \
              rendered rows were {rendered:?}"
+        );
+    }
+
+    struct ConfigurableMockGenerator {
+        name: String,
+        supports_streaming: bool,
+        stream_error: Option<String>,
+        stream_declined: bool,
+        generate_error: Option<String>,
+        generate_response_text: String,
+        stream_calls: Arc<AtomicUsize>,
+        generate_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for ConfigurableMockGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.generate_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(ref err) = self.generate_error {
+                anyhow::bail!("{err}");
+            }
+            let text = self.generate_response_text.clone();
+            Ok(crate::generators::GeneratorResponse {
+                text: text.clone(),
+                content_blocks: vec![ContentBlock::Text { text }],
+                tool_uses: vec![],
+                metadata: crate::generators::ResponseMetadata {
+                    generator: self.name.clone(),
+                    model: self.name.clone(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(ref err) = self.stream_error {
+                anyhow::bail!("{err}");
+            }
+            if self.stream_declined {
+                return Ok(None);
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let text = self.generate_response_text.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(StreamChunk::TextDelta(text.clone()))).await;
+                let _ = tx
+                    .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
+                        text,
+                    })))
+                    .await;
+            });
+            Ok(Some(rx))
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static STREAMING_CAPS: std::sync::OnceLock<GeneratorCapabilities> =
+                std::sync::OnceLock::new();
+            static NON_STREAMING_CAPS: std::sync::OnceLock<GeneratorCapabilities> =
+                std::sync::OnceLock::new();
+            if self.supports_streaming {
+                STREAMING_CAPS.get_or_init(|| GeneratorCapabilities {
+                    supports_streaming: true,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: None,
+                })
+            } else {
+                NON_STREAMING_CAPS.get_or_init(|| GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: None,
+                })
+            }
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct TestQueryHarness {
+        task: tokio::task::JoinHandle<()>,
+        events: mpsc::UnboundedReceiver<ReplEvent>,
+        output: Arc<OutputManager>,
+        query_states: Arc<QueryStateManager>,
+        query_id: Uuid,
+        _tempdir: tempfile::TempDir,
+    }
+
+    async fn spawn_test_query(
+        query: &str,
+        gen: Arc<dyn Generator>,
+        streaming_enabled: bool,
+    ) -> TestQueryHarness {
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message(query.to_string());
+
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+        let task = tokio::spawn(process_query_with_tools(
+            query_id,
+            query.to_string(),
+            event_tx,
+            Arc::clone(&gen),
+            Arc::clone(&gen),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(tokio::sync::RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            conversation,
+            Arc::clone(&query_states),
+            tool_coordinator,
+            Arc::clone(&runtime),
+            tui_renderer,
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            status,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+            "test-session".to_string(),
+            "/test/workspace".to_string(),
+            4,
+            20,
+            0,
+            streaming_enabled,
+            false,
+            false,
+            Arc::clone(&gen),
+            summary_cache,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            "test persona".to_string(),
+            None,
+        ));
+        TestQueryHarness {
+            task,
+            events,
+            output,
+            query_states,
+            query_id,
+            _tempdir: tempdir,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_does_not_fall_through_to_generate_duplicate_retries() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let generate_calls = Arc::new(AtomicUsize::new(0));
+        let gen = Arc::new(ConfigurableMockGenerator {
+            name: "ciru-mock".to_string(),
+            supports_streaming: true,
+            stream_error: Some("502 Bad Gateway".to_string()),
+            stream_declined: false,
+            generate_error: None,
+            generate_response_text: "must never run".to_string(),
+            stream_calls: Arc::clone(&stream_calls),
+            generate_calls: Arc::clone(&generate_calls),
+        });
+
+        let mut harness = spawn_test_query("hello", gen, true).await;
+        harness.task.await.expect("query task panicked");
+
+        assert_eq!(
+            stream_calls.load(Ordering::SeqCst),
+            1,
+            "stream was called exactly once"
+        );
+        assert_eq!(
+            generate_calls.load(Ordering::SeqCst),
+            0,
+            "generate() must NOT be called on stream error -- prevents duplicate retry cycles (#1470)"
+        );
+
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        let failed_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ReplEvent::QueryFailed { .. }))
+            .collect();
+        assert_eq!(
+            failed_events.len(),
+            1,
+            "exactly one terminal QueryFailed event emitted: {events:?}"
+        );
+        if let ReplEvent::QueryFailed {
+            error,
+            generator_name,
+            ..
+        } = &failed_events[0]
+        {
+            assert!(
+                error.contains("502 Bad Gateway"),
+                "error preserved: {error}"
+            );
+            assert_eq!(
+                generator_name.as_deref(),
+                Some("ciru-mock"),
+                "generator attributed"
+            );
+        }
+
+        assert!(
+            events.iter().all(|e| !matches!(
+                e,
+                ReplEvent::StreamingComplete { .. }
+                    | ReplEvent::VmEffect { .. }
+                    | ReplEvent::VmOutputComplete { .. }
+            )),
+            "no completion or execution events emitted: {events:?}"
+        );
+
+        let messages = harness.output.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].status(),
+            MessageStatus::Failed,
+            "work unit marked failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_declined_ok_none_falls_through_to_generate() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let generate_calls = Arc::new(AtomicUsize::new(0));
+        let gen = Arc::new(ConfigurableMockGenerator {
+            name: "fallback-mock".to_string(),
+            supports_streaming: true,
+            stream_error: None,
+            stream_declined: true,
+            generate_error: None,
+            generate_response_text: "(say \"non-streaming fallback\")".to_string(),
+            stream_calls: Arc::clone(&stream_calls),
+            generate_calls: Arc::clone(&generate_calls),
+        });
+
+        let mut harness = spawn_test_query("hello", gen, true).await;
+        harness.task.await.expect("query task panicked");
+
+        assert_eq!(
+            stream_calls.load(Ordering::SeqCst),
+            1,
+            "stream was attempted once"
+        );
+        assert_eq!(
+            generate_calls.load(Ordering::SeqCst),
+            1,
+            "generate() was called because stream returned Ok(None)"
+        );
+
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, ReplEvent::QueryFailed { .. })),
+            "no failure event should be emitted: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_under_invalidation_fences_failure_event() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let generate_calls = Arc::new(AtomicUsize::new(0));
+        let gen = Arc::new(ConfigurableMockGenerator {
+            name: "fenced-mock".to_string(),
+            supports_streaming: true,
+            stream_error: Some("502 Bad Gateway".to_string()),
+            stream_declined: false,
+            generate_error: None,
+            generate_response_text: "must never run".to_string(),
+            stream_calls: Arc::clone(&stream_calls),
+            generate_calls: Arc::clone(&generate_calls),
+        });
+
+        let mut harness = spawn_test_query("hello", gen, true).await;
+        // Invalidate / cancel query state before the stream error is processed
+        harness.query_states.cancel_query(harness.query_id).await;
+
+        harness.task.await.expect("query task panicked");
+
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, ReplEvent::QueryFailed { .. })),
+            "cancelled query must not project QueryFailed: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ReplEvent::QueryContextInvalidated { query_id } if *query_id == harness.query_id
+            )),
+            "cancelled query must emit QueryContextInvalidated: {events:?}"
         );
     }
 }
