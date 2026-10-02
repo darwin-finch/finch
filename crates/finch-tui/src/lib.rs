@@ -4192,7 +4192,7 @@ impl TuiRenderer {
                 self.scroll_expanded_tool(-(PAGE_STEP_LINES as isize));
                 true
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.scroll_expanded_tool(PAGE_STEP_LINES as isize);
                 true
             }
@@ -8031,6 +8031,36 @@ mod tests {
             lines.last(),
             scrolled.last()
         );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_expanded_tool_consumes_space_key() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .map(|region| region.row_id.clone())
+            .expect("a painted tool-result region exists");
+        renderer.open_expanded_tool(&output_row_all);
+
+        let space_key = KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            kind: event::KeyEventKind::Press,
+            state: event::KeyEventState::empty(),
+        };
+
+        // Pass the key to the expanded tool handler directly, as it normally
+        // gets routed there by the main event loop when the view is open.
+        let handled = renderer.handle_expanded_tool_key(space_key);
+        assert!(handled, "Space key must be consumed by the expanded tool view");
+
+        // The viewport must scroll
+        let view = renderer.expanded_tool.as_ref().unwrap();
+        assert!(view.scroll > 0, "Space key must page down the expanded tool view");
+
         renderer.is_active = false;
     }
 
