@@ -116,8 +116,8 @@ impl From<&Span> for ManifestSpan {
         let style: &SpanStyle = &span.style;
         ManifestSpan {
             text: span.text.clone(),
-            fg: style.fg.map(ManifestColor::from),
-            bg: style.bg.map(ManifestColor::from),
+            fg: style.fg.clone().map(ManifestColor::from),
+            bg: style.bg.clone().map(ManifestColor::from),
             bold: style.bold,
             dim: style.dim,
         }

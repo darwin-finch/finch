@@ -21,7 +21,7 @@
 //! markers), and code-block bodies stay whitespace-exact byte-for-byte.
 
 /// Inline spans of one source line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 enum Span {
     /// Literal text.
     Text(String),
@@ -34,7 +34,7 @@ enum Span {
 }
 
 /// One block-level construct of the bounded subset.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 enum Block {
     /// One source line's inline content (no paragraph joining, no re-wrapping:
     /// the row model's line economics and wrapping stay unchanged).
