@@ -104,8 +104,8 @@ classifier = "~/.claude-proxy/models/classifier.mlmodel"
 # Path to generator model
 generator = "~/.claude-proxy/models/generator-7b.mlmodel"
 
-# Frontend semantic memory owns its ONNX embedder separately and remains
-# unaffected by the daemon chat-backend migration.
+# Frontend semantic memory separately owns a fixed managed BGE GGUF embedder
+# through llama.cpp; the daemon chat-model setting does not select it.
 
 # Storage Configuration
 [storage]

@@ -83,6 +83,7 @@ outside the system temporary directory so a reboot cannot discard uncommitted wo
 - Remove a worker's workspace, and delete its branch, once `main` contains its accepted change.
   Squashed integration hides ancestry, so use the recorded integration evidence or a tree
   comparison against `main` rather than `git branch --merged`.
+- Before deleting a branch, check for an open pull request based on it. An ordinary dependent pull request (not a tracker's own formal stacking feature, if it has one — see the loaded binding) may not retarget itself when its base branch disappears; the tracker can close it instead, leaving its otherwise-unique commits to be recovered onto a fresh branch. Land or retarget a dependent pull request first, or retarget it explicitly, before deleting the branch it stacks on.
 - Before removing a workspace that has uncommitted changes or a commit no ref reaches, record that
   state under `refs/salvage/`.
 - Stop disposable databases and containers with the workspace that created them.

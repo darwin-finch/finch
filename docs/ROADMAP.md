@@ -25,8 +25,8 @@ Brains must all remain subject to explicit capability and privacy boundaries.
 
 The current source includes an interactive TUI and raw REPL, provider-backed chat, a bounded HTTP
 daemon, named Brain persistence, a typed Lisp/Co-Forth runtime, approval-aware tools, an MCP client,
-explicit feedback storage, and a llama.cpp/GGUF local-chat loader. ONNX remains only in the
-separately owned frontend memory embedder; Candle is no longer a dependency.
+explicit feedback storage, and llama.cpp/GGUF paths for local chat and the separately owned
+frontend memory embedder. Candle and ONNX Runtime are no longer dependencies.
 
 Those components have uneven end-to-end maturity. In particular, configuration variants do not
 prove provider conformance, configured local models do not prove local routing, and implemented

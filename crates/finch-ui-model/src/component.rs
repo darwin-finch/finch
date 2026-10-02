@@ -59,6 +59,8 @@ pub enum ComponentView {
     /// expands on click (#1235), the same component-owned disclosure
     /// mechanism the say turn's `show_program` uses.
     MemoryRecalled(MemoryRecalledView),
+    /// A user turn component: local user query or attributed participant message.
+    UserTurn(UserTurnView),
 }
 
 /// The ViewModel of a [`ComponentView::StaticText`] component: the message's
@@ -158,6 +160,17 @@ pub struct MemoryRecallRowView {
     pub expanded: bool,
 }
 
+/// The ViewModel of a [`ComponentView::UserTurn`] component: the prompt
+/// marker, optional subject (e.g. participant name), the content lines,
+/// and optional participant index for color palette selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserTurnView {
+    pub marker: char,
+    pub subject: Option<String>,
+    pub content_lines: Vec<String>,
+    pub participant_index: Option<usize>,
+}
+
 /// The style roles the component renderers read (stage 4, #1141).
 ///
 /// Plain data, terminal-independent: the engine builds it from the user's
@@ -192,6 +205,8 @@ pub struct ComponentStylePalette {
     pub static_success: SpanStyle,
     /// Static `⚠️` rows — pre-migration: `colors.status.operation`.
     pub static_warning: SpanStyle,
+    /// User turn foreground colour.
+    pub user_foreground: SpanColor,
 }
 
 impl Default for ComponentStylePalette {
@@ -209,6 +224,7 @@ impl Default for ComponentStylePalette {
             static_error: SpanStyle::fg(SpanColor::DARK_RED),
             static_success: SpanStyle::fg(SpanColor::DARK_GREY),
             static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
+            user_foreground: SpanColor::CYAN,
         }
     }
 }
@@ -229,6 +245,7 @@ pub fn component_lines(
         ComponentView::LiveTool(live_tool) => live_tool_lines(live_tool, palette),
         ComponentView::Operation(operation) => operation_lines(operation, palette),
         ComponentView::MemoryRecalled(memory) => memory_recalled_lines(memory, palette),
+        ComponentView::UserTurn(user_turn) => user_turn_lines(user_turn, palette),
     }
 }
 
@@ -516,6 +533,39 @@ fn memory_recalled_lines(
     lines
 }
 
+/// Render a user turn component: marker (and subject if present) on line 0,
+/// content lines 1..N beneath it. Every line is styled with the user foreground,
+/// ensuring continuation lines retain their styling even when scrolled down.
+fn user_turn_lines(
+    view: &UserTurnView,
+    palette: &ComponentStylePalette,
+) -> Vec<RenderedTranscriptLine> {
+    let style = SpanStyle::fg(palette.user_foreground);
+
+    let first_line_content = view.content_lines.first().map(|s| s.as_str()).unwrap_or("");
+    let first_line_text = match &view.subject {
+        Some(subject) => format!(" {} {}: {}", view.marker, subject, first_line_content),
+        None => format!(" {} {}", view.marker, first_line_content),
+    };
+
+    let mut lines = Vec::with_capacity(view.content_lines.len().max(1));
+    lines.push(RenderedTranscriptLine::from_spans(vec![Span::styled(
+        first_line_text,
+        style,
+    )]));
+
+    if view.content_lines.len() > 1 {
+        for line in &view.content_lines[1..] {
+            lines.push(RenderedTranscriptLine::from_spans(vec![Span::styled(
+                line.clone(),
+                style,
+            )]));
+        }
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +584,7 @@ mod tests {
         static_error: SpanStyle::fg(SpanColor::DARK_RED),
         static_success: SpanStyle::fg(SpanColor::DARK_GREY),
         static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
+        user_foreground: SpanColor::CYAN,
     };
 
     /// The say component rides the generalized accessor end to end: a say
@@ -566,9 +617,9 @@ mod tests {
         let texts: Vec<String> = via_component.iter().map(|line| line.text.clone()).collect();
         assert_eq!(
             texts,
-            vec!["hello", "", "\u{25b8} (ran 2s)"],
-            "the say card renders prose, a blank separator, and the chevron-prefixed \
-             elapsed annotation through the accessor; got {texts:?}"
+            vec!["hello", "(ran 2s)"],
+            "the say card renders its actionable prose and non-control elapsed metadata \
+             through the generalized accessor; got {texts:?}"
         );
     }
 
@@ -619,8 +670,8 @@ mod tests {
         );
         let rect = layout.keyed(CARD).expect("the card claims a rect");
         assert_eq!(
-            rect.height, 3,
-            "prose + blank + annotation claim three rows; got {rect:?}"
+            rect.height, 2,
+            "prose + elapsed metadata claim two rows; got {rect:?}"
         );
     }
 
@@ -1558,5 +1609,35 @@ mod tests {
             "⏺ bash(echo hi)…",
             "the plain projection still reads identically; got {started:?}"
         );
+    }
+
+    /// User turn lines style every line with foreground colour.
+    #[test]
+    fn test_user_turn_lines_style_every_line_with_foreground() {
+        let view = UserTurnView {
+            marker: '❯',
+            subject: None,
+            content_lines: vec![
+                "first line".into(),
+                "second line".into(),
+                "third line".into(),
+            ],
+            participant_index: None,
+        };
+        let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text, " ❯ first line");
+        assert_eq!(lines[1].text, "second line");
+        assert_eq!(lines[2].text, "third line");
+
+        let expected_style = SpanStyle::fg(PALETTE.user_foreground);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line.spans.len(), 1, "line {i} must have 1 span");
+            assert_eq!(
+                line.spans[0].style, expected_style,
+                "line {i} must wear expected style"
+            );
+            assert_eq!(crate::spans_text(&line.spans), line.text);
+        }
     }
 }

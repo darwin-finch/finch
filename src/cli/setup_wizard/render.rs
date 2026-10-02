@@ -13,6 +13,7 @@
 //! with the same budget the tree will claim.
 
 use super::chatgpt_recovery::{chatgpt_setup_failure_cause, chatgpt_setup_failure_summary};
+use super::gemini_recovery::{gemini_setup_failure_cause, gemini_setup_failure_summary};
 use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary};
 use super::*;
 use crate::cli::tui::WizardColor as Color;
@@ -326,6 +327,7 @@ fn provider_row_display(model: &ModelConfig, primary: bool) -> String {
             } => {
                 let key_display = if provider.eq_ignore_ascii_case("chatgpt")
                     || provider.eq_ignore_ascii_case("grok-sub")
+                    || provider.eq_ignore_ascii_case("gemini-sub")
                 {
                     "Named device credential".to_string()
                 } else if api_key.is_empty() {
@@ -394,13 +396,15 @@ fn models_section_lines(
             persisted,
             ..
         } if provider.eq_ignore_ascii_case("chatgpt")
-            || provider.eq_ignore_ascii_case("grok-sub") =>
+            || provider.eq_ignore_ascii_case("grok-sub")
+            || provider.eq_ignore_ascii_case("gemini-sub") =>
         {
             matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
         }
         ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
         ModelConfig::Local { .. } => true,
     };
+    const GEMINI_SUB_DETAIL: &str = "Gemini subscription uses Google Gemini via device sign-in; AI Studio API keys are a separate provider and are never used automatically.";
     const GROK_SUB_DETAIL: &str = "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically.";
     const CHATGPT_DETAIL: &str = "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate.";
     const NO_KEY_DETAIL: &str = "Paste your API key below (E), or add a provider with A.\n\
@@ -410,6 +414,9 @@ fn models_section_lines(
         1 + tool_models.len()
     );
     let description_text = match primary_model {
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("gemini-sub") => {
+            GEMINI_SUB_DETAIL.to_string()
+        }
         ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok-sub") => {
             GROK_SUB_DETAIL.to_string()
         }
@@ -1310,8 +1317,11 @@ fn device_auth_card(
     editing_existing_provider: bool,
 ) -> WizardCard {
     let is_grok_sub = cloud_provider_id(provider_idx).eq_ignore_ascii_case("grok-sub");
+    let is_gemini_sub = cloud_provider_id(provider_idx).eq_ignore_ascii_case("gemini-sub");
     let title_text = if is_grok_sub {
         format!("Grok subscription device sign-in for {provider_name}")
+    } else if is_gemini_sub {
+        format!("Gemini subscription device sign-in for {provider_name}")
     } else {
         format!("ChatGPT device sign-in for {provider_name}")
     };
@@ -1333,6 +1343,8 @@ fn device_auth_card(
         Some(Err(failure)) => {
             let summary = if is_grok_sub {
                 grok_setup_failure_summary(grok_setup_failure_cause(failure))
+            } else if is_gemini_sub {
+                gemini_setup_failure_summary(gemini_setup_failure_cause(failure))
             } else {
                 chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
             };
@@ -1350,18 +1362,25 @@ fn device_auth_card(
                     "Open: {}",
                     presentation.verification_uri
                 )));
-                body.push(wizard_line(
-                    &format!("One-time code: {}", presentation.user_code),
-                    Color::White,
-                ));
-                body.push(WizardLine::blank());
-                body.push(wizard_plain(
-                    "Approve the code in your browser; this dialog finishes automatically.",
-                ));
-                body.push(wizard_plain(&format!(
-                    "The code expires in {} minutes.",
-                    presentation.expires_in.as_secs().div_ceil(60)
-                )));
+                if !presentation.user_code.is_empty() {
+                    body.push(wizard_line(
+                        &format!("One-time code: {}", presentation.user_code),
+                        Color::White,
+                    ));
+                    body.push(WizardLine::blank());
+                    body.push(wizard_plain(
+                        "Approve the code in your browser; this dialog finishes automatically.",
+                    ));
+                    body.push(wizard_plain(&format!(
+                        "The code expires in {} minutes.",
+                        presentation.expires_in.as_secs().div_ceil(60)
+                    )));
+                } else {
+                    body.push(WizardLine::blank());
+                    body.push(wizard_plain(
+                        "Complete sign-in in your browser; this dialog finishes automatically.",
+                    ));
+                }
                 controls = wizard_line("Esc: Cancel", Color::Yellow);
             }
             None => {

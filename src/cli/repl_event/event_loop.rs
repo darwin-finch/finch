@@ -1193,7 +1193,10 @@ struct AgentLifecycleBinding {
 
 struct RemoteBrainRunProjection {
     unit: Arc<crate::cli::messages::WorkUnit>,
-    status_row: usize,
+    /// Non-interactive/background runs retain their explicit lifecycle row.
+    /// Interactive turns express terminal state on the semantic unit itself.
+    status_row: Option<usize>,
+    interactive: bool,
     prompt_row: Option<usize>,
     program_row: Option<usize>,
     result_row: Option<usize>,
@@ -1236,20 +1239,36 @@ fn ensure_remote_brain_run_projection<'a>(
     recovery: Option<&super::runner_recovery::RunnerRecovery>,
 ) -> &'a mut RemoteBrainRunProjection {
     projections.entry(run_id).or_insert_with(|| {
+        let interactive = kind == Some(crate::brain::BrainRunKind::Interactive);
         let label = brain_run_group_label(run_id, kind);
-        let unit = output_manager.start_work_unit(&label);
-        // WorkUnit's completed row presentation otherwise uses the generic
-        // "Tools" title. Keep the canonical kind/id visible without
-        // misclassifying lifecycle rows as model tool calls.
-        unit.set_activity_presentation(&label);
-        let status_row = unit.add_activity_row(format!("{label} · status"));
-        unit.complete_row(
-            status_row,
-            super::runner_recovery::brain_run_status_label(status, recovery),
-        );
+        let unit = output_manager.start_work_unit(if interactive {
+            "Assistant turn"
+        } else {
+            &label
+        });
+        let status_row = if interactive {
+            unit.set_interactive_presentation();
+            if recovery.is_some() {
+                unit.set_response(super::runner_recovery::brain_run_status_label(
+                    status, recovery,
+                ));
+            }
+            None
+        } else {
+            // Background/speculative runs remain explicit lifecycle activity:
+            // their identity and status are operationally meaningful.
+            unit.set_activity_presentation(&label);
+            let row = unit.add_activity_row(format!("{label} · status"));
+            unit.complete_row(
+                row,
+                super::runner_recovery::brain_run_status_label(status, recovery),
+            );
+            Some(row)
+        };
         RemoteBrainRunProjection {
             unit,
             status_row,
+            interactive,
             prompt_row: None,
             program_row: None,
             result_row: None,
@@ -1270,25 +1289,27 @@ fn ensure_remote_brain_run_projection<'a>(
 /// is already on screen (#820).
 fn apply_brain_run_status(
     unit: &crate::cli::messages::WorkUnit,
-    status_row: usize,
+    status_row: Option<usize>,
     status: crate::brain::BrainRunStatus,
     detail: Option<&str>,
 ) {
     let label = super::runner_recovery::brain_run_status_label(status, None);
-    if status == crate::brain::BrainRunStatus::Failed {
-        unit.fail_row(
-            status_row,
-            detail
+    if let Some(status_row) = status_row {
+        if status == crate::brain::BrainRunStatus::Failed {
+            unit.fail_row(
+                status_row,
+                detail
+                    .filter(|detail| !detail.is_empty())
+                    .unwrap_or(&label)
+                    .to_string(),
+            );
+        } else {
+            let summary = detail
                 .filter(|detail| !detail.is_empty())
-                .unwrap_or(&label)
-                .to_string(),
-        );
-    } else {
-        let summary = detail
-            .filter(|detail| !detail.is_empty())
-            .map(|detail| format!("{label}: {detail}"))
-            .unwrap_or(label.clone());
-        unit.complete_row(status_row, summary);
+                .map(|detail| format!("{label}: {detail}"))
+                .unwrap_or(label.clone());
+            unit.complete_row(status_row, summary);
+        }
     }
     if status.is_terminal() {
         let detail = detail.filter(|detail| !detail.is_empty());
@@ -1301,7 +1322,16 @@ fn apply_brain_run_status(
         // A run that resolved while child rows were still in flight must not
         // leave them at their last-known running status (#910).
         unit.resolve_running_rows_with_run_outcome(failed, summary);
-        unit.set_complete();
+        if failed && status_row.is_none() {
+            if detail.is_some() {
+                unit.set_response(detail.expect("checked above"));
+            } else if crate::cli::messages::Message::content(unit).is_empty() {
+                unit.set_response(label);
+            }
+            unit.set_failed();
+        } else {
+            unit.set_complete();
+        }
     }
 }
 
@@ -1571,6 +1601,12 @@ fn project_remote_brain_run_event(
             );
         }
         BrainEventKind::Result { output, error, .. } => {
+            if projection.interactive {
+                projection
+                    .unit
+                    .set_response(error.as_deref().unwrap_or(output));
+                return true;
+            }
             let row = *projection
                 .result_row
                 .get_or_insert_with(|| projection.unit.add_activity_row("result"));
@@ -3541,7 +3577,10 @@ impl EventLoop {
         ) {
             Ok(effective) => self
                 .output_manager
-                .write_info(effective.status_report(self.default_provider.as_deref())),
+                .write_info(effective.status_report_with_provider(
+                    self.default_provider.as_deref(),
+                    &self.available_providers[effective.provider_index],
+                )),
             Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
         }
     }
@@ -5032,6 +5071,7 @@ fn prompt_attachments(
 fn brain_context_text(
     event: &crate::brain::BrainEvent,
     local_machine: Option<&str>,
+    interactive_run_ids: &std::collections::HashSet<crate::brain::RunId>,
 ) -> Option<String> {
     use crate::brain::BrainEventKind;
 
@@ -5053,10 +5093,16 @@ fn brain_context_text(
     } else {
         format!("{}…", compact.chars().take(69).collect::<String>())
     };
-    Some(format!(
-        "{}: {compact}",
+    let speaker = if event
+        .run_id
+        .is_some_and(|run_id| interactive_run_ids.contains(&run_id))
+        && matches!(event.kind, BrainEventKind::Result { error: None, .. })
+    {
+        "assistant".to_string()
+    } else {
         participant_display_name(&event.sender, local_machine)
-    ))
+    };
+    Some(format!("{speaker}: {compact}"))
 }
 
 fn project_brain_context(
@@ -5101,6 +5147,17 @@ fn projected_brain_context_lines(
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
+    let interactive_run_ids = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            crate::brain::BrainEventKind::RunStarted { run }
+                if run.kind == crate::brain::BrainRunKind::Interactive =>
+            {
+                Some(run.run_id)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
     let mut lines = events
         .iter()
         .rev()
@@ -5109,7 +5166,7 @@ fn projected_brain_context_lines(
                 .run_id
                 .is_none_or(|run_id| !speculative_run_ids.contains(&run_id))
         })
-        .filter_map(|event| brain_context_text(event, local_machine))
+        .filter_map(|event| brain_context_text(event, local_machine, &interactive_run_ids))
         .take(depth)
         .collect::<Vec<_>>();
     lines.reverse();
@@ -5345,13 +5402,14 @@ fn reconstruct_replayed_say_turn_cards(
             );
             projection.program_row = Some(row);
         }
-        // `begin_say_turn` leaves the card Running; the output append mirrors
-        // into the output part under the same lock; and the completion path
+        // `begin_say_turn` leaves the card Running; setting the already-durable
+        // result mirrors it into the output part under the same lock without
+        // appending a second copy to the Interactive response; and the completion path
         // owns the one guarded Running → Completed transition, so a settled
         // turn cannot keep wearing `running` (#820-class residue).
         unit.begin_say_turn(language, source);
         if let Some(output) = output.filter(|output| !output.is_empty()) {
-            unit.append_response(output);
+            unit.set_response(output);
         }
         if group.status == BrainRunStatus::Completed {
             unit.set_complete();

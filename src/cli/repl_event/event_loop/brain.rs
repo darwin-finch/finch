@@ -1124,7 +1124,6 @@ impl EventLoop {
                 let say_covered_programs: std::collections::HashSet<Vec<String>> = self
                     .remote_brain_run_units
                     .values()
-                    .filter(|projection| projection.unit.is_activity_presentation())
                     .filter_map(|projection| projection.unit.say_turn_snapshot())
                     .map(|view| view.vm.program.lines.clone())
                     .collect();
@@ -1173,7 +1172,7 @@ impl EventLoop {
                     }
                     _ => {}
                 }
-                if brain_context_text(&event, None).is_some() {
+                if brain_context_text(&event, None, &std::collections::HashSet::new()).is_some() {
                     if let Some(client) = self.selected_brain().cloned() {
                         if let Ok(snapshot) = client.snapshot().await {
                             let local_machine = (!client.target.secure)

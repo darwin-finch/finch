@@ -24,8 +24,9 @@ actionable diagnostics, not raw exploration logs, and keep independent coordinat
 - Who owns implementation, review, integration, and unresolved decisions.
 - Explicit permission or prohibition for edits, prototypes, external messages, push, merge, issue
   closure, claim termination, and cleanup.
-- Expected handoff: commit, changed files, **the gate matrix** (below), failures, residual risks,
-  and next action.
+- Model lane (`cheap` / `default` / `strong`) — never a vendor model or agent type.
+- Context boundary: start the worker without inherited conversation history unless a named dependency requires a small, explicit excerpt.
+- Expected handoff: commit, changed files, **the gate matrix** (below), requested lane, model actually selected, failures, residual risks, and next action.
 
 The handoff does not repeat the issue or pull request history. Link durable evidence and report only
 the change, verification, remaining risk, ownership, and next action.
@@ -56,3 +57,24 @@ engine. When authority is unclear, say so and ask rather than manufacturing a pr
 Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost
 proportional to the change; otherwise remove it. For a small local edit, the packet should be short.
 Add isolation, concurrency, rollout, or recovery detail only when the actual risk requires it.
+
+## Model lane
+
+Name a lane, never a vendor model or agent type. Other people will open this ticket in a different harness.
+
+| Lane | When |
+|------|------|
+| **cheap** | bounded Tier 1 work that passes the preflight below |
+| **strong** | review, an independent verifier, implementation at Tier 3, or contract authoring |
+| **default** | every other implementation task |
+
+- Pick the lane from role, risk tier, and the preflight below. Cost does not pick a model lane; it ranks the queue.
+- A cheaper model may draft or implement only when the packet could state the full contract in a page: explicit acceptance criteria already recorded on the item, no authority, credential, security, persistence, wire-format, concurrency, process-lifecycle, or release impact, and allowed files and proof named exactly.
+- DO NOT let a worker running below `strong` lane author or rewrite a solution contract, however small, when one is missing or thin. Stop and escalate instead of improvising.
+- The coordinator or designated reviewer still owns triage, acceptance, review, integration, and every external message. A cheap worker's success signal is never proof a ticket is safe or complete.
+
+### Resolving a lane to an actual model
+
+- DO resolve the packet's lane to a concrete model before calling the native delegation mechanism — a lane recorded in a packet and never resolved has no effect.
+- The consuming repo's `AGENTS.md` may map lanes to a spawn slug this harness understands.
+- DO NOT silently substitute when the harness cannot select the requested lane. If the named lane cannot be selected, inherit the current model and report `requested <lane>, ran <actual>`.

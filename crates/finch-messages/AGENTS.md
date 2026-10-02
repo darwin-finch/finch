@@ -40,7 +40,8 @@ interrupted run may resume, so its child rows intentionally stay live rather tha
 force-resolved. `test_run_terminal_status_resolves_stuck_child_rows_on_disconnect` in
 `src/cli/repl_event/event_loop/tests.rs` replays the issue's real disconnect transcript capture. A complete transcript is canonical text for copying and permanent
 scrollback; renderer disclosure may change visible rows but must not change that text. A say-turn
-component action mutates its owning ViewModel under the message lock; unmigrated rows keep the
+component action swaps the visible output/exact-source state in its owning ViewModel under the
+message lock; unmigrated rows keep the
 renderer-owned `RowId` open set. `MemoryRecalledMessage` (#1235) rides the same component-owned
 disclosure pattern: `header`/`rows` are immutable once constructed, but each row's `expanded`
 flag lives in its own `RwLock<Vec<bool>>`, collapsed by default, and `ToggleMemoryRow` (addressed
@@ -53,6 +54,10 @@ existing lock(s) — no new lock, no OutputManager ownership change; the rendere
 on the message type. Say turns ride the same accessor (`ComponentView::Say`); `say_turn_view`
 stays for the consolidated-source pairing helper and the disclosure-direction read. Brain
 replay remains authoritative for durable state.
+
+`WorkUnitPresentation::Interactive` is the client-local semantic projection of a durable
+named-Brain Interactive run. It may retain program, tool, approval, and terminal child rows, but
+its root is assistant conversation and must never expose the run UUID as presentation text.
 
 **Extension rules:** add a concrete message only for a real application producer and renderer
 need. Keep pure snapshot-to-widget conversion in `finch-ui-model`; do not put terminal I/O or

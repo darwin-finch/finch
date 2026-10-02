@@ -113,8 +113,10 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         // this offline snapshot only offers the three general-purpose API tiers
         // documented when STATIC_FALLBACK_AS_OF was reviewed.
         "openai" => &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        // Official Meta Model API overview and model page, reviewed 2026-10-01.
+        "meta_model_api" => &["muse-spark-1.3"],
         "grok" | "grok-sub" => &["grok-4.6"],
-        "gemini" => &["gemini-2.5-flash"],
+        "gemini" | "gemini-sub" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
         "groq" => &["openai/gpt-oss-120b"],
         "openrouter" => &["z-ai/glm-5.3-flash"],
@@ -416,6 +418,38 @@ mod tests {
         assert!(!contents.contains("secret-that-must-not-be-cached"));
         assert!(contents.contains("refreshed_at"));
         assert!(contents.contains("models_url"));
+    }
+
+    #[tokio::test]
+    async fn meta_model_api_refresh_uses_documented_models_path_and_bearer_audience() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("authorization", "Bearer LLM|meta-id|meta-secret")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"muse-spark-1.3"}]}"#)
+            .create_async()
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let profile = ModelCatalogProfile::new(
+            "meta_model_api",
+            "meta-work",
+            "LLM|meta-id|meta-secret",
+            ProviderEndpoints::new(&server.url(), "/v1/chat/completions", "/v1/models"),
+            CatalogAuth::Bearer,
+        );
+        let catalog = refresh(&profile, cache.path())
+            .await
+            .expect("the documented Meta model catalogue must decode");
+        mock.assert_async().await;
+        assert_eq!(catalog.models, vec!["muse-spark-1.3"]);
+        assert_eq!(catalog.provider, "meta_model_api");
+
+        let cached = std::fs::read_to_string(cache_path(&profile, cache.path())).unwrap();
+        assert!(
+            !cached.contains("meta-secret"),
+            "the Meta model catalogue cache must remain secret-free: {cached}"
+        );
     }
 
     #[tokio::test]

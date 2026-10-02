@@ -50,5 +50,11 @@ its native worker API (for example, Finch `spawn_agent`, Claude Code tasks, Code
 OpenCode/Grok equivalent). If the harness cannot select the requested provider/model, report that
 constraint rather than silently substituting the primary model.
 
+The exact base must come from a fetch performed immediately before worktree creation and be verified
+as the remote default-branch tip; do not infer freshness from a local `main`/`master` name. When the
+coordinator's primary checkout can advance safely, fast-forward its local default branch with
+`--ff-only` first. When pre-existing changes prevent that, preserve them, record the divergence,
+and base independent worktrees directly on the verified remote commit.
+
 Mechanical output is advisory. Human authority remains required for readiness, claims, scope
 changes, provider credentials, review, merge, and closure.

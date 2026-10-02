@@ -5,7 +5,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `crates/finch-providers/src/`: the `LlmProvider` / `ProviderBackend` dispatch
 boundary, provider-neutral wire types and stream events, model catalog, capabilities,
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
-and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok / Claude-subscription adapters.
+and the Claude / OpenAI-compatible (including origin-pinned direct Meta Model API) / Gemini /
+ChatGPT / SuperGrok / Claude-subscription adapters.
 
 **Platform boundary (issue #1357).** `claude_cli.rs`'s MCP tool-call bridge is a
 `tokio::net::{UnixListener, UnixStream}` transport with no Windows equivalent. Rather than gating
@@ -87,6 +88,21 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - `ValidatedProviderRequest` is unforgeable; backends consume `into_request_for`.
 - Tool calls become semantic `ToolUse` only after adapter validation.
 - Opaque reasoning/replay material is not display content.
+- Direct Meta Model API `reasoning_content` is dialect-scoped: buffered values are validated and
+  discarded, while streamed values become bounded `ThinkingDelta` events carrying Meta
+  provider/model provenance and no opaque replay. Schema-valid `null` and empty streamed values are
+  ignored as no-ops. Reasoning never enters assistant-visible completed content, and canonical
+  OpenAI does not accept the Meta-only field.
+- **Configured generic OpenAI-compatible responses are strict, bounded, and secret-safe.** Their
+  request bytes and operator-attested capability contract remain separate from first-party OpenAI,
+  while response handling requires the documented SSE media type, one valid terminal choice and
+  one `[DONE]`, rejects malformed/unknown/wrong-typed/sparse/truncated/late events, and never treats
+  `reasoning_content` as generic output. Limits are 1 MiB per SSE line/event, 4 MiB per stream,
+  1 MiB accumulated arguments per tool call, 32 MiB per non-stream success, and 64 KiB consumed
+  from a non-success body. Compatible error diagnostics redact response bodies, and receiver drop,
+  cancellation, timeout, parse failure, or disconnect releases the upstream transport with no
+  successful completion or late post-terminal mutation. Canonical OpenAI and direct Meta retain
+  their own dialect rules; legacy compatible constructors retain their historical parser.
 - Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
   OpenAI and Claude also emit native `ToolCallDelta` / `ToolCallComplete`.
   Generation-layer translation of `ContentBlockComplete(ToolUse)` into
@@ -316,6 +332,13 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
+- **Direct Meta Model API credentials are a distinct origin-bound namespace.**
+  `CredentialProvider::MetaModelApi` requires issuer `meta-model-api`, audience
+  `EndpointFamily::MetaModelApi`, and the fixed `https://api.meta.ai` origin.
+  `OpenAIProvider::new_meta_model_api` uses the documented Chat Completions
+  surface and `muse-spark-1.3`; it never falls back to OpenCode Zen, Muse Code,
+  contributor-tier models, or a custom compatible origin (#317, direct Meta Model API for Muse Spark; reviewed
+  against official Meta documentation on 2026-10-01).
 - Subscription and API billing are never automatically interchangeable.
 - Claude requests opt into Anthropic's top-level automatic moving-prefix cache. OpenAI API and
   ChatGPT transports continue to send stable, complete prefixes and rely on those services'

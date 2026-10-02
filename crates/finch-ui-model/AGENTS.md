@@ -11,6 +11,8 @@ semantic segments, no terminal bytes; `RenderedTranscriptLine.spans` concatenate
 exactly, and the `ComponentStylePalette` the engine injects carries the scheme-owned styles),
 bounded assistant-prose markdown, line measurement, and the claiming layout pass. These are
 plain data and pure functions shared by message producers and render engines.
+The `Interactive` WorkUnit presentation projects a durable named-Brain run as assistant content
+with semantic children; internal run identity is deliberately absent from its labels and body.
 The message layer retains and mutates domain state and constructs snapshots; it does not own
 their presentation projection. Component renderers construct no SGR — pinned by
 `test_component_renderers_construct_no_sgr_bytes`; styles are palette values the engines

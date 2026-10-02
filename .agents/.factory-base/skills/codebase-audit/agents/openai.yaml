@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codebase Audit"
+  short_description: "Audit architecture since the last completed pass"
+  default_prompt: "Use $codebase-audit to survey the tree since the last completed audit/refactor checkpoint and draft evidence-backed tickets. Do not refactor in place."
+
+policy:
+  allow_implicit_invocation: true

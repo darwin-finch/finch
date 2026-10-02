@@ -174,6 +174,11 @@ compatibility boundary, not an OpenAI-supported third-party integration. Legacy 
 `chatgpt_subscription` configuration is rejected with migration guidance; subscription
 authentication must not be inferred from OpenAI API-key support.
 
+Muse Spark 1.3 can be configured through the direct, origin-bound Meta Model
+API profile with a named `MODEL_API_KEY`; see
+[docs/META_MODEL_API.md](docs/META_MODEL_API.md). This is not OpenCode Zen or
+the Muse Code harness, and it does not claim local Muse Spark weights.
+
 A hand-written `type = "claude_cli_backend"` entry drives the official `claude`
 CLI as a subscription subprocess instead of metered API billing. It is never
 offered by the setup wizard, it disables the CLI's own tools so Finch's
@@ -207,8 +212,9 @@ ONNX/CoreML repeatedly crashed the daemon during Qwen session construction, whil
 path lacked kernels required by the supported model families and produced wrong, absent, or
 impractically slow output. The replacement llama.cpp/GGUF path had completed real buffered,
 streamed, and CPU generation on the target MacBook before the cutover. The historical commit is
-for source archaeology, not a supported installation recommendation. Frontend memory's separately
-owned ONNX embedder is unaffected by this chat-provider decision.
+for source archaeology, not a supported installation recommendation. Frontend memory remains a
+separate path: it uses its own fixed managed bge-small-en-v1.5 Q8_0 GGUF through llama.cpp rather
+than the user-selected chat GGUF, with a hashed-n-gram fallback while that artifact is unavailable.
 
 ### HTTP daemon
 

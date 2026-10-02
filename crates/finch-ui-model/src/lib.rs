@@ -22,7 +22,7 @@ mod work_unit;
 pub use component::{
     component_lines, ComponentStylePalette, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
-    StaticTextView,
+    StaticTextView, UserTurnView,
 };
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
@@ -119,6 +119,12 @@ pub struct RenderedTranscriptLine {
     /// state lives on the component's ViewModel, not the renderer's
     /// RowId-keyed maps, and a click routes to the component's handle.
     pub component_owned: bool,
+    /// True when repeated physical lines with this `RowId` form one semantic
+    /// keyboard target. Mouse hit regions remain per line; only focus-order
+    /// registration is consolidated. Completed say output/source uses this
+    /// because its multiline content is one in-place toggle. Other component
+    /// and legacy rows retain their existing per-line traversal behavior.
+    pub single_focus_target: bool,
 }
 
 impl RenderedTranscriptLine {

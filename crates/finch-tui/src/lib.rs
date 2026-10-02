@@ -937,6 +937,21 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     Ok(frame.lines.len())
 }
 
+fn reanchor_shrinking_live_frame(
+    out: &mut impl Write,
+    previous_rows: usize,
+    next_rows: usize,
+    terminal_rows: usize,
+) -> Result<()> {
+    if next_rows < previous_rows {
+        execute!(
+            out,
+            cursor::MoveTo(0, terminal_rows.saturating_sub(next_rows) as u16)
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Live-area frame ──────────────────────────────────────────────────────────
 
 /// Columns the input prompt (`❯ `) and its continuation (`  `) both occupy.
@@ -1416,6 +1431,7 @@ fn transcript_disclosure_hitboxes(
             },
             row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
             component_owned: viewport_content[index].component_owned,
+            single_focus_target: viewport_content[index].single_focus_target,
         })
         .collect()
 }
@@ -2194,6 +2210,8 @@ impl TuiRenderer {
                 term_h,
                 term_width,
             );
+            let rows = frame.lines.len();
+            reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
             let rows = write_tiny_live_frame(out, &frame)?;
             execute!(out, EndSynchronizedUpdate)?;
             self.flush_attention_bell(out)?;
@@ -2233,54 +2251,21 @@ impl TuiRenderer {
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
-        // A shrinking live area (#1293) invalidates any active selection
-        // instead of repositioning the write to compensate for it.
-        //
-        // `rebuild_transcript_hit_regions` (below) builds `SelectionIndex`
-        // assuming the live area's absolute rows are always
-        // `term_height - this_frame's_row_count .. term_height` — true
-        // immediately after a full `redraw_full_viewport_inner` repaint
-        // (which does an explicit `cursor::MoveTo(0, plan.transcript_top)`),
-        // but never re-verified on an ordinary tick. `write_live_frame`
-        // otherwise just continues from wherever `erase_live_area` (based on
-        // the *previous* frame's own row count) left the terminal cursor: a
-        // growing frame overflows the bottom and a native terminal scroll
-        // happens to re-bottom-anchor everything for free, but a shrinking
-        // frame (e.g. the "/" completion pane closing) simply lands higher
-        // on the physical screen than the formula assumes, and nothing ever
-        // notices or corrects the resulting drift. From that tick on,
-        // `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`
-        // would target whatever `row` the (now physically wrong)
-        // `SelectionIndex` reports, stamping stale selected text onto
-        // unrelated content — typically the status line, once its row
-        // happens to fall where the drift says old transcript content still
-        // lives.
-        //
-        // An earlier version of this fix instead recomputed and reapplied a
-        // bottom-anchored `cursor::MoveTo` on every size-changing tick, so
-        // physical and assumed geometry could never diverge. That is
-        // correct in isolation, but a live-session regression (traced
-        // through a reconnect/replay production test, `named_brain_attach`)
-        // showed it corrupting the live area under rapid successive
-        // grow/shrink ticks — the interaction with `erase_live_area`'s own,
-        // separately-tracked relative bookkeeping was not fully understood
-        // and the risk of shipping a half-diagnosed repositioning fix
-        // outweighed fixing the narrower, better-understood problem: a
-        // selection surviving into geometry it no longer describes. Since
-        // growth always self-corrects (the paragraph above), only a
-        // detected *shrink* needs to act, and clearing the selection here
-        // is exactly the same invalidation `redraw_full_viewport_inner`
-        // already performs on every full repaint (any full repaint clears
-        // it) — extended to cover the one case a full repaint does not run
-        // for. `self.last_live_frame_rows` (not `self.active_rows`, which
-        // `erase_live_area` always zeroes just before this function runs as
-        // part of its own, unrelated bookkeeping) is the previous tick's
-        // row count.
+        // The erase ends at the previous frame's top. If the replacement is
+        // smaller, painting from there strands the whole frame above blank
+        // rows. Re-anchor only shrinking frames (#1472): growth must remain
+        // relative so overflowing the bottom scrolls retained terminal
+        // content upward. `last_live_frame_rows` survives erase bookkeeping;
+        // `active_rows` does not. A shrink also invalidates any selection
+        // whose absolute rows described the old geometry (#1293).
         let this_frame_rows = frame.physical_rows(term_width.max(1));
-        if this_frame_rows < self.last_live_frame_rows && self.selection.is_some() {
-            self.selection = None;
-            self.selection_press_candidate = None;
-            self.previous_highlighted_rows.clear();
+        reanchor_shrinking_live_frame(out, self.last_live_frame_rows, this_frame_rows, term_h)?;
+        if this_frame_rows < self.last_live_frame_rows {
+            if self.selection.is_some() {
+                self.selection = None;
+                self.selection_press_candidate = None;
+                self.previous_highlighted_rows.clear();
+            }
         }
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
@@ -2576,8 +2561,8 @@ struct CanonicalCommitPlan {
 }
 
 /// Completed prefix of unprinted messages. Since the component-owned say turn
-/// (#882) the program source is show_program-gated card content, never a
-/// deleted row: every completed message emits its canonical record exactly
+/// (#882) the program source is mutually exclusive component content, never a
+/// deleted canonical row: every completed message emits its canonical record exactly
 /// once. A completed program source only waits (staying in the live suffix)
 /// while its paired output is still running without body, so source and
 /// output cannot commit out of order.
@@ -8928,7 +8913,7 @@ mod tests {
             !after_rendered
                 .iter()
                 .any(|line| line.contains("(say \"hello\")")),
-            "the say card must not swap to its program source after a click on \
+            "the say card must not reveal its program source after a click on \
              an unrelated legacy row; rendered={after_rendered:?}"
         );
         assert!(
@@ -9113,12 +9098,7 @@ mod tests {
     }
 
     #[test]
-    fn say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps() {
-        // INVARIANT (#882): a migrated say turn's show_program state lives on
-        // the component ViewModel. The renderer's RowId-keyed maps must stay
-        // empty for the card's rows, and toggling must go through the
-        // component action, not the accordion. Stage 2: the toggle hit target
-        // is the completed output region — there is no chrome row.
+    fn say_card_content_is_the_stable_in_place_toggle_target() {
         let colors = ColorScheme::default();
         let manager = Arc::new(OutputManager::new(colors.clone()));
         manager.disable_stdout();
@@ -9127,104 +9107,289 @@ mod tests {
             Arc::new(StatusBar::new()),
             colors.clone(),
         );
+        fn component_point(
+            renderer: &TuiRenderer,
+            target: &view_model::RowId,
+            width: u16,
+            height: u16,
+        ) -> (u16, u16) {
+            for row in 0..height {
+                for column in 0..width {
+                    if renderer.accordion.component_region_at(column, row).as_ref() == Some(target)
+                    {
+                        return (column, row);
+                    }
+                }
+            }
+            panic!(
+                "the painted frame must expose the stable component target; target={target:?} {}",
+                renderer.accordion.diagnostic_state()
+            );
+        }
 
         let output = Arc::new(WorkUnit::new("VM program output"));
         output.set_program_output();
-        output.begin_say_turn("lisp", "(say \"hello\")");
-        output.append_response("hello");
+        let exact_source = "(say \"hello\")\n# exact second line";
+        output.begin_say_turn("lisp", exact_source);
+        output.append_response("assistant answer");
         output.set_complete();
         manager.add_trait_message(output.clone());
 
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
-        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.text.contains("(say \"hello\")")),
-            "show_program defaults to false for a say turn; got {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("hello"))
-                && rendered.iter().any(|line| line.contains("(ran ")),
-            "the completed card renders prose plus the `(ran Ns)` annotation; got {rendered:?}"
-        );
-        let target = lines
-            .first()
-            .expect("the completed card renders toggle-target lines")
-            .row_id
-            .clone()
-            .expect("completed lines carry the output-region identity");
+        let canonical_before = output.complete_transcript(&colors);
+        let closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let target = closed
+            .iter()
+            .find(|line| line.text == "assistant answer")
+            .and_then(|line| line.row_id.clone())
+            .expect("the displayed assistant output itself is the toggle target");
         assert_eq!(
             target.path,
             vec![1],
-            "the output region is the toggle target; got {:?}",
-            target.path
+            "the existing stable action path is retained"
         );
         assert!(
-            lines.iter().all(|line| line.component_owned),
-            "the completed card's lines are component-owned routing"
-        );
-        assert!(
-            !lines.iter().any(|line| line.text.contains('\u{23fa}')),
-            "the completed card wears no chrome glyph; got {rendered:?}"
+            !closed.iter().any(|line| {
+                line.text.contains("Show program") || line.text.contains("Hide program")
+            }),
+            "no separate visible show/hide control row may remain; lines={closed:?}"
         );
 
-        // Click anywhere in the output region: the hitbox resolves to the
-        // output region's RowId and the routed action toggles the ViewModel.
+        let mut paint_bytes = Vec::new();
+        renderer
+            .draw_live_area_to_at(&mut paint_bytes, 80, 24, None)
+            .expect("the production live-frame paint must register output hit regions");
+        let (output_column, output_row) = component_point(&renderer, &target, 80, 24);
+        let press = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: output_column,
+            row: output_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(
+            !renderer.handle_mouse_to(press, &mut Vec::new()),
+            "the real mouse path must defer disclosure until a matching Up"
+        );
+        assert!(
+            !output.say_turn_view().expect("say VM").vm.show_program,
+            "Down alone must not swap the displayed output"
+        );
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..press
+                },
+                &mut Vec::new(),
+            ),
+            "a matching Down -> Up on the displayed output must route through the production \
+             click gesture and component action path"
+        );
+
+        let open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let open_text = open
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        let source_lines = exact_source.lines().collect::<Vec<_>>();
+        assert!(
+            !open_text.contains(&"assistant answer")
+                && open_text
+                    .windows(2)
+                    .any(|lines| lines == source_lines.as_slice()),
+            "activation swaps output for exact source in place and never shows both; lines={open:?}"
+        );
+        assert!(
+            open.iter()
+                .filter(|line| line.text == "(say \"hello\")" || line.text == "# exact second line")
+                .all(|line| line.row_id.as_ref() == Some(&target)),
+            "every displayed source line routes to the same stable component identity; lines={open:?}"
+        );
+
+        renderer
+            .handle_resize(64, 20)
+            .expect("the production resize path must accept the source-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the source state");
+        assert_eq!(
+            renderer.accordion.visible_order_count(&target),
+            1,
+            "multiline source remains one keyboard target after resize/repaint; {}",
+            renderer.accordion.diagnostic_state()
+        );
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_press = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(!renderer.handle_mouse_to(source_press, &mut Vec::new()));
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: source_column.saturating_add(1),
+            ..source_press
+        };
+        assert!(renderer.handle_mouse_to(drag, &mut Vec::new()));
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..drag
+                },
+                &mut Vec::new(),
+            ),
+            "a drag that begins on source content must finish as selection"
+        );
+        assert!(
+            output.say_turn_view().expect("say VM").vm.show_program,
+            "a real drag must not also activate the source toggle"
+        );
+
+        // This press clears the finalized selection through a synchronous
+        // full repaint. The production Down -> Up gesture must survive that
+        // repaint and still swap source back to output.
+        // `redraw_full_viewport()` reads the real terminal size in production;
+        // this headless test instead pins the same 64x20 geometry it simulated
+        // above so the repaint cannot move content under the recorded press.
+        renderer.pending_viewport_size = Some((64, 20));
+        let (source_column, source_row) = component_point(&renderer, &target, 64, 20);
+        let source_click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: source_column,
+            row: source_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(renderer.handle_mouse_to(source_click, &mut Vec::new()));
+        assert!(
+            renderer.handle_mouse_to(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Up(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    ..source_click
+                },
+                &mut Vec::new(),
+            ),
+            "clicking displayed source through the real gesture path swaps back to output"
+        );
+        let mouse_closed = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(mouse_closed.iter().any(|line| {
+            line.text == "assistant answer" && line.row_id.as_ref() == Some(&target)
+        }));
+
+        renderer
+            .handle_resize(80, 24)
+            .expect("the production resize path must accept the output-state geometry");
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("the production full repaint must reconstruct the output state");
+        let output_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
+                .accordion
+                .component_region_at(output_point.0, output_point.1)
+                .as_ref(),
+            Some(&target),
+            "output repaint must retain the same action identity"
+        );
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE,)));
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        let keyboard_open = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(keyboard_open.iter().any(|line| {
+            line.text == "(say \"hello\")" && line.row_id.as_ref() == Some(&target)
+        }));
         renderer
             .accordion
-            .rebuild_retained_hit_regions(&lines, 0, 80);
-        let clicked = renderer
-            .accordion
-            .component_region_at(0, 0)
-            .expect("the output region registers as a component hit region");
+            .rebuild_retained_hit_regions(&keyboard_open, 0, 80);
+        assert_eq!(renderer.accordion.focused.as_ref(), Some(&target));
+        assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        let closed_again = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(closed_again.iter().any(|line| {
+            line.text == "assistant answer" && line.row_id.as_ref() == Some(&target)
+        }));
+        assert!(
+            !closed_again
+                .iter()
+                .any(|line| exact_source.lines().any(|source| line.text == source)),
+            "keyboard activation swaps exact source back to output; lines={closed_again:?}"
+        );
         assert_eq!(
-            clicked, target,
-            "the component hit region is the output region"
+            output.complete_transcript(&colors),
+            canonical_before,
+            "presentation toggles must not mutate canonical transcript bytes"
         );
+
+        let mut canonical_bytes = Vec::new();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("the swapped turn must commit to native history");
+        let committed = String::from_utf8(canonical_bytes.clone()).expect("canonical UTF-8");
+        for expected in ["Program output", "assistant answer"] {
+            assert_eq!(
+                committed.matches(expected).count(),
+                1,
+                "native history keeps each canonical line exactly once; \
+                 expected={expected:?} committed={committed:?}"
+            );
+        }
         assert!(
-            !renderer
+            exact_source
+                .lines()
+                .all(|source| !committed.contains(source)),
+            "the interactive source projection must not replace or duplicate the canonical \
+             output record in native history; committed={committed:?}"
+        );
+        let committed_len = canonical_bytes.len();
+        commit_complete_messages(
+            &mut canonical_bytes,
+            &manager.get_messages(),
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("a repeated native-history pass remains idempotent");
+        assert_eq!(
+            canonical_bytes.len(),
+            committed_len,
+            "the completed turn must not append duplicate native-history bytes"
+        );
+
+        renderer.pending_viewport_size = Some((80, 24));
+        renderer.viewport_invalidated = true;
+        paint_bytes.clear();
+        renderer
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .expect("post-commit reconstruction must repaint the retained say target");
+        let retained_point = component_point(&renderer, &target, 80, 24);
+        assert_eq!(
+            renderer
                 .accordion
-                .handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(
-                        crossterm::event::MouseButton::Left
-                    ),
-                    column: 0,
-                    row: 0,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                }),
-            "the accordion must NOT toggle a component-owned row through its own maps"
+                .component_region_at(retained_point.0, retained_point.1)
+                .as_ref(),
+            Some(&target),
+            "native-history reconstruction retains the same in-place action identity"
         );
-
-        assert!(
-            renderer.dispatch_component_disclosure(&target, None),
-            "the routed action must reach the component's handle"
-        );
-        let view = output.say_turn_view().expect("migrated say turn");
-        assert!(
-            view.vm.show_program,
-            "the component handle toggled show_program through the message lock"
-        );
-
-        // The next frame re-renders from the mutated VM: the prose swapped to
-        // the program source, the annotation stayed.
-        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
-        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert!(
-            !rendered.contains(&"hello"),
-            "the prose swapped away; got {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("(say \"hello\")")),
-            "the program source renders in the card after the toggle; got {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("(ran ")),
-            "the `(ran Ns)` annotation stays through the swap; got {rendered:?}"
-        );
-        assert!(
-            lines.iter().all(|line| line.row_expanded == Some(true)),
-            "row_expanded reports the opened state for assistive consumers"
+        assert_eq!(
+            output.complete_transcript(&colors),
+            canonical_before,
+            "native-history reconstruction must not mutate canonical source/output bytes"
         );
     }
 
@@ -9234,7 +9399,7 @@ mod tests {
     /// `TranscriptHitRegion`/`component_region_at` hit-testing plus
     /// `dispatch_component_disclosure` -- rather than calling
     /// `MemoryRecalledMessage`'s handle directly. Mirrors
-    /// `say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps`:
+    /// `say_card_content_is_the_stable_in_place_toggle_target`:
     /// same component-owned mechanism (#882), different message type.
     #[test]
     fn test_memory_recall_row_collapsed_by_default_click_expands_click_again_collapses() {
@@ -10474,6 +10639,36 @@ mod tests {
             "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
         );
     }
+
+    /// DEFECT REGRESSION: user turn continuation lines retain foreground color
+    /// even when scrolled down past line 0.
+    #[test]
+    fn test_user_turn_continuation_lines_retain_color_when_scrolled_down() {
+        use finch_messages::UserQueryMessage;
+        let mut renderer = headless_renderer();
+        let user = Arc::new(UserQueryMessage::new("first line\nsecond line\nthird line"));
+        let message: MessageRef = Arc::clone(&user) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let lines = renderer.projected_message_lines(&message, 80);
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].spans.is_empty(), "line 0 must carry spans");
+        assert!(!lines[1].spans.is_empty(), "line 1 must carry spans");
+        assert!(!lines[2].spans.is_empty(), "line 2 must carry spans");
+
+        // When line 0 rolls off-screen, lines 1 and 2 are lowered independently.
+        // Each lowered continuation line MUST carry ANSI color escape sequences.
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1]);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2]);
+
+        assert_ne!(lowered_line1, "second line");
+        assert_ne!(lowered_line2, "third line");
+        assert!(lowered_line1.contains("\x1b["));
+        assert!(lowered_line2.contains("\x1b["));
+    }
+
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
@@ -14063,6 +14258,7 @@ mod attention_bell_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use crate::vt_oracle::VtOracle;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use finch_messages::{StaticMessage, WorkUnit};
     use std::sync::Arc;
@@ -14457,23 +14653,12 @@ mod selection_tests {
     /// longer has anything to do with what `write_live_frame` actually,
     /// physically painted there this tick.
     ///
-    /// The fix reacts to a detected shrink by clearing the selection
-    /// (`self.selection = None`, `self.previous_highlighted_rows.clear()`)
-    /// instead of forcing physical and assumed geometry to agree with an
-    /// explicit `cursor::MoveTo`. An earlier version of this fix took the
-    /// `MoveTo` approach; it was correct in isolation but, verified against
-    /// a live-session reconnect/replay production test
-    /// (`test_reconnected_completed_say_renders_the_component_card` in
-    /// `tests/named_brain_attach.rs`), corrupted the live area under rapid
-    /// successive grow/shrink ticks. Since growth always self-corrects (the
-    /// paragraph above), only a shrink needs to act, and dropping the
-    /// selection is exactly the same invalidation `redraw_full_viewport_inner`
-    /// already performs on every full repaint, extended to the one case a
-    /// full repaint does not cover. This means a selection does not survive
-    /// a shrinking live area with its highlight intact — a real UX
-    /// narrowing versus the `MoveTo` approach — but the row it pointed at is
-    /// never stamped with stale content, which is the actual invariant this
-    /// test (and the reported bug) cares about.
+    /// The completed fix reacts only to a detected shrink: it moves to the
+    /// smaller frame's absolute bottom-owned origin and clears the selection
+    /// whose rows described the old geometry. Growth remains relative so it
+    /// can scroll retained terminal content instead of overwriting it; that
+    /// distinction avoids the reconnect/replay corruption caused by an
+    /// earlier attempt to reposition every size change.
     ///
     /// This test drives the real `TuiRenderer` methods a live session uses —
     /// `handle_mouse`, `draw_live_area_to`, `update_ghost_text` (opening the
@@ -14628,13 +14813,8 @@ mod selection_tests {
              closes, not duplicated onto a stale row; occurrences={occurrences:?}\n{}",
             term.diagnostic()
         );
-        // The fix clears a survived selection on a detected shrink rather
-        // than forcing the live area to stay glued to the terminal's true
-        // bottom row (see this test's doc comment): a shrinking live area
-        // is free to end up higher on the physical screen than before,
-        // exactly as it already could pre-#1293, so the status line is
-        // located by its own content rather than assumed to sit at the
-        // last row.
+        // The shrink must both invalidate the old selection and put the
+        // smaller replacement frame at the physical bottom.
         let status_row = term.find_row("Tab complete").unwrap_or_else(|| {
             panic!(
                 "the idle status line must be on screen somewhere;\n{}",
@@ -14642,12 +14822,200 @@ mod selection_tests {
             )
         });
         assert_eq!(
+            status_row,
+            23,
+            "after the completion pane closes, the idle status line must be \
+             physically anchored to the terminal's final row; \
+             active_rows={} cursor_row_from_top={} last_live_frame_rows={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            renderer.last_live_frame_rows,
+            term.diagnostic()
+        );
+        assert_eq!(
             term.row(status_row),
             "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Esc cancel",
             "the idle status line must read its real content with no stale \
              selected-text prefix bleeding in from the row the selection used \
              to occupy before the completion pane opened and closed;\n{}",
             term.diagnostic()
+        );
+    }
+
+    fn paint_live_cycle_at(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        renderer
+            .erase_live_area_to(&mut bytes)
+            .expect("the production live-area erase must succeed");
+        renderer
+            .draw_live_area_to_at(&mut bytes, width, height, None)
+            .expect("the production live-area draw must succeed");
+        terminal.feed(&bytes);
+        bytes
+    }
+
+    fn seed_bottom_anchored_viewport(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) {
+        renderer.pending_viewport_size = Some((width as u16, height as u16));
+        let mut bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .expect("the production full-viewport repaint must succeed");
+        terminal.feed(&bytes);
+    }
+
+    fn assert_live_chrome_is_bottom_anchored(
+        label: &str,
+        renderer: &TuiRenderer,
+        terminal: &VtOracle,
+        transition_bytes: &[u8],
+        width: usize,
+        height: usize,
+    ) {
+        let live_top = height.saturating_sub(renderer.active_rows);
+        let expected_move = format!("\x1b[{};1H", live_top + 1);
+        assert!(
+            transition_bytes
+                .windows(expected_move.len())
+                .any(|window| window == expected_move.as_bytes()),
+            "{label}: a shrinking live-frame transition must explicitly move to its \
+             new bottom-anchored origin; expected_move={expected_move:?} \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(transition_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            live_top + renderer.cursor_row_from_top,
+            "{label}: the physical cursor row must agree with the renderer's claimed \
+             bottom-anchored live rect; width={width} height={height} \
+             live_top={live_top} active_rows={} cursor_row_from_top={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(height - 1),
+            "{label}: the final status row must occupy the terminal's final physical row; \
+             width={width} height={height} live_top={live_top} active_rows={}\n{}",
+            renderer.active_rows,
+            terminal.diagnostic()
+        );
+        if let Some((top, bottom)) = renderer.transcript_scroll.visible_row_bounds() {
+            assert!(
+                usize::from(top) <= live_top
+                    && live_top <= usize::from(bottom)
+                    && usize::from(bottom) < height,
+                "{label}: the transcript claim must contain the rendered transcript \
+                 tail at the top of the bottom-anchored live frame; claim={top}..={bottom} \
+                 live_top={live_top} height={height}\n{}",
+                terminal.diagnostic()
+            );
+        }
+    }
+
+    /// Production-boundary regression (#1472): every transient live surface
+    /// may grow the bottom-owned frame, but removing that surface must move
+    /// the smaller replacement frame down to the real terminal bottom. The
+    /// transition is exercised through the same renderer erase/draw methods
+    /// and VT byte stream as a live session, not through the pure planner.
+    #[test]
+    fn test_transient_live_surfaces_shrink_back_to_the_physical_terminal_bottom() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 24;
+
+        // Query/progress/retry status rows can disappear without changing the
+        // transcript. The fallback help status must return to the last row.
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.add_trait_message(Arc::new(StaticMessage::plain("retained transcript row")));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors);
+        let mut terminal = VtOracle::new(WIDTH, HEIGHT);
+        seed_bottom_anchored_viewport(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.set_operation_status("Analyzing…\nRetrying request…");
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.clear_operation_status();
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert_live_chrome_is_bottom_anchored(
+            "query/progress rows removed",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+        assert_eq!(
+            output.get_messages().len(),
+            1,
+            "removing transient status rows must not delete retained semantic components"
+        );
+
+        // Slash help is a completion pane. Enter submits the selected command,
+        // clears the composer, and removes the pane in the same transition.
+        renderer.input_textarea.insert_str("/");
+        renderer.update_ghost_text();
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        let submitted = renderer
+            .take_submitted_input()
+            .expect("Enter on slash help must submit its selected command");
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert!(
+            submitted.starts_with('/'),
+            "slash-help submission must remain a command; submitted={submitted:?}"
+        );
+        assert_live_chrome_is_bottom_anchored(
+            "slash help submitted",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+
+        // A terminal resize takes the absolute full-repaint path. It must
+        // retain the same bottom-row invariant after the preceding shrink.
+        const RESIZED_WIDTH: usize = 96;
+        const RESIZED_HEIGHT: usize = 30;
+        renderer
+            .handle_resize(RESIZED_WIDTH as u16, RESIZED_HEIGHT as u16)
+            .expect("resize invalidation must succeed");
+        terminal.resize(RESIZED_WIDTH, RESIZED_HEIGHT);
+        let mut resize_bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut resize_bytes, false)
+            .expect("resize full repaint must succeed");
+        terminal.feed(&resize_bytes);
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(RESIZED_HEIGHT - 1),
+            "resize must leave status on the new final physical row; \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            RESIZED_HEIGHT - renderer.active_rows + renderer.cursor_row_from_top,
+            "resize must leave the physical cursor inside the newly claimed \
+             bottom-owned live rect; bytes={:?}\n{}",
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
         );
     }
 

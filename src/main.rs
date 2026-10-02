@@ -2,6 +2,7 @@
 // Main entry point
 
 use anyhow::{Context, Result};
+use clap::error::ContextValue;
 use clap::Parser;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -125,6 +126,7 @@ enum Command {
     /// Execute a single query
     Query {
         /// Query text
+        #[arg(value_parser = parse_nonblank_query)]
         query: String,
         /// Print each raw provider VM program to stderr before Finch executes it
         #[arg(long)]
@@ -209,37 +211,94 @@ enum Command {
     },
 }
 
+fn parse_nonblank_query(query: &str) -> std::result::Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("query must contain at least one non-whitespace character".to_string());
+    }
+    Ok(query.to_string())
+}
+
+fn escape_cli_diagnostic_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            // Keep ESC unchanged so Clap's existing ANSI handling still strips
+            // complete escape sequences instead of making them printable.
+            '\u{001b}' => escaped.push(character),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:04x}}}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn exit_with_safe_cli_error(mut error: clap::Error) -> ! {
+    let sanitized_context = error
+        .context()
+        .filter_map(|(kind, value)| match value {
+            ContextValue::String(value) => Some((
+                kind,
+                ContextValue::String(escape_cli_diagnostic_controls(value)),
+            )),
+            ContextValue::Strings(values) => Some((
+                kind,
+                ContextValue::Strings(
+                    values
+                        .iter()
+                        .map(|value| escape_cli_diagnostic_controls(value))
+                        .collect(),
+                ),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (kind, value) in sanitized_context {
+        error.insert(kind, value);
+    }
+    error.exit()
+}
+
 #[derive(Parser, Debug)]
 enum AuthCommand {
     /// Show local, secret-free authentication status without network access
     Status {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
-    /// Start Finch-native ChatGPT, SuperGrok, or Claude subscription sign-in
+    /// Start Finch-native ChatGPT, SuperGrok, Claude, or Google Gemini subscription sign-in
     ///
     /// Claude subscription sign-in is disabled by default; see
     /// `claude_subscription_oauth_enabled` under `[features]` in config.toml.
     Login {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
-        /// Copy the one-time code to the clipboard (chatgpt/grok-sub device
+        /// Copy the one-time code to the clipboard (chatgpt/grok-sub/gemini device
         /// codes only; has no effect for claude, whose browser flow has no
         /// one-time code to copy)
         #[arg(long)]
@@ -250,26 +309,30 @@ enum AuthCommand {
     },
     /// Revoke a named subscription credential and retain a local tombstone
     Logout {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
     },
     /// Recover an interrupted local mutation as a signed-out tombstone
     Recover {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub", "claude", "gemini", "gemini-sub"])]
         provider: String,
         #[arg(
             long,
             default_value = "chatgpt:default",
             default_value_if("provider", "grok-sub", Some("grok-sub:default")),
             default_value_if("provider", "claude", Some("claude:default")),
+            default_value_if("provider", "gemini", Some("gemini-sub:default")),
+            default_value_if("provider", "gemini-sub", Some("gemini-sub:default")),
             value_parser = parse_credential_reference
         )]
         credential: String,
@@ -973,7 +1036,7 @@ async fn main() -> Result<()> {
     // Parse command-line arguments
     let mut args = {
         let _phase = finch::startup::phase(finch::startup::PHASE_ARGS);
-        Args::parse()
+        Args::try_parse().unwrap_or_else(|error| exit_with_safe_cli_error(error))
     };
     reject_retired_session_flags(&args)?;
     // `finch attach NAME` is the canonical REPL entry; take it so the
@@ -997,10 +1060,10 @@ async fn main() -> Result<()> {
             None
         }
     };
-    // `Command::Query` is dispatched before the REPL setup below, so preserve
-    // this global flag explicitly rather than accidentally dropping it on the
-    // one-shot path.
-    let cloud_only = args.cloud_only;
+    // `Command::Query` and piped input are dispatched before the REPL setup
+    // below, so preserve the global direct-provider decision explicitly rather
+    // than accidentally dropping `--direct` on either one-shot path.
+    let bypass_daemon = args.direct || args.cloud_only;
 
     // Dispatch based on command
     match args.command {
@@ -1029,7 +1092,7 @@ async fn main() -> Result<()> {
             query,
             show_program,
         }) => {
-            return run_query(&query, cloud_only, show_program).await;
+            return run_query(&query, bypass_daemon, show_program).await;
         }
         Some(Command::Worker { bind, info }) => {
             return run_worker(bind, info).await;
@@ -1114,7 +1177,7 @@ async fn main() -> Result<()> {
         }
 
         // Run query via daemon
-        return run_query(input.trim(), cloud_only, false).await;
+        return run_query(input.trim(), bypass_daemon, false).await;
     }
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
@@ -2518,7 +2581,7 @@ fn is_clearly_forth(s: &str) -> bool {
 }
 
 /// Run a single query with full tool support (agentic mode)
-async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<()> {
+async fn run_query(query: &str, bypass_daemon: bool, show_program: bool) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
 
@@ -2553,10 +2616,10 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Build tool executor (same tools as the REPL)
     let (executor, tool_definitions, program_runtime) = build_query_tool_executor(&config).await?;
 
-    // A one-shot cloud-only query must not first attempt the daemon. Besides
-    // defeating the flag, that startup attempt can consume the whole caller
-    // timeout and makes direct-provider smoke tests look hung.
-    if cloud_only {
+    // An explicitly direct one-shot query must not first attempt the daemon.
+    // Besides defeating the flag, that startup attempt can consume the whole
+    // caller timeout and makes direct-provider smoke tests look hung.
+    if bypass_daemon {
         return run_query_cloud_only(
             query,
             &config,
@@ -3056,6 +3119,7 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
         "chatgpt" => run_chatgpt_auth(command).await,
         "grok-sub" => run_grok_auth(command).await,
         "claude" => run_claude_auth(command).await,
+        "gemini" | "gemini-sub" => run_gemini_auth(command).await,
         other => anyhow::bail!("unsupported auth provider {other}"),
     }
 }
@@ -3234,6 +3298,54 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
             let config = load_config()?;
             save_grok_named_credential(config, metadata)?;
             println!("Recovered Grok credential {credential} as signed_out; run `finch auth login grok-sub --credential {credential}` to sign in again.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_gemini_auth(command: AuthCommand) -> Result<()> {
+    use finch::cli::{
+        render_gemini_auth_status_line, save_gemini_named_credential, GeminiAuthService,
+        GeminiBrowserLoginPresentation,
+    };
+
+    let service = GeminiAuthService::production()?;
+    match command {
+        AuthCommand::Status { credential, .. } => {
+            let status = service.status(&credential)?;
+            println!("{}", render_gemini_auth_status_line(&status)?);
+        }
+        AuthCommand::Login {
+            credential, open, ..
+        } => {
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    GeminiBrowserLoginPresentation {
+                        open_browser: if open { true } else { true },
+                    },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "Gemini login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Gemini login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout { credential, .. } => {
+            let metadata = service.logout(&credential, command_cancellation()).await?;
+            let config = load_config()?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Gemini credential {credential} was revoked and signed out.");
+        }
+        AuthCommand::Recover { credential, .. } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_gemini_named_credential(config, metadata)?;
+            println!("Recovered Gemini credential {credential} as signed_out; run `finch auth login gemini-sub --credential {credential}` to sign in again.");
         }
     }
     Ok(())
@@ -4168,6 +4280,30 @@ mod tests {
                 }
             }) if provider == "grok-sub" && credential == "grok-sub:default"
         ));
+
+        let gemini_sub = Args::try_parse_from(["finch", "auth", "login", "gemini-sub"]).unwrap();
+        assert!(matches!(
+            gemini_sub.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    ..
+                }
+            }) if provider == "gemini-sub" && credential == "gemini-sub:default"
+        ));
+
+        let gemini = Args::try_parse_from(["finch", "auth", "login", "gemini"]).unwrap();
+        assert!(matches!(
+            gemini.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    ..
+                }
+            }) if provider == "gemini" && credential == "gemini-sub:default"
+        ));
     }
 
     #[test]
@@ -4215,6 +4351,55 @@ mod tests {
             Some(Command::Auth {
                 auth_command: AuthCommand::Recover { credential, .. }
             }) if credential == "claude:work"
+        ));
+    }
+
+    #[test]
+    fn gemini_auth_cli_parses_default_credential_for_every_subcommand() {
+        let login =
+            Args::try_parse_from(["finch", "auth", "login", "gemini-sub", "--open"]).unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    open: true,
+                    ..
+                }
+            }) if provider == "gemini-sub" && credential == "gemini-sub:default"
+        ));
+
+        let status = Args::try_parse_from(["finch", "auth", "status", "gemini"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Status { credential, .. }
+            }) if credential == "gemini-sub:default"
+        ));
+
+        let logout = Args::try_parse_from(["finch", "auth", "logout", "gemini-sub"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Logout { credential, .. }
+            }) if credential == "gemini-sub:default"
+        ));
+
+        let recover = Args::try_parse_from([
+            "finch",
+            "auth",
+            "recover",
+            "gemini",
+            "--credential",
+            "gemini-sub:personal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Recover { credential, .. }
+            }) if credential == "gemini-sub:personal"
         ));
     }
 

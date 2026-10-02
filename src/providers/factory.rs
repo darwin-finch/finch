@@ -16,7 +16,7 @@ use crate::config::{
 };
 use finch_providers::{
     ChatGptSubscriptionProvider, ClaudeCliProvider, ClaudeProvider, ClaudeSubscriptionProvider,
-    GeminiProvider, GrokSubscriptionProvider, OpenAIProvider,
+    GeminiProvider, GeminiSubscriptionProvider, GrokSubscriptionProvider, OpenAIProvider,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -438,26 +438,32 @@ fn create_provider_from_resolved_entry(
             Ok(Box::new(provider))
         }
         CredentialProvider::OpenaiPlatform
+        | CredentialProvider::MetaModelApi
         | CredentialProvider::Xai
         | CredentialProvider::Mistral
         | CredentialProvider::Groq
         | CredentialProvider::Openrouter => {
             let (default_base, default_model, provider_name) = match provider {
                 CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "gpt-4o", "openai"),
+                CredentialProvider::MetaModelApi => ("https://api.meta.ai", "muse-spark-1.3", "meta_model_api"),
                 CredentialProvider::Xai => ("https://api.x.ai", "grok-4.6", "grok"),
                 CredentialProvider::Mistral => ("https://api.mistral.ai", "mistral-large-2512", "mistral"),
                 CredentialProvider::Groq => ("https://api.groq.com/openai", "openai/gpt-oss-120b", "groq"),
                 CredentialProvider::Openrouter => ("https://openrouter.ai/api", "z-ai/glm-5.3-flash", "openrouter"),
                 _ => unreachable!("outer match limits provider"),
             };
-            let mut provider = OpenAIProvider::new_compatible(
-                secret,
-                base_url.clone().unwrap_or_else(|| default_base.to_string()),
-                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
-                models_path.as_deref().unwrap_or("/v1/models"),
-                default_model.to_string(),
-                provider_name.to_string(),
-            )?;
+            let mut provider = if *provider == CredentialProvider::MetaModelApi {
+                OpenAIProvider::new_meta_model_api(secret)?
+            } else {
+                OpenAIProvider::new_compatible(
+                    secret,
+                    base_url.clone().unwrap_or_else(|| default_base.to_string()),
+                    chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                    models_path.as_deref().unwrap_or("/v1/models"),
+                    default_model.to_string(),
+                    provider_name.to_string(),
+                )?
+            };
             if let Some(model) = model {
                 provider = provider.with_model(model.clone());
             }
@@ -484,6 +490,9 @@ fn create_provider_from_resolved_entry(
         ),
         CredentialProvider::GrokSubscription => bail!(
             "Grok subscription credentials are distinct from xAI Console API-key credentials and cannot be resolved as an environment secret"
+        ),
+        CredentialProvider::GeminiSubscription => bail!(
+            "Gemini subscription credentials are distinct from Google AI Studio API-key credentials and cannot be resolved as an environment secret"
         ),
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
@@ -514,6 +523,7 @@ fn resolve_named_graph(
         if credential.provider == CredentialProvider::ChatgptSubscription
             || credential.provider == CredentialProvider::ClaudeSubscription
             || credential.provider == CredentialProvider::GrokSubscription
+            || credential.provider == CredentialProvider::GeminiSubscription
         {
             continue;
         }
@@ -546,6 +556,7 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
         base_url,
         chat_path,
         models_path,
+        model,
         ..
     } = entry
     else {
@@ -567,6 +578,11 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
         {
             bail!("Grok subscription custom endpoints and paths are not supported")
         }
+        CredentialProvider::GeminiSubscription
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Gemini subscription custom endpoints and paths are not supported")
+        }
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
         ),
@@ -574,6 +590,18 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("Gemini AI Studio custom endpoints are not supported by this transport")
+        }
+        CredentialProvider::MetaModelApi
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Meta Model API profiles are fixed to https://api.meta.ai/v1 and do not accept endpoint overrides")
+        }
+        CredentialProvider::MetaModelApi
+            if model
+                .as_deref()
+                .is_some_and(|model| model != "muse-spark-1.3") =>
+        {
+            bail!("Meta Model API currently supports only muse-spark-1.3")
         }
         _ => Ok(()),
     }
@@ -618,7 +646,8 @@ fn create_named_profiles_from_config_with_resolver(
                 ProviderEntry::Credentialed {
                     provider: CredentialProvider::ChatgptSubscription
                         | CredentialProvider::ClaudeSubscription
-                        | CredentialProvider::GrokSubscription,
+                        | CredentialProvider::GrokSubscription
+                        | CredentialProvider::GeminiSubscription,
                     ..
                 }
             )
@@ -677,6 +706,18 @@ fn create_named_profiles_from_config_with_resolver(
                         unreachable!("credential binding implies credentialed entry")
                     };
                     Ok(Box::new(GrokSubscriptionProvider::production(
+                        metadata,
+                        model.as_deref(),
+                        *reasoning_effort,
+                    )?) as Box<dyn LlmProvider>)
+                } else if metadata.provider == CredentialProvider::GeminiSubscription {
+                    if !production_oauth {
+                        bail!("Injected credential resolvers cannot fabricate a refreshable Gemini subscription lease")
+                    }
+                    let ProviderEntry::Credentialed { model, reasoning_effort, .. } = entry else {
+                        unreachable!("credential binding implies credentialed entry")
+                    };
+                    Ok(Box::new(GeminiSubscriptionProvider::production(
                         metadata,
                         model.as_deref(),
                         *reasoning_effort,
@@ -872,6 +913,7 @@ pub fn create_provider_profile_from_config_with_resolver(
         if credential.provider == CredentialProvider::ChatgptSubscription
             || credential.provider == CredentialProvider::ClaudeSubscription
             || credential.provider == CredentialProvider::GrokSubscription
+            || credential.provider == CredentialProvider::GeminiSubscription
         {
             bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
         }
@@ -955,6 +997,21 @@ fn create_provider_from_overlaid_entry_with_resolver(
                 *reasoning_effort,
             )?) as Arc<dyn LlmProvider>);
         }
+        if credential.provider == CredentialProvider::GeminiSubscription {
+            let ProviderEntry::Credentialed {
+                model,
+                reasoning_effort,
+                ..
+            } = entry
+            else {
+                unreachable!("credential binding implies credentialed entry")
+            };
+            return Ok(Arc::new(GeminiSubscriptionProvider::production(
+                credential,
+                model.as_deref(),
+                *reasoning_effort,
+            )?) as Arc<dyn LlmProvider>);
+        }
         let handle = resolve_named_credential(binding, credential, resolver)?;
         let inner = create_provider_from_resolved_entry(entry, &handle)?;
         Ok(Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>)
@@ -999,8 +1056,12 @@ mod tests {
         OpenAiCompatibleToolChoice, ProviderCredential, ResolvedSecret,
     };
     use crate::models::{InferenceProvider, ModelFamily, ModelSize};
+    use crate::providers::{ContentBlock, Message};
+    use finch_providers::{ToolDefinition, ToolInputSchema};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -1130,6 +1191,111 @@ mod tests {
         }
     }
 
+    fn named_meta(profile_name: &str, credential_ref: &str) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::MetaModelApi,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("muse-spark-1.3".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(profile_name.into()),
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+        }
+    }
+
+    fn meta_credential(name: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::MetaModelApi,
+            issuer: "meta-model-api".into(),
+            audience: AudienceBinding::standard(EndpointFamily::MetaModelApi),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::Active {
+                expires_at: None,
+                refreshable: false,
+            },
+            revocation: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_meta_named_profile_constructs_truthful_model_identity_and_rejects_overrides() {
+        let profile = named_meta("muse", "meta-work");
+        let config = Config::with_providers(vec![profile.clone()])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let graph = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .expect("the origin-bound Meta profile must construct");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "muse");
+        assert_eq!(graph.profiles()[0].provider().name(), "meta_model_api");
+        assert_eq!(
+            graph.profiles()[0].provider().default_model(),
+            "muse-spark-1.3"
+        );
+        assert!(graph.profiles()[0]
+            .capabilities()
+            .unwrap()
+            .tools
+            .is_supported());
+
+        let mut overridden = profile;
+        if let ProviderEntry::Credentialed { chat_path, .. } = &mut overridden {
+            *chat_path = Some("/compatible-but-not-meta".into());
+        }
+        let invalid = Config::with_providers(vec![overridden])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let calls_before = resolver.calls.load(Ordering::SeqCst);
+        let error = match create_provider_graph_from_config_with_resolver(&invalid, &resolver) {
+            Ok(_) => panic!("Meta profiles must not silently redirect their credential"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("do not accept endpoint overrides"),
+            "{error}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            calls_before,
+            "unsafe Meta endpoint overrides must fail before secret resolution"
+        );
+
+        let mut future_model = named_meta("future-muse", "meta-work");
+        if let ProviderEntry::Credentialed { model, .. } = &mut future_model {
+            *model = Some("muse-spark-future".into());
+        }
+        let invalid = Config::with_providers(vec![future_model])
+            .with_credentials(vec![meta_credential("meta-work")]);
+        let error = match create_provider_graph_from_config_with_resolver(&invalid, &resolver) {
+            Ok(_) => panic!("undocumented future Muse models must remain unavailable"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("currently supports only muse-spark-1.3"),
+            "{error}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            calls_before,
+            "unknown Meta models must fail before secret resolution"
+        );
+    }
+
     fn named_openai_credential(name: &str, account: &str) -> ProviderCredential {
         ProviderCredential {
             name: name.into(),
@@ -1220,6 +1386,115 @@ mod tests {
             lifecycle: CredentialLifecycle::default(),
             revocation: Default::default(),
         }
+    }
+
+    fn configured_compatible_provider_at(
+        endpoint: &str,
+    ) -> (Arc<dyn LlmProvider>, Arc<AtomicUsize>) {
+        let config = Config::with_providers(vec![generic_openai_compatible(
+            "configured-boundary",
+            "configured-boundary-key",
+            endpoint,
+        )])
+        .with_credentials(vec![generic_openai_compatible_credential(
+            "configured-boundary-key",
+            endpoint,
+        )]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        struct BoundaryResolver(Arc<AtomicUsize>);
+        impl CredentialResolver for BoundaryResolver {
+            fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ResolvedCredential {
+                    credential_name: credential.name.clone(),
+                    secret: ResolvedSecret::new("factory-boundary-sentinel-secret")?,
+                })
+            }
+        }
+        let graph = create_provider_graph_from_config_with_resolver(
+            &config,
+            &BoundaryResolver(Arc::clone(&calls)),
+        )
+        .expect("real Config and origin-bound resolver must construct the compatible profile");
+        (graph.default_provider(), calls)
+    }
+
+    async fn configured_factory_stream_outcome(
+        endpoint: &str,
+        request: &ProviderRequest,
+    ) -> (Vec<StreamChunk>, Vec<String>) {
+        let (provider, _) = configured_compatible_provider_at(endpoint);
+        let result = provider.send_message_stream(request).await;
+        let mut chunks = Vec::new();
+        let mut errors = Vec::new();
+        match result {
+            Ok(mut receiver) => {
+                while let Some(item) = receiver.recv().await {
+                    match item {
+                        Ok(chunk) => chunks.push(chunk),
+                        Err(error) => errors.push(format!("{error:#}")),
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+        (chunks, errors)
+    }
+
+    async fn factory_stalling_server(
+        send_sse_headers: bool,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("factory fixture must bind a kernel-assigned loopback port");
+        let address = listener.local_addr().expect("fixture address must resolve");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("fixture must accept");
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            if send_sse_headers {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("fixture must write SSE headers");
+                socket.flush().await.expect("fixture headers must flush");
+            }
+            let _ = accepted_tx.send(());
+            let mut byte = [0u8; 1];
+            while matches!(socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (format!("http://{address}"), accepted_rx, closed_rx)
+    }
+
+    async fn factory_disconnect_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("disconnect fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("disconnect fixture address must resolve");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("fixture must accept");
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\ndata: {\"id\":",
+                )
+                .await
+                .expect("disconnect fixture must write its partial response");
+            socket.flush().await.expect("partial response must flush");
+        });
+        format!("http://{address}")
     }
 
     // -----------------------------------------------------------------------
@@ -1359,6 +1634,436 @@ mod tests {
         assert!(capabilities.tools.is_supported());
         assert_eq!(capabilities.context_window.max_tokens, Some(262_144));
         assert_eq!(capabilities.output_token_limit.max_tokens, Some(65_536));
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_public_dispatch_enforces_strict_bounded_responses()
+    {
+        let mut nonstream_server = mockito::Server::new_async().await;
+        let nonstream_mock = nonstream_server
+            .mock("POST", "/v1/chat/completions")
+            .match_header(
+                "authorization",
+                "Bearer factory-boundary-sentinel-secret",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"chat-1","object":"chat.completion","model":"main","choices":[{"index":0,"message":{"role":"assistant","content":"bounded"},"finish_reason":"stop"}]}"#,
+            )
+            .create_async()
+            .await;
+        let (provider, resolutions) = configured_compatible_provider_at(&nonstream_server.url());
+        let response = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("factory-built configured-compatible nonstream dispatch must succeed");
+        assert_eq!(
+            response.content,
+            vec![ContentBlock::Text {
+                text: "bounded".into()
+            }],
+            "factory-built compatible response changed successful content ordering"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "factory must resolve the exact origin-bound credential once"
+        );
+        nonstream_mock.assert_async().await;
+
+        let body = concat!(
+            "data: {\"id\":\"chat-2\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"streamed\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-2\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut stream_server = mockito::Server::new_async().await;
+        let stream_mock = stream_server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer factory-boundary-sentinel-secret")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream; charset=utf-8")
+            .with_body(body)
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&stream_server.url());
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("factory-built configured-compatible stream must start");
+        let mut completed = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            if let StreamChunk::ContentBlockComplete(block) =
+                item.expect("valid factory-built stream must not fail")
+            {
+                completed.push(block);
+            }
+        }
+        assert_eq!(
+            completed,
+            vec![ContentBlock::Text {
+                text: "streamed".into()
+            }],
+            "factory-built compatible stream changed successful completion ordering"
+        );
+        stream_mock.assert_async().await;
+
+        let mut malformed_server = mockito::Server::new_async().await;
+        malformed_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: not-json\n\ndata: [DONE]\n\n")
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&malformed_server.url());
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("malformed body is diagnosed by the returned stream");
+        let first = receiver
+            .recv()
+            .await
+            .expect("malformed stream must emit its terminal error")
+            .expect_err("malformed stream must not emit a successful chunk");
+        assert!(
+            format!("{first:#}").contains("malformed JSON"),
+            "factory dispatch surfaced the wrong malformed-stream error: {first:#}"
+        );
+        assert!(
+            receiver.recv().await.is_none(),
+            "factory dispatch emitted a late outcome after its parse failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_rejects_adversarial_sse_framing_and_bounds() {
+        const MIB: usize = 1024 * 1024;
+        let terminal = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let oversized_tool_arguments = "x".repeat(MIB + 1);
+        let cases = vec![
+            (
+                "wrong content type",
+                "application/json",
+                terminal.to_string(),
+            ),
+            (
+                "missing DONE",
+                "text/event-stream",
+                terminal.replace("data: [DONE]\n\n", ""),
+            ),
+            (
+                "duplicate DONE",
+                "text/event-stream",
+                format!("{terminal}data: [DONE]\n\n"),
+            ),
+            (
+                "late SSE data",
+                "text/event-stream",
+                format!(
+                    "{terminal}data: {{\"id\":\"late\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[]}}\n\n"
+                ),
+            ),
+            (
+                "DONE without blank terminator",
+                "text/event-stream",
+                terminal
+                    .strip_suffix('\n')
+                    .expect("terminal fixture ends with a blank delimiter")
+                    .to_string(),
+            ),
+            (
+                "oversized SSE line",
+                "text/event-stream",
+                format!("data: {}\n\n", "x".repeat(MIB)),
+            ),
+            (
+                "oversized SSE aggregate",
+                "text/event-stream",
+                format!(":{}\n", "x".repeat(MIB - 2)).repeat(5),
+            ),
+            (
+                "oversized tool arguments",
+                "text/event-stream",
+                format!(
+                    concat!(
+                        "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read\",\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                        "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                    oversized_tool_arguments
+                ),
+            ),
+        ];
+
+        for (case, content_type, body) in cases {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", content_type)
+                .with_body(body)
+                .create_async()
+                .await;
+            let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![
+                ToolDefinition {
+                    name: "read".into(),
+                    description: "read".into(),
+                    input_schema: ToolInputSchema::simple(vec![]),
+                },
+            ]);
+            let (chunks, errors) = configured_factory_stream_outcome(&server.url(), &request).await;
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+                "factory-boundary {case} published a successful completion: {chunks:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "factory-boundary {case} must emit exactly one terminal error: chunks={chunks:?}, errors={errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_bounds_nonstream_success_body() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(vec![b'x'; 32 * 1024 * 1024 + 1])
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&server.url());
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect_err("factory-built provider must reject an oversized success body");
+        assert!(
+            format!("{error:#}").contains("32 MiB"),
+            "factory-built provider reported the wrong oversized-success diagnostic: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_redacts_reflected_credentials_and_releases_on_drop()
+    {
+        let secret = "factory-boundary-sentinel-secret";
+        let request =
+            ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                input_schema: ToolInputSchema::simple(vec![]),
+            }]);
+        let reflected_nonstream = serde_json::json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "model": "main",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": secret, "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let mut reflected_nonstream_server = mockito::Server::new_async().await;
+        reflected_nonstream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&reflected_nonstream).unwrap())
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&reflected_nonstream_server.url());
+        let error = provider
+            .send_message(&request)
+            .await
+            .expect_err("factory-built provider must reject an unadvertised reflected tool name");
+        assert!(
+            !format!("{error:#}").contains(secret),
+            "factory nonstream schema diagnostic leaked the resolved credential: {error:#}"
+        );
+
+        let reflected_stream = format!(
+            concat!(
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"main\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            secret
+        );
+        let mut reflected_stream_server = mockito::Server::new_async().await;
+        reflected_stream_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(reflected_stream)
+            .create_async()
+            .await;
+        let (chunks, errors) =
+            configured_factory_stream_outcome(&reflected_stream_server.url(), &request).await;
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::ContentBlockComplete(_))),
+            "factory streaming schema failure published a completion: {chunks:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "factory streaming schema failure must emit exactly one error: {errors:?}"
+        );
+        assert!(
+            !errors[0].contains(secret),
+            "factory streaming schema diagnostic leaked the resolved credential: {}",
+            errors[0]
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"error":{{"message":"Authorization: Bearer {secret} {}"}}}}"#,
+                "x".repeat(65 * 1024)
+            ))
+            .create_async()
+            .await;
+        let (provider, _) = configured_compatible_provider_at(&server.url());
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect_err("factory-built configured-compatible 400 must fail");
+        let displayed = format!("{error:#}");
+        assert!(displayed.contains("response body redacted"), "{displayed}");
+        assert!(
+            !displayed.contains(secret),
+            "secret leaked in error: {displayed}"
+        );
+        assert!(
+            displayed.len() < 1024,
+            "factory error diagnostic was not bounded: {} bytes",
+            displayed.len()
+        );
+
+        let (endpoint, accepted, closed) = factory_stalling_server(true).await;
+        let (provider, _) = configured_compatible_provider_at(&endpoint);
+        let receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("factory-built stream must return after SSE headers");
+        accepted
+            .await
+            .expect("factory receiver-drop fixture did not accept the request");
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("factory receiver drop did not promptly close upstream")
+            .expect("factory receiver-drop fixture lost its closure signal");
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_cancellation_releases_upstream_without_late_result()
+    {
+        let (endpoint, accepted, closed) = factory_stalling_server(false).await;
+        let (provider, _) = configured_compatible_provider_at(&endpoint);
+        let dispatch = tokio::spawn(async move {
+            provider
+                .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+                .await
+        });
+        accepted
+            .await
+            .expect("factory cancellation fixture did not accept the request");
+        dispatch.abort();
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("factory cancellation did not promptly close upstream")
+            .expect("factory cancellation fixture lost its closure signal");
+        assert!(
+            dispatch
+                .await
+                .expect_err("aborted dispatch must not complete")
+                .is_cancelled(),
+            "cancelled factory dispatch produced a late non-cancellation outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_post_header_timeout_is_one_terminal_error() {
+        let (endpoint, accepted, closed) = factory_stalling_server(true).await;
+        let (provider, _) = configured_compatible_provider_at(&endpoint);
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("factory-built stream must return after SSE headers");
+        accepted
+            .await
+            .expect("factory timeout fixture did not accept the request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let error = receiver
+            .recv()
+            .await
+            .expect("factory timeout stream ended without its terminal error")
+            .expect_err("factory timeout must not emit a successful chunk");
+        assert!(
+            format!("{error:#}")
+                .to_ascii_lowercase()
+                .contains("timed out"),
+            "factory timeout reported the wrong terminal diagnostic: {error:#}"
+        );
+        assert!(
+            receiver.recv().await.is_none(),
+            "factory timeout emitted more than one terminal outcome"
+        );
+        closed
+            .await
+            .expect("factory timeout did not release the upstream transport");
+    }
+
+    #[tokio::test]
+    async fn test_configured_compatible_factory_disconnect_is_one_terminal_error_without_completion(
+    ) {
+        let endpoint = factory_disconnect_server().await;
+        let (provider, _) = configured_compatible_provider_at(&endpoint);
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("disconnect fixture must return after SSE headers");
+        let mut errors = Vec::new();
+        let mut completions = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(block)) => completions.push(block),
+                Ok(_) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        assert!(
+            completions.is_empty(),
+            "transport disconnect produced a successful completion: {completions:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "transport disconnect must emit one terminal error: {errors:?}"
+        );
     }
 
     #[test]

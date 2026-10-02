@@ -24,19 +24,36 @@ use crate::ContentBlock;
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// How a [`GeminiProvider`] instance authenticates against Google APIs.
+#[derive(Clone)]
+pub(crate) enum GeminiAuth {
+    ApiKey(String),
+    OAuthBearer(String),
+}
+
 /// Google Gemini API provider
 ///
 /// Supports Gemini 2.0 Flash and other Gemini models.
 #[derive(Clone)]
 pub struct GeminiProvider {
     client: Client,
-    api_key: String,
+    auth: GeminiAuth,
     default_model: String,
+    base_url: String,
 }
 
 impl GeminiProvider {
-    /// Create a new Gemini provider
+    /// Create a new Gemini provider with an API key
     pub fn new(api_key: String) -> Result<Self> {
+        Self::new_with_auth(GeminiAuth::ApiKey(api_key), GEMINI_BASE_URL)
+    }
+
+    /// Create a new Gemini provider with an OAuth bearer token
+    pub(crate) fn new_with_oauth_bearer(access_token: String) -> Result<Self> {
+        Self::new_with_auth(GeminiAuth::OAuthBearer(access_token), GEMINI_BASE_URL)
+    }
+
+    pub(crate) fn new_with_auth(auth: GeminiAuth, base_url: &str) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
@@ -44,8 +61,9 @@ impl GeminiProvider {
 
         Ok(Self {
             client,
-            api_key,
+            auth,
             default_model: "gemini-2.5-flash".to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -215,10 +233,19 @@ impl GeminiProvider {
         let gemini_request = self.to_gemini_request(request, bindings)?;
         let model = gemini_request.model.clone();
 
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            GEMINI_BASE_URL, model, self.api_key
-        );
+        let (url, auth_header) = match &self.auth {
+            GeminiAuth::ApiKey(api_key) => (
+                format!(
+                    "{}/models/{}:generateContent?key={}",
+                    self.base_url, model, api_key
+                ),
+                None,
+            ),
+            GeminiAuth::OAuthBearer(token) => (
+                format!("{}/models/{}:generateContent", self.base_url, model),
+                Some(format!("Bearer {token}")),
+            ),
+        };
 
         tracing::debug!(
             model = %gemini_request.model,
@@ -230,10 +257,15 @@ impl GeminiProvider {
             "sending Gemini request"
         );
 
-        let response = self
+        let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(auth) = auth_header {
+            req = req.header("authorization", auth);
+        }
+
+        let response = req
             .json(&gemini_request)
             .send()
             .await
@@ -276,17 +308,34 @@ impl GeminiProvider {
         let gemini_request = self.to_gemini_request(request, bindings)?;
         let model = gemini_request.model.clone();
 
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?key={}&alt=sse",
-            GEMINI_BASE_URL, model, self.api_key
-        );
+        let (url, auth_header) = match &self.auth {
+            GeminiAuth::ApiKey(api_key) => (
+                format!(
+                    "{}/models/{}:streamGenerateContent?key={}&alt=sse",
+                    self.base_url, model, api_key
+                ),
+                None,
+            ),
+            GeminiAuth::OAuthBearer(token) => (
+                format!(
+                    "{}/models/{}:streamGenerateContent?alt=sse",
+                    self.base_url, model
+                ),
+                Some(format!("Bearer {token}")),
+            ),
+        };
 
         tracing::debug!("Sending streaming request to Gemini API");
 
-        let response = self
+        let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(auth) = auth_header {
+            req = req.header("authorization", auth);
+        }
+
+        let response = req
             .json(&gemini_request)
             .send()
             .await

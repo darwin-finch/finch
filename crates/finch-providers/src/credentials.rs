@@ -30,6 +30,7 @@ pub enum CredentialKind {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialProvider {
     Anthropic,
+    MetaModelApi,
     OpenaiPlatform,
     OpenaiCompatible,
     ChatgptSubscription,
@@ -37,6 +38,7 @@ pub enum CredentialProvider {
     Xai,
     GrokSubscription,
     GeminiAiStudio,
+    GeminiSubscription,
     GoogleVertex,
     Mistral,
     Groq,
@@ -47,6 +49,7 @@ impl CredentialProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
+            Self::MetaModelApi => "meta_model_api",
             Self::OpenaiPlatform => "openai_platform",
             Self::OpenaiCompatible => "openai_compatible",
             Self::ChatgptSubscription => "chatgpt_subscription",
@@ -54,6 +57,7 @@ impl CredentialProvider {
             Self::Xai => "xai",
             Self::GrokSubscription => "grok_subscription",
             Self::GeminiAiStudio => "gemini_ai_studio",
+            Self::GeminiSubscription => "gemini_subscription",
             Self::GoogleVertex => "google_vertex",
             Self::Mistral => "mistral",
             Self::Groq => "groq",
@@ -68,12 +72,14 @@ impl CredentialProvider {
 #[serde(rename_all = "snake_case")]
 pub enum EndpointFamily {
     AnthropicApi,
+    MetaModelApi,
     OpenaiPlatform,
     ChatgptSubscription,
     ClaudeSubscription,
     XaiApi,
     GrokSubscription,
     GeminiAiStudio,
+    GeminiSubscription,
     GoogleVertex,
     MistralApi,
     GroqApi,
@@ -319,6 +325,11 @@ const GROK_SESSION: &[CredentialKind] = &[
 // generic escape hatch the ChatGPT/Grok session lanes keep.
 const CLAUDE_SESSION: &[CredentialKind] =
     &[CredentialKind::OauthBrowserPkce, CredentialKind::Bearer];
+const GEMINI_SESSION: &[CredentialKind] = &[
+    CredentialKind::OauthDevice,
+    CredentialKind::OauthBrowserPkce,
+    CredentialKind::Bearer,
+];
 
 pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor {
     match provider {
@@ -328,6 +339,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             kinds: API_KEY,
             family: EndpointFamily::AnthropicApi,
             standard_origin: "https://api.anthropic.com",
+        },
+        CredentialProvider::MetaModelApi => ProviderAuthDescriptor {
+            provider,
+            issuer: "meta-model-api",
+            kinds: API_KEY,
+            family: EndpointFamily::MetaModelApi,
+            standard_origin: "https://api.meta.ai",
         },
         CredentialProvider::OpenaiPlatform => ProviderAuthDescriptor {
             provider,
@@ -384,6 +402,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             issuer: "google-ai-studio",
             kinds: API_KEY,
             family: EndpointFamily::GeminiAiStudio,
+            standard_origin: "https://generativelanguage.googleapis.com",
+        },
+        CredentialProvider::GeminiSubscription => ProviderAuthDescriptor {
+            provider,
+            issuer: "google-gemini",
+            kinds: GEMINI_SESSION,
+            family: EndpointFamily::GeminiSubscription,
             standard_origin: "https://generativelanguage.googleapis.com",
         },
         CredentialProvider::GoogleVertex => ProviderAuthDescriptor {
@@ -691,6 +716,7 @@ mod tests {
     fn test_provider_kind_audience_matrix() {
         let providers = [
             CredentialProvider::Anthropic,
+            CredentialProvider::MetaModelApi,
             CredentialProvider::OpenaiPlatform,
             CredentialProvider::OpenaiCompatible,
             CredentialProvider::ChatgptSubscription,

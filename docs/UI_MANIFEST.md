@@ -1,4 +1,4 @@
-# UI manifest — the DOM wire contract (version 1)
+# UI manifest — the DOM wire contract (version 3)
 
 Status: current (stage 4 of [TUI_DESIGN.md](TUI_DESIGN.md), #1141 part 2). The
 manifest is the serialization boundary between Finch's widget engine and a
@@ -14,12 +14,14 @@ The wire payload is one JSON object; a consumer reads `manifest_version`
 first and rejects (or versions) everything else:
 
 ```json
-{ "manifest_version": 1, "root": { …DynamicUiNode… } }
+{ "manifest_version": 3, "root": { …DynamicUiNode… } }
 ```
 
 | Version | When | Notes |
 |---|---|---|
-| 1 | 2026-09 (this document) | initial contract |
+| 1 | 2026-09 | initial contract |
+| 2 | 2026-10 | Say turns expose one labelled `#1` program-disclosure control; answer and source content are non-actionable |
+| 3 | 2026-10 | Say turns remove that separate control; the displayed output or source is the stable `#1` in-place toggle target |
 
 Any shape change bumps the version and updates this document and the TS
 artifacts in the same commit.
@@ -41,7 +43,8 @@ artifacts in the same commit.
   uuid, or `{uuid}#{path}` for a semantic path under it (path segments
   joined by dots; `[1]` → `{uuid}#1`). This matches the terminal renderer's
   `RowId` discipline, so `propagate_ui_action(widget_id, action_id, payload)`
-  routes back through the same ids.
+  routes back through the same ids. Non-actionable component content uses an
+  empty id, matching terminal lines with no `RowId`.
 - `props` — JSON-valued, sorted keys (the Rust side uses a `BTreeMap`), never
   pre-rendered presentation strings. A GUI component reads semantics and
   decides its own presentation.
@@ -54,13 +57,13 @@ A rendered line's spans lower to `ManifestSpan[]`:
 `{ "Rgb": [r, g, b] }`. Absent optional fields are omitted; a plain span
 serializes as `{"text": "…"}`.
 
-## Element types and props (contract v1)
+## Element types and props (contract v3)
 
 | element_type | props | children |
 |---|---|---|
-| `SayTurnCard` | `status` (`running`/`completed`), `elapsedMs`, `showProgram` | `ProgramSource` (`#0`), `Output` (`#1`, present when output exists) |
-| `ProgramSource` | `language`, `lines` | — |
-| `Output` | `lines` | — |
+| `SayTurnCard` | `status` (`running`/`completed`), `elapsedMs`, `showProgram` | Running: non-actionable `ProgramSource`, then optional non-actionable `Output`. Completed: exactly one actionable child at `#1`: `Output` or `ProgramSource`, swapped in place. |
+| `ProgramSource` | `language`, `lines`; completed target also carries `actionLabel` (`Show output`) | — |
+| `Output` | `lines`; completed target also carries `actionLabel` (`Show program`) | — |
 | `StaticText` | `kind` (`info`/`error`/`success`/`warning`/`plain`), `lines` | — |
 | `Progress` | `label`, `current`, `total`, `status` (`in_progress`/`complete`/`failed`) | — |
 | `LiveTool` | `header`, `lines`, `status` | — |
@@ -91,17 +94,17 @@ by id. Transport is #808's scope; this document pins only the payload shape.
   with `FINCH_UPDATE_UI_MANIFEST_GOLDEN=1` and commit the diff with this
   document's version bump).
 
-## JSON schema (v1)
+## JSON schema (v3)
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://finch.dev/schemas/ui-manifest-v1.json",
+  "$id": "https://finch.dev/schemas/ui-manifest-v3.json",
   "title": "Finch UI manifest",
   "type": "object",
   "required": ["manifest_version", "root"],
   "properties": {
-    "manifest_version": { "const": 1 },
+    "manifest_version": { "const": 3 },
     "root": { "$ref": "#/$defs/node" }
   },
   "$defs": {

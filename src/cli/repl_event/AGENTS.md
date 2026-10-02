@@ -72,6 +72,20 @@ prefer showing instead. `test_repairable_rejection_diagnostic_reaches_debug_log_
 `query_processor.rs` cover the successful-repair, cancelled-before-repair, and cancelled-during-repair
 cases.
 
+**A deterministic raw-prose fallback must caption unsupported completed filesystem mutation
+claims.** `claims_tool_grounded_fact` (`query_processor.rs`) recognizes a narrow completed-claim
+grammar for create/write/edit/update/patch/move/rename/delete assertions whose direct target is a
+path, file, or directory, optionally after the bounded standalone acknowledgement `Done.`/`Done!`.
+When that query has no completed tool call, the existing visible unverified-tool caveat is retained
+in the live output and canonical `StreamingComplete` response; prospective instructions, requests,
+plans, refusals, examples, hyphenated adjectives such as `file-based`, and creative prose remain
+uncaveated. `named_brain_raw_prose_file_creation_claim_is_caveated_without_creating_the_file`,
+`completed_filesystem_mutation_claims_match_only_asserted_effects`,
+`completed_filesystem_mutation_claim_after_done_line_is_detected`,
+`hyphenated_file_adjective_is_not_a_filesystem_target`, and
+`unattempted_prose_claiming_file_creation_gets_no_caveat_after_completed_write` in
+`query_processor.rs` cover the production boundary and controls (#1477).
+
 **Snapshot replay reconstructs say-turn cards (#970).** The say ViewModel is produced only by
 the live paths, so `project_remote_brain_snapshot_runs` also runs
 `reconstruct_replayed_say_turn_cards`: a freshly replayed Interactive run whose journal pattern is
@@ -87,6 +101,14 @@ this snapshot did not create (a locally rendered live turn or an earlier snapsho
 already carries a card (a later snapshot must not reset `show_program` or duplicate output). The
 Snapshot branch also skips the run-unaffiliated Program source unit for programs a replayed card
 already covers, so one turn never wears two representations.
+
+**Interactive named-Brain runs project semantic turns, not lifecycle UUIDs (#422).** A remote or
+replayed `Interactive` run retains its `RunId` in orchestration state, but its transcript unit is
+an `Interactive` WorkUnit: program and tool/approval rows remain inspectable, successful `Result`
+bytes are the assistant body, and the terminal run status settles the unit. Failed and cancelled
+turns carry their actionable diagnostic once on that unit. Speculative/background runs retain the
+explicit run-labelled activity projection. Brain-context recaps attribute a correlated successful
+Interactive result to `assistant`, never to the journal sender `daemon`.
 
 **Locally executed runs never wear the legacy run group (#978).** When this frontend holds the
 home runner lease, runs it initiated are executed by its own callback paths and rendered through
@@ -106,6 +128,15 @@ initiate or execute, keeps its legacy rows (the control regressions pin this).
 **The state is shared, and that is the known weakness.** Every handler takes `&mut self` on an
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.
+
+**Generic-compatible status is capability-aware and secret-free.** `/status` identifies an
+`openai_compatible` profile as generic OpenAI-compatible Chat Completions and reports only its
+profile/model, operator-configured context and output limits, image-input state, and whether
+capacity is configured. Endpoint URLs and paths, credential references, environment bindings,
+headers, and resolved secrets never enter the status view. Built-in provider reports retain their
+existing four-line shape. Capability values are attested for the configured compatible model only;
+when a Brain or one-shot model overlay selects a different model, `/status` withholds those values
+and names both the selected overlay and configured model in a secret-free provenance diagnostic.
 
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was

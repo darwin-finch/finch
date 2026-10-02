@@ -15,14 +15,14 @@
 use finch_ui_model::{
     Axis, ComponentView, LiveToolView, MemoryRecalledView, MessageId, MessageStatus, OperationView,
     ProgressView, RowId, SayTurnStatus, SayTurnView, Span, SpanColor, SpanStyle, StaticTextKind,
-    StaticTextView, Track, Widget, WorkRowStatus,
+    StaticTextView, Track, UserTurnView, Widget, WorkRowStatus,
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 /// The manifest contract version. Bump on any shape change and update
 /// `docs/UI_MANIFEST.md` in the same commit; consumers read this first.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// One node of the serializable UI manifest: an element type (the registry
 /// key the JSX side maps to a component), a derived stable id, JSON-valued
@@ -137,7 +137,7 @@ pub fn manifest_id(message_id: &MessageId) -> String {
 
 /// The manifest id of a semantic path under a message: `{uuid}#1.2` — the
 /// append-only path segments joined by dots. A single-segment path `[1]` (the
-/// say output region, the toggle hit target) reads `{uuid}#1`.
+/// say program-disclosure control) reads `{uuid}#1`.
 pub fn manifest_path_id(message_id: &MessageId, path: &[u32]) -> String {
     if path.is_empty() {
         manifest_id(message_id)
@@ -236,32 +236,54 @@ pub fn component_manifest(view: &ComponentView) -> DynamicUiNode {
         ComponentView::LiveTool(live_tool) => live_tool_manifest(live_tool),
         ComponentView::Operation(operation) => operation_manifest(operation),
         ComponentView::MemoryRecalled(memory) => memory_recalled_manifest(memory),
+        ComponentView::UserTurn(user_turn) => user_turn_manifest(user_turn),
     }
 }
 
-/// The say-turn card's manifest: the VM fields a GUI card component reads,
-/// with the program and output regions as children carrying their semantic
-/// paths (`#0` program, `#1` output — the toggle hit target's path).
+/// The say-turn card's manifest: the VM fields a GUI card component reads.
+/// Completed cards lower exactly one content child: output or exact source.
+/// That displayed child carries semantic path `#1` plus a truthful alternate
+/// action label; there is no separate visible control node. Running cards
+/// retain their inline non-actionable source/output representation.
 pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
     let status = match view.vm.status {
         SayTurnStatus::Running => "running",
         SayTurnStatus::Completed => "completed",
     };
-    let program = DynamicUiNode::leaf("ProgramSource", manifest_path_id(&view.message_id, &[0]))
-        .with_prop("language", view.vm.program.language.clone())
-        .with_prop("lines", view.vm.program.lines.clone());
+    let program = |id: String| {
+        DynamicUiNode::leaf("ProgramSource", id)
+            .with_prop("language", view.vm.program.language.clone())
+            .with_prop("lines", view.vm.program.lines.clone())
+    };
+    let output = |id: String| {
+        view.vm.output.as_ref().map(|output| {
+            DynamicUiNode::leaf("Output", id).with_prop("lines", output.lines.clone())
+        })
+    };
     let mut card = DynamicUiNode::leaf("SayTurnCard", manifest_id(&view.message_id))
         .with_prop("status", status)
         .with_prop("elapsedMs", view.elapsed.as_millis() as u64)
-        .with_prop("showProgram", view.vm.show_program)
-        .with_child(program);
-    if let Some(output) = &view.vm.output {
-        card = card.with_child(
-            DynamicUiNode::leaf("Output", manifest_path_id(&view.message_id, &[1]))
-                .with_prop("lines", output.lines.clone()),
-        );
+        .with_prop("showProgram", view.vm.show_program);
+
+    if view.vm.status == SayTurnStatus::Running {
+        card = card.with_child(program(String::new()));
+        if let Some(output) = output(String::new()) {
+            card = card.with_child(output);
+        }
+        return card;
     }
-    card
+
+    let target_id = manifest_path_id(&view.message_id, &[1]);
+    let content = if view.vm.show_program {
+        program(target_id).with_prop("actionLabel", "Show output")
+    } else {
+        output(target_id.clone())
+            .unwrap_or_else(|| {
+                DynamicUiNode::leaf("Output", target_id).with_prop("lines", Vec::<String>::new())
+            })
+            .with_prop("actionLabel", "Show program")
+    };
+    card.with_child(content)
 }
 
 /// A static text message's manifest: kind + content lines.
@@ -329,6 +351,16 @@ pub fn memory_recalled_manifest(view: &MemoryRecalledView) -> DynamicUiNode {
     DynamicUiNode::leaf("MemoryRecalled", "")
         .with_prop("header", view.header.clone())
         .with_children(rows)
+}
+
+/// A user turn message's manifest: marker, optional subject, content lines,
+/// and optional participant index.
+pub fn user_turn_manifest(view: &UserTurnView) -> DynamicUiNode {
+    DynamicUiNode::leaf("UserTurn", "")
+        .with_prop("marker", view.marker.to_string())
+        .with_prop("subject", view.subject.clone())
+        .with_prop("lines", view.content_lines.clone())
+        .with_prop("participantIndex", view.participant_index)
 }
 
 fn manifest_status(status: &MessageStatus) -> &'static str {
