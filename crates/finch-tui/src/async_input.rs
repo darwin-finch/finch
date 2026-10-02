@@ -432,7 +432,7 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
     } else if COMPOSER_DELETE_CHAR.owns(&key) {
         // Readline/Emacs semantics: delete the character under the cursor. On
         // an empty buffer this acts as EOF and exits Finch.
-        if tui.input_textarea.lines().join("").is_empty() {
+        if tui.input_textarea.is_empty() {
             (false, Some("/quit".to_string()))
         } else {
             tui.input_textarea.delete_next_char();
