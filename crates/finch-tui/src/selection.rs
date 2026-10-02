@@ -26,21 +26,11 @@
 //! an index entry for (mouse coordinates outside the transcript claim
 //! entirely) is skipped rather than guessed at.
 //!
-//! Column math (`column_to_char_index`) walks `text` char-by-char using
-//! display width, with no awareness of embedded ANSI escapes. Most
-//! transcript lines are plain by the time they reach here (component spans
-//! are lowered separately, at paint), but a legacy line that still carries
-//! raw SGR bytes directly in its `text` field (span-free, pre-formatted
-//! content — see `span_render::lower_rendered_line`'s doc comment) would
-//! have its escape bytes miscounted as display columns. That is a known,
-//! narrow gap rather than something silently mishandled: such a line still
-//! selects and copies (whole-row column bounds are unaffected), only a
-//! partial-column boundary landing inside its escape bytes could drift. The
-//! same narrow gap applies to `split_into_physical_rows`'s row-boundary
-//! placement for such a line; `SelectionIndex::build` keeps `physical_rows`
-//! (not the split's own chunk count) as the authoritative row-count per
-//! line, so a mismatch there stays confined to that one line's own slice
-//! boundaries and never drifts the row numbering of every line after it.
+//! Column math (`column_to_char_index`) walks visible `text` char-by-char using
+//! display width. Lines are sanitized of ANSI escapes (`strip_ansi`) when
+//! building the index, guaranteeing that display columns align 1:1 with visible
+//! characters, escape sequences are never sliced or indexed, and copied text
+//! contains clean plain text without escape artifacts (#1493).
 //!
 //! The index is rebuilt every frame in
 //! `TuiRenderer::rebuild_transcript_hit_regions`, from the same
@@ -51,7 +41,7 @@
 //! see that function's doc comment for why a simple "clear on redraw" rule
 //! was chosen over trying to carry a selection across content that moved.
 
-use finch_ui_model::{char_display_width, physical_rows, RenderedTranscriptLine};
+use finch_ui_model::{char_display_width, physical_rows, strip_ansi, RenderedTranscriptLine};
 
 /// One selectable physical terminal row, keyed by its absolute row. `text`
 /// is exactly that row's own on-screen slice — the full logical line for a
@@ -75,16 +65,15 @@ pub(crate) struct SelectionIndex {
 }
 
 /// Split `text` into the column-window chunks a hard wrap at `width` display
-/// columns would produce — one chunk per physical row, in order. Mirrors
-/// `finch_ui_model::physical_rows`'s counting exactly for plain text; see the
-/// module docs for the narrow, already-documented gap on a line still
-/// carrying raw ANSI bytes.
+/// columns would produce — one chunk per physical row, in order. Strips ANSI
+/// escape codes so wrapping aligns with visible terminal columns (#1493).
 fn split_into_physical_rows(text: &str, width: usize) -> Vec<String> {
+    let clean = strip_ansi(text);
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut current = String::new();
     let mut col = 0usize;
-    for ch in text.chars() {
+    for ch in clean.chars() {
         let w = char_display_width(ch).max(1);
         if col + w > width && !current.is_empty() {
             rows.push(std::mem::take(&mut current));
@@ -105,8 +94,9 @@ impl SelectionIndex {
         let mut rows = Vec::new();
         let mut cursor = usize::from(top);
         for line in combined {
-            let rows_here = physical_rows(&line.text, width);
-            let slices = split_into_physical_rows(&line.text, width);
+            let clean = strip_ansi(&line.text);
+            let rows_here = physical_rows(&clean, width);
+            let slices = split_into_physical_rows(&clean, width);
             for i in 0..rows_here {
                 if cursor > usize::from(u16::MAX) {
                     break;
@@ -290,7 +280,7 @@ pub(crate) fn selected_text(index: &SelectionIndex, selection: &TranscriptSelect
         out.push_str(&piece);
         first = false;
     }
-    out
+    strip_ansi(&out)
 }
 
 /// Rows to paint with the highlight background for the current selection:
@@ -538,4 +528,64 @@ mod tests {
             "highlighting 'hello' is char range [0,5) into the full row text"
         );
     }
+
+    /// #1493 regression: raw ANSI SGR escape sequences (e.g. `\x1b[38;5;8m`)
+    /// embedded in rendered transcript lines must never have their escape
+    /// bytes counted as display columns or sliced at char boundaries, which
+    /// emitted raw parameters like `;5;8m` as visible text and corrupted the selection.
+    #[test]
+    fn test_selection_strips_ansi_sgr_escapes_without_splitting_escape_parameters() {
+        let text = "\x1b[36m\x1b[1mGrep\x1b[0m\x1b[38;5;8m(Type[- ]4...)\x1b[0m";
+        let index = SelectionIndex::build(&[line(0, text)], 3, 80);
+        assert_eq!(index.len(), 1);
+        let row_entry = index.row(3).expect("row 3 must exist");
+        assert_eq!(
+            row_entry.text, "Grep(Type[- ]4...)",
+            "row text in SelectionIndex must be sanitized of ANSI escapes"
+        );
+
+        // Select "Grep(Typ" across what used to be the ANSI escape boundary between
+        // Grep and (Type[- ]4...).
+        let selection = TranscriptSelection {
+            anchor: SelectionPoint { row: 3, col: 0 },
+            head: SelectionPoint { row: 3, col: 7 },
+            dragging: false,
+        };
+        let selected = selected_text(&index, &selection);
+        assert_eq!(
+            selected, "Grep(Typ",
+            "selected text must not contain broken ANSI escape codes like ;5;8m"
+        );
+        assert!(
+            !selected.contains(";5;8m") && !selected.contains("\x1b"),
+            "selected text must be clean plain text"
+        );
+
+        let rows = highlighted_rows(&index, &selection);
+        assert_eq!(
+            rows,
+            vec![(3, "Grep(Type[- ]4...)".to_string(), (0, 8))],
+            "highlighted char range must index into clean text"
+        );
+    }
+
+    #[test]
+    fn test_selection_spans_wrapped_line_with_ansi_escapes() {
+        // Line with 40 visible chars surrounded and interspersed with ANSI codes,
+        // wrapping at width 20 into exactly 2 rows of 20 chars each.
+        let text = format!(
+            "\x1b[31m{}\x1b[0m\x1b[32m{}\x1b[0m",
+            "a".repeat(20),
+            "b".repeat(20)
+        );
+        let index = SelectionIndex::build(&[line(0, &text)], 5, 20);
+        assert_eq!(
+            index.len(),
+            2,
+            "ANSI escapes must not inflate the physical row count or slice boundaries"
+        );
+        assert_eq!(index.row(5).map(|r| r.text.as_str()), Some("a".repeat(20).as_str()));
+        assert_eq!(index.row(6).map(|r| r.text.as_str()), Some("b".repeat(20).as_str()));
+    }
 }
+
