@@ -8,7 +8,9 @@ The provider-visible history and ordered staging of tool results belong to
 [`finch-conversation`](../../../crates/finch-conversation/README.md); this module decides when
 to commit a round, generate a summary, and admit a continuation. `EventLoop` and its `LlmLoop`
 worker share the session's committed-summary cache so a conversation reset invalidates both the
-raw history and the derived provider prefix before another request is assembled.
+raw history and the derived provider prefix before another request is assembled. Reset completion
+also releases the exact pre-reset query; late events retain that old query identity and cannot
+disturb the first fresh turn or anything queued behind it.
 
 Two callers illustrate the boundary:
 

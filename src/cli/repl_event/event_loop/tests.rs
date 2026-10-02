@@ -7435,6 +7435,8 @@ struct BlockingSummaryRequestRecorder {
     summary_started: tokio::sync::Notify,
     release_summary: tokio::sync::Notify,
     summary_returned: tokio::sync::Notify,
+    newer_request_started: tokio::sync::Notify,
+    release_newer_request: tokio::sync::Notify,
 }
 
 impl BlockingSummaryRequestRecorder {
@@ -7444,6 +7446,8 @@ impl BlockingSummaryRequestRecorder {
             summary_started: tokio::sync::Notify::new(),
             release_summary: tokio::sync::Notify::new(),
             summary_returned: tokio::sync::Notify::new(),
+            newer_request_started: tokio::sync::Notify::new(),
+            release_newer_request: tokio::sync::Notify::new(),
         }
     }
 
@@ -7467,6 +7471,10 @@ impl crate::generators::Generator for BlockingSummaryRequestRecorder {
                 .text_content()
                 .starts_with("Summarise the following conversation history concisely")
         });
+        let is_newer_request = messages.iter().any(|message| {
+            message.role == "user"
+                && message.text_content() == "new active prompt before old invalidation arrives"
+        });
         self.requests
             .lock()
             .expect("blocking summary recorder lock poisoned")
@@ -7476,10 +7484,14 @@ impl crate::generators::Generator for BlockingSummaryRequestRecorder {
             self.release_summary.notified().await;
             self.summary_returned.notify_one();
         }
+        if is_newer_request {
+            self.newer_request_started.notify_one();
+            self.release_newer_request.notified().await;
+        }
         let text = if is_summary_request {
             "summary produced from the cleared conversation"
         } else {
-            "(say \"provider must never receive this stale request\")"
+            "(say \"fresh provider response\")"
         };
         Ok(crate::generators::GeneratorResponse {
             text: text.to_string(),
@@ -7572,6 +7584,22 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
         .read()
         .await
         .expect("the blocked summary must belong to the active query");
+    let stale_round = event_loop
+        .conversation
+        .write()
+        .await
+        .stage_assistant(
+            query_id,
+            crate::providers::Message {
+                role: "assistant".into(),
+                content: vec![crate::providers::ContentBlock::ToolUse {
+                    id: "late_old_tool".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            },
+        )
+        .expect("the hostile fixture must retain an old-generation tool token");
 
     event_loop
         .handle_user_input(command.to_string())
@@ -7593,6 +7621,131 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
             .is_empty(),
         "{command} must clear the conversation while the summarizer is blocked"
     );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "{command} must release the cancelled query before visibly confirming the fresh context"
+    );
+
+    const FRESH_PROMPT: &str = "fresh prompt submitted while old summary remains blocked";
+    event_loop
+        .handle_user_input(FRESH_PROMPT.to_string())
+        .await
+        .expect("the first post-reset prompt must start immediately");
+    let fresh_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the first post-reset prompt must own the active slot");
+    assert_ne!(
+        fresh_query_id, query_id,
+        "the fresh prompt must not reuse the cancelled query identity"
+    );
+    let fresh_request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = recorder.requests().into_iter().find(|request| {
+                request
+                    .iter()
+                    .any(|message| message.role == "user" && message.text_content() == FRESH_PROMPT)
+            }) {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fresh prompt must reach the real provider while the old summarizer is blocked");
+    assert!(
+        fresh_request.iter().all(|message| {
+            !message.text_content().contains("pre-clear")
+                && !message
+                    .text_content()
+                    .contains("summary produced from the cleared conversation")
+        }),
+        "{command} must send only fresh-generation context; request={fresh_request:?}"
+    );
+
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the fresh prompt must reach a terminal event while the old summary is blocked")
+        .expect("the event channel must remain open");
+        assert!(
+            !matches!(event, ReplEvent::QueryContextInvalidated { query_id: id } if id == query_id),
+            "the old query cannot invalidate before its summarizer is released"
+        );
+        let fresh_complete = matches!(event, ReplEvent::StreamingComplete { query_id: id, .. } if id == fresh_query_id);
+        event_loop
+            .handle_event(event)
+            .await
+            .expect("fresh-generation events must dispatch");
+        if fresh_complete {
+            break;
+        }
+    }
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "the fresh prompt must settle normally before the old task returns"
+    );
+    assert_eq!(
+        recorder
+            .requests()
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user" && message.text_content() == FRESH_PROMPT
+            }))
+            .count(),
+        1,
+        "the first post-reset prompt must reach the provider exactly once"
+    );
+
+    const NEW_ACTIVE: &str = "new active prompt before old invalidation arrives";
+    const NEW_QUEUED: &str = "queued prompt that late invalidation must preserve";
+    event_loop
+        .handle_user_input(NEW_ACTIVE.to_string())
+        .await
+        .expect("a newer query must start after the fresh prompt settles");
+    let new_active_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the newer query must own the active slot");
+    event_loop
+        .handle_user_input(NEW_QUEUED.to_string())
+        .await
+        .expect("a subsequent prompt must queue behind the newer query");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.newer_request_started.notified(),
+    )
+    .await
+    .expect("the newer active query must block at the provider boundary");
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        [NEW_QUEUED],
+        "the hostile fixture must contain a newer queued prompt"
+    );
+    {
+        let tui = event_loop.tui_renderer.lock().await;
+        tui.set_operation_status("fresh generation remains active");
+    }
+    use crate::cli::tui::TuiStatusPort;
+    let status_before_late_event = event_loop.status_bar.status_without_session();
+    let transcript_before_late_event = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    let requests_before_late_event = recorder.requests().len();
 
     recorder.release_summary.notify_one();
     tokio::time::timeout(
@@ -7606,11 +7759,11 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
         event_loop.event_rx.recv(),
     )
     .await
-    .expect("the invalidated request must emit one terminal event")
+    .expect("the invalidated old request must emit one terminal event")
     .expect("the event channel must remain open");
     assert!(
         matches!(terminal, ReplEvent::QueryContextInvalidated { query_id: id } if id == query_id),
-        "{command} must terminalize the exact invalidated query without a provider failure; event={terminal:?}"
+        "the blocked newer request cannot produce an event before the old generation's invalidation; got {terminal:?}"
     );
     event_loop
         .handle_event(terminal)
@@ -7619,20 +7772,106 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
 
     assert_eq!(
         *event_loop.active_query_id.read().await,
-        None,
-        "{command} must release the active-query slot after invalidated assembly"
+        Some(new_active_id),
+        "{command} late invalidation must not release the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        [NEW_QUEUED],
+        "{command} late invalidation must not delete newer queued prompts"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before_late_event,
+        "{command} late invalidation must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.format(&crate::theme::ColorScheme::default()))
+            .collect::<Vec<_>>(),
+        transcript_before_late_event,
+        "{command} late invalidation must not append or rewrite visible output"
     );
     let requests = recorder.requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "{command} must make only the already-started summary request and never send the stale main-provider request; requests={requests:?}"
-    );
     assert!(
-        requests[0].iter().any(|message| message
-            .text_content()
-            .starts_with("Summarise the following conversation history concisely")),
-        "the sole observed request must be the deliberately blocked summarizer request; requests={requests:?}"
+        requests.len() >= requests_before_late_event,
+        "request recording is append-only across the late event; before={requests_before_late_event}, requests={requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user"
+                    && message.text_content() == "question whose summary is blocked"
+            }))
+            .count(),
+        0,
+        "{command} must never send the invalidated old query to the main provider; requests={requests:?}"
+    );
+
+    event_loop
+        .handle_event(ReplEvent::ToolResult {
+            query_id,
+            round_token: stale_round,
+            tool_id: "late_old_tool".into(),
+            result: Ok("late old result".into()),
+        })
+        .await
+        .expect("a late old-generation tool event must be ignored idempotently");
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_active_id),
+        "a late old-generation tool event must not mutate the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "a late old-generation tool event must preserve newer queued input"
+    );
+    event_loop
+        .handle_event(ReplEvent::StreamingComplete {
+            query_id,
+            full_response: "late old completion".into(),
+        })
+        .await
+        .expect("a late old-generation completion must be ignored idempotently");
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_active_id),
+        "late old-generation tool and completion events must preserve the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "late old-generation tool and completion events must preserve newer queued input"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before_late_event,
+        "late old-generation tool and completion events must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.format(&crate::theme::ColorScheme::default()))
+            .collect::<Vec<_>>(),
+        transcript_before_late_event,
+        "late old-generation tool and completion events must not append or rewrite visible output"
     );
 
     let regrown = summary_reuse_fixture("post-clear");
@@ -7646,10 +7885,18 @@ async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &st
     );
     tokio::task::yield_now().await;
     assert_eq!(
-        recorder.requests().len(),
-        1,
-        "{command} must produce no late provider effects after the terminal invalidation"
+        recorder
+            .requests()
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user"
+                    && message.text_content() == "question whose summary is blocked"
+            }))
+            .count(),
+        0,
+        "{command} must produce no late old-generation provider effect after terminal invalidation"
     );
+    recorder.release_newer_request.notify_one();
 }
 
 fn summary_reuse_fixture(prefix: &str) -> Vec<crate::providers::Message> {

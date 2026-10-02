@@ -433,7 +433,14 @@ impl EventLoop {
             }
 
             ReplEvent::QueryContextInvalidated { query_id } => {
-                self.query_states.cancel_query(query_id).await;
+                // `/clear` and `/reset` already terminalize and release their
+                // exact active query before confirming the fresh context.
+                // Its worker may still report invalidation after a newer turn
+                // has claimed the slot; that terminal event is deliberately
+                // idempotent and must not touch the newer owner or its queue.
+                if !self.query_states.cancel_query(query_id).await {
+                    return Ok(());
+                }
                 self.tool_coordinator
                     .terminalize(query_id, crate::tools::ToolLoopTerminal::Cancelled)
                     .await;
@@ -447,7 +454,6 @@ impl EventLoop {
                 }
                 if *self.active_query_id.read().await == Some(query_id) {
                     *self.active_query_id.write().await = None;
-                    self.pending_queries.clear();
                 }
                 self.tool_call_history.write().await.remove(&query_id);
             }
@@ -479,6 +485,13 @@ impl EventLoop {
                             *self.active_query_id.write().await = None;
                         }
                     }
+                    return Ok(());
+                }
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled | QueryState::Failed { .. })
+                ) {
+                    tracing::debug!("Discarding late tool result for closed query {}", query_id);
                     return Ok(());
                 }
                 if let Some(restart) =
