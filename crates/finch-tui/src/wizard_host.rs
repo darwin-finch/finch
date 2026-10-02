@@ -853,7 +853,7 @@ fn wizard_welcome_banner(width: usize) -> Vec<String> {
     wizard_boxed(
         "Welcome to Finch",
         &[wizard_plain(
-            "Finch is an AI assistant that helps you build and change your software projects directly on your computer.",
+            "Finch is an AI assistant that helps you get work done, answer questions, and solve problems directly on your computer.",
         )],
         WizardColor::Cyan,
         width,
@@ -2118,6 +2118,10 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("Welcome to Finch")),
             "the welcome banner text must be rendered"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("software projects")),
+            "the welcome banner must not contain 'software projects' jargon"
         );
         assert!(
             frame.rects.tab_row.y >= frame.rects.banner.height,
