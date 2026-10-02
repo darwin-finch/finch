@@ -8757,3 +8757,50 @@ fn test_o_key_on_device_dialog_does_not_panic() {
     // Pressing Enter must not panic and must be handled.
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
 }
+
+#[test]
+fn test_pressing_e_or_enter_on_unconfigured_provider_focuses_api_key_field() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+
+    // Press 'E' on the default unconfigured provider
+    handle_models_input(&mut state, key(KeyCode::Char('E'))).unwrap();
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
+    {
+        match adding_provider {
+            Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                assert_eq!(
+                    *focused_field, 3,
+                    "pressing 'E' must focus the API Key field (field 3)"
+                );
+            }
+            other => panic!("expected ConfigureRemote step, got {other:?}"),
+        }
+    } else {
+        panic!("missing Models section state");
+    }
+
+    // Dismiss overlay
+    handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
+
+    // Press Enter on the unconfigured provider
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
+    {
+        match adding_provider {
+            Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                assert_eq!(
+                    *focused_field, 3,
+                    "pressing Enter on empty key must focus API Key field (field 3)"
+                );
+            }
+            other => panic!("expected ConfigureRemote step, got {other:?}"),
+        }
+    } else {
+        panic!("missing Models section state");
+    }
+}

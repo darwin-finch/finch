@@ -2044,7 +2044,16 @@ pub(super) fn handle_models_input(
                             } else {
                                 None
                             },
-                            focused_field: 1,
+                            focused_field: if (matches!(
+                                key.code,
+                                KeyCode::Char('e') | KeyCode::Char('E')
+                            ) || api_key.is_empty())
+                                && provider_requires_inline_api_key(provider)
+                            {
+                                3
+                            } else {
+                                1
+                            },
                             editing_idx: Some(*selected_idx),
                         });
                     } else if let Some(ModelConfig::Local {
