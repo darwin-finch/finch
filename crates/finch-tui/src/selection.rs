@@ -584,8 +584,13 @@ mod tests {
             2,
             "ANSI escapes must not inflate the physical row count or slice boundaries"
         );
-        assert_eq!(index.row(5).map(|r| r.text.as_str()), Some("a".repeat(20).as_str()));
-        assert_eq!(index.row(6).map(|r| r.text.as_str()), Some("b".repeat(20).as_str()));
+        assert_eq!(
+            index.row(5).map(|r| r.text.as_str()),
+            Some("a".repeat(20).as_str())
+        );
+        assert_eq!(
+            index.row(6).map(|r| r.text.as_str()),
+            Some("b".repeat(20).as_str())
+        );
     }
 }
-

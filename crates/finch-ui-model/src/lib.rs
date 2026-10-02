@@ -1355,7 +1355,10 @@ mod tests {
     #[test]
     fn test_strip_ansi_removes_sgr_and_osc_and_preserves_plain() {
         assert_eq!(strip_ansi("plain text"), "plain text");
-        assert_eq!(strip_ansi("\x1b[38;5;8mgrep(\"foo\")\x1b[0m"), "grep(\"foo\")");
+        assert_eq!(
+            strip_ansi("\x1b[38;5;8mgrep(\"foo\")\x1b[0m"),
+            "grep(\"foo\")"
+        );
         assert_eq!(
             strip_ansi("\x1b[36m\x1b[1mGrep\x1b[0m\x1b[38;5;8m(Type[- ]4...)\x1b[0m"),
             "Grep(Type[- ]4...)"
@@ -1363,4 +1366,3 @@ mod tests {
         assert_eq!(strip_ansi("\x1b]0;title\x07hello"), "hello");
     }
 }
-

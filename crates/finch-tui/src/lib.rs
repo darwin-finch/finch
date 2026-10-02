@@ -15640,7 +15640,8 @@ mod selection_tests {
             .map(|col| term.cell(row as usize, col).character)
             .collect();
         assert_eq!(
-            line_text, "Grep(Type[- ]4...)",
+            line_text,
+            "Grep(Type[- ]4...)",
             "terminal line must display clean text without broken ANSI fragments; screen:\n{}",
             term.diagnostic()
         );
