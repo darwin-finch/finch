@@ -251,7 +251,14 @@ pub fn wizard_visible_length(text: &str) -> usize {
                         }
                     }
                 } else {
-                    chars.next();
+                    let mut c = chars.next();
+                    while let Some(ch) = c {
+                        if ('\x20'..='\x2F').contains(&ch) {
+                            c = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
             '\r' | '\x08' | '\x7f' => {}
@@ -472,6 +479,57 @@ pub fn wizard_centered(line: WizardLine, width: usize) -> WizardLine {
     WizardLine(spans)
 }
 
+/// Splits a string into words by space, ignoring any spaces that appear inside ANSI sequences.
+fn ansi_aware_split_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current_word = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            current_word.push(ch);
+            if chars.peek() == Some(&'[') {
+                current_word.push(chars.next().unwrap());
+                while let Some(c) = chars.next() {
+                    current_word.push(c);
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                current_word.push(chars.next().unwrap());
+                while let Some(c) = chars.next() {
+                    current_word.push(c);
+                    if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
+                        if c == '\x1b' {
+                            if let Some(slash) = chars.next() {
+                                current_word.push(slash);
+                            }
+                        }
+                        break;
+                    }
+                }
+            } else {
+                let mut c_opt = chars.next();
+                while let Some(c) = c_opt {
+                    current_word.push(c);
+                    if ('\x20'..='\x2F').contains(&c) {
+                        c_opt = chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if ch == ' ' {
+            words.push(current_word);
+            current_word = String::new();
+        } else {
+            current_word.push(ch);
+        }
+    }
+    words.push(current_word);
+    words
+}
+
 /// Word-wrap a styled line at `width` display columns. Each fragment
 /// re-carries the style of the segment it started in, so wrapped box rows
 /// keep their style — the span equivalent of the SGR-prefix behaviour the
@@ -496,12 +554,56 @@ pub fn wizard_wrap(line: &WizardLine, width: usize) -> Vec<WizardLine> {
                 column = 0;
             }
             let paragraph = paragraph.trim_end_matches('\r');
-            for word in paragraph.split(' ') {
-                if column > 0 && column + wizard_word_width(word) > width {
+            for word in ansi_aware_split_words(paragraph) {
+                let word_str = word.as_str();
+                if column > 0 && column + wizard_word_width(word_str) > width {
                     close_row(&mut current, &mut lines_out);
                     column = 0;
                 }
-                for ch in word.chars() {
+                let mut chars = word_str.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '\x1b' {
+                        append_char(&mut current, span, ch);
+                        if chars.peek() == Some(&'[') {
+                            append_char(&mut current, span, chars.next().unwrap());
+                            while let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                                if c.is_ascii_alphabetic() {
+                                    break;
+                                }
+                            }
+                        } else if chars.peek() == Some(&']') {
+                            append_char(&mut current, span, chars.next().unwrap());
+                            while let Some(c) = chars.next() {
+                                append_char(&mut current, span, c);
+                                if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
+                                    if c == '\x1b' {
+                                        if let Some(slash) = chars.next() {
+                                            append_char(&mut current, span, slash);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            let mut c_opt = chars.next();
+                            while let Some(c) = c_opt {
+                                append_char(&mut current, span, c);
+                                if ('\x20'..='\x2F').contains(&c) {
+                                    c_opt = chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if ch == '\r' || ch == '\x08' || ch == '\x7f' {
+                        append_char(&mut current, span, ch);
+                        continue;
+                    }
+
                     let char_width = wizard_char_width(ch);
                     if column + char_width > width {
                         close_row(&mut current, &mut lines_out);
@@ -1876,7 +1978,14 @@ mod tests {
                         }
                     }
                 } else {
-                    chars.next();
+                    let mut c = chars.next();
+                    while let Some(ch) = c {
+                        if ('\x20'..='\x2F').contains(&ch) {
+                            c = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
                 }
             } else {
                 out.push(c);
@@ -2142,9 +2251,39 @@ mod tests {
 }
 
 #[cfg(test)]
+mod test_wizard {
+    use super::*;
+
+    #[test]
+    fn test_wizard_visible_length_vs_wrap_mismatch() {
+        let text = "\x1b(Btest";
+        let len = wizard_visible_length(text);
+        
+        let line = WizardLine::plain(text);
+        let wrapped = wizard_wrap(&line, len);
+        
+        assert_eq!(len, 4);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].plain_text(), text);
+    }
+}
+
 mod osc8_tests {
     use super::*;
 
+    #[test]
+    fn test_wizard_wrap_preserves_spaces_inside_ansi() {
+        // OSC 8 link with spaces
+        let text = "\x1b]8;;http://example.com/a b c\x1b\\Link\x1b]8;;\x1b\\";
+        let line = WizardLine::plain(text);
+        
+        // Wrapping at a small width should wrap "Link", not the URL contents
+        let wrapped = wizard_wrap(&line, 2);
+        
+        assert_eq!(wrapped.len(), 2);
+        // The first wrap should contain the entire start of the ANSI sequence plus some of Link
+        assert!(wrapped[0].plain_text().contains("\x1b]8;;http://example.com/a b c\x1b\\"));
+    }
     #[test]
     fn test_wizard_url_renders_osc8() {
         let span = WizardSpan {
