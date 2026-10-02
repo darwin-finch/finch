@@ -961,6 +961,46 @@ pub(crate) async fn resume_queued_named_brain_runs_in_lane(
     Ok(resumed)
 }
 
+/// Result plus the schedule lineage observed while queueing held the Brain guard.
+#[derive(Debug)]
+pub(crate) struct ScheduleDeliveryAttempt {
+    pub(crate) delivered: usize,
+    pub(crate) started: Option<(crate::brain::BrainId, u64)>,
+    pub(crate) completion: Option<(crate::brain::BrainId, u64, bool)>,
+}
+
+/// A failed schedule delivery plus any lineage established before it failed.
+#[derive(Debug, thiserror::Error)]
+#[error("{error:#}")]
+pub(crate) struct ScheduleDeliveryFailure {
+    #[source]
+    pub(crate) error: anyhow::Error,
+    pub(crate) started: Option<(crate::brain::BrainId, u64)>,
+    pub(crate) completion: Option<(crate::brain::BrainId, u64, bool)>,
+}
+
+impl ScheduleDeliveryFailure {
+    fn before_queue(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            started: None,
+            completion: None,
+        }
+    }
+
+    fn after_queue(
+        error: anyhow::Error,
+        started: Option<(crate::brain::BrainId, u64)>,
+        completion: Option<(crate::brain::BrainId, u64, bool)>,
+    ) -> Self {
+        Self {
+            error,
+            started,
+            completion,
+        }
+    }
+}
+
 /// Advance one Brain's durable schedules and, when its environment runner is
 /// live, execute the newly queued ProgramRuns through that exact runner.
 pub(crate) async fn deliver_due_named_brain_schedules(
@@ -968,31 +1008,73 @@ pub(crate) async fn deliver_due_named_brain_schedules(
     runners: crate::server::BrainRunnerBroker,
     name: String,
     now_ms: u64,
-) -> anyhow::Result<usize> {
+) -> Result<ScheduleDeliveryAttempt, ScheduleDeliveryFailure> {
     use crate::brain::BrainRunStatus;
 
-    let execution_lock = store.execution_lock(&name)?;
+    let execution_lock = store
+        .execution_lock(&name)
+        .map_err(ScheduleDeliveryFailure::before_queue)?;
     let _turn = execution_lock.lock_owned().await;
-    let queued = store.queue_due_schedules(&name, now_ms)?;
-    if queued.is_empty() || !named_brain_runner_is_ready(&store, &runners, &name)? {
-        return Ok(queued.len());
+    let (queued, started, completion) = match store.queue_due_schedules_observed(&name, now_ms) {
+        Ok(observed) => observed,
+        Err(crate::brain::ScheduleQueueError::Before(error)) => {
+            return Err(ScheduleDeliveryFailure::before_queue(error));
+        }
+        Err(crate::brain::ScheduleQueueError::After {
+            error,
+            started,
+            completion,
+        }) => {
+            return Err(ScheduleDeliveryFailure::after_queue(
+                error, started, completion,
+            ));
+        }
+    };
+    #[cfg(test)]
+    crate::server::schedule_delivery::run_after_queue_hook();
+    let after_queue = |error| ScheduleDeliveryFailure::after_queue(error, started, completion);
+    if queued.is_empty()
+        || !named_brain_runner_is_ready(&store, &runners, &name).map_err(after_queue)?
+    {
+        return Ok(ScheduleDeliveryAttempt {
+            delivered: queued.len(),
+            started,
+            completion,
+        });
     }
 
+    // The queue already committed. A runner that dies before dispatch is the
+    // same delivery outcome as one that was absent at the check above: report
+    // the queued count so a retired one-shot still counts as recovery.
+    #[cfg(test)]
+    crate::server::schedule_delivery::run_before_dispatch_readiness_hook();
+    let queued_len = queued.len();
     let mut dispatched = 0;
     for run in queued {
-        if !named_brain_runner_is_ready(&store, &runners, &name)? {
-            break;
+        if !named_brain_runner_is_ready(&store, &runners, &name).map_err(after_queue)? {
+            return Ok(ScheduleDeliveryAttempt {
+                delivered: queued_len,
+                started,
+                completion,
+            });
         }
-        let current = store.inspect_run(&name, run.run_id)?;
+        let current = store.inspect_run(&name, run.run_id).map_err(after_queue)?;
         if current.status != BrainRunStatus::QueuedForEnvironment {
             continue;
         }
-        let running =
-            store.transition_run(&name, "daemon", run.run_id, BrainRunStatus::Running, None)?;
-        dispatch_named_brain_run(&store, &runners, &name, &running).await?;
+        let running = store
+            .transition_run(&name, "daemon", run.run_id, BrainRunStatus::Running, None)
+            .map_err(after_queue)?;
+        dispatch_named_brain_run(&store, &runners, &name, &running)
+            .await
+            .map_err(after_queue)?;
         dispatched += 1;
     }
-    Ok(dispatched)
+    Ok(ScheduleDeliveryAttempt {
+        delivered: dispatched,
+        started,
+        completion,
+    })
 }
 
 fn commit_named_brain_approval_decision(

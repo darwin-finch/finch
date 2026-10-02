@@ -412,7 +412,10 @@ impl<'a> OperationRows<'a> {
                     WorkRowStatus::Complete(summary) if summary.is_empty() => {}
                     WorkRowStatus::Complete(summary) => {
                         spans.push(Span::plain(" "));
-                        spans.push(Span::styled(summary.clone(), palette.operation_summary.clone()));
+                        spans.push(Span::styled(
+                            summary.clone(),
+                            palette.operation_summary.clone(),
+                        ));
                     }
                     WorkRowStatus::Error(error) => {
                         spans.push(Span::plain(" "));
@@ -1632,7 +1635,10 @@ mod tests {
         )
         .remove(0);
         assert_eq!(
-            (started.spans[0].style.is_plain(), started.spans[1].style.clone()),
+            (
+                started.spans[0].style.is_plain(),
+                started.spans[1].style.clone()
+            ),
             (true, SpanStyle::fg(SpanColor::DARK_GREY).with_dim(true)),
             "header plain + dimmed running ellipsis; got {started:?}"
         );

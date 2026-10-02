@@ -283,15 +283,140 @@ fn supervised_state_root(
     Ok(SupervisedStateRoot { directory, path })
 }
 
-/// The two timing decisions the schedule delivery loop makes.
+/// Delivery-loop timing, failure-episode state, and deterministic race hooks.
 ///
-/// Extracted as free functions because the loop body lives inside a
-/// `tokio::spawn` closure and is otherwise unreachable from a test. Both are
-/// pure -- they take the clock as a parameter -- so their tests assert
-/// behaviour with no clock of their own (#374, and #242's lesson about
-/// wall-clock assertions).
+/// The timing decisions remain pure and take the clock as a parameter. The
+/// process-local episode registry bounds transition logs, while test-only
+/// hooks expose otherwise unreachable lifecycle windows inside the spawned
+/// loop and its queue boundary.
 pub(crate) mod schedule_delivery {
+    #[cfg(test)]
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use crate::brain::BrainId;
     use tokio::time::Duration;
+
+    #[cfg(test)]
+    thread_local! {
+        static AFTER_OBSERVATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_QUEUE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_ATTEMPT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static AFTER_RESULT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static BEFORE_DISPATCH_READINESS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_observation_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_OBSERVATION_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_observation_hook() {
+        if let Some(hook) = AFTER_OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_queue_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_QUEUE_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_queue_hook() {
+        if let Some(hook) = AFTER_QUEUE_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_attempt_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_ATTEMPT_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_attempt_hook() {
+        if let Some(hook) = AFTER_ATTEMPT_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_result_hook(hook: Box<dyn FnOnce()>) {
+        AFTER_RESULT_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_result_hook() {
+        if let Some(hook) = AFTER_RESULT_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_dispatch_readiness_hook(hook: Box<dyn FnOnce()>) {
+        BEFORE_DISPATCH_READINESS_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(hook).is_none());
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_before_dispatch_readiness_hook() {
+        if let Some(hook) = BEFORE_DISPATCH_READINESS_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Process-ephemeral delivery failures, keyed by durable Brain identity
+    /// and display name rather than by the reusable alias alone.
+    #[derive(Debug, Default)]
+    pub(crate) struct FailureEpisodes {
+        failing: HashMap<(BrainId, String), u64>,
+    }
+
+    impl FailureEpisodes {
+        /// Drop entries that no longer own the same active schedule set.
+        ///
+        /// The caller resolves only names already in the failure registry, so
+        /// the idle path does no work and reconciliation is O(failures), not
+        /// O(all active scheduled Brains).
+        pub(crate) fn reconcile(
+            &mut self,
+            mut active_observation: impl FnMut(&str) -> Option<(BrainId, u64)>,
+        ) {
+            self.failing.retain(|(brain_id, name), epoch| {
+                active_observation(name) == Some((*brain_id, *epoch))
+            });
+        }
+
+        /// Returns `true` only for the first failure in this episode.
+        pub(crate) fn record_failure(&mut self, identity: (BrainId, String), epoch: u64) -> bool {
+            self.failing.insert(identity, epoch) != Some(epoch)
+        }
+
+        /// Returns `true` only when a real success clears a prior failure.
+        pub(crate) fn record_success(&mut self, identity: &(BrainId, String), epoch: u64) -> bool {
+            if self.failing.get(identity) != Some(&epoch) {
+                return false;
+            }
+            self.failing.remove(identity);
+            true
+        }
+
+        #[cfg(test)]
+        pub(crate) fn len(&self) -> usize {
+            self.failing.len()
+        }
+    }
 
     /// Ceiling on one sleep. A clock jump or a missed notification then costs
     /// one idle wake rather than an unbounded stall. It is a backstop, not the
@@ -420,6 +545,35 @@ pub(crate) mod schedule_delivery {
             assert!(
                 !should_back_off(None, None, 1_000),
                 "and an empty index is not a failed delivery"
+            );
+        }
+
+        #[test]
+        fn test_failure_episode_reconciliation_is_identity_keyed_and_bounded() {
+            let first = (BrainId(uuid::Uuid::from_u128(1)), "reused-name".to_string());
+            let successor = (BrainId(uuid::Uuid::from_u128(2)), "reused-name".to_string());
+            let mut episodes = FailureEpisodes::default();
+            assert!(episodes.record_failure(first.clone(), 1));
+            assert!(!episodes.record_failure(first.clone(), 1));
+            assert!(
+                episodes.record_failure(first.clone(), 2),
+                "the same durable identity after an empty-to-active ABA must start fresh"
+            );
+
+            episodes.reconcile(|name| (name == successor.1.as_str()).then_some((successor.0, 3)));
+            assert_eq!(
+                episodes.len(),
+                0,
+                "reconciliation must evict a retired identity even when its display name is reused"
+            );
+            assert!(
+                episodes.record_failure(successor, 3),
+                "a new BrainId under the same display name must start a fresh failure episode"
+            );
+            assert_eq!(
+                episodes.len(),
+                1,
+                "the registry must remain bounded by active indexed identities after reconciliation"
             );
         }
     }
@@ -727,6 +881,7 @@ impl AgentServer {
             // cost actually being removed.
             schedule_store.warm_schedule_index();
             let mut last_warm = tokio::time::Instant::now();
+            let mut failure_episodes = schedule_delivery::FailureEpisodes::default();
 
             let wakeup = schedule_store.schedule_wakeup();
             // A due schedule whose Brain has no ready runner is not delivered
@@ -749,6 +904,8 @@ impl AgentServer {
                     last_warm = tokio::time::Instant::now();
                 }
 
+                failure_episodes.reconcile(|name| schedule_store.active_schedule_observation(name));
+
                 let now = crate::brain::unix_millis();
                 let sleep_for =
                     schedule_delivery::sleep_for(schedule_store.next_schedule_due_ms(), now);
@@ -767,16 +924,86 @@ impl AgentServer {
                 // Brains that actually have work, without hydrating any.
                 let names = schedule_store.due_schedule_brains(now);
                 for name in names {
-                    if let Err(error) = handlers::deliver_due_named_brain_schedules(
+                    let Some((brain_id, epoch)) = schedule_store.active_schedule_observation(&name)
+                    else {
+                        continue;
+                    };
+                    #[cfg(test)]
+                    schedule_delivery::run_after_observation_hook();
+
+                    let identity = (brain_id, name.clone());
+                    let result = handlers::deliver_due_named_brain_schedules(
                         schedule_store.clone(),
                         schedule_runners.clone(),
                         name.clone(),
                         crate::brain::unix_millis(),
                     )
-                    .await
-                    {
-                        tracing::warn!(brain = %name, %error, "could not deliver due Brain schedule");
+                    .await;
+
+                    #[cfg(test)]
+                    schedule_delivery::run_after_attempt_hook();
+
+                    match result {
+                        Err(failure) => {
+                            // A post-sample failure warns for the completion
+                            // epoch. An earlier one-shot in the same queue call
+                            // advances the activity epoch, and reconcile only
+                            // keeps the epoch still active. The entry epoch
+                            // would be dropped on the next pass, so the sibling
+                            // would warn again and its later success would not
+                            // count as recovery. Recovery below still requires
+                            // the loop sample, so a successor cannot clear a
+                            // predecessor. A pre-sample failure still requires
+                            // the live active set to be the one this pass selected.
+                            let record_epoch = match failure.started {
+                                Some((started_id, _))
+                                    if started_id == brain_id
+                                        && schedule_store.schedule_lifecycle_observation(&name)
+                                            == failure.completion =>
+                                {
+                                    failure
+                                        .completion
+                                        .map(|(_, completion_epoch, _)| completion_epoch)
+                                }
+                                None if schedule_store.active_schedule_observation(&name)
+                                    == Some((brain_id, epoch)) =>
+                                {
+                                    Some(epoch)
+                                }
+                                _ => None,
+                            };
+                            if record_epoch.is_some_and(|record_epoch| {
+                                failure_episodes.record_failure(identity.clone(), record_epoch)
+                            }) {
+                                tracing::warn!(
+                                    brain_id = %brain_id.0,
+                                    brain = %name,
+                                    error = %format_args!("{:#}", failure.error),
+                                    "could not deliver due Brain schedule"
+                                );
+                            }
+                        }
+                        Ok(attempt)
+                            if attempt.delivered > 0
+                                && attempt.started == Some((brain_id, epoch))
+                                && attempt.completion.is_some_and(|(completion_id, _, _)| {
+                                    completion_id == brain_id
+                                })
+                                && schedule_store.schedule_lifecycle_observation(&name)
+                                    == attempt.completion
+                                && failure_episodes.record_success(&identity, epoch) =>
+                        {
+                            tracing::info!(
+                                brain_id = %brain_id.0,
+                                brain = %name,
+                                "due Brain schedule delivery recovered"
+                            );
+                        }
+                        Ok(_) => {}
                     }
+
+                    #[cfg(test)]
+                    schedule_delivery::run_after_result_hook();
                 }
 
                 // If the head did not move, nothing advanced -- typically a due
@@ -1249,8 +1476,10 @@ fn publish_isolated_address_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     #[derive(Clone)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1266,6 +1495,93 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    struct CaptureEventsLayer(CapturedEvents);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureEventsLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Visitor {
+                fields: HashMap<String, String>,
+            }
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.fields
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            let message = visitor.fields.remove("message").unwrap_or_default();
+            self.0 .0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message,
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    impl CapturedEvents {
+        fn schedule_events(&self, message: &str) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.message.contains(message))
+                .cloned()
+                .collect()
+        }
+    }
+
+    async fn wait_for_schedule_events(events: &CapturedEvents, message: &str, expected: usize) {
+        for _ in 0..200 {
+            if events.schedule_events(message).len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "schedule delivery never emitted {expected} event(s) containing {message:?}; events={:?}",
+            events.0.lock().unwrap()
+        );
+    }
+
+    fn corrupt_brain_journal(root: &std::path::Path, name: &str) {
+        let path = root.join(name).join("events.jsonl");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_record_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .expect("a scheduled Brain journal must contain a committed record");
+        bytes.extend_from_within(..first_record_end);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn isolated_provider_graph() -> ProviderGraph {
         let config =
             crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
@@ -1278,6 +1594,1141 @@ mod tests {
             }]);
         crate::providers::create_provider_graph_from_config(&config)
             .expect("isolated tests need an in-memory provider graph")
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_final_one_shot_post_queue_failure_is_logged_before_retirement() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const NAME: &str = "one-shot-post-queue-error";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([38; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let attachment = store
+            .attach(NAME, "one-shot", crate::brain::AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"once\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                None,
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let brain_id = store.snapshot(NAME).unwrap().brain_id;
+        let brain_root = temp.path().join("brains");
+
+        let hook_store = store.clone();
+        let hook_root = brain_root.clone();
+        schedule_delivery::set_after_queue_hook(Box::new(move || {
+            assert!(
+                hook_store.evict_resident_brain_for_tests(NAME),
+                "the post-queue probe must evict the resident one-shot before readiness reloads it"
+            );
+            corrupt_brain_journal(&hook_root, NAME);
+        }));
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        let failures = captured.schedule_events(FAILURE);
+        let brain_id_text = brain_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            1,
+            "a post-queue one-shot error must begin one failure episode; events={failures:?}"
+        );
+        assert_eq!(
+            failures[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the warning must retain the retired one-shot's durable identity; event={:?}",
+            failures[0]
+        );
+        assert!(
+            failures[0]
+                .fields
+                .get("error")
+                .is_some_and(|error| error.contains("duplicate or reordered")),
+            "the warning must preserve the post-queue readiness failure; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            store.active_schedule_observation(NAME),
+            None,
+            "the final one-shot must already be inactive, proving the warning used captured lineage"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    /// A one-shot that commits inside `queue_due_schedules_observed`, then a
+    /// later sibling append in that same call, must still WARN once. The
+    /// episode has to follow the post-commit epoch: the sibling is still due,
+    /// the head has moved, and the next pass retries it immediately. That
+    /// retry is the recovery and must INFO exactly once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_partial_queue_failure_after_one_shot_commit_warns_once() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const NAME: &str = "partial-queue-one-shot";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([41; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let attachment = store
+            .attach(NAME, "partial", crate::brain::AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"once\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                None,
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"later\")",
+                crate::vm::EffectSet::pure(),
+                1,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let brain_id = store.snapshot(NAME).unwrap().brain_id;
+        let hook_store = store.clone();
+        schedule_delivery::set_after_observation_hook(Box::new(move || {
+            hook_store.fail_journal_appends_after_successes_for_test(1, 1);
+        }));
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        let failures = captured.schedule_events(FAILURE);
+        let brain_id_text = brain_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            1,
+            "a journal error after the one-shot commit must warn once; events={failures:?}"
+        );
+        assert_eq!(
+            failures[0].level,
+            tracing::Level::WARN,
+            "the partial-queue failure must be a warning; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            failures[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the warning must name the Brain whose one-shot already committed; event={:?}",
+            failures[0]
+        );
+        assert!(
+            failures[0]
+                .fields
+                .get("error")
+                .is_some_and(|error| error.contains("injected journal append failure")),
+            "the warning must keep the later append's cause; event={:?}",
+            failures[0]
+        );
+        let snapshot = store.snapshot(NAME).unwrap();
+        assert!(
+            snapshot
+                .schedules
+                .iter()
+                .any(|schedule| schedule.interval_ms.is_none() && !schedule.active),
+            "the one-shot must already be retired, so the warning depended on captured lineage; \
+             schedules={:?}",
+            snapshot.schedules
+        );
+
+        const RECOVERY: &str = "due Brain schedule delivery recovered";
+        wait_for_schedule_events(&captured, RECOVERY, 1).await;
+        let failures = captured.schedule_events(FAILURE);
+        let recoveries = captured.schedule_events(RECOVERY);
+        assert_eq!(
+            failures.len(),
+            1,
+            "the sibling retry must not warn again; events={failures:?}"
+        );
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "the sibling queued on the immediate retry must recover the partial-queue episode; \
+             events={recoveries:?}"
+        );
+        assert_eq!(
+            recoveries[0].level,
+            tracing::Level::INFO,
+            "the partial-queue recovery must be info; event={:?}",
+            recoveries[0]
+        );
+        assert_eq!(
+            recoveries[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the recovery must name the same Brain as the warning; event={:?}",
+            recoveries[0]
+        );
+        assert!(
+            store.snapshot(NAME).unwrap().runs.iter().any(|run| {
+                run.status == crate::brain::BrainRunStatus::QueuedForEnvironment
+            }),
+            "the recurring sibling must have been queued once the injected append failure was spent"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    /// Cancel-last plus a same-BrainId one-shot, then a post-queue readiness
+    /// failure, must WARN for that successor. The sampled predecessor epoch
+    /// must not swallow it, and the successor must not log recovery.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_recreated_one_shot_post_queue_failure_still_warns() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const NAME: &str = "recreated-one-shot-failure";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([42; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let attachment = store
+            .attach(
+                NAME,
+                "predecessor",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let predecessor = store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"old\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let brain_id = store.snapshot(NAME).unwrap().brain_id;
+        let brain_root = temp.path().join("brains");
+        let hook_store = store.clone();
+        let hook_root = brain_root.clone();
+        let predecessor_id = predecessor.schedule_id;
+        let predecessor_attachment = attachment.attachment_id;
+        let predecessor_subject = attachment.subject.clone();
+        schedule_delivery::set_after_observation_hook(Box::new(move || {
+            hook_store
+                .cancel_schedule(
+                    NAME,
+                    &predecessor_subject,
+                    predecessor_attachment,
+                    predecessor_id,
+                )
+                .unwrap();
+            let replacement = hook_store
+                .attach(
+                    NAME,
+                    "successor",
+                    crate::brain::AttachmentRole::Driver,
+                    None,
+                )
+                .unwrap();
+            hook_store
+                .create_schedule(
+                    NAME,
+                    &replacement.subject,
+                    replacement.attachment_id,
+                    crate::brain::ProgramLanguage::Lisp,
+                    "(say \"once\")",
+                    crate::vm::EffectSet::pure(),
+                    0,
+                    None,
+                    crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+                )
+                .unwrap();
+        }));
+        let hook_store = store.clone();
+        schedule_delivery::set_after_queue_hook(Box::new(move || {
+            assert!(
+                hook_store.evict_resident_brain_for_tests(NAME),
+                "the post-queue probe must evict the resident successor before readiness reloads it"
+            );
+            corrupt_brain_journal(&hook_root, NAME);
+        }));
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        let failures = captured.schedule_events(FAILURE);
+        let brain_id_text = brain_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the recreated one-shot's post-queue failure must warn once; events={failures:?}"
+        );
+        assert_eq!(
+            failures[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the warning must name the same BrainId the predecessor used; event={:?}",
+            failures[0]
+        );
+        assert!(
+            failures[0]
+                .fields
+                .get("error")
+                .is_some_and(|error| error.contains("duplicate or reordered")),
+            "the warning must preserve the post-queue readiness failure; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            store.active_schedule_observation(NAME),
+            None,
+            "the successor one-shot must already be inactive"
+        );
+        assert_eq!(
+            captured
+                .schedule_events("due Brain schedule delivery recovered")
+                .len(),
+            0,
+            "successor failure must not recover the predecessor"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    /// A runner that passes the pre-dispatch check and is gone before the
+    /// dispatch loop must still count the queued one-shot as recovery.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_runner_loss_after_queue_still_recovers_retired_one_shot() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const RECOVERY: &str = "due Brain schedule delivery recovered";
+        const NAME: &str = "runner-dropped-one-shot";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([43; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let attachment = store
+            .attach(
+                NAME,
+                "runner-drop",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"once\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                None,
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let brain_id = store.snapshot(NAME).unwrap().brain_id;
+        let journal = temp.path().join("brains").join(NAME).join("events.jsonl");
+        let healthy_journal = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(temp.path().join("brains").as_path(), NAME);
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        std::fs::write(&journal, &healthy_journal).unwrap();
+        let lease = store
+            .acquire_runner_lease(NAME, "runner", store.environment().generation, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registration = server.brain_runners().register(NAME, lease.lease_id, tx);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_dropped = Arc::clone(&dropped);
+        let hook_runners = server.brain_runners().clone();
+        schedule_delivery::set_before_dispatch_readiness_hook(Box::new(move || {
+            hook_runners.unregister(NAME, registration);
+            hook_dropped.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        wait_for_schedule_events(&captured, RECOVERY, 1).await;
+
+        let recoveries = captured.schedule_events(RECOVERY);
+        let brain_id_text = brain_id.0.to_string();
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "runner loss after the queue commit must still recover the one-shot; events={recoveries:?}"
+        );
+        assert_eq!(
+            recoveries[0].level,
+            tracing::Level::INFO,
+            "the queued one-shot recovery must be info; event={:?}",
+            recoveries[0]
+        );
+        assert_eq!(
+            recoveries[0].fields.get("brain_id").map(String::as_str),
+            Some(brain_id_text.as_str()),
+            "the recovery must name the retired one-shot's Brain; event={:?}",
+            recoveries[0]
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the in-loop readiness hook must have dropped the runner"
+        );
+        assert_eq!(
+            store.active_schedule_observation(NAME),
+            None,
+            "the one-shot must already be inactive when recovery is logged"
+        );
+        assert_eq!(
+            store.snapshot(NAME).unwrap().runs[0].status,
+            crate::brain::BrainRunStatus::QueuedForEnvironment,
+            "the runner was dropped before dispatch, so the queued run must not be running"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "dispatch must not have sent a runner request"
+        );
+        assert_eq!(
+            captured.schedule_events(FAILURE).len(),
+            1,
+            "the repaired one-shot must not warn again"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    /// Regression for #395 at the production boundary: the real
+    /// `serve_on_listener` timer repeatedly selects an unreadable scheduled
+    /// Brain. Structured events, not rendered substrings, prove the exact
+    /// severity, identity, and actionable cause carried by each transition.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_schedule_delivery_logs_failure_episodes_not_retry_attempts() {
+        const FAILURE: &str = "could not deliver due Brain schedule";
+        const RECOVERY: &str = "due Brain schedule delivery recovered";
+        const NAME: &str = "scheduled-broken";
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([39; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), authority).unwrap(),
+        );
+        let store = server.brain_store.clone();
+        let brain_root = temp.path().join("brains");
+        let (attachment_id, first_schedule_id) =
+            crate::brain::seed_scheduled_brain_for_tests(&store, NAME, 0);
+        let first_id = store.snapshot(NAME).unwrap().brain_id;
+        let journal = brain_root.join(NAME).join("events.jsonl");
+        let healthy_journal = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        let corruption = store
+            .snapshot(NAME)
+            .expect_err("the delivery fixture must be unreadable before the server starts");
+        assert!(
+            format!("{corruption:#}").contains("duplicate or reordered"),
+            "fixture corruption must fail through the real journal integrity check: {corruption:#}"
+        );
+        assert_eq!(
+            store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
+            Some(first_id)
+        );
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureEventsLayer(captured.clone()));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        wait_for_schedule_events(&captured, FAILURE, 1).await;
+
+        for _ in 0..4 {
+            tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+            tokio::task::yield_now().await;
+        }
+        let failures = captured.schedule_events(FAILURE);
+        let first_id_text = first_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            1,
+            "one unchanged human-repairable condition must emit one WARN across retries; events={failures:?}"
+        );
+        assert_eq!(
+            failures[0].level,
+            tracing::Level::WARN,
+            "the first failure transition must remain visible as WARN; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            failures[0].fields.get("brain").map(String::as_str),
+            Some(NAME),
+            "the actionable failure must name the display identity; event={:?}",
+            failures[0]
+        );
+        assert_eq!(
+            failures[0].fields.get("brain_id").map(String::as_str),
+            Some(first_id_text.as_str()),
+            "the failure episode must carry the exact durable identity; event={:?}",
+            failures[0]
+        );
+        let error = failures[0].fields.get("error").cloned().unwrap_or_default();
+        assert!(
+            error.contains("duplicate or reordered"),
+            "the WARN must retain the actionable journal-integrity cause, not only an outer context; error={error:?}, event={:?}",
+            failures[0]
+        );
+
+        std::fs::write(&journal, &healthy_journal).unwrap();
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        wait_for_schedule_events(&captured, RECOVERY, 1).await;
+        let recoveries = captured.schedule_events(RECOVERY);
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "repair must emit one recovery; events={recoveries:?}"
+        );
+        assert_eq!(recoveries[0].level, tracing::Level::INFO);
+        assert_eq!(
+            recoveries[0].fields.get("brain_id").map(String::as_str),
+            Some(first_id_text.as_str())
+        );
+
+        // Make the same durable identity fail again. Holding its real
+        // execution lane keeps the timer from delivering the newly due work
+        // before the journal is corrupted and the resident projection evicted.
+        let execution_lock = store.execution_lock(NAME).unwrap();
+        let turn = execution_lock.lock_owned().await;
+        let recurrence_attachment = store
+            .attach(
+                NAME,
+                "recurrence",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let second_schedule = store
+            .create_schedule(
+                NAME,
+                &recurrence_attachment.subject,
+                recurrence_attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"again\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let repaired_journal = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(turn);
+        wait_for_schedule_events(&captured, FAILURE, 2).await;
+        assert_eq!(
+            captured.schedule_events(FAILURE).len(),
+            2,
+            "failure -> recovery -> failure for one BrainId must begin a fresh episode"
+        );
+
+        // Retiring every active schedule clears the episode silently. This
+        // repairs the journal only so the cancellation API can load the same
+        // identity; neither cancellation nor the next timer pass is recovery.
+        std::fs::write(&journal, &repaired_journal).unwrap();
+        store
+            .cancel_schedule(NAME, "alice", attachment_id, first_schedule_id)
+            .unwrap();
+        store
+            .cancel_schedule(
+                NAME,
+                &recurrence_attachment.subject,
+                recurrence_attachment.attachment_id,
+                second_schedule.schedule_id,
+            )
+            .unwrap();
+        tokio::time::advance(schedule_delivery::REWARM_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            1,
+            "schedule retirement must silently discard a failed episode rather than synthesize recovery"
+        );
+
+        // A repaired one-shot is a real successful delivery even though that
+        // delivery retires its final active slot before the handler returns.
+        let one_shot_lock = store.execution_lock(NAME).unwrap();
+        let one_shot_turn = one_shot_lock.lock_owned().await;
+        let episode_attachment = store
+            .attach(NAME, "episode", crate::brain::AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &episode_attachment.subject,
+                episode_attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"once\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                None,
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let one_shot_healthy = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(one_shot_turn);
+        wait_for_schedule_events(&captured, FAILURE, 3).await;
+        std::fs::write(&journal, &one_shot_healthy).unwrap();
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        wait_for_schedule_events(&captured, RECOVERY, 2).await;
+        assert_eq!(
+            store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
+            None,
+            "the repaired one-shot must have delivered and retired its final active slot"
+        );
+
+        // Recreate active work under the same BrainId after the delivery loop
+        // samples the predecessor but before queueing acquires the Brain
+        // guard. A successful replacement queue must not falsely recover the
+        // retired predecessor; the replacement's later failure must WARN.
+        let aba_lock = store.execution_lock(NAME).unwrap();
+        let aba_turn = aba_lock.lock_owned().await;
+        let aba_attachment = store
+            .attach(NAME, "aba", crate::brain::AttachmentRole::Driver, None)
+            .unwrap();
+        let aba_schedule = store
+            .create_schedule(
+                NAME,
+                &aba_attachment.subject,
+                aba_attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"old\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let aba_healthy = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(aba_turn);
+        wait_for_schedule_events(&captured, FAILURE, 4).await;
+
+        let replacement_fixture = Arc::new(std::sync::Mutex::new(None));
+        let hook_fixture = Arc::clone(&replacement_fixture);
+        let hook_store = store.clone();
+        let hook_root = brain_root.clone();
+        let hook_healthy = aba_healthy.clone();
+        let aba_attachment_id = aba_attachment.attachment_id;
+        let aba_subject = aba_attachment.subject.clone();
+        let capture_to_queue_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_finished = Arc::clone(&capture_to_queue_finished);
+        schedule_delivery::set_after_result_hook(Box::new(move || {
+            hook_finished.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        schedule_delivery::set_after_observation_hook(Box::new(move || {
+            std::fs::write(hook_root.join(NAME).join("events.jsonl"), hook_healthy).unwrap();
+            hook_store
+                .cancel_schedule(
+                    NAME,
+                    &aba_subject,
+                    aba_attachment_id,
+                    aba_schedule.schedule_id,
+                )
+                .unwrap();
+            let replacement_attachment = hook_store
+                .attach(
+                    NAME,
+                    "aba-replacement",
+                    crate::brain::AttachmentRole::Driver,
+                    None,
+                )
+                .unwrap();
+            hook_store
+                .create_schedule(
+                    NAME,
+                    &replacement_attachment.subject,
+                    replacement_attachment.attachment_id,
+                    crate::brain::ProgramLanguage::Lisp,
+                    "(say \"replacement\")",
+                    crate::vm::EffectSet::pure(),
+                    0,
+                    None,
+                    crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+                )
+                .unwrap();
+            *hook_fixture.lock().unwrap() = Some((
+                replacement_attachment.attachment_id,
+                replacement_attachment.subject,
+            ));
+        }));
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        for _ in 0..200 {
+            if capture_to_queue_finished.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            capture_to_queue_finished.load(std::sync::atomic::Ordering::Acquire),
+            "the real delivery loop must finish processing the capture-to-queue replacement attempt"
+        );
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "replacement success after capture-to-queue recreation must not recover the retired predecessor"
+        );
+        let (replacement_attachment_id, replacement_subject) =
+            replacement_fixture.lock().unwrap().clone().unwrap();
+        let replacement_lock = store.execution_lock(NAME).unwrap();
+        let replacement_turn = replacement_lock.lock_owned().await;
+        let replacement_id = store
+            .create_schedule(
+                NAME,
+                &replacement_subject,
+                replacement_attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"replacement later\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap()
+            .schedule_id;
+        let replacement_healthy = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(replacement_turn);
+        wait_for_schedule_events(&captured, FAILURE, 5).await;
+
+        // Now cross the awaited failure itself with another cancel-last and
+        // recreation under the same durable identity. The stale Err must not
+        // populate the successor epoch or suppress its first real WARN.
+        let awaited_successor_fixture = Arc::new(std::sync::Mutex::new(None));
+        let hook_successor_fixture = Arc::clone(&awaited_successor_fixture);
+        let hook_store = store.clone();
+        let hook_root = brain_root.clone();
+        schedule_delivery::set_after_attempt_hook(Box::new(move || {
+            std::fs::write(
+                hook_root.join(NAME).join("events.jsonl"),
+                replacement_healthy,
+            )
+            .unwrap();
+            hook_store
+                .cancel_schedule(
+                    NAME,
+                    &replacement_subject,
+                    replacement_attachment_id,
+                    replacement_id,
+                )
+                .unwrap();
+            let successor_attachment = hook_store
+                .attach(
+                    NAME,
+                    "aba-successor",
+                    crate::brain::AttachmentRole::Driver,
+                    None,
+                )
+                .unwrap();
+            let successor_attachment = hook_store
+                .activate_connection(
+                    NAME,
+                    successor_attachment.attachment_id,
+                    successor_attachment.connection_id.unwrap(),
+                )
+                .unwrap();
+            let successor = hook_store
+                .create_schedule(
+                    NAME,
+                    &successor_attachment.subject,
+                    successor_attachment.attachment_id,
+                    crate::brain::ProgramLanguage::Lisp,
+                    "(say \"successor\")",
+                    crate::vm::EffectSet::pure(),
+                    0,
+                    Some(1_000),
+                    crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+                )
+                .unwrap();
+            let healthy = std::fs::read(hook_root.join(NAME).join("events.jsonl")).unwrap();
+            *hook_successor_fixture.lock().unwrap() = Some((
+                successor.schedule_id,
+                successor_attachment.attachment_id,
+                successor_attachment.subject,
+                healthy,
+            ));
+            assert!(hook_store.evict_resident_brain_for_tests(NAME));
+            corrupt_brain_journal(&hook_root, NAME);
+        }));
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            captured.schedule_events(FAILURE).len(),
+            5,
+            "the stale failure crossing same-identity recreation must be discarded"
+        );
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        wait_for_schedule_events(&captured, FAILURE, 6).await;
+
+        // Park a real runner dispatch after queueing, then cancel the last
+        // recurring schedule through the lifecycle service while the handler
+        // is awaiting that runner. The atomic queue observation predates this
+        // external retirement, so the eventual successful runner reply must
+        // not masquerade as recovery of the failed delivery episode.
+        let (awaited_schedule_id, awaited_attachment_id, awaited_subject, awaited_healthy) =
+            awaited_successor_fixture.lock().unwrap().clone().unwrap();
+        std::fs::write(&journal, awaited_healthy).unwrap();
+        let cancellation_attachment = store
+            .attach(
+                NAME,
+                &awaited_subject,
+                crate::brain::AttachmentRole::Driver,
+                Some(awaited_attachment_id),
+            )
+            .unwrap();
+        let cancellation_attachment = store
+            .activate_connection(
+                NAME,
+                cancellation_attachment.attachment_id,
+                cancellation_attachment.connection_id.unwrap(),
+            )
+            .unwrap();
+        let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+        let lease = store
+            .acquire_runner_lease(NAME, "runner", store.environment().generation, None, 60_000)
+            .unwrap();
+        let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .brain_runners
+            .register(NAME, lease.lease_id, runner_tx);
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), runner_rx.recv())
+            .await
+            .expect("scheduled delivery must reach the registered runner before the liveness bound")
+            .expect(
+                "the runner request channel must stay open until the scheduled dispatch arrives",
+            );
+        let crate::server::RunnerRequest::Program(request) = request else {
+            panic!("scheduled Lisp delivery must park on a program runner request")
+        };
+        assert!(
+            lifecycle
+                .cancel_schedule(
+                    NAME,
+                    cancellation_attachment.attachment_id,
+                    cancellation_attachment.connection_id.unwrap(),
+                    awaited_schedule_id,
+                )
+                .unwrap(),
+            "the real lifecycle cancellation path must retire the parked attempt's final schedule"
+        );
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: finch_programs::ProgramLanguage::Lisp,
+                source_id: Some("schedule-cancel-race".into()),
+                source: request.source,
+                intent: "schedule cancellation race".into(),
+                effect: finch_programs::ExecutionEffect::Unclassified,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == outcome.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+        let (result_processed_tx, result_processed_rx) = tokio::sync::oneshot::channel();
+        schedule_delivery::set_after_result_hook(Box::new(move || {
+            let _ = result_processed_tx.send(());
+        }));
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: outcome.output,
+                runtime_revision: outcome.output_revision,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), result_processed_rx)
+            .await
+            .expect("the parked delivery result must be classified before the liveness bound")
+            .expect("the delivery result hook must remain live until classification");
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "external cancellation during awaited dispatch must retire the episode silently"
+        );
+
+        let fresh_attachment = store
+            .attach(
+                NAME,
+                "post-race",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        store
+            .create_schedule(
+                NAME,
+                &fresh_attachment.subject,
+                fresh_attachment.attachment_id,
+                crate::brain::ProgramLanguage::Lisp,
+                "(say \"fresh after cancellation\")",
+                crate::vm::EffectSet::pure(),
+                0,
+                Some(1_000),
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        wait_for_schedule_events(&captured, FAILURE, 7).await;
+
+        // Archive and recreate the display name under a new BrainId. Force a
+        // second archive in the exact window after that successor's failed
+        // delivery returns but before the loop commits its observation. The
+        // stale completion must neither warn nor reinsert an episode.
+        store.archive(NAME).unwrap();
+        let successor_lock = store.execution_lock(NAME).unwrap();
+        let successor_turn = successor_lock.lock_owned().await;
+        crate::brain::seed_scheduled_brain_for_tests(&store, NAME, 0);
+        let successor_id = store.snapshot(NAME).unwrap().brain_id;
+        assert_ne!(
+            successor_id, first_id,
+            "archive/name reuse must mint a new BrainId"
+        );
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        let hook_store = store.clone();
+        schedule_delivery::set_after_attempt_hook(Box::new(move || {
+            hook_store.archive(NAME).unwrap();
+        }));
+        drop(successor_turn);
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        for _ in 0..200 {
+            if !brain_root.join(NAME).exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !brain_root.join(NAME).exists(),
+            "the deterministic post-attempt hook must retire the attempted identity"
+        );
+        assert_eq!(
+            captured.schedule_events(FAILURE).len(),
+            7,
+            "a failed completion crossing retirement must not reinsert or log a stale episode"
+        );
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "retirement crossed by a completion must not synthesize recovery"
+        );
+
+        // Reuse the name once more. The new identity's first failure must be
+        // independent even though both retired predecessors used this alias.
+        let final_lock = store.execution_lock(NAME).unwrap();
+        let final_turn = final_lock.lock_owned().await;
+        crate::brain::seed_scheduled_brain_for_tests(&store, NAME, 0);
+        let final_id = store.snapshot(NAME).unwrap().brain_id;
+        assert_ne!(final_id, successor_id);
+        assert_ne!(final_id, first_id);
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(final_turn);
+        wait_for_schedule_events(&captured, FAILURE, 8).await;
+        let failures = captured.schedule_events(FAILURE);
+        let final_id_text = final_id.0.to_string();
+        assert_eq!(
+            failures.len(),
+            8,
+            "the successor's first failure must warn; events={failures:?}"
+        );
+        assert_eq!(
+            failures[7].fields.get("brain_id").map(String::as_str),
+            Some(final_id_text.as_str()),
+            "the reused name must start a new identity-keyed episode; event={:?}",
+            failures[7]
+        );
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "archive and name reuse must not report the predecessor as recovered"
+        );
+
+        // A directory removed outside Finch is retired lazily by the real
+        // delivery boundary. That disappearance is not recovery, and a later
+        // Brain reusing the name must warn independently.
+        std::fs::remove_dir_all(brain_root.join(NAME)).unwrap();
+        tokio::time::advance(schedule_delivery::UNDELIVERED_RETRY).await;
+        for _ in 0..200 {
+            if store.active_schedule_observation(NAME).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.active_schedule_observation(NAME), None);
+        assert_eq!(captured.schedule_events(FAILURE).len(), 8);
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "external absence must silently retire the failed episode"
+        );
+        // Clear the old identity's remaining in-process durable handles before
+        // intentionally creating a replacement in this same test process.
+        // A real external replacement would ordinarily be observed after a
+        // daemon restart; `archive` on the already-absent path is side-effect
+        // free on disk and performs that in-memory retirement.
+        store.archive(NAME).unwrap();
+
+        let external_successor_lock = store.execution_lock(NAME).unwrap();
+        let external_successor_turn = external_successor_lock.lock_owned().await;
+        crate::brain::seed_scheduled_brain_for_tests(&store, NAME, 0);
+        let external_successor_id = store.snapshot(NAME).unwrap().brain_id;
+        assert_ne!(external_successor_id, final_id);
+        let external_successor_healthy_journal = std::fs::read(&journal).unwrap();
+        assert!(store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(external_successor_turn);
+        wait_for_schedule_events(&captured, FAILURE, 9).await;
+        let failures = captured.schedule_events(FAILURE);
+        let external_successor_id_text = external_successor_id.0.to_string();
+        assert_eq!(
+            failures[8].fields.get("brain_id").map(String::as_str),
+            Some(external_successor_id_text.as_str()),
+            "name reuse after external absence must start a fresh episode"
+        );
+
+        serving.abort();
+        let _ = serving.await;
+
+        // A daemon restart deliberately starts with no failure registry. Once
+        // the same exact identity is indexed and genuinely fails again, it
+        // may warn once; it must not emit recovery merely because the old
+        // process had recorded a failure. Hold the real execution lane until
+        // startup warm-up has indexed the healthy durable state, then corrupt
+        // it before the first delivery can pass that lane.
+        std::fs::write(&journal, &external_successor_healthy_journal).unwrap();
+        let restart_authority = crate::brain::BrainCredentialAuthority::ephemeral([40; 32]);
+        let restarted = Arc::new(
+            AgentServer::for_brain_http_test("schedule-log.local", temp.path(), restart_authority)
+                .unwrap(),
+        );
+        let restarted_store = restarted.brain_store.clone();
+        let restart_lock = restarted_store.execution_lock(NAME).unwrap();
+        let restart_turn = restart_lock.lock_owned().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let restarted_serving = tokio::spawn(Arc::clone(&restarted).serve_on_listener(listener));
+        for _ in 0..200 {
+            if restarted_store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id)
+                == Some(external_successor_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            restarted_store
+                .active_schedule_observation(NAME)
+                .map(|(brain_id, _)| brain_id),
+            Some(external_successor_id),
+            "restart warm-up must index the same durable identity before the failure probe"
+        );
+        assert!(restarted_store.evict_resident_brain_for_tests(NAME));
+        corrupt_brain_journal(&brain_root, NAME);
+        drop(restart_turn);
+        wait_for_schedule_events(&captured, FAILURE, 10).await;
+        let failures = captured.schedule_events(FAILURE);
+        assert_eq!(
+            failures.len(),
+            10,
+            "restart may warn once for its first real failed attempt"
+        );
+        assert_eq!(
+            failures[9].fields.get("brain_id").map(String::as_str),
+            Some(external_successor_id_text.as_str())
+        );
+        assert_eq!(
+            captured.schedule_events(RECOVERY).len(),
+            2,
+            "restart must not synthesize recovery from the previous process's ephemeral state"
+        );
+        restarted_serving.abort();
+        let _ = restarted_serving.await;
     }
 
     async fn submit_feedback_to_daemon(address: SocketAddr, query: &str) {

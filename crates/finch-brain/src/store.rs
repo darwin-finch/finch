@@ -471,6 +471,14 @@ pub struct BrainStore {
     fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     fail_cancellation_terminal_appends: Arc<std::sync::atomic::AtomicUsize>,
+    /// `(successful appends to allow, failures still to inject)`.
+    ///
+    /// Both zero means the seam is idle. A queue that commits one schedule and
+    /// then fails a later append uses this to hit that second append only.
+    /// Shared across `BrainStore` clones, like the other test seams: the
+    /// delivery task and the test hook are different clones of one store.
+    #[cfg(any(test, feature = "test-support"))]
+    journal_append_fault: Arc<std::sync::Mutex<(usize, usize)>>,
     #[cfg(any(test, feature = "test-support"))]
     cancellation_reservation_pause:
         Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
@@ -735,6 +743,8 @@ impl BrainStore {
             fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             fail_cancellation_terminal_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            journal_append_fault: Arc::new(std::sync::Mutex::new((0, 0))),
             #[cfg(any(test, feature = "test-support"))]
             cancellation_reservation_pause: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -2210,7 +2220,7 @@ impl BrainStore {
                 .write()
                 .expect("schedule index lock poisoned");
             let earliest_before = index.next_due_ms();
-            index.reindex(name, &state.schedules);
+            index.reindex(name, state.brain_id, &state.schedules);
             let earliest_after = index.next_due_ms();
             // Only wake the delivery loop when the head actually moved earlier.
             // A schedule created far in the future must not interrupt a sleep
@@ -2235,14 +2245,14 @@ impl BrainStore {
 
     /// Move one schedule in the due index, waking the loop if it became the
     /// head. The per-event path: O(log n), touching only this schedule.
-    fn upsert_schedule_locked(&self, name: &str, schedule: &BrainSchedule) {
+    fn upsert_schedule_locked(&self, name: &str, brain_id: BrainId, schedule: &BrainSchedule) {
         let moved_earlier = {
             let mut index = self
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
             let earliest_before = index.next_due_ms();
-            index.upsert(name, schedule);
+            index.upsert(name, brain_id, schedule);
             let earliest_after = index.next_due_ms();
             match (earliest_before, earliest_after) {
                 (Some(before), Some(after)) => after < before,
@@ -2448,6 +2458,22 @@ impl BrainStore {
             .due_brains(now_ms)
     }
 
+    /// Exact active identity plus its process-local schedule-set generation.
+    pub fn active_schedule_observation(&self, name: &str) -> Option<(BrainId, u64)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .active_observation(name)
+    }
+
+    /// Latest indexed schedule lifecycle, including an inactive final set.
+    pub fn schedule_lifecycle_observation(&self, name: &str) -> Option<(BrainId, u64, bool)> {
+        self.schedule_index
+            .read()
+            .expect("schedule index lock poisoned")
+            .lifecycle_observation(name)
+    }
+
     /// Populate the due index from every Brain on disk, once.
     ///
     /// Schedules only become known when a Brain is loaded, so a freshly started
@@ -2572,22 +2598,119 @@ impl BrainStore {
             .expect("schedule index lock poisoned")
             .len()
     }
+}
 
+/// Queue error, with the lineage sampled after the Brain write guard when the
+/// failure happened after that sample.
+///
+/// `Before` is an invalid name, an unreadable load, or concurrent removal.
+/// A missing Brain is pruned and returned as an empty queue, not `Before`.
+/// `After` is an error from a due schedule whose earlier siblings in the same
+/// call may already have committed, including a one-shot retirement that moved
+/// the activity epoch.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum ScheduleQueueError {
+    /// The queue call failed before it sampled an entry lineage.
+    Before(anyhow::Error),
+    /// The queue call failed after sampling `started`. `completion` is the
+    /// lifecycle at the failure, still under the Brain write guard.
+    After {
+        /// The queue error, with its cause chain intact.
+        error: anyhow::Error,
+        /// Active identity and epoch at entry, if a schedule set was active.
+        started: Option<(BrainId, u64)>,
+        /// Lifecycle after the failing operation, including a retired one-shot.
+        completion: Option<(BrainId, u64, bool)>,
+    },
+}
+
+impl ScheduleQueueError {
+    fn before(error: anyhow::Error) -> Self {
+        Self::Before(error)
+    }
+
+    fn after(
+        error: anyhow::Error,
+        started: Option<(BrainId, u64)>,
+        completion: Option<(BrainId, u64, bool)>,
+    ) -> Self {
+        Self::After {
+            error,
+            started,
+            completion,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Before(error) | Self::After { error, .. } => error,
+        }
+    }
+}
+
+impl BrainStore {
     /// Atomically advance due schedules and append the exact queued ProgramRun
     /// for each delivery. The returned runs are durable before this method
     /// returns and are safe for the runner broker to dispatch immediately.
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
-        let name = Self::validate_name(name)?;
+        self.queue_due_schedules_observed(name, now_ms)
+            .map(|(queued, _, _)| queued)
+            .map_err(ScheduleQueueError::into_error)
+    }
+
+    /// Queue due runs and atomically return the entry and resulting lifecycles.
+    ///
+    /// Both observations are sampled while the Brain write guard is held.
+    /// Callers use the entry observation to prove that queueing began from the
+    /// lifecycle they selected, and the completion observation to distinguish
+    /// the delivery's own one-shot retirement from a later external
+    /// cancellation.
+    #[doc(hidden)]
+    pub fn queue_due_schedules_observed(
+        &self,
+        name: &str,
+        now_ms: u64,
+    ) -> std::result::Result<
+        (
+            Vec<BrainRun>,
+            Option<(BrainId, u64)>,
+            Option<(BrainId, u64, bool)>,
+        ),
+        ScheduleQueueError,
+    > {
+        let name = Self::validate_name(name).map_err(ScheduleQueueError::before)?;
         // Before the load, not after a failed one: a Brain that is gone is
         // pruned, a Brain that is merely unreadable is reported (#383).
         if self.prune_schedules_if_brain_is_absent(name) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None, self.schedule_lifecycle_observation(name)));
         }
-        self.ensure_loaded(name)?;
+        self.ensure_loaded(name)
+            .map_err(ScheduleQueueError::before)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains
-            .get_mut(name)
-            .context("Brain was removed concurrently")?;
+        let Some(state) = brains.get_mut(name) else {
+            return Err(ScheduleQueueError::before(anyhow::anyhow!(
+                "Brain was removed concurrently"
+            )));
+        };
+        // External schedule mutation also requires `brains.write()`. Sampling
+        // after this guard is acquired makes `started` the exact lineage from
+        // which every event below is committed, rather than a pre-lock hint
+        // vulnerable to cancel-last/recreate ABA. A later `Err` still returns
+        // that entry plus the lifecycle at the failure, so an earlier one-shot
+        // commit in this call cannot hide the error.
+        let started = self.active_schedule_observation(name);
+        macro_rules! queue_or_fail {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let completion = self.schedule_lifecycle_observation(name);
+                        return Err(ScheduleQueueError::after(error, started, completion));
+                    }
+                }
+            };
+        }
         let mut schedules = state
             .schedules
             .values()
@@ -2616,7 +2739,7 @@ impl BrainStore {
             }
 
             let (occurrence_count, last_due_ms, next_due_ms) =
-                schedule_due_window(&schedule, now_ms)?;
+                queue_or_fail!(schedule_due_window(&schedule, now_ms));
             match &schedule.delivery_policy {
                 BrainScheduleDeliveryPolicy::Coalesce => {
                     if let Some(existing) = pending.into_iter().find(|due| {
@@ -2640,12 +2763,12 @@ impl BrainStore {
                             missed_count: existing.missed_count.saturating_add(occurrence_count),
                             next_due_ms,
                         };
-                        self.push_locked(
+                        queue_or_fail!(self.push_locked(
                             name,
                             state,
                             "daemon:scheduler",
                             BrainEventKind::ScheduleDue { due },
-                        )?;
+                        ));
                         queued.push(run);
                     } else {
                         let run = queued_schedule_run(&schedule, state.revision + 1, now_ms);
@@ -2660,12 +2783,12 @@ impl BrainStore {
                             missed_count: occurrence_count,
                             next_due_ms,
                         };
-                        self.push_locked(
+                        queue_or_fail!(self.push_locked(
                             name,
                             state,
                             "daemon:scheduler",
                             BrainEventKind::ScheduleDue { due },
-                        )?;
+                        ));
                         queued.push(run);
                     }
                 }
@@ -2708,12 +2831,12 @@ impl BrainStore {
                             missed_count: 1,
                             next_due_ms: delivery_next,
                         };
-                        self.push_locked(
+                        queue_or_fail!(self.push_locked(
                             name,
                             state,
                             "daemon:scheduler",
                             BrainEventKind::ScheduleDue { due },
-                        )?;
+                        ));
                         queued.push(run);
                         let Some(next) = delivery_next else {
                             break;
@@ -2723,7 +2846,8 @@ impl BrainStore {
                 }
             }
         }
-        Ok(queued)
+        let lifecycle = self.schedule_lifecycle_observation(name);
+        Ok((queued, started, lifecycle))
     }
 
     pub fn inspect_schedule(
@@ -4880,7 +5004,7 @@ impl BrainStore {
         // process-wide `brains` write guard.
         if let Some(schedule_id) = touched {
             if let Some(schedule) = state.schedules.get(&schedule_id).cloned() {
-                self.upsert_schedule_locked(name, &schedule);
+                self.upsert_schedule_locked(name, state.brain_id, &schedule);
             }
         }
         let _ = state.tx.send(event.clone());
@@ -6156,6 +6280,23 @@ impl BrainStore {
 
     fn append_event(&self, name: &str, event: &BrainEvent) -> Result<()> {
         #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut fault = self
+                .journal_append_fault
+                .lock()
+                .expect("journal append fault lock poisoned");
+            let (allow, failures) = *fault;
+            if failures > 0 {
+                if allow > 0 {
+                    *fault = (allow - 1, failures);
+                } else {
+                    *fault = (0, failures - 1);
+                    drop(fault);
+                    anyhow::bail!("injected journal append failure");
+                }
+            }
+        }
+        #[cfg(any(test, feature = "test-support"))]
         if matches!(
             event.kind,
             BrainEventKind::RunStatusChanged {
@@ -6312,6 +6453,20 @@ impl BrainStore {
     pub fn fail_cancellation_terminal_appends_for_test(&self, count: usize) {
         self.fail_cancellation_terminal_appends
             .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Let `allow_successes` journal appends commit, then fail the next
+    /// `failures` appends with `injected journal append failure`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_journal_appends_after_successes_for_test(
+        &self,
+        allow_successes: usize,
+        failures: usize,
+    ) {
+        *self
+            .journal_append_fault
+            .lock()
+            .expect("journal append fault lock poisoned") = (allow_successes, failures);
     }
 }
 

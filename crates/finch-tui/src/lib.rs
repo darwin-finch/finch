@@ -3819,13 +3819,14 @@ impl TuiRenderer {
     }
 
     fn handle_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
-        let hover_row = if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
-            Some(region)
-        } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
-            Some(region.row_id.clone())
-        } else {
-            None
-        };
+        let hover_row =
+            if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
+                Some(region)
+            } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
+                Some(region.row_id.clone())
+            } else {
+                None
+            };
 
         if self.hovered_row != hover_row {
             self.hovered_row = hover_row;
@@ -4438,7 +4439,17 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
         let painted_transcript = transcript
             .iter()
-            .map(|l| span_render::lower_rendered_line(l, if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref() { Some(finch_ui_model::SpanColor::DARK_GREY) } else { None }))
+            .map(|l| {
+                span_render::lower_rendered_line(
+                    l,
+                    if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
+                    {
+                        Some(finch_ui_model::SpanColor::DARK_GREY)
+                    } else {
+                        None
+                    },
+                )
+            })
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
@@ -6514,7 +6525,9 @@ mod tests {
         live: &[RenderedTranscriptLine],
     ) -> LiveFrame {
         let draft = vec![String::new()];
-        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &draft,
@@ -7969,17 +7982,32 @@ mod tests {
 
         // 2. Assert text is correctly bounded in physical rows
         let sources_during = renderer.live_frame_sources(20); // Narrow width to force wrap
-        let lines_during = renderer.focused_reader_lines(&sources_during, 20, 10, None).expect("Reader active");
-        
-        let physical_rows_used: usize = lines_during.iter().map(|l| shadow_buffer::physical_rows(l, 20)).sum();
-        assert!(physical_rows_used <= 10, "Text is correctly bounded in physical rows");
+        let lines_during = renderer
+            .focused_reader_lines(&sources_during, 20, 10, None)
+            .expect("Reader active");
+
+        let physical_rows_used: usize = lines_during
+            .iter()
+            .map(|l| shadow_buffer::physical_rows(l, 20))
+            .sum();
+        assert!(
+            physical_rows_used <= 10,
+            "Text is correctly bounded in physical rows"
+        );
 
         // 3. Assert closing restores transcript view fully
         renderer.close_expanded_tool();
         let sources_after = renderer.live_frame_sources(80);
         let transcript_after = renderer.focused_reader_lines(&sources_after, 80, 24, None);
-        assert!(transcript_after.is_none(), "Transcript view fully restored upon closing");
-        assert_eq!(renderer.tool_viewports.child_scroll(&output_row_all), 5, "Compact scroll restored");
+        assert!(
+            transcript_after.is_none(),
+            "Transcript view fully restored upon closing"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row_all),
+            5,
+            "Compact scroll restored"
+        );
     }
 
     #[test]
@@ -8542,8 +8570,10 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0], None) == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0], None).contains(&original_header),
+                && span_render::lower_rendered_line(&literal_state[0], None)
+                    == literal_state[0].text
+                && !span_render::lower_rendered_line(&literal_state[0], None)
+                    .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
@@ -11745,7 +11775,9 @@ mod tests {
         input_lines: &'a [String],
         status: &'a str,
     ) -> view_model::LiveViewModel<'a> {
-        view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -11824,7 +11856,9 @@ mod tests {
                     ..RenderedTranscriptLine::default()
                 })
                 .collect();
-            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+            let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
                 input_lines: &input_lines,
@@ -11999,7 +12033,9 @@ mod tests {
         let plan_at = |w: usize, h: usize| {
             let draft = vec![String::new()];
             let status = "ready";
-            let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+            let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
                 input_lines: &draft,
@@ -12090,7 +12126,9 @@ mod tests {
         let width = 80;
         let draft = vec![String::new()];
         let status = "ready";
-        let vm = view_model::LiveViewModel { hover_bg: None, hovered_row: None,
+        let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
             input_lines: &draft,
