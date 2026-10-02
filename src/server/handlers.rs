@@ -1015,9 +1015,21 @@ pub(crate) async fn deliver_due_named_brain_schedules(
         .execution_lock(&name)
         .map_err(ScheduleDeliveryFailure::before_queue)?;
     let _turn = execution_lock.lock_owned().await;
-    let (queued, started, completion) = store
-        .queue_due_schedules_observed(&name, now_ms)
-        .map_err(ScheduleDeliveryFailure::before_queue)?;
+    let (queued, started, completion) = match store.queue_due_schedules_observed(&name, now_ms) {
+        Ok(observed) => observed,
+        Err(crate::brain::ScheduleQueueError::Before(error)) => {
+            return Err(ScheduleDeliveryFailure::before_queue(error));
+        }
+        Err(crate::brain::ScheduleQueueError::After {
+            error,
+            started,
+            completion,
+        }) => {
+            return Err(ScheduleDeliveryFailure::after_queue(
+                error, started, completion,
+            ));
+        }
+    };
     #[cfg(test)]
     crate::server::schedule_delivery::run_after_queue_hook();
     let after_queue = |error| ScheduleDeliveryFailure::after_queue(error, started, completion);
@@ -1031,10 +1043,20 @@ pub(crate) async fn deliver_due_named_brain_schedules(
         });
     }
 
+    // The queue already committed. A runner that dies before dispatch is the
+    // same delivery outcome as one that was absent at the check above: report
+    // the queued count so a retired one-shot still counts as recovery.
+    #[cfg(test)]
+    crate::server::schedule_delivery::run_before_dispatch_readiness_hook();
+    let queued_len = queued.len();
     let mut dispatched = 0;
     for run in queued {
         if !named_brain_runner_is_ready(&store, &runners, &name).map_err(after_queue)? {
-            break;
+            return Ok(ScheduleDeliveryAttempt {
+                delivered: queued_len,
+                started,
+                completion,
+            });
         }
         let current = store.inspect_run(&name, run.run_id).map_err(after_queue)?;
         if current.status != BrainRunStatus::QueuedForEnvironment {

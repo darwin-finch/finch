@@ -65,6 +65,8 @@ pub use schedule::{
     BrainScheduleModuleIdentity, ProgramLanguage, ScheduleId,
 };
 pub use store::BrainStore;
+#[doc(hidden)]
+pub use store::ScheduleQueueError;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::{directory_listing_for_tests, seed_scheduled_brain_for_tests};
 pub use store::{unix_millis, EffectAuditAuthorityGrant, RunPublicationGate};
