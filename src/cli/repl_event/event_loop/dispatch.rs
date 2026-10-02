@@ -343,9 +343,6 @@ impl EventLoop {
                 error,
                 generator_name,
             } => {
-                // A terminal provider failure closes publication immediately;
-                // detached #163 effects may still finish their durable audit.
-                self.conversation.write().await.abort_staged(query_id);
                 if let Some(turn) = self.pending_named_brain_turns.get(&query_id) {
                     if turn.cancellation_requested {
                         // A cancelled provider may report its terminal error
@@ -362,6 +359,15 @@ impl EventLoop {
                         return Ok(());
                     }
                 }
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    return Ok(());
+                }
+                // A terminal provider failure closes publication immediately;
+                // detached #163 effects may still finish their durable audit.
+                self.conversation.write().await.abort_staged(query_id);
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 
@@ -432,6 +438,32 @@ impl EventLoop {
                 }
             }
 
+            ReplEvent::QueryContextInvalidated { query_id } => {
+                // `/clear` and `/reset` already terminalize and release their
+                // exact active query before confirming the fresh context.
+                // Its worker may still report invalidation after a newer turn
+                // has claimed the slot; that terminal event is deliberately
+                // idempotent and must not touch the newer owner or its queue.
+                if !self.query_states.cancel_query(query_id).await {
+                    return Ok(());
+                }
+                self.tool_coordinator
+                    .terminalize(query_id, crate::tools::ToolLoopTerminal::Cancelled)
+                    .await;
+                self.pending_approvals.write().await.remove(&query_id);
+                self.conversation.write().await.abort_staged(query_id);
+                self.close_active_tool_rows(query_id, "cancelled by conversation reset")
+                    .await;
+                if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
+                    pending.cancellation_requested = true;
+                    self.finish_named_brain_turn(query_id, String::new()).await;
+                }
+                if *self.active_query_id.read().await == Some(query_id) {
+                    *self.active_query_id.write().await = None;
+                }
+                self.tool_call_history.write().await.remove(&query_id);
+            }
+
             ReplEvent::ToolResult {
                 query_id,
                 round_token,
@@ -459,6 +491,13 @@ impl EventLoop {
                             *self.active_query_id.write().await = None;
                         }
                     }
+                    return Ok(());
+                }
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled | QueryState::Failed { .. })
+                ) {
+                    tracing::debug!("Discarding late tool result for closed query {}", query_id);
                     return Ok(());
                 }
                 if let Some(restart) =

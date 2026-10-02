@@ -7374,6 +7374,1252 @@ fn observe_llm_queries(
     observed_rx
 }
 
+async fn assert_clear_command_resets_provider_context(command: &str) {
+    use crate::cli::conversation::ToolRoundError;
+    use crate::providers::{ContentBlock, Message};
+
+    let (mut event_loop, output) = lifecycle_test_event_loop();
+    output.disable_stdout();
+    let query_id = uuid::Uuid::new_v4();
+    let round_token = {
+        let mut conversation = event_loop.conversation.write().await;
+        conversation.add_user_message("history before clear".to_string());
+        conversation.add_assistant_message("answer before clear".to_string());
+        conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_before_clear".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"path": "README.md"}),
+                    }],
+                },
+            )
+            .expect("the fixture must stage the provider-invisible tool round")
+    };
+    let mut observed_rx = observe_llm_queries(&mut event_loop);
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the advertised clear command must dispatch through the active event loop");
+
+    let mut conversation = event_loop.conversation.write().await;
+    assert!(
+        conversation.get_messages().is_empty(),
+        "{command} must remove every committed provider-visible message; messages={:?}",
+        conversation.get_messages()
+    );
+    assert_eq!(
+        conversation.record_tool_result(
+            query_id,
+            round_token,
+            "call_before_clear",
+            &Ok("stale result".to_string()),
+        ),
+        Err(ToolRoundError::NoActiveStage),
+        "{command} must remove provider-invisible staged tool rounds as part of the same conversation-owned clear boundary"
+    );
+    drop(conversation);
+
+    let transcript = output
+        .get_messages()
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    assert!(
+        transcript
+            .iter()
+            .any(|message| message.contains("Conversation history cleared. Starting fresh.")),
+        "{command} must visibly confirm the fresh context; transcript={transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .all(|message| !message.contains("recognized but not yet implemented")),
+        "{command} must never reach the generic command fallback; transcript={transcript:?}"
+    );
+
+    event_loop
+        .handle_user_input("fresh question".to_string())
+        .await
+        .expect("the first post-clear query must dispatch");
+    let (_, text, request_messages) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+            .await
+            .expect("the first post-clear provider request must not stall")
+            .expect("the provider request observer must remain open");
+    assert_eq!(
+        text, "fresh question",
+        "the provider request must carry the post-clear query, not prior text"
+    );
+    assert_eq!(
+        request_messages,
+        vec![Message::user("fresh question")],
+        "the first provider request after {command} must contain only the fresh user turn; request_messages={request_messages:?}"
+    );
+}
+
+struct SummaryRequestRecorder {
+    requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    request_ready: tokio::sync::Notify,
+}
+
+impl SummaryRequestRecorder {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            request_ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn request_containing_user_text(&self, expected: &str) -> Vec<crate::providers::Message> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = self
+                    .requests
+                    .lock()
+                    .expect("summary request recorder lock poisoned")
+                    .iter()
+                    .find(|request| {
+                        request.iter().any(|message| {
+                            message.role == "user" && message.text_content() == expected
+                        })
+                    })
+                    .cloned()
+                {
+                    return request;
+                }
+                self.request_ready.notified().await;
+            }
+        })
+        .await
+        .expect("the real LlmLoop must reach the generator request boundary")
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for SummaryRequestRecorder {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let is_summary_request = messages.iter().any(|message| {
+            message
+                .text_content()
+                .starts_with("Summarise the following conversation history concisely")
+        });
+        self.requests
+            .lock()
+            .expect("summary request recorder lock poisoned")
+            .push(messages);
+        self.request_ready.notify_waiters();
+        let text = if is_summary_request {
+            "fresh post-clear summary"
+        } else {
+            "(say \"fresh response\")"
+        };
+        Ok(crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "summary-request-recorder".to_string(),
+                model: "summary-request-recorder".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(4),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "summary-request-recorder"
+    }
+}
+
+struct BlockingSummaryRequestRecorder {
+    requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    summary_started: tokio::sync::Notify,
+    release_summary: tokio::sync::Notify,
+    summary_returned: tokio::sync::Notify,
+    newer_request_started: tokio::sync::Notify,
+    release_newer_request: tokio::sync::Notify,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LateProviderOutcome {
+    Success,
+    Failure,
+}
+
+struct BlockingLateProvider {
+    outcome: LateProviderOutcome,
+    old_started: tokio::sync::Notify,
+    release_old: tokio::sync::Notify,
+    newer_started: tokio::sync::Notify,
+    release_newer: tokio::sync::Notify,
+}
+
+impl BlockingLateProvider {
+    fn new(outcome: LateProviderOutcome) -> Self {
+        Self {
+            outcome,
+            old_started: tokio::sync::Notify::new(),
+            release_old: tokio::sync::Notify::new(),
+            newer_started: tokio::sync::Notify::new(),
+            release_newer: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn response(text: &str) -> crate::generators::GeneratorResponse {
+        crate::generators::GeneratorResponse {
+            text: text.into(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "blocking-late-provider".into(),
+                model: "blocking-late-provider-model".into(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+                latency_ms: Some(5),
+                primary_allowance_used_percent: Some(6.0),
+                secondary_allowance_used_percent: Some(7.0),
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for BlockingLateProvider {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let query = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(crate::providers::Message::text_content)
+            .unwrap_or_default();
+        match query.as_str() {
+            "old provider request" => {
+                self.old_started.notify_one();
+                self.release_old.notified().await;
+                match self.outcome {
+                    LateProviderOutcome::Success => {
+                        let tool = crate::tools::ToolUse {
+                            id: "late-provider-tool".into(),
+                            name: "late_probe".into(),
+                            input: serde_json::json!({}),
+                        };
+                        let mut response = Self::response("(say \"stale provider text\")");
+                        response
+                            .content_blocks
+                            .push(crate::providers::ContentBlock::ToolUse {
+                                id: tool.id.clone(),
+                                name: tool.name.clone(),
+                                input: tool.input.clone(),
+                            });
+                        response.tool_uses.push(tool);
+                        response.metadata.input_tokens = Some(901);
+                        response.metadata.output_tokens = Some(902);
+                        Ok(response)
+                    }
+                    LateProviderOutcome::Failure => {
+                        anyhow::bail!("stale provider failure after reset")
+                    }
+                }
+            }
+            "new active request" => {
+                self.newer_started.notify_one();
+                self.release_newer.notified().await;
+                Ok(Self::response("(say \"new active response\")"))
+            }
+            _ => Ok(Self::response("(say \"fresh provider response\")")),
+        }
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "blocking-late-provider"
+    }
+}
+
+struct LateProviderProbe {
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for LateProviderProbe {
+    fn name(&self) -> &str {
+        "late_probe"
+    }
+
+    fn effect(&self) -> finch_programs::ExecutionEffect {
+        finch_programs::ExecutionEffect::WorkspaceRead
+    }
+
+    fn description(&self) -> &str {
+        "records whether stale provider output launched a tool"
+    }
+
+    fn input_schema(&self) -> crate::tools::ToolInputSchema {
+        crate::tools::ToolInputSchema::simple(Vec::new())
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _context: &crate::tools::ToolContext<'_>,
+    ) -> anyhow::Result<String> {
+        self.executions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("stale tool executed".into())
+    }
+}
+
+impl BlockingSummaryRequestRecorder {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            summary_started: tokio::sync::Notify::new(),
+            release_summary: tokio::sync::Notify::new(),
+            summary_returned: tokio::sync::Notify::new(),
+            newer_request_started: tokio::sync::Notify::new(),
+            release_newer_request: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn requests(&self) -> Vec<Vec<crate::providers::Message>> {
+        self.requests
+            .lock()
+            .expect("blocking summary recorder lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for BlockingSummaryRequestRecorder {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let is_summary_request = messages.iter().any(|message| {
+            message
+                .text_content()
+                .starts_with("Summarise the following conversation history concisely")
+        });
+        let is_newer_request = messages.iter().any(|message| {
+            message.role == "user"
+                && message.text_content() == "new active prompt before old invalidation arrives"
+        });
+        self.requests
+            .lock()
+            .expect("blocking summary recorder lock poisoned")
+            .push(messages);
+        if is_summary_request {
+            self.summary_started.notify_one();
+            self.release_summary.notified().await;
+            self.summary_returned.notify_one();
+        }
+        if is_newer_request {
+            self.newer_request_started.notify_one();
+            self.release_newer_request.notified().await;
+        }
+        let text = if is_summary_request {
+            "summary produced from the cleared conversation"
+        } else {
+            "(say \"fresh provider response\")"
+        };
+        Ok(crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "blocking-summary-recorder".to_string(),
+                model: "blocking-summary-recorder".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(4),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "blocking-summary-recorder"
+    }
+}
+
+async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &str) {
+    use crate::cli::repl_event::query_state::QueryState;
+
+    let recorder = Arc::new(BlockingSummaryRequestRecorder::new());
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let patterns = tempfile::tempdir()
+        .expect("isolated in-flight summary-reset tool state")
+        .path()
+        .join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .expect("construct inert in-flight summary-reset tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.max_verbatim_messages = 4;
+    event_loop.enable_summarization = true;
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in summary_reuse_fixture("pre-clear") {
+            conversation.add_message(message);
+        }
+    }
+
+    event_loop.start_llm_worker();
+    event_loop
+        .handle_user_input("question whose summary is blocked".to_string())
+        .await
+        .expect("the real LlmLoop query must start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.summary_started.notified(),
+    )
+    .await
+    .expect("the real LlmLoop must reach the blocking summarizer");
+    let query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the blocked summary must belong to the active query");
+    let stale_round = event_loop
+        .conversation
+        .write()
+        .await
+        .stage_assistant(
+            query_id,
+            crate::providers::Message {
+                role: "assistant".into(),
+                content: vec![crate::providers::ContentBlock::ToolUse {
+                    id: "late_old_tool".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            },
+        )
+        .expect("the hostile fixture must retain an old-generation tool token");
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the reset command must invalidate the in-flight request");
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "{command} must atomically cancel the query whose provider context it invalidated"
+    );
+    assert!(
+        event_loop
+            .conversation
+            .read()
+            .await
+            .get_messages()
+            .is_empty(),
+        "{command} must clear the conversation while the summarizer is blocked"
+    );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "{command} must release the cancelled query before visibly confirming the fresh context"
+    );
+
+    const FRESH_PROMPT: &str = "fresh prompt submitted while old summary remains blocked";
+    event_loop
+        .handle_user_input(FRESH_PROMPT.to_string())
+        .await
+        .expect("the first post-reset prompt must start immediately");
+    let fresh_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the first post-reset prompt must own the active slot");
+    assert_ne!(
+        fresh_query_id, query_id,
+        "the fresh prompt must not reuse the cancelled query identity"
+    );
+    let fresh_request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = recorder.requests().into_iter().find(|request| {
+                request
+                    .iter()
+                    .any(|message| message.role == "user" && message.text_content() == FRESH_PROMPT)
+            }) {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fresh prompt must reach the real provider while the old summarizer is blocked");
+    assert!(
+        fresh_request.iter().all(|message| {
+            !message.text_content().contains("pre-clear")
+                && !message
+                    .text_content()
+                    .contains("summary produced from the cleared conversation")
+        }),
+        "{command} must send only fresh-generation context; request={fresh_request:?}"
+    );
+
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the fresh prompt must reach a terminal event while the old summary is blocked")
+        .expect("the event channel must remain open");
+        assert!(
+            !matches!(event, ReplEvent::QueryContextInvalidated { query_id: id } if id == query_id),
+            "the old query cannot invalidate before its summarizer is released"
+        );
+        let fresh_complete = matches!(event, ReplEvent::StreamingComplete { query_id: id, .. } if id == fresh_query_id);
+        event_loop
+            .handle_event(event)
+            .await
+            .expect("fresh-generation events must dispatch");
+        if fresh_complete {
+            break;
+        }
+    }
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "the fresh prompt must settle normally before the old task returns"
+    );
+    assert_eq!(
+        recorder
+            .requests()
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user" && message.text_content() == FRESH_PROMPT
+            }))
+            .count(),
+        1,
+        "the first post-reset prompt must reach the provider exactly once"
+    );
+
+    const NEW_ACTIVE: &str = "new active prompt before old invalidation arrives";
+    const NEW_QUEUED: &str = "queued prompt that late invalidation must preserve";
+    event_loop
+        .handle_user_input(NEW_ACTIVE.to_string())
+        .await
+        .expect("a newer query must start after the fresh prompt settles");
+    let new_active_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the newer query must own the active slot");
+    event_loop
+        .handle_user_input(NEW_QUEUED.to_string())
+        .await
+        .expect("a subsequent prompt must queue behind the newer query");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.newer_request_started.notified(),
+    )
+    .await
+    .expect("the newer active query must block at the provider boundary");
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        [NEW_QUEUED],
+        "the hostile fixture must contain a newer queued prompt"
+    );
+    {
+        let tui = event_loop.tui_renderer.lock().await;
+        tui.set_operation_status("fresh generation remains active");
+    }
+    use crate::cli::tui::TuiStatusPort;
+    let status_before_late_event = event_loop.status_bar.status_without_session();
+    let transcript_before_late_event = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>();
+    let requests_before_late_event = recorder.requests().len();
+
+    recorder.release_summary.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.summary_returned.notified(),
+    )
+    .await
+    .expect("the released summarizer must return");
+    let terminal = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.event_rx.recv(),
+    )
+    .await
+    .expect("the invalidated old request must emit one terminal event")
+    .expect("the event channel must remain open");
+    assert!(
+        matches!(terminal, ReplEvent::QueryContextInvalidated { query_id: id } if id == query_id),
+        "the blocked newer request cannot produce an event before the old generation's invalidation; got {terminal:?}"
+    );
+    event_loop
+        .handle_event(terminal)
+        .await
+        .expect("the invalidation terminal event must dispatch");
+
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_active_id),
+        "{command} late invalidation must not release the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        [NEW_QUEUED],
+        "{command} late invalidation must not delete newer queued prompts"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before_late_event,
+        "{command} late invalidation must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.format(&crate::theme::ColorScheme::default()))
+            .collect::<Vec<_>>(),
+        transcript_before_late_event,
+        "{command} late invalidation must not append or rewrite visible output"
+    );
+    let requests = recorder.requests();
+    assert!(
+        requests.len() >= requests_before_late_event,
+        "request recording is append-only across the late event; before={requests_before_late_event}, requests={requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user"
+                    && message.text_content() == "question whose summary is blocked"
+            }))
+            .count(),
+        0,
+        "{command} must never send the invalidated old query to the main provider; requests={requests:?}"
+    );
+
+    event_loop
+        .handle_event(ReplEvent::ToolResult {
+            query_id,
+            round_token: stale_round,
+            tool_id: "late_old_tool".into(),
+            result: Ok("late old result".into()),
+        })
+        .await
+        .expect("a late old-generation tool event must be ignored idempotently");
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_active_id),
+        "a late old-generation tool event must not mutate the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "a late old-generation tool event must preserve newer queued input"
+    );
+    event_loop
+        .handle_event(ReplEvent::StreamingComplete {
+            query_id,
+            full_response: "late old completion".into(),
+        })
+        .await
+        .expect("a late old-generation completion must be ignored idempotently");
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_active_id),
+        "late old-generation tool and completion events must preserve the newer active query"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "late old-generation tool and completion events must preserve newer queued input"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before_late_event,
+        "late old-generation tool and completion events must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.format(&crate::theme::ColorScheme::default()))
+            .collect::<Vec<_>>(),
+        transcript_before_late_event,
+        "late old-generation tool and completion events must not append or rewrite visible output"
+    );
+
+    let regrown = summary_reuse_fixture("post-clear");
+    let fresh_compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    );
+    assert!(
+        matches!(fresh_compactor.plan_summary(&regrown, 4), crate::cli::conversation_compactor::SummaryPlan::Summarize { .. }),
+        "{command} must reject the late summary commit; a regrown same-shape history must require fresh summarization"
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        recorder
+            .requests()
+            .iter()
+            .filter(|request| request.iter().any(|message| {
+                message.role == "user"
+                    && message.text_content() == "question whose summary is blocked"
+            }))
+            .count(),
+        0,
+        "{command} must produce no late old-generation provider effect after terminal invalidation"
+    );
+    recorder.release_newer_request.notify_one();
+}
+
+async fn assert_reset_fences_late_main_provider_result(
+    command: &str,
+    outcome: LateProviderOutcome,
+) {
+    use crate::cli::repl_event::query_state::QueryState;
+    use std::sync::atomic::Ordering;
+
+    let provider = Arc::new(BlockingLateProvider::new(outcome));
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry.register(Box::new(LateProviderProbe {
+        executions: Arc::clone(&executions),
+    }));
+    let definitions = registry.definitions();
+    let patterns = tempfile::tempdir()
+        .expect("isolated late-provider tool state")
+        .path()
+        .join("patterns.json");
+    let executor =
+        crate::tools::ToolExecutor::new(registry, crate::tools::PermissionManager::new(), patterns)
+            .expect("construct late-provider tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&provider) as Arc<dyn crate::generators::Generator>,
+        definitions,
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::new(crate::runtime::ProgramRuntime::new()),
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.start_llm_worker();
+
+    event_loop
+        .handle_user_input("old provider request".into())
+        .await
+        .expect("the old real provider request must start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.old_started.notified(),
+    )
+    .await
+    .expect("the old request must block inside the real provider");
+    let old_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the blocked old provider request must own the active slot");
+
+    event_loop
+        .handle_user_input(command.into())
+        .await
+        .expect("the reset command must complete while the old provider is blocked");
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(old_query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "{command} must terminalize the blocked provider query before confirming"
+    );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "{command} must release the old provider query before confirming"
+    );
+
+    const FRESH: &str = "fresh request after provider reset";
+    event_loop
+        .handle_user_input(FRESH.into())
+        .await
+        .expect("the first fresh query must start immediately");
+    let fresh_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the first fresh query must own the released slot");
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the fresh query must settle while the old provider stays blocked")
+        .expect("the event channel must remain open");
+        let complete = matches!(event, ReplEvent::StreamingComplete { query_id, .. } if query_id == fresh_query_id);
+        event_loop
+            .handle_event(event)
+            .await
+            .expect("fresh-query events must dispatch");
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "the fresh query must settle before the old provider returns"
+    );
+
+    const NEW_ACTIVE: &str = "new active request";
+    const NEW_QUEUED: &str = "new queued request";
+    event_loop
+        .handle_user_input(NEW_ACTIVE.into())
+        .await
+        .expect("a newer query must start after the fresh turn settles");
+    let new_query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the newer query must own the active slot");
+    event_loop
+        .handle_user_input(NEW_QUEUED.into())
+        .await
+        .expect("a following prompt must queue behind the newer query");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.newer_started.notified(),
+    )
+    .await
+    .expect("the newer query must block at the provider boundary");
+    {
+        let tui = event_loop.tui_renderer.lock().await;
+        tui.set_operation_status("new generation owns the frontend");
+    }
+    use crate::cli::tui::TuiStatusPort;
+    let status_before = event_loop.status_bar.status_without_session();
+    let transcript_before = event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect::<Vec<_>>();
+    let conversation_before = event_loop.conversation.read().await.get_messages();
+
+    provider.release_old.notify_one();
+    let terminal = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.event_rx.recv(),
+    )
+    .await
+    .expect("the late provider result must reach its fenced terminal boundary")
+    .expect("the event channel must remain open");
+    assert!(
+        matches!(terminal, ReplEvent::QueryContextInvalidated { query_id } if query_id == old_query_id),
+        "late {outcome:?} must become an idempotent invalidation, not a result-derived event; got {terminal:?}"
+    );
+    event_loop
+        .handle_event(terminal)
+        .await
+        .expect("the old invalidation event must dispatch idempotently");
+
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(old_query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "late {outcome:?} must not overwrite the old query's cancelled terminal state"
+    );
+    assert!(
+        event_loop
+            .query_states
+            .get_metadata(old_query_id)
+            .await
+            .is_some_and(|metadata| metadata.invocation_metadata.is_none()),
+        "late {outcome:?} statistics must not be recorded after {command}"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "late {outcome:?} provider tools must never execute after {command}"
+    );
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        Some(new_query_id),
+        "late {outcome:?} must preserve the newer active owner"
+    );
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .front()
+            .map(|(text, _, _)| text.as_str()),
+        Some(NEW_QUEUED),
+        "late {outcome:?} must preserve the newer queued prompt"
+    );
+    assert_eq!(
+        event_loop.status_bar.status_without_session(),
+        status_before,
+        "late {outcome:?} must not overwrite newer-generation status"
+    );
+    assert_eq!(
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.content())
+            .collect::<Vec<_>>(),
+        transcript_before,
+        "late {outcome:?} must not mutate the post-reset transcript"
+    );
+    assert_eq!(
+        event_loop.conversation.read().await.get_messages(),
+        conversation_before,
+        "late {outcome:?} must not mutate provider-visible conversation history"
+    );
+    let cache_probe = crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&provider) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    );
+    assert!(
+        matches!(
+            cache_probe.plan_summary(&summary_reuse_fixture("post-provider-reset"), 4),
+            crate::cli::conversation_compactor::SummaryPlan::Summarize { .. }
+        ),
+        "late {outcome:?} must not repopulate the reset summary cache"
+    );
+    provider.release_newer.notify_one();
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_fence_late_non_streaming_provider_success_and_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                for outcome in [LateProviderOutcome::Success, LateProviderOutcome::Failure] {
+                    assert_reset_fences_late_main_provider_result(command, outcome).await;
+                }
+            }
+        })
+        .await;
+}
+
+fn summary_reuse_fixture(prefix: &str) -> Vec<crate::providers::Message> {
+    use crate::providers::Message;
+    vec![
+        Message::user(format!("{prefix} user zero")),
+        Message::assistant(format!("{prefix} assistant one")),
+        Message::user(format!("{prefix} user two")),
+        Message::assistant(format!("{prefix} assistant three")),
+        Message::user(format!("{prefix} user four")),
+        Message::assistant("shared boundary message"),
+    ]
+}
+
+async fn assert_clear_command_invalidates_committed_summary(command: &str) {
+    const STALE_SUMMARY: &str = "STALE SUMMARY FROM CLEARED CONVERSATION";
+    const FRESH_QUESTION: &str = "fresh question after summary reset";
+
+    let recorder = Arc::new(SummaryRequestRecorder::new());
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let patterns = tempfile::tempdir()
+        .expect("isolated summary-reset tool state")
+        .path()
+        .join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .expect("construct inert summary-reset tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.max_verbatim_messages = 4;
+    event_loop.enable_summarization = true;
+
+    let mut old_history = summary_reuse_fixture("old");
+    old_history.push(crate::providers::Message::user("old trailing message"));
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in old_history.iter().cloned() {
+            conversation.add_message(message);
+        }
+    }
+    let boundary = crate::cli::conversation_compactor::ConversationCompactor::boundary_fingerprint(
+        &old_history,
+        5,
+    );
+    crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    )
+    .commit_summary(5, boundary, STALE_SUMMARY.to_string());
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the clear alias must dispatch before the worker starts");
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in summary_reuse_fixture("new") {
+            conversation.add_message(message);
+        }
+    }
+
+    event_loop.start_llm_worker();
+    event_loop
+        .handle_user_input(FRESH_QUESTION.to_string())
+        .await
+        .expect("the post-clear question must dispatch through the real LlmLoop");
+    let provider_request = recorder.request_containing_user_text(FRESH_QUESTION).await;
+    let rendered_request = provider_request
+        .iter()
+        .map(crate::providers::Message::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered_request.contains(STALE_SUMMARY),
+        "{command} must invalidate committed summary bytes before a same-boundary history regrows; provider_request={provider_request:?}"
+    );
+    assert!(
+        rendered_request.contains("fresh post-clear summary"),
+        "the actual generator request must carry a newly assembled post-clear summary, proving the test traversed request assembly; provider_request={provider_request:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_commands_remove_committed_and_staged_provider_context() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_command_resets_provider_context(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_commands_invalidate_summary_before_actual_generator_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_command_invalidates_committed_summary(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_during_inflight_summary_never_send_stale_provider_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_during_inflight_summary_cancels_stale_request(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_unrelated_help_command_preserves_provider_context_and_staged_round() {
+    use crate::cli::conversation::ToolRoundProgress;
+    use crate::providers::{ContentBlock, Message};
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = uuid::Uuid::new_v4();
+            let round_token = {
+                let mut conversation = event_loop.conversation.write().await;
+                conversation.add_user_message("history before help".to_string());
+                conversation.add_assistant_message("answer before help".to_string());
+                conversation
+                    .stage_assistant(
+                        query_id,
+                        Message {
+                            role: "assistant".into(),
+                            content: vec![ContentBlock::ToolUse {
+                                id: "call_before_help".into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            }],
+                        },
+                    )
+                    .expect("the fixture must stage the provider-invisible tool round")
+            };
+            let retained_messages = event_loop.conversation.read().await.get_messages();
+            let boundary =
+                crate::cli::conversation_compactor::ConversationCompactor::boundary_fingerprint(
+                    &retained_messages,
+                    1,
+                );
+            crate::cli::conversation_compactor::ConversationCompactor::new(
+                Arc::new(NeverCompletes),
+                Arc::clone(&event_loop.summary_cache),
+            )
+            .commit_summary(1, boundary, "retained summary bytes".to_string());
+
+            event_loop
+                .handle_user_input("/help".to_string())
+                .await
+                .expect("the unrelated help command must retain its existing dispatch");
+
+            let mut conversation = event_loop.conversation.write().await;
+            assert_eq!(
+                conversation.get_messages(),
+                vec![
+                    Message::user("history before help"),
+                    Message::assistant("answer before help"),
+                ],
+                "an unrelated slash command must not clear committed provider context"
+            );
+            assert_eq!(
+                conversation
+                    .record_tool_result(
+                        query_id,
+                        round_token,
+                        "call_before_help",
+                        &Ok("retained result".to_string()),
+                    )
+                    .expect("the unrelated command must preserve the staged round"),
+                ToolRoundProgress::Complete,
+                "the staged round must remain usable after an unrelated command"
+            );
+            let compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+                Arc::new(NeverCompletes),
+                Arc::clone(&event_loop.summary_cache),
+            );
+            assert_eq!(
+                compactor.plan_summary(&conversation.get_messages(), 1),
+                crate::cli::conversation_compactor::SummaryPlan::Reuse(
+                    "retained summary bytes".to_string()
+                ),
+                "an unrelated slash command must preserve the committed summary cache"
+            );
+        })
+        .await;
+}
+
 async fn start_executing_tools_query(
     event_loop: &mut EventLoop,
     tool_id: &str,

@@ -64,6 +64,13 @@ pub enum ReplEvent {
         generator_name: Option<String>,
     },
 
+    /// Request assembly observed that its conversation snapshot was cleared.
+    /// The provider was not invoked; settle the cancelled query without
+    /// adding a second user-facing message after `/clear` or `/reset`.
+    QueryContextInvalidated {
+        query_id: Uuid,
+    },
+
     /// A tool execution completed
     ToolResult {
         query_id: Uuid,

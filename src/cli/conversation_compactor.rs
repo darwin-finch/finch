@@ -62,6 +62,9 @@ pub enum SummaryPlan {
     /// No valid committed summary: summarise `history[..input_end]` and
     /// commit the result over that range.
     Summarize { input_end: usize },
+    /// The conversation was invalidated after this compactor took its
+    /// request snapshot. Do not inject or commit bytes from that snapshot.
+    Invalidated,
 }
 
 /// One committed summary: the exact bytes injected at the front of the
@@ -83,15 +86,31 @@ struct CommittedSummary {
 /// covers and the bytes injected for it. The summary is reused byte-for-byte
 /// while the sliding window's drop point stays inside the covered range and
 /// the boundary fingerprint still matches, and is replaced only when the
-/// window slides past the committed end.
+/// window slides past the committed end. `generation` advances on explicit
+/// conversation invalidation so a compactor holding a pre-clear snapshot
+/// cannot recommit after the reset.
 #[derive(Default)]
 pub struct SummaryCache {
     committed: Option<CommittedSummary>,
+    generation: u64,
 }
 
 impl SummaryCache {
     pub fn new() -> Self {
-        Self { committed: None }
+        Self {
+            committed: None,
+            generation: 0,
+        }
+    }
+
+    /// Forget any committed summary bytes.
+    ///
+    /// Conversation owners call this while clearing the corresponding
+    /// provider-visible history so a later, regrown history cannot reuse a
+    /// summary produced from turns that no longer belong to the session.
+    pub fn invalidate(&mut self) {
+        self.committed = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -103,6 +122,7 @@ pub type SharedSummaryCache = Arc<Mutex<SummaryCache>>;
 pub struct ConversationCompactor {
     generator: Arc<dyn Generator>,
     cache: SharedSummaryCache,
+    cache_generation: u64,
 }
 
 const LOCK_POISONED: &str = "summary cache lock poisoned";
@@ -120,7 +140,12 @@ fn committed_input_end(ideal_drop: usize, max_verbatim: usize, total: usize) -> 
 
 impl ConversationCompactor {
     pub fn new(generator: Arc<dyn Generator>, cache: SharedSummaryCache) -> Self {
-        Self { generator, cache }
+        let cache_generation = cache.lock().expect(LOCK_POISONED).generation;
+        Self {
+            generator,
+            cache,
+            cache_generation,
+        }
     }
 
     /// Decide this turn's summary against the committed range.
@@ -132,8 +157,12 @@ impl ConversationCompactor {
     /// and the generator is not consulted. A fingerprint of the first message
     /// past the committed range guards against replaced history.
     pub fn plan_summary(&self, history: &[Message], max_verbatim: usize) -> SummaryPlan {
+        let cache = self.cache.lock().expect(LOCK_POISONED);
+        if cache.generation != self.cache_generation {
+            return SummaryPlan::Invalidated;
+        }
         let ideal_drop = history.len().saturating_sub(max_verbatim);
-        let committed = self.cache.lock().expect(LOCK_POISONED).committed.clone();
+        let committed = cache.committed.clone();
         if let Some(entry) = committed {
             let boundary_intact = entry.covered < history.len()
                 && Self::boundary_fingerprint(history, entry.covered) == entry.boundary;
@@ -150,13 +179,22 @@ impl ConversationCompactor {
     ///
     /// `covered` must equal the end of the range actually summarised, so the
     /// committed coverage is never broader than the summary's input.
-    pub fn commit_summary(&self, covered: usize, boundary: u64, text: String) {
+    pub fn commit_summary(&self, covered: usize, boundary: u64, text: String) -> bool {
         let mut cache = self.cache.lock().expect(LOCK_POISONED);
+        if cache.generation != self.cache_generation {
+            return false;
+        }
         cache.committed = Some(CommittedSummary {
             covered,
             boundary,
             text,
         });
+        true
+    }
+
+    /// Whether this request snapshot still belongs to the active conversation.
+    pub fn is_current(&self) -> bool {
+        self.cache.lock().expect(LOCK_POISONED).generation == self.cache_generation
     }
 
     /// Fingerprint of the history message at `at` — the first message past a
@@ -600,6 +638,7 @@ mod tests {
                 compactor.commit_summary(input_end, boundary, text);
                 SummaryPlan::Summarize { input_end }
             }
+            SummaryPlan::Invalidated => SummaryPlan::Invalidated,
         }
     }
 
@@ -695,6 +734,37 @@ mod tests {
             plan,
             SummaryPlan::Reuse("committed bytes".to_string()),
             "valid committed summary must be reused without touching the generator: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_invalidation_rejects_pre_clear_compactor_plan_and_commit() {
+        let gen = Arc::new(PanicGenerator);
+        let cache = Arc::new(Mutex::new(SummaryCache::new()));
+        let stale_compactor =
+            ConversationCompactor::new(Arc::clone(&gen) as Arc<dyn Generator>, Arc::clone(&cache));
+        let history = exchange_history(30);
+        let boundary = ConversationCompactor::boundary_fingerprint(&history, 50);
+
+        cache
+            .lock()
+            .expect("summary cache lock poisoned")
+            .invalidate();
+        assert_eq!(
+            stale_compactor.plan_summary(&history, 20),
+            SummaryPlan::Invalidated,
+            "a compactor holding a pre-clear history snapshot must not plan summary bytes after invalidation"
+        );
+        stale_compactor.commit_summary(50, boundary, "stale bytes".to_string());
+
+        let post_clear_compactor =
+            ConversationCompactor::new(gen as Arc<dyn Generator>, Arc::clone(&cache));
+        assert!(
+            matches!(
+                post_clear_compactor.plan_summary(&history, 20),
+                SummaryPlan::Summarize { .. }
+            ),
+            "a stale in-flight commit must not repopulate the invalidated cache"
         );
     }
 

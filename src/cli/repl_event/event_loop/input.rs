@@ -16,6 +16,19 @@ impl EventLoop {
                             .context("Failed to send shutdown event")?;
                         return Ok(());
                     }
+                    Command::Clear => {
+                        self.terminalize_active_query_for_conversation_reset().await;
+                        let mut conversation = self.conversation.write().await;
+                        conversation.clear();
+                        self.summary_cache
+                            .lock()
+                            .expect("summary cache lock poisoned")
+                            .invalidate();
+                        drop(conversation);
+                        self.output_manager
+                            .write_info("Conversation history cleared. Starting fresh.");
+                        self.render_tui().await?;
+                    }
                     Command::Help => {
                         let help_text = format_help();
                         self.output_manager.write_info(help_text);
@@ -731,5 +744,46 @@ Rules:\n\
         );
         self.update_plan_mode_indicator(&new_mode);
         Ok(())
+    }
+
+    /// Close the turn that owned the pre-reset conversation before reporting
+    /// that a fresh context is ready. Any input queued before the boundary is
+    /// part of that discarded generation; input submitted after this method
+    /// returns may immediately claim the now-empty active-query slot.
+    async fn terminalize_active_query_for_conversation_reset(&mut self) {
+        self.pending_queries.clear();
+
+        let query_id = *self.active_query_id.read().await;
+        let Some(query_id) = query_id else {
+            return;
+        };
+
+        self.query_states.cancel_query(query_id).await;
+        self.tool_coordinator
+            .terminalize(query_id, crate::tools::ToolLoopTerminal::Cancelled)
+            .await;
+        self.pending_approvals.write().await.remove(&query_id);
+        self.close_active_tool_rows(query_id, "cancelled by conversation reset")
+            .await;
+
+        let named_turn_can_finish = self
+            .pending_named_brain_turns
+            .get_mut(&query_id)
+            .map(|turn| {
+                turn.cancellation_requested = true;
+                turn.active_tool_ids.is_empty()
+            })
+            .unwrap_or(false);
+        if named_turn_can_finish {
+            self.finish_named_brain_turn(query_id, String::new()).await;
+        }
+
+        {
+            let mut active = self.active_query_id.write().await;
+            if *active == Some(query_id) {
+                *active = None;
+            }
+        }
+        self.tool_call_history.write().await.remove(&query_id);
     }
 }
