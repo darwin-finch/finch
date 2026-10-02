@@ -13,10 +13,10 @@ pub use claude_cli_daemon::DaemonClaudeCliProvider;
 pub use factory::preflight_provider_config;
 pub use factory::{
     create_provider_from_config, create_provider_from_entries, create_provider_from_entry,
-    create_provider_from_overlaid_entry, create_provider_graph_from_config,
-    create_provider_graph_from_config_with_resolver, create_provider_profile_from_config,
-    create_provider_profile_from_config_with_resolver, create_providers_from_config,
-    create_providers_from_entries, ProviderGraph, ProviderProfile,
+    create_provider_from_overlaid_entry, create_provider_from_overlaid_entry_with_resolver,
+    create_provider_graph_from_config, create_provider_graph_from_config_with_resolver,
+    create_provider_profile_from_config, create_provider_profile_from_config_with_resolver,
+    create_providers_from_config, create_providers_from_entries, ProviderGraph, ProviderProfile,
 };
 pub use finch_providers::{
     chatgpt_required_scopes, claude_required_scopes, default_cache_dir, fallback_catalog,

@@ -257,35 +257,7 @@ impl ProviderResolver {
         if entry.profile_name() == active.name() {
             return Ok(active);
         }
-        if entry.is_local() {
-            let client = self.daemon_client.clone().ok_or_else(|| {
-                anyhow::anyhow!("NoEligibleModel: local profile requires a running daemon")
-            })?;
-            return Ok(Arc::new(crate::generators::DaemonLocalGenerator::new(
-                client,
-                entry.profile_name(),
-            )));
-        }
-        let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
-            let resolver = self
-                .credential_resolver
-                .as_deref()
-                .expect("complete config always carries its credential resolver");
-            crate::providers::create_provider_profile_from_config_with_resolver(
-                config,
-                &entry.profile_name(),
-                resolver,
-            )?
-        } else {
-            Arc::from(crate::providers::create_provider_from_entry(entry)?)
-        };
-        let client = crate::claude::ClaudeClient::with_shared_provider(provider);
-        let inner: Arc<dyn Generator> =
-            Arc::new(crate::generators::ClaudeGenerator::new(Arc::new(client)));
-        Ok(Arc::new(crate::generators::ProfiledGenerator::new(
-            entry.profile_name(),
-            inner,
-        )))
+        self.resolve_entry(entry).await
     }
 
     /// Activate a specific (possibly overlaid) provider entry without treating
@@ -307,7 +279,11 @@ impl ProviderResolver {
             )));
         }
         let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
-            crate::providers::create_provider_from_overlaid_entry(config, entry)?
+            let env_resolver = crate::config::EnvironmentCredentialResolver;
+            let resolver = self.credential_resolver.as_deref().unwrap_or(&env_resolver);
+            crate::providers::create_provider_from_overlaid_entry_with_resolver(
+                config, entry, resolver,
+            )?
         } else {
             Arc::from(crate::providers::create_provider_from_entry(entry)?)
         };
@@ -1762,6 +1738,56 @@ mod tests {
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[tokio::test]
+    async fn subscription_provider_resolves_without_injected_resolver_rejection() {
+        let entry = ProviderEntry::Credentialed {
+            provider: CredentialProvider::ChatgptSubscription,
+            credential: CredentialBinding {
+                credential_ref: "chatgpt-sub".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: Some("user@example.com".into()),
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("chatgpt-sub".into()),
+            reasoning_effort: None,
+        };
+        let credential = ProviderCredential {
+            name: "chatgpt-sub".into(),
+            kind: CredentialKind::Bearer,
+            provider: CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: AudienceBinding::standard(crate::config::EndpointFamily::ChatgptSubscription),
+            tenant: None,
+            project: None,
+            account: Some("user@example.com".into()),
+            scopes: BTreeSet::new(),
+            secret_ref: "oauth-store:chatgpt-sub".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let config = crate::config::Config::with_providers(vec![entry.clone()])
+            .with_credentials(vec![credential]);
+        let resolver = ProviderResolver::with_config(Arc::new(EchoGenerator), config, None);
+
+        let generator = resolver
+            .resolve_entry(&entry)
+            .await
+            .expect("resolve_entry must succeed for subscription provider");
+        assert_eq!(generator.name(), "chatgpt-sub");
+
+        let resolved = resolver
+            .resolve(Some("chatgpt-sub"), None)
+            .await
+            .expect("resolve must succeed for subscription provider");
+        assert_eq!(resolved.name(), "chatgpt-sub");
     }
 
     #[tokio::test]

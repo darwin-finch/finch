@@ -12253,3 +12253,88 @@ capacity: not configured";
         })
         .await;
 }
+
+#[tokio::test]
+async fn provider_switch_activates_configured_subscription_provider() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let entry = crate::config::ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::ChatgptSubscription,
+                credential: crate::config::CredentialBinding {
+                    credential_ref: "chatgpt-sub".into(),
+                    audience: None,
+                    tenant: None,
+                    project: None,
+                    account: Some("user@example.com".into()),
+                    required_scopes: std::collections::BTreeSet::new(),
+                },
+                model: Some("gpt-5.6-sol".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("ChatGPT Subscription".into()),
+                reasoning_effort: None,
+            };
+            let credential = crate::config::ProviderCredential {
+                name: "chatgpt-sub".into(),
+                kind: crate::config::CredentialKind::Bearer,
+                provider: crate::config::CredentialProvider::ChatgptSubscription,
+                issuer: "openai-chatgpt".into(),
+                audience: crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::ChatgptSubscription,
+                ),
+                tenant: None,
+                project: None,
+                account: Some("user@example.com".into()),
+                scopes: std::collections::BTreeSet::new(),
+                secret_ref: "oauth-store:chatgpt-sub".into(),
+                lifecycle: crate::config::CredentialLifecycle::default(),
+                revocation: Default::default(),
+            };
+            let initial = crate::config::ProviderEntry::Openai {
+                api_key: "sk-test".into(),
+                model: Some("gpt-4o".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("Initial OpenAI".into()),
+                reasoning_effort: None,
+            };
+            let config = crate::config::Config::with_providers(vec![initial, entry])
+                .with_credentials(vec![credential]);
+
+            let mut event_loop =
+                super::EventLoop::new_provider_switch_test_runner_with_config(config, 0, None);
+            event_loop.output_manager.disable_stdout();
+
+            event_loop
+                .handle_provider_switch("2".to_string())
+                .await
+                .expect("provider switch to subscription must not error");
+
+            let messages: Vec<String> = event_loop
+                .output_manager
+                .get_messages()
+                .iter()
+                .map(|message| message.content())
+                .collect();
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.contains("Injected credential resolvers cannot fabricate")),
+                "switching to subscription provider must not hit injected credential resolver bail; messages={messages:?}"
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.contains("Failed to create model")),
+                "switching to subscription provider must not fail model creation; messages={messages:?}"
+            );
+            assert_eq!(
+                event_loop.model_selection.active_index().await,
+                1,
+                "the active generator must switch to the subscription entry index"
+            );
+        })
+        .await;
+}
