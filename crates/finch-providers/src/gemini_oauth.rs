@@ -38,7 +38,7 @@ pub const GEMINI_SUBSCRIPTION_BASE_URL: &str = "https://generativelanguage.googl
 pub const GOOGLE_REQUIRED_TOKEN_ISSUER: &str = "https://accounts.google.com";
 pub const GOOGLE_REQUIRED_TOKEN_ISSUER_ALT: &str = "accounts.google.com";
 pub const GEMINI_DEVICE_WIRE_SCOPES: &str =
-    "openid email profile https://www.googleapis.com/auth/generative-language";
+    "openid email profile https://www.googleapis.com/auth/cloud-platform";
 
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -84,7 +84,7 @@ pub fn gemini_required_scopes() -> BTreeSet<String> {
         "openid".into(),
         "email".into(),
         "profile".into(),
-        "https://www.googleapis.com/auth/generative-language".into(),
+        "https://www.googleapis.com/auth/cloud-platform".into(),
     ])
 }
 
@@ -783,6 +783,16 @@ mod tests {
             dialect.descriptor().audience,
             AudienceBinding::standard(EndpointFamily::GeminiSubscription)
         );
+    }
+
+    #[test]
+    fn required_scopes_use_cloud_platform() {
+        let scopes = gemini_required_scopes();
+        assert!(scopes.contains("https://www.googleapis.com/auth/cloud-platform"));
+        assert!(!scopes.contains("https://www.googleapis.com/auth/generative-language"));
+        
+        assert!(GEMINI_DEVICE_WIRE_SCOPES.contains("https://www.googleapis.com/auth/cloud-platform"));
+        assert!(!GEMINI_DEVICE_WIRE_SCOPES.contains("https://www.googleapis.com/auth/generative-language"));
     }
 
     #[test]
