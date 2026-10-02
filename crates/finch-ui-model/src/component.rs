@@ -1509,7 +1509,7 @@ mod tests {
         );
         let chrome = &lines[0];
         assert_eq!(
-            (chrome.spans[0].style, chrome.spans[0].text.as_str()),
+            (chrome.spans[0].style.clone(), chrome.spans[0].text.as_str()),
             (SpanStyle::fg(SpanColor::CYAN), "\u{23fa}"),
             "the chrome glyph wears the cyan glyph style; got {chrome:?}"
         );
@@ -1632,7 +1632,7 @@ mod tests {
         )
         .remove(0);
         assert_eq!(
-            (started.spans[0].style.is_plain(), started.spans[1].style),
+            (started.spans[0].style.is_plain(), started.spans[1].style.clone()),
             (true, SpanStyle::fg(SpanColor::DARK_GREY).with_dim(true)),
             "header plain + dimmed running ellipsis; got {started:?}"
         );
