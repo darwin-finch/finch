@@ -432,6 +432,26 @@ impl EventLoop {
                 }
             }
 
+            ReplEvent::QueryContextInvalidated { query_id } => {
+                self.query_states.cancel_query(query_id).await;
+                self.tool_coordinator
+                    .terminalize(query_id, crate::tools::ToolLoopTerminal::Cancelled)
+                    .await;
+                self.pending_approvals.write().await.remove(&query_id);
+                self.conversation.write().await.abort_staged(query_id);
+                self.close_active_tool_rows(query_id, "cancelled by conversation reset")
+                    .await;
+                if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
+                    pending.cancellation_requested = true;
+                    self.finish_named_brain_turn(query_id, String::new()).await;
+                }
+                if *self.active_query_id.read().await == Some(query_id) {
+                    *self.active_query_id.write().await = None;
+                    self.pending_queries.clear();
+                }
+                self.tool_call_history.write().await.remove(&query_id);
+            }
+
             ReplEvent::ToolResult {
                 query_id,
                 round_token,

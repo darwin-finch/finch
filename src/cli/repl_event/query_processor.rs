@@ -1831,13 +1831,18 @@ pub(crate) async fn process_query_with_tools(
         // is keyed on a committed range, so its bytes stay stable across
         // turns and the request prefix can be cached.
         let mut msgs = if let Some(compactor) = compactor {
-            assemble_window_with_summary(
+            let Some(messages) = assemble_window_with_summary(
                 &compactor,
                 all_msgs,
                 max_verbatim,
                 Some(persona_system_prompt.clone()),
             )
             .await
+            else {
+                let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+                return;
+            };
+            messages
         } else {
             apply_sliding_window(all_msgs, max_verbatim)
         };
@@ -1953,6 +1958,14 @@ pub(crate) async fn process_query_with_tools(
             // synchronously, right here, makes the ordering structural
             // instead.
             display_recalled_memories(output_manager.as_ref(), &presented_recall);
+        }
+        if query_states
+            .get_metadata(query_id)
+            .await
+            .is_some_and(|metadata| metadata.cancellation_token.is_cancelled())
+        {
+            let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+            return;
         }
         // The user's own echo row commits here -- after the memory notice
         // above (or, when there was no memory system to consult, at the
@@ -3126,7 +3139,7 @@ pub(crate) async fn assemble_window_with_summary(
     history: Vec<crate::providers::Message>,
     max_verbatim: usize,
     summarizer_system: Option<String>,
-) -> Vec<crate::providers::Message> {
+) -> Option<Vec<crate::providers::Message>> {
     let summary = match compactor.plan_summary(&history, max_verbatim) {
         SummaryPlan::Reuse(text) => Some(text),
         SummaryPlan::Summarize { input_end } => {
@@ -3137,7 +3150,9 @@ pub(crate) async fn assemble_window_with_summary(
             {
                 Ok(text) => {
                     let boundary = ConversationCompactor::boundary_fingerprint(&history, input_end);
-                    compactor.commit_summary(input_end, boundary, text.clone());
+                    if !compactor.commit_summary(input_end, boundary, text.clone()) {
+                        return None;
+                    }
                     Some(text)
                 }
                 Err(error) => {
@@ -3148,12 +3163,13 @@ pub(crate) async fn assemble_window_with_summary(
                 }
             }
         }
-        SummaryPlan::Invalidated => None,
+        SummaryPlan::Invalidated => return None,
     };
     let window = apply_sliding_window(history, max_verbatim);
     match summary {
-        Some(text) => inject_summary_prefix(text, window),
-        None => window,
+        Some(text) => Some(inject_summary_prefix(text, window)),
+        None if compactor.is_current() => Some(window),
+        None => None,
     }
 }
 
@@ -9648,7 +9664,8 @@ mod tests {
             20,
             Some("test persona".to_string()),
         )
-        .await;
+        .await
+        .expect("an unchanged conversation generation must assemble a request");
         assert_eq!(
             summary_gen.calls(),
             1,
@@ -9688,7 +9705,8 @@ mod tests {
         ));
         let second =
             assemble_window_with_summary(&compactor, grown, 20, Some("test persona".to_string()))
-                .await;
+                .await
+                .expect("summary reuse must remain valid without a conversation reset");
         assert_eq!(
             summary_gen.calls(),
             1,

@@ -17,6 +17,10 @@ impl EventLoop {
                         return Ok(());
                     }
                     Command::Clear => {
+                        let active_query_id = *self.active_query_id.read().await;
+                        if let Some(query_id) = active_query_id {
+                            self.query_states.cancel_query(query_id).await;
+                        }
                         let mut conversation = self.conversation.write().await;
                         conversation.clear();
                         self.summary_cache

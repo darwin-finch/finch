@@ -7430,6 +7430,228 @@ impl crate::generators::Generator for SummaryRequestRecorder {
     }
 }
 
+struct BlockingSummaryRequestRecorder {
+    requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    summary_started: tokio::sync::Notify,
+    release_summary: tokio::sync::Notify,
+    summary_returned: tokio::sync::Notify,
+}
+
+impl BlockingSummaryRequestRecorder {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            summary_started: tokio::sync::Notify::new(),
+            release_summary: tokio::sync::Notify::new(),
+            summary_returned: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn requests(&self) -> Vec<Vec<crate::providers::Message>> {
+        self.requests
+            .lock()
+            .expect("blocking summary recorder lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for BlockingSummaryRequestRecorder {
+    async fn generate(
+        &self,
+        messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let is_summary_request = messages.iter().any(|message| {
+            message
+                .text_content()
+                .starts_with("Summarise the following conversation history concisely")
+        });
+        self.requests
+            .lock()
+            .expect("blocking summary recorder lock poisoned")
+            .push(messages);
+        if is_summary_request {
+            self.summary_started.notify_one();
+            self.release_summary.notified().await;
+            self.summary_returned.notify_one();
+        }
+        let text = if is_summary_request {
+            "summary produced from the cleared conversation"
+        } else {
+            "(say \"provider must never receive this stale request\")"
+        };
+        Ok(crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "blocking-summary-recorder".to_string(),
+                model: "blocking-summary-recorder".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(4),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "blocking-summary-recorder"
+    }
+}
+
+async fn assert_clear_during_inflight_summary_cancels_stale_request(command: &str) {
+    use crate::cli::repl_event::query_state::QueryState;
+
+    let recorder = Arc::new(BlockingSummaryRequestRecorder::new());
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let patterns = tempfile::tempdir()
+        .expect("isolated in-flight summary-reset tool state")
+        .path()
+        .join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .expect("construct inert in-flight summary-reset tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    event_loop.output_manager.disable_stdout();
+    event_loop.max_verbatim_messages = 4;
+    event_loop.enable_summarization = true;
+    {
+        let mut conversation = event_loop.conversation.write().await;
+        for message in summary_reuse_fixture("pre-clear") {
+            conversation.add_message(message);
+        }
+    }
+
+    event_loop.start_llm_worker();
+    event_loop
+        .handle_user_input("question whose summary is blocked".to_string())
+        .await
+        .expect("the real LlmLoop query must start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.summary_started.notified(),
+    )
+    .await
+    .expect("the real LlmLoop must reach the blocking summarizer");
+    let query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the blocked summary must belong to the active query");
+
+    event_loop
+        .handle_user_input(command.to_string())
+        .await
+        .expect("the reset command must invalidate the in-flight request");
+    assert!(
+        matches!(
+            event_loop.query_states.get_state(query_id).await,
+            Some(QueryState::Cancelled)
+        ),
+        "{command} must atomically cancel the query whose provider context it invalidated"
+    );
+    assert!(
+        event_loop
+            .conversation
+            .read()
+            .await
+            .get_messages()
+            .is_empty(),
+        "{command} must clear the conversation while the summarizer is blocked"
+    );
+
+    recorder.release_summary.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recorder.summary_returned.notified(),
+    )
+    .await
+    .expect("the released summarizer must return");
+    let terminal = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.event_rx.recv(),
+    )
+    .await
+    .expect("the invalidated request must emit one terminal event")
+    .expect("the event channel must remain open");
+    assert!(
+        matches!(terminal, ReplEvent::QueryContextInvalidated { query_id: id } if id == query_id),
+        "{command} must terminalize the exact invalidated query without a provider failure; event={terminal:?}"
+    );
+    event_loop
+        .handle_event(terminal)
+        .await
+        .expect("the invalidation terminal event must dispatch");
+
+    assert_eq!(
+        *event_loop.active_query_id.read().await,
+        None,
+        "{command} must release the active-query slot after invalidated assembly"
+    );
+    let requests = recorder.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "{command} must make only the already-started summary request and never send the stale main-provider request; requests={requests:?}"
+    );
+    assert!(
+        requests[0].iter().any(|message| message
+            .text_content()
+            .starts_with("Summarise the following conversation history concisely")),
+        "the sole observed request must be the deliberately blocked summarizer request; requests={requests:?}"
+    );
+
+    let regrown = summary_reuse_fixture("post-clear");
+    let fresh_compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+        Arc::clone(&recorder) as Arc<dyn crate::generators::Generator>,
+        Arc::clone(&event_loop.summary_cache),
+    );
+    assert!(
+        matches!(fresh_compactor.plan_summary(&regrown, 4), crate::cli::conversation_compactor::SummaryPlan::Summarize { .. }),
+        "{command} must reject the late summary commit; a regrown same-shape history must require fresh summarization"
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        recorder.requests().len(),
+        1,
+        "{command} must produce no late provider effects after the terminal invalidation"
+    );
+}
+
 fn summary_reuse_fixture(prefix: &str) -> Vec<crate::providers::Message> {
     use crate::providers::Message;
     vec![
@@ -7535,6 +7757,17 @@ async fn test_clear_and_reset_commands_invalidate_summary_before_actual_generato
         .run_until(async {
             for command in ["/clear", "/reset"] {
                 assert_clear_command_invalidates_committed_summary(command).await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_clear_and_reset_during_inflight_summary_never_send_stale_provider_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for command in ["/clear", "/reset"] {
+                assert_clear_during_inflight_summary_cancels_stale_request(command).await;
             }
         })
         .await;

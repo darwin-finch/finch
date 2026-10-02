@@ -144,10 +144,14 @@ path holds the conversation write boundary while it calls `ConversationHistory::
 committed messages and provider-invisible staged tool rounds) and invalidates that cache, so a
 regrown history cannot reuse summary bytes from before the reset. The cache generation also makes
 a compactor holding an in-flight pre-clear snapshot discard its plan and reject a late commit. It
-then confirms that the
-conversation is starting fresh. `test_clear_and_reset_commands_remove_committed_and_staged_provider_context`
+then propagates that rejection through request assembly, terminally cancels the invalidated query,
+and never falls back to sending either its stale summary or its stale raw window. The command
+confirms that the conversation is starting fresh.
+`test_clear_and_reset_commands_remove_committed_and_staged_provider_context`
 pins the raw/staged boundary; `test_clear_and_reset_commands_invalidate_summary_before_actual_generator_request`
 drives both spellings through the real `LlmLoop` and captures the assembled generator request;
+`test_clear_and_reset_during_inflight_summary_never_send_stale_provider_request` blocks the real
+summarizer across both commands and proves the late result has no provider or cache effect;
 `test_unrelated_help_command_preserves_provider_context_and_staged_round` keeps raw, staged, and
 summary context non-destructive for unrelated slash commands.
 

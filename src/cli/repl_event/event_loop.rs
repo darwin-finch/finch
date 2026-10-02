@@ -2782,6 +2782,7 @@ impl EventLoop {
                         ReplEvent::StreamingComplete { .. } => "StreamingComplete",
                         ReplEvent::QueryComplete { .. } => "QueryComplete",
                         ReplEvent::QueryFailed { .. } => "QueryFailed",
+                        ReplEvent::QueryContextInvalidated { .. } => "QueryContextInvalidated",
                         ReplEvent::ToolResult { .. } => "ToolResult",
                         ReplEvent::ToolCallsStarted { .. } => "ToolCallsStarted",
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",

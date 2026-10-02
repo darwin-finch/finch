@@ -179,16 +179,22 @@ impl ConversationCompactor {
     ///
     /// `covered` must equal the end of the range actually summarised, so the
     /// committed coverage is never broader than the summary's input.
-    pub fn commit_summary(&self, covered: usize, boundary: u64, text: String) {
+    pub fn commit_summary(&self, covered: usize, boundary: u64, text: String) -> bool {
         let mut cache = self.cache.lock().expect(LOCK_POISONED);
         if cache.generation != self.cache_generation {
-            return;
+            return false;
         }
         cache.committed = Some(CommittedSummary {
             covered,
             boundary,
             text,
         });
+        true
+    }
+
+    /// Whether this request snapshot still belongs to the active conversation.
+    pub fn is_current(&self) -> bool {
+        self.cache.lock().expect(LOCK_POISONED).generation == self.cache_generation
     }
 
     /// Fingerprint of the history message at `at` — the first message past a
