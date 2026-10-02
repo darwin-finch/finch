@@ -2161,6 +2161,6 @@ mod test_wizard {
         let line = WizardLine::plain(text);
         let wrapped = wizard_wrap(&line, len);
         
-        panic!("len = {}, wrapped len = {}", len, wrapped.len());
+        panic!("len = {}, wrapped len = {}. wrapped[0] text: {:?}", len, wrapped.len(), wrapped[0].plain_text());
     }
 }
