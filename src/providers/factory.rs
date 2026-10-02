@@ -905,25 +905,7 @@ pub fn create_provider_profile_from_config_with_resolver(
         .iter()
         .find(|entry| !entry.is_local() && entry.profile_name() == profile_name)
         .with_context(|| format!("Provider profile '{profile_name}' was not found"))?;
-    let provider = if let Some(binding) = entry.credential_binding() {
-        let credentials = crate::config::credential_index(config.credentials())?;
-        let credential = credentials
-            .get(binding.credential_ref.as_str())
-            .expect("Config::validate checked the selected named credential reference");
-        if credential.provider == CredentialProvider::ChatgptSubscription
-            || credential.provider == CredentialProvider::ClaudeSubscription
-            || credential.provider == CredentialProvider::GrokSubscription
-            || credential.provider == CredentialProvider::GeminiSubscription
-        {
-            bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
-        }
-        let handle = resolve_named_credential(binding, credential, resolver)?;
-        let inner = create_provider_from_resolved_entry(entry, &handle)?;
-        Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>
-    } else {
-        Arc::from(create_provider_from_entry(entry)?)
-    };
-    Ok(provider)
+    create_provider_from_overlaid_entry_with_resolver(config, entry, resolver)
 }
 
 /// Build one provider from an already-overlaid entry, reusing config credentials.
@@ -937,7 +919,7 @@ pub fn create_provider_from_overlaid_entry(
     create_provider_from_overlaid_entry_with_resolver(config, entry, &EnvironmentCredentialResolver)
 }
 
-fn create_provider_from_overlaid_entry_with_resolver(
+pub fn create_provider_from_overlaid_entry_with_resolver(
     config: &Config,
     entry: &ProviderEntry,
     resolver: &dyn CredentialResolver,

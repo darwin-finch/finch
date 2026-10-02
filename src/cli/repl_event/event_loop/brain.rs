@@ -66,6 +66,33 @@ impl EventLoop {
         active_index: usize,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
     ) -> Self {
+        let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
+        Self::new_test_runner_with_resolver(
+            label,
+            generator,
+            provider_resolver,
+            tool_definitions,
+            tool_executor,
+            program_runtime,
+            available_providers,
+            active_index,
+            daemon_client,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_test_runner_with_resolver(
+        label: &str,
+        generator: Arc<dyn Generator>,
+        provider_resolver: crate::scheduler::ProviderResolver,
+        tool_definitions: Vec<ToolDefinition>,
+        tool_executor: Arc<Mutex<ToolExecutor>>,
+        program_runtime: Arc<crate::runtime::ProgramRuntime>,
+        available_providers: Vec<crate::config::ProviderEntry>,
+        active_index: usize,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    ) -> Self {
         let colors = crate::theme::ColorScheme::default();
         let output_manager = Arc::new(OutputManager::new(colors.clone()));
         let status_bar = Arc::new(StatusBar::new());
@@ -81,7 +108,6 @@ impl EventLoop {
             crate::cli::repl_event::memory_commitment::memory_commitment_journal(Arc::clone(
                 &committed_memories,
             ));
-        let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
         let agent_scheduler = crate::scheduler::AgentScheduler::new(
             provider_resolver.clone(),
             Arc::clone(&program_runtime),
@@ -310,6 +336,41 @@ impl EventLoop {
         Self::new_test_runner(
             "provider-switch-test",
             generator,
+            Vec::new(),
+            Arc::new(Mutex::new(tool_executor)),
+            program_runtime,
+            available_providers,
+            active_index,
+            daemon_client,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_provider_switch_test_runner_with_config(
+        config: crate::config::Config,
+        active_index: usize,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    ) -> Self {
+        let generator: Arc<dyn Generator> = Arc::new(NeverCompletesGenerator);
+        let program_runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let tempdir = tempfile::tempdir().expect("provider switch fixture: isolated tool state");
+        let tool_executor = crate::tools::ToolExecutor::new(
+            crate::tools::ToolRegistry::new(),
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("provider switch fixture: construct inert tool executor");
+        std::mem::forget(tempdir);
+        let provider_resolver = crate::scheduler::ProviderResolver::with_config(
+            Arc::clone(&generator),
+            config.clone(),
+            daemon_client.clone(),
+        );
+        let available_providers = config.providers.clone();
+        Self::new_test_runner_with_resolver(
+            "provider-switch-test",
+            generator,
+            provider_resolver,
             Vec::new(),
             Arc::new(Mutex::new(tool_executor)),
             program_runtime,
