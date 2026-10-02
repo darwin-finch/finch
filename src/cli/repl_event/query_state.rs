@@ -238,6 +238,24 @@ impl QueryStateManager {
             .map(|m| m.state.clone())
     }
 
+    /// Whether provider output may still project into live UI, accounting,
+    /// conversation, or execution state for this query.
+    pub async fn accepts_provider_projection(&self, query_id: Uuid) -> bool {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .is_some_and(|metadata| {
+                !metadata.cancellation_token.is_cancelled()
+                    && !matches!(
+                        metadata.state,
+                        QueryState::Cancelled
+                            | QueryState::Failed { .. }
+                            | QueryState::Completed { .. }
+                    )
+            })
+    }
+
     /// Get full metadata for a query
     pub async fn get_metadata(&self, query_id: Uuid) -> Option<QueryMetadata> {
         self.states.read().await.get(&query_id).cloned()

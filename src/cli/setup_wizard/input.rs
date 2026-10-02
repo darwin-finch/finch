@@ -7,6 +7,10 @@
 use super::chatgpt_recovery::{
     chatgpt_setup_failure_cause, chatgpt_setup_failure_summary, spawn_add_time_chatgpt_device_flow,
 };
+use super::gemini_recovery::{
+    gemini_persisted_reference, gemini_setup_failure_cause, gemini_setup_failure_summary,
+    spawn_add_time_gemini_device_flow,
+};
 use super::grok_recovery::{
     grok_persisted_reference, grok_setup_failure_cause, grok_setup_failure_summary,
     spawn_add_time_grok_device_flow,
@@ -16,6 +20,8 @@ use super::*;
 fn device_setup_failure_summary(provider_id: &str, failure: &anyhow::Error) -> String {
     if provider_id.eq_ignore_ascii_case("grok-sub") {
         grok_setup_failure_summary(grok_setup_failure_cause(failure))
+    } else if provider_id.eq_ignore_ascii_case("gemini-sub") {
+        gemini_setup_failure_summary(gemini_setup_failure_cause(failure))
     } else {
         chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
     }
@@ -419,6 +425,7 @@ pub(super) fn handle_models_input(
     let credentials = state.credentials.clone();
     let chatgpt_authenticator = state.chatgpt_authenticator.clone();
     let grok_authenticator = state.grok_authenticator.clone();
+    let gemini_authenticator = state.gemini_authenticator.clone();
     // Credential published by a completed add-time device ceremony (#424),
     // recorded into wizard state once the section borrow ends.
     let mut record_named_credential: Option<crate::config::ProviderCredential> = None;
@@ -955,6 +962,15 @@ pub(super) fn handle_models_input(
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
+                    if let Some(AddProviderStep::DeviceAuth { pending, .. }) =
+                        adding_provider.as_ref()
+                    {
+                        if c == 'o' || c == 'O' {
+                            if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                open_browser_silently(&presentation.verification_uri);
+                            }
+                        }
+                    }
                     if let Some(AddProviderStep::ConfigureCompatibleConnection {
                         draft,
                         focused_field,
@@ -1171,7 +1187,7 @@ pub(super) fn handle_models_input(
                                     api_key: remote_api_key_input(CLOUD_PROVIDERS[selected].0),
                                     focused_field: if matches!(
                                         CLOUD_PROVIDERS[selected].0,
-                                        "chatgpt" | "grok-sub"
+                                        "chatgpt" | "grok-sub" | "gemini-sub"
                                     ) {
                                         1
                                     } else {
@@ -1248,7 +1264,8 @@ pub(super) fn handle_models_input(
                                     provider_id,
                                 );
                                 if (provider_id.eq_ignore_ascii_case("chatgpt")
-                                    || provider_id.eq_ignore_ascii_case("grok-sub"))
+                                    || provider_id.eq_ignore_ascii_case("grok-sub")
+                                    || provider_id.eq_ignore_ascii_case("gemini-sub"))
                                     && editing_idx.is_none()
                                 {
                                     // #424: run the device exchange here, in
@@ -1298,30 +1315,84 @@ pub(super) fn handle_models_input(
                                             );
                                             None
                                         }
-                                    } else if let Some(authenticator) = grok_authenticator.as_ref()
-                                    {
-                                        let reference =
-                                            grok_persisted_reference(persisted.as_ref());
-                                        let pending = Arc::new(Mutex::new(None));
-                                        let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
-                                        let cancel = tokio_util::sync::CancellationToken::new();
-                                        spawn_add_time_grok_device_flow(
-                                            authenticator.clone(),
-                                            reference.clone(),
-                                            pending.clone(),
-                                            outcome.clone(),
-                                            cancel.clone(),
-                                        );
-                                        Some(AddProviderStep::DeviceAuth {
-                                            provider_idx,
-                                            name,
-                                            model: resolved_model,
-                                            reference,
-                                            editing_idx,
-                                            pending,
-                                            outcome,
-                                            cancel,
-                                        })
+                                    } else if provider_id.eq_ignore_ascii_case("grok-sub") {
+                                        if let Some(authenticator) = grok_authenticator.as_ref() {
+                                            let reference =
+                                                grok_persisted_reference(persisted.as_ref());
+                                            let pending = Arc::new(Mutex::new(None));
+                                            let outcome: DeviceAuthOutcome =
+                                                Arc::new(Mutex::new(None));
+                                            let cancel = tokio_util::sync::CancellationToken::new();
+                                            spawn_add_time_grok_device_flow(
+                                                authenticator.clone(),
+                                                reference.clone(),
+                                                pending.clone(),
+                                                outcome.clone(),
+                                                cancel.clone(),
+                                            );
+                                            Some(AddProviderStep::DeviceAuth {
+                                                provider_idx,
+                                                name,
+                                                model: resolved_model,
+                                                reference,
+                                                editing_idx,
+                                                pending,
+                                                outcome,
+                                                cancel,
+                                            })
+                                        } else {
+                                            commit_remote_provider(
+                                                primary_model,
+                                                tool_models,
+                                                selected_idx,
+                                                provider_id,
+                                                &name,
+                                                &resolved_model,
+                                                api_key,
+                                                editing_idx,
+                                                persisted,
+                                            );
+                                            None
+                                        }
+                                    } else if provider_id.eq_ignore_ascii_case("gemini-sub") {
+                                        if let Some(authenticator) = gemini_authenticator.as_ref() {
+                                            let reference =
+                                                gemini_persisted_reference(persisted.as_ref());
+                                            let pending = Arc::new(Mutex::new(None));
+                                            let outcome: DeviceAuthOutcome =
+                                                Arc::new(Mutex::new(None));
+                                            let cancel = tokio_util::sync::CancellationToken::new();
+                                            spawn_add_time_gemini_device_flow(
+                                                authenticator.clone(),
+                                                reference.clone(),
+                                                pending.clone(),
+                                                outcome.clone(),
+                                                cancel.clone(),
+                                            );
+                                            Some(AddProviderStep::DeviceAuth {
+                                                provider_idx,
+                                                name,
+                                                model: resolved_model,
+                                                reference,
+                                                editing_idx,
+                                                pending,
+                                                outcome,
+                                                cancel,
+                                            })
+                                        } else {
+                                            commit_remote_provider(
+                                                primary_model,
+                                                tool_models,
+                                                selected_idx,
+                                                provider_id,
+                                                &name,
+                                                &resolved_model,
+                                                api_key,
+                                                editing_idx,
+                                                persisted,
+                                            );
+                                            None
+                                        }
                                     } else {
                                         // No credential authority (no home
                                         // directory): keep the save-time
@@ -1545,6 +1616,16 @@ pub(super) fn handle_models_input(
                                                 retry_cancel.clone(),
                                             );
                                         }
+                                    } else if provider_id.eq_ignore_ascii_case("gemini-sub") {
+                                        if let Some(authenticator) = gemini_authenticator.as_ref() {
+                                            spawn_add_time_gemini_device_flow(
+                                                authenticator.clone(),
+                                                reference.clone(),
+                                                retry_pending.clone(),
+                                                retry_outcome.clone(),
+                                                retry_cancel.clone(),
+                                            );
+                                        }
                                     } else if let Some(authenticator) =
                                         chatgpt_authenticator.as_ref()
                                     {
@@ -1567,17 +1648,22 @@ pub(super) fn handle_models_input(
                                         cancel: retry_cancel,
                                     })
                                 }
-                                // Still running: ignore Enter.
-                                None => Some(AddProviderStep::DeviceAuth {
-                                    provider_idx,
-                                    name,
-                                    model,
-                                    reference,
-                                    editing_idx,
-                                    pending,
-                                    outcome,
-                                    cancel,
-                                }),
+                                // Still running: attempt to open the URL in the browser on Enter.
+                                None => {
+                                    if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                        open_browser_silently(&presentation.verification_uri);
+                                    }
+                                    Some(AddProviderStep::DeviceAuth {
+                                        provider_idx,
+                                        name,
+                                        model,
+                                        reference,
+                                        editing_idx,
+                                        pending,
+                                        outcome,
+                                        cancel,
+                                    })
+                                }
                             }
                         }
                         // ── single-screen local dialog — confirm ─────────────────────
@@ -1958,7 +2044,16 @@ pub(super) fn handle_models_input(
                             } else {
                                 None
                             },
-                            focused_field: 1,
+                            focused_field: if (matches!(
+                                key.code,
+                                KeyCode::Char('e') | KeyCode::Char('E')
+                            ) || api_key.is_empty())
+                                && provider_requires_inline_api_key(provider)
+                            {
+                                3
+                            } else {
+                                1
+                            },
                             editing_idx: Some(*selected_idx),
                         });
                     } else if let Some(ModelConfig::Local {
@@ -2602,4 +2697,24 @@ pub(super) fn handle_review_input(
         }
         _ => Ok(false),
     }
+}
+
+pub(super) fn open_browser_silently(url: &str) {
+    #[cfg(test)]
+    {
+        let _ = url; // used
+        return;
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    let _ = std::process::Command::new("open")
+        .arg("--")
+        .arg(url)
+        .status();
+    #[cfg(all(not(test), target_os = "linux"))]
+    let _ = std::process::Command::new("xdg-open").arg(url).status();
+    #[cfg(all(not(test), target_os = "windows"))]
+    let _ = std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status();
 }

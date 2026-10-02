@@ -134,6 +134,7 @@ impl LlmLoop {
         } = ui;
         let crate::cli::repl_event::parts::LlmSession {
             conversation,
+            summary_cache,
             active_persona,
             mode,
             query_states,
@@ -190,9 +191,7 @@ impl LlmLoop {
             enable_summarization,
             auto_compact_enabled,
             wire_metrics_logger,
-            summary_cache: Arc::new(std::sync::Mutex::new(
-                crate::cli::conversation_compactor::SummaryCache::new(),
-            )),
+            summary_cache,
         }
     }
 

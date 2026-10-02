@@ -74,6 +74,7 @@ pub struct WizardSpan {
     pub bg: Option<WizardColor>,
     pub bold: bool,
     pub dim: bool,
+    pub osc8_url: Option<String>,
 }
 
 impl WizardSpan {
@@ -85,6 +86,7 @@ impl WizardSpan {
             bg: None,
             bold: false,
             dim: false,
+            osc8_url: None,
         }
     }
 
@@ -96,6 +98,7 @@ impl WizardSpan {
             bg: None,
             bold,
             dim: false,
+            osc8_url: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl WizardSpan {
             bg: Some(bg),
             bold: true,
             dim: false,
+            osc8_url: None,
         }
     }
 }
@@ -174,7 +178,7 @@ impl WizardLine {
 
 /// Visible display-column width of one span's text.
 fn wizard_span_visible_length(span: &WizardSpan) -> usize {
-    span.text.chars().map(wizard_char_width).sum()
+    wizard_visible_length(&span.text)
 }
 
 /// SGR reset closing every styled wizard span.
@@ -383,11 +387,19 @@ fn span_sgr_codes(span: &WizardSpan) -> String {
 /// escape codes; view builders construct spans, never bytes.
 pub fn lower_wizard_span(span: &WizardSpan) -> String {
     let codes = span_sgr_codes(span);
-    if codes.is_empty() {
-        span.text.clone()
-    } else {
-        format!("\x1b[{codes}m{}{WIZ_RESET}", span.text)
+    let mut out = String::new();
+    if let Some(url) = &span.osc8_url {
+        out.push_str(&format!("\x1b]8;;{}\x1b\\", url));
     }
+    if codes.is_empty() {
+        out.push_str(&span.text);
+    } else {
+        out.push_str(&format!("\x1b[{codes}m{}{WIZ_RESET}", span.text));
+    }
+    if span.osc8_url.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
+    out
 }
 
 /// Lower one logical line to its painted bytes.
@@ -430,6 +442,18 @@ pub fn wizard_line(text: &str, fg: WizardColor) -> WizardLine {
 /// A coloured, bold wizard span.
 pub fn wizard_bold(text: &str, fg: WizardColor) -> WizardLine {
     WizardLine::bold(text, fg)
+}
+
+/// A wizard URL span (OSC 8 link).
+pub fn wizard_url(text: &str, url: &str, fg: Option<WizardColor>) -> WizardLine {
+    WizardLine(vec![WizardSpan {
+        text: text.into(),
+        fg,
+        bg: None,
+        bold: false,
+        dim: false,
+        osc8_url: Some(url.into()),
+    }])
 }
 
 /// A plain wizard span.
@@ -516,11 +540,11 @@ fn close_row(current: &mut Vec<WizardSpan>, lines_out: &mut Vec<WizardLine>) {
 
 /// Greedy word width as a terminal renders it.
 fn wizard_word_width(word: &str) -> usize {
-    word.chars().map(wizard_char_width).sum()
+    wizard_visible_length(word)
 }
 
 fn same_style(a: &WizardSpan, b: &WizardSpan) -> bool {
-    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.dim == b.dim
+    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.dim == b.dim && a.osc8_url == b.osc8_url
 }
 
 /// Append one character to the line, merging with the previous span when the
@@ -534,6 +558,7 @@ fn append_char(current: &mut Vec<WizardSpan>, style_of: &WizardSpan, ch: char) {
             bg: style_of.bg,
             bold: style_of.bold,
             dim: style_of.dim,
+            osc8_url: style_of.osc8_url.clone(),
         }),
     }
 }
@@ -716,7 +741,7 @@ impl WizardCard {
         if clipped > 0 {
             lines.push(self.boxed_fragment(
                 width,
-                &wizard_plain(&format!("… {clipped} more lines — grow the terminal")),
+                &wizard_plain(&format!("… {clipped} more lines — resize window")),
             ));
         }
         for fragment in &controls_fragment {
@@ -744,6 +769,7 @@ mod wizard_keys {
     pub const SECTION: u16 = 21;
     pub const CARD: u16 = 22;
     pub const HELP: u16 = 23;
+    pub const BANNER: u16 = 24;
 }
 
 /// The section content: full logical lines plus how the host should window
@@ -823,6 +849,20 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
     ]
 }
 
+fn wizard_welcome_banner(width: usize) -> Vec<String> {
+    wizard_boxed(
+        "Welcome to Finch",
+        &[wizard_plain(
+            "Finch is an AI assistant that helps you get work done, answer questions, and solve problems directly on your computer.",
+        )],
+        WizardColor::Cyan,
+        width,
+    )
+    .into_iter()
+    .map(|l| lower_wizard_line(&l))
+    .collect()
+}
+
 /// Project the wizard view into the standard claiming tree: a column whose
 /// tab row and help claim their natural extent, the section claims the
 /// leftover, and an open card claims its natural extent as an inline
@@ -832,26 +872,38 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
 /// and the paint read the same bytes.
 fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<String>>) -> Widget {
     let lowered_section: Vec<String> = view.section.lines.iter().map(lower_wizard_line).collect();
-    let mut children: Vec<(Track, Widget)> = vec![
-        (
+    let mut children: Vec<(Track, Widget)> = Vec::new();
+
+    if view.title == " Finch Setup " && view.selected_tab == 0 {
+        children.push((
             Track::Natural,
             Widget::Marked(
-                wizard_keys::TAB_ROW,
+                wizard_keys::BANNER,
                 Box::new(Widget::Text {
-                    lines: tab_row_lines(view, width),
+                    lines: wizard_welcome_banner(width),
                 }),
             ),
+        ));
+    }
+
+    children.push((
+        Track::Natural,
+        Widget::Marked(
+            wizard_keys::TAB_ROW,
+            Box::new(Widget::Text {
+                lines: tab_row_lines(view, width),
+            }),
         ),
-        (
-            Track::Flex { weight: 1, min: 1 },
-            Widget::Marked(
-                wizard_keys::SECTION,
-                Box::new(Widget::Text {
-                    lines: lowered_section,
-                }),
-            ),
+    ));
+    children.push((
+        Track::Flex { weight: 1, min: 1 },
+        Widget::Marked(
+            wizard_keys::SECTION,
+            Box::new(Widget::Text {
+                lines: lowered_section,
+            }),
         ),
-    ];
+    ));
     if let Some(lines) = card_lines {
         children.push((
             Track::Natural,
@@ -880,6 +932,7 @@ fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<S
 /// The claimed regions of one wizard frame, in the frame's own coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WizardRects {
+    pub banner: Rect,
     pub tab_row: Rect,
     pub section: Rect,
     /// The open overlay card (#807). Empty when no card is open or it was
@@ -1005,6 +1058,7 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
     });
     let layout = widgets::layout(&project_wizard_root(view, width, card_natural_lines), frame);
     let rects = WizardRects {
+        banner: layout.keyed(wizard_keys::BANNER).unwrap_or_default(),
         tab_row: layout.keyed(wizard_keys::TAB_ROW).unwrap_or_default(),
         section: layout.keyed(wizard_keys::SECTION).unwrap_or_default(),
         card: layout.keyed(wizard_keys::CARD).unwrap_or_default(),
@@ -1028,6 +1082,18 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
             *row += rows;
         }
     };
+
+    // Banner: clip to the claimed rows on tiny frames.
+    if rects.banner.height > 0 {
+        let banner_lines = wizard_welcome_banner(width);
+        let claim = rects.banner.height.min(banner_lines.len());
+        push(
+            &mut lines,
+            &mut row_spans,
+            &mut row,
+            banner_lines[..claim].to_vec(),
+        );
+    }
 
     // Tab row: clip to the claimed rows on tiny frames.
     {
@@ -1191,7 +1257,7 @@ mod tests {
 
     fn plain_view(section_lines: Vec<&str>) -> WizardView {
         WizardView {
-            title: " Finch Setup ".to_string(),
+            title: " Test Setup ".to_string(),
             tab_titles: vec!["Alpha ✓".to_string(), "Beta".to_string()],
             selected_tab: 1,
             section: WizardSectionContent::plain(
@@ -1476,7 +1542,7 @@ mod tests {
         // row-diff blit, not just `plan_wizard_frame`'s span construction.
         fn view_with_active_tab(selected_tab: usize) -> WizardView {
             WizardView {
-                title: " Finch Setup ".to_string(),
+                title: " Test Setup ".to_string(),
                 tab_titles: vec!["Alpha".to_string(), "Beta".to_string()],
                 selected_tab,
                 section: WizardSectionContent::plain(vec![WizardLine::plain("same content")]),
@@ -1780,7 +1846,7 @@ mod tests {
 
     fn emoji_section_view(section_lines: Vec<WizardLine>) -> WizardView {
         WizardView {
-            title: " Finch Setup ".to_string(),
+            title: " Test Setup ".to_string(),
             tab_titles: vec![
                 "Look & Feel".to_string(),
                 "Model Setup".to_string(),
@@ -2031,5 +2097,89 @@ mod tests {
             !tabs.contains("\x1b[1;35;40m\u{1b}[0m\u{1b}[1;35;40m"),
             "exactly one tab wears the active marking; got {tabs:?}"
         );
+    }
+
+    #[test]
+    fn test_welcome_banner_displayed_at_start_of_setup_wizard() {
+        let view = WizardView {
+            title: " Finch Setup ".to_string(),
+            tab_titles: vec!["Welcome".to_string(), "Next".to_string()],
+            selected_tab: 0,
+            section: WizardSectionContent::plain(vec![WizardLine::plain("content")]),
+            help: None,
+            card: None,
+        };
+        let frame = plan_wizard_frame(&view, 80, 24);
+        assert!(
+            frame.rects.banner.height > 0,
+            "banner must claim rows on the first tab of Finch Setup"
+        );
+        let rows = frame.to_shadow_buffer(80, 24).rows_as_text();
+        assert!(
+            rows.iter().any(|row| row.contains("Welcome to Finch")),
+            "the welcome banner text must be rendered"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("software projects")),
+            "the welcome banner must not contain 'software projects' jargon"
+        );
+        assert!(
+            frame.rects.tab_row.y >= frame.rects.banner.height,
+            "the tab row must be pushed below the banner"
+        );
+
+        // Advancing to the next tab removes the banner
+        let view_next = WizardView {
+            selected_tab: 1,
+            ..view
+        };
+        let frame_next = plan_wizard_frame(&view_next, 80, 24);
+        assert_eq!(
+            frame_next.rects.banner.height, 0,
+            "banner must yield when advancing past the first tab"
+        );
+    }
+}
+
+#[cfg(test)]
+mod osc8_tests {
+    use super::*;
+
+    #[test]
+    fn test_wizard_url_renders_osc8() {
+        let span = WizardSpan {
+            text: "Click me".to_string(),
+            fg: None,
+            bg: None,
+            bold: false,
+            dim: false,
+            osc8_url: Some("https://example.com".to_string()),
+        };
+        let lowered = lower_wizard_span(&span);
+        assert!(lowered.contains("\x1b]8;;https://example.com\x1b\\"));
+        assert!(lowered.contains("Click me"));
+        assert!(lowered.ends_with("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn test_card_with_ansi_text_maintains_straight_borders() {
+        let card = WizardCard::new(
+            "Validation Error",
+            vec![
+                wizard_plain("\x1b[33m\x1b[1mPossible causes:\x1b[0m empty API key"),
+                wizard_plain("Plain line without any escape codes"),
+            ],
+            Some(wizard_line("Enter / Esc: Back", WizardColor::Yellow)),
+        );
+        let lines = card.chrome_lines(80);
+        for line in &lines {
+            assert_eq!(
+                line.display_length(),
+                80,
+                "boxed line has visible length {} != 80: {:?}",
+                line.display_length(),
+                line.plain_text()
+            );
+        }
     }
 }

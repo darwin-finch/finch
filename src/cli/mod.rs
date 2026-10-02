@@ -9,6 +9,7 @@ use finch_conversation as conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
 mod diagnostic_console;
 mod diff;
+mod gemini_auth;
 mod global_output; // Phase 3.5: Global output system with macros
 mod grok_auth;
 mod input;
@@ -51,6 +52,12 @@ pub(crate) use diff::{
     render_files, sanitize_multiline, sanitize_terminal, summarize_files, DiffColorMode, DiffHunk,
     DiffLine, DiffLineKind, FileDiff, MAX_DIFF_HUNKS, MAX_DIFF_INPUT_BYTES, MAX_DIFF_LINES,
     MAX_DIFF_LINE_CHARS,
+};
+pub use gemini_auth::{
+    render_status_line as render_gemini_auth_status_line,
+    save_named_credential as save_gemini_named_credential,
+    BrowserLoginPresentation as GeminiBrowserLoginPresentation,
+    DeviceLoginPresentation as GeminiDeviceLoginPresentation, GeminiAuthService,
 };
 pub use global_output::{
     get_global_tui_renderer, global_output, global_status, is_non_interactive, logging_enabled,

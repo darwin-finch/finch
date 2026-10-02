@@ -212,6 +212,13 @@ pub(super) fn handle_wizard_key(
         });
     }
 
+    if state.save_error.is_some() {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            state.save_error = None;
+        }
+        return Ok(WizardAction::Continue);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
@@ -323,6 +330,21 @@ pub(super) fn run_tabbed_wizard(
             None
         }
     };
+    state.gemini_authenticator = match crate::cli::gemini_auth::GeminiAuthService::production() {
+        Ok(service) => {
+            Some(Arc::new(service)
+                as Arc<
+                    dyn crate::cli::gemini_auth::GeminiCredentialAuthenticator,
+                >)
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "Gemini subscription device sign-in is unavailable in setup; the exchange will run when setup is saved"
+            );
+            None
+        }
+    };
 
     let mut host = crate::cli::tui::WizardHost::new();
 
@@ -337,32 +359,72 @@ pub(super) fn run_tabbed_wizard(
 
         // When scanning for network agents, poll with a short timeout so we can check
         // the background thread's results without blocking on keyboard input.
-        let key_opt: Option<crossterm::event::KeyEvent> = if is_scanning_state(&state) {
+        let event_opt: Option<Event> = if is_scanning_state(&state) {
             advance_scan_if_done(&mut state);
             advance_catalog_refresh_if_done(&mut state);
             if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) => Some(key),
-                    _ => None,
-                }
+                Some(event::read()?)
             } else {
                 None
             }
         } else {
-            match event::read()? {
-                Event::Key(key) => Some(key),
-                _ => None,
-            }
+            Some(event::read()?)
         };
 
-        let Some(key) = key_opt else {
+        let Some(ev) = event_opt else {
             continue;
         };
 
-        match handle_wizard_key(&mut state, key)? {
-            WizardAction::Continue => {}
-            WizardAction::Save => return build_setup_result(&state),
-            WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
+        match ev {
+            Event::Key(key) => match handle_wizard_key(&mut state, key)? {
+                WizardAction::Continue => {}
+                WizardAction::Save => {
+                    if let Some(result) = handle_save_action(&mut state)? {
+                        return Ok(result);
+                    }
+                }
+                WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
+            },
+            Event::Mouse(mouse) => {
+                handle_wizard_mouse(&mut state, mouse);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn handle_wizard_mouse(state: &mut WizardState, mouse: crossterm::event::MouseEvent) {
+    if matches!(
+        mouse.kind,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        if let Some(SectionState::Models {
+            adding_provider, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_ref() {
+                if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                    open_browser_silently(&presentation.verification_uri);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn handle_save_action(state: &mut WizardState) -> Result<Option<SetupResult>> {
+    match build_setup_result(state) {
+        Ok(result) => {
+            let config = config_from_setup_result(&result);
+            if let Err(e) = config.validate() {
+                state.save_error = Some(e.to_string());
+                Ok(None)
+            } else {
+                Ok(Some(result))
+            }
+        }
+        Err(e) => {
+            state.save_error = Some(e.to_string());
+            Ok(None)
         }
     }
 }

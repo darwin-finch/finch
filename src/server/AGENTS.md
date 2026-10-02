@@ -30,6 +30,34 @@ mutates Brain state or dispatches a runner request. An IPC disconnect or retry m
 a second committed Brain turn. Keep runner callback and approval protocol changes covered by
 the server and supervised IPC tests, not just a helper unit test.
 
+**Schedule-delivery diagnostics report transitions, not retry cadence.** The process-ephemeral
+failure registry in `schedule_delivery::FailureEpisodes` is keyed by exact indexed `BrainId` plus
+display name and fenced by the schedule set's process-local lifecycle epoch, so cancel-last plus
+same-identity recreation cannot form an ABA. The first failed attempt emits one actionable WARN with the full cause chain;
+unchanged retries are silent; the first real success emits one INFO and clears the episode.
+Archive, unused removal, external absence, and schedule retirement silently reconcile the entry,
+and a completion that crossed one of those boundaries cannot reinsert it. A successful one-shot
+captures its completion observation while the execution lane is still held, so its natural final
+retirement does not hide the real recovery. That observation comes from the atomic schedule-queue
+commit together with the in-lock entry observation; recovery requires that entry to match the
+loop's sampled generation, so cancel-last/recreate before queueing cannot substitute successor
+work, while a later external cancellation cannot masquerade as the delivery's own retirement.
+Post-queue failures carry the same entry and completion observations: a final one-shot may retire
+before runner readiness or dispatch fails, and that genuine failure must still WARN when the
+captured completion remains the current lifecycle. An error raised inside the queue call after
+the entry sample carries that same pair, so a one-shot committed earlier in the call cannot hide
+a later sibling's failure. The episode is stored at that completion epoch: the one-shot's
+retirement has already moved the activity epoch, and reconcile only keeps the epoch still
+active. The sibling's unchanged retries stay silent, and its later success emits the one INFO.
+A successor one-shot queued after cancel-last recreation warns when its captured completion is
+still current; it does not recover the predecessor, because recovery still requires the loop's
+sampled epoch. A runner that is live for the first
+readiness check and gone before dispatch reports the queued count, the same success as a runner
+that was already absent, so that retirement does not drop the recovery line. Pre-queue failures
+retain the stricter active observation check.
+Restart deliberately
+starts empty, so the first real post-restart failure may warn again but never invents recovery.
+
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and
 `SpeculativePrompt` receives the daemon-authored `TypedRuntime::intrinsic_grants()` ceiling in its
 `RunnerTurnRequest`; the frontend may transport and apply that ceiling but may not reconstruct it

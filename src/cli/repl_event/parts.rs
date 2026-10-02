@@ -150,6 +150,10 @@ pub struct LlmUi {
 /// Who is talking, as what, from where.
 pub struct LlmSession {
     pub conversation: Arc<RwLock<ConversationHistory>>,
+    /// Committed summary bytes for `conversation`. The event loop keeps the
+    /// same handle so destructive conversation commands invalidate both
+    /// provider-visible representations together.
+    pub summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
     pub active_persona: Arc<RwLock<crate::config::Persona>>,
     pub mode: Arc<RwLock<ReplMode>>,
     pub query_states: Arc<super::query_state::QueryStateManager>,

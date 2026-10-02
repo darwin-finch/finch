@@ -138,6 +138,35 @@ existing four-line shape. Capability values are attested for the configured comp
 when a Brain or one-shot model overlay selects a different model, `/status` withholds those values
 and names both the selected overlay and configured model in a secret-free provenance diagnostic.
 
+**`/clear` and `/reset` clear every provider-context representation, not only the visible
+transcript.** `EventLoop` and `LlmLoop` share one session `SharedSummaryCache`. The active command
+path holds the conversation write boundary while it calls `ConversationHistory::clear` (removing
+committed messages and provider-invisible staged tool rounds) and invalidates that cache, so a
+regrown history cannot reuse summary bytes from before the reset. The cache generation also makes
+a compactor holding an in-flight pre-clear snapshot discard its plan and reject a late commit. It
+then propagates that rejection through request assembly, terminally cancels the invalidated query,
+and never falls back to sending either its stale summary or its stale raw window. Before the
+command confirms that the conversation is starting fresh, it terminalizes and releases the exact
+old active query and discards only input queued before the reset boundary. A post-confirmation
+prompt can therefore claim the active slot immediately; late invalidation, completion, and tool
+events carrying the old query id are idempotent and cannot release the new owner, delete its
+queue, overwrite its status, or repopulate the cleared cache. Query processing checks that same
+query-owned cancellation/state fence immediately after a non-streaming provider returns and at
+each streaming receive boundary, before response bytes can mutate a WorkUnit, publish statistics,
+stage or execute tools, run wire source, or emit a visible failure.
+`test_clear_and_reset_commands_remove_committed_and_staged_provider_context`
+pins the raw/staged boundary; `test_clear_and_reset_commands_invalidate_summary_before_actual_generator_request`
+drives both spellings through the real `LlmLoop` and captures the assembled generator request;
+`test_clear_and_reset_during_inflight_summary_never_send_stale_provider_request` blocks the real
+summarizer across both commands, starts and settles a fresh provider turn before releasing it, and
+proves the late invalidation/tool events have no provider, cache, active-query, queue, status, or
+transcript effect;
+`test_clear_and_reset_fence_late_non_streaming_provider_success_and_failure` blocks a real main
+provider across both commands and proves both a rich success and a failure are fenced before any
+post-reset projection or execution;
+`test_unrelated_help_command_preserves_provider_context_and_staged_round` keeps raw, staged, and
+summary context non-destructive for unrelated slash commands.
+
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was
 created or loaded in the durable store (`EventLoop::home_brain_registered`), or a visible

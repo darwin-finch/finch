@@ -104,27 +104,21 @@ pub fn api_key_invalid_error(provider: &str) -> String {
     format!(
         "{} API key is invalid or missing\n\n\
         {}\n\
-        • API key not set in config\n\
+        • API key not set or empty\n\
         • API key format is incorrect\n\
         • API key has been revoked\n\n\
         {}\n\
-        1. Run setup wizard:\n\
-           {}\n\n\
-        2. Check your config file:\n\
-           {}\n\n\
-        3. Verify API key format:\n\
+        1. Verify API key format:\n\
            • Claude: sk-ant-...\n\
            • OpenAI: sk-...\n\
            • Gemini: AI...\n\n\
-        4. Get a new API key:\n\
+        2. Get a new API key:\n\
            • Claude: https://console.anthropic.com/\n\
            • OpenAI: https://platform.openai.com/api-keys\n\
            • Google: https://makersuite.google.com/app/apikey",
         provider,
         "Possible causes:".yellow().bold(),
         "Try:".green().bold(),
-        "finch setup".cyan(),
-        "cat ~/.finch/config.toml".cyan(),
     )
 }
 
@@ -285,5 +279,7 @@ mod tests {
         let msg = api_key_invalid_error("Claude");
         assert!(msg.contains("console.anthropic.com"));
         assert!(msg.contains("sk-ant-"));
+        assert!(!msg.contains("finch setup"));
+        assert!(!msg.contains("cat"));
     }
 }

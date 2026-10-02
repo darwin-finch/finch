@@ -38,6 +38,7 @@ pub enum CredentialProvider {
     Xai,
     GrokSubscription,
     GeminiAiStudio,
+    GeminiSubscription,
     GoogleVertex,
     Mistral,
     Groq,
@@ -56,6 +57,7 @@ impl CredentialProvider {
             Self::Xai => "xai",
             Self::GrokSubscription => "grok_subscription",
             Self::GeminiAiStudio => "gemini_ai_studio",
+            Self::GeminiSubscription => "gemini_subscription",
             Self::GoogleVertex => "google_vertex",
             Self::Mistral => "mistral",
             Self::Groq => "groq",
@@ -77,6 +79,7 @@ pub enum EndpointFamily {
     XaiApi,
     GrokSubscription,
     GeminiAiStudio,
+    GeminiSubscription,
     GoogleVertex,
     MistralApi,
     GroqApi,
@@ -322,6 +325,11 @@ const GROK_SESSION: &[CredentialKind] = &[
 // generic escape hatch the ChatGPT/Grok session lanes keep.
 const CLAUDE_SESSION: &[CredentialKind] =
     &[CredentialKind::OauthBrowserPkce, CredentialKind::Bearer];
+const GEMINI_SESSION: &[CredentialKind] = &[
+    CredentialKind::OauthDevice,
+    CredentialKind::OauthBrowserPkce,
+    CredentialKind::Bearer,
+];
 
 pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor {
     match provider {
@@ -394,6 +402,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             issuer: "google-ai-studio",
             kinds: API_KEY,
             family: EndpointFamily::GeminiAiStudio,
+            standard_origin: "https://generativelanguage.googleapis.com",
+        },
+        CredentialProvider::GeminiSubscription => ProviderAuthDescriptor {
+            provider,
+            issuer: "google-gemini",
+            kinds: GEMINI_SESSION,
+            family: EndpointFamily::GeminiSubscription,
             standard_origin: "https://generativelanguage.googleapis.com",
         },
         CredentialProvider::GoogleVertex => ProviderAuthDescriptor {

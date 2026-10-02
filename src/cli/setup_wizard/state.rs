@@ -184,6 +184,9 @@ pub(super) struct WizardState {
     pub(super) chatgpt_authenticator: Option<std::sync::Arc<dyn ChatGptCredentialAuthenticator>>,
     pub(super) grok_authenticator:
         Option<std::sync::Arc<dyn crate::cli::grok_auth::GrokCredentialAuthenticator>>,
+    pub(super) gemini_authenticator:
+        Option<std::sync::Arc<dyn crate::cli::gemini_auth::GeminiCredentialAuthenticator>>,
+    pub(super) save_error: Option<String>,
 }
 
 impl WizardState {
@@ -427,6 +430,8 @@ impl WizardState {
                 .unwrap_or_default(),
             chatgpt_authenticator: None,
             grok_authenticator: None,
+            gemini_authenticator: None,
+            save_error: None,
         }
     }
 

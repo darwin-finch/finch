@@ -166,6 +166,12 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "custom endpoint; capabilities must be explicitly attested",
     ),
     (
+        "gemini-sub",
+        "Gemini subscription (Google)",
+        "gemini-2.5-flash",
+        "device sign-in uses Google Gemini subscription; not an AI Studio API key",
+    ),
+    (
         "gemini",
         "Gemini (Google)",
         "gemini-2.5-flash",
@@ -224,6 +230,10 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
         }
         | ProviderEntry::Gemini { .. } => Some("gemini"),
         ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GeminiSubscription,
+            ..
+        } => Some("gemini-sub"),
+        ProviderEntry::Credentialed {
             provider: crate::config::CredentialProvider::Mistral,
             ..
         }
@@ -252,7 +262,7 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
 pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
     !matches!(
         provider.to_ascii_lowercase().as_str(),
-        "chatgpt" | "grok-sub" | "openai-compatible" | "ollama" | "finch"
+        "chatgpt" | "grok-sub" | "gemini-sub" | "openai-compatible" | "ollama" | "finch"
     )
 }
 
@@ -920,6 +930,25 @@ pub(super) fn provider_entry_from_remote_model(
             models_path: None,
             name,
             reasoning_effort: Some(crate::config::ReasoningEffort::Medium),
+        },
+        _ if provider.eq_ignore_ascii_case("gemini-sub") => ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GeminiSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "gemini-sub:default".into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::GeminiSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::gemini_required_scopes(),
+            },
+            model,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name,
+            reasoning_effort: None,
         },
         _ => ProviderEntry::from_provider_fields(provider, api_key.to_string(), model, None, name),
     }

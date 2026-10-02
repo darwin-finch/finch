@@ -16,7 +16,7 @@ use crate::config::{
 };
 use finch_providers::{
     ChatGptSubscriptionProvider, ClaudeCliProvider, ClaudeProvider, ClaudeSubscriptionProvider,
-    GeminiProvider, GrokSubscriptionProvider, OpenAIProvider,
+    GeminiProvider, GeminiSubscriptionProvider, GrokSubscriptionProvider, OpenAIProvider,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -491,6 +491,9 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::GrokSubscription => bail!(
             "Grok subscription credentials are distinct from xAI Console API-key credentials and cannot be resolved as an environment secret"
         ),
+        CredentialProvider::GeminiSubscription => bail!(
+            "Gemini subscription credentials are distinct from Google AI Studio API-key credentials and cannot be resolved as an environment secret"
+        ),
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
         ),
@@ -520,6 +523,7 @@ fn resolve_named_graph(
         if credential.provider == CredentialProvider::ChatgptSubscription
             || credential.provider == CredentialProvider::ClaudeSubscription
             || credential.provider == CredentialProvider::GrokSubscription
+            || credential.provider == CredentialProvider::GeminiSubscription
         {
             continue;
         }
@@ -573,6 +577,11 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("Grok subscription custom endpoints and paths are not supported")
+        }
+        CredentialProvider::GeminiSubscription
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Gemini subscription custom endpoints and paths are not supported")
         }
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
@@ -637,7 +646,8 @@ fn create_named_profiles_from_config_with_resolver(
                 ProviderEntry::Credentialed {
                     provider: CredentialProvider::ChatgptSubscription
                         | CredentialProvider::ClaudeSubscription
-                        | CredentialProvider::GrokSubscription,
+                        | CredentialProvider::GrokSubscription
+                        | CredentialProvider::GeminiSubscription,
                     ..
                 }
             )
@@ -696,6 +706,18 @@ fn create_named_profiles_from_config_with_resolver(
                         unreachable!("credential binding implies credentialed entry")
                     };
                     Ok(Box::new(GrokSubscriptionProvider::production(
+                        metadata,
+                        model.as_deref(),
+                        *reasoning_effort,
+                    )?) as Box<dyn LlmProvider>)
+                } else if metadata.provider == CredentialProvider::GeminiSubscription {
+                    if !production_oauth {
+                        bail!("Injected credential resolvers cannot fabricate a refreshable Gemini subscription lease")
+                    }
+                    let ProviderEntry::Credentialed { model, reasoning_effort, .. } = entry else {
+                        unreachable!("credential binding implies credentialed entry")
+                    };
+                    Ok(Box::new(GeminiSubscriptionProvider::production(
                         metadata,
                         model.as_deref(),
                         *reasoning_effort,
@@ -883,24 +905,7 @@ pub fn create_provider_profile_from_config_with_resolver(
         .iter()
         .find(|entry| !entry.is_local() && entry.profile_name() == profile_name)
         .with_context(|| format!("Provider profile '{profile_name}' was not found"))?;
-    let provider = if let Some(binding) = entry.credential_binding() {
-        let credentials = crate::config::credential_index(config.credentials())?;
-        let credential = credentials
-            .get(binding.credential_ref.as_str())
-            .expect("Config::validate checked the selected named credential reference");
-        if credential.provider == CredentialProvider::ChatgptSubscription
-            || credential.provider == CredentialProvider::ClaudeSubscription
-            || credential.provider == CredentialProvider::GrokSubscription
-        {
-            bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
-        }
-        let handle = resolve_named_credential(binding, credential, resolver)?;
-        let inner = create_provider_from_resolved_entry(entry, &handle)?;
-        Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>
-    } else {
-        Arc::from(create_provider_from_entry(entry)?)
-    };
-    Ok(provider)
+    create_provider_from_overlaid_entry_with_resolver(config, entry, resolver)
 }
 
 /// Build one provider from an already-overlaid entry, reusing config credentials.
@@ -914,7 +919,7 @@ pub fn create_provider_from_overlaid_entry(
     create_provider_from_overlaid_entry_with_resolver(config, entry, &EnvironmentCredentialResolver)
 }
 
-fn create_provider_from_overlaid_entry_with_resolver(
+pub fn create_provider_from_overlaid_entry_with_resolver(
     config: &Config,
     entry: &ProviderEntry,
     resolver: &dyn CredentialResolver,
@@ -969,6 +974,21 @@ fn create_provider_from_overlaid_entry_with_resolver(
                 unreachable!("credential binding implies credentialed entry")
             };
             return Ok(Arc::new(GrokSubscriptionProvider::production(
+                credential,
+                model.as_deref(),
+                *reasoning_effort,
+            )?) as Arc<dyn LlmProvider>);
+        }
+        if credential.provider == CredentialProvider::GeminiSubscription {
+            let ProviderEntry::Credentialed {
+                model,
+                reasoning_effort,
+                ..
+            } = entry
+            else {
+                unreachable!("credential binding implies credentialed entry")
+            };
+            return Ok(Arc::new(GeminiSubscriptionProvider::production(
                 credential,
                 model.as_deref(),
                 *reasoning_effort,

@@ -220,8 +220,8 @@ pub use dom_manifest::{
 pub use wizard_host::{
     lower_wizard_line, lower_wizard_span, plan_wizard_frame, wizard_bold, wizard_boxed,
     wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_plain,
-    wizard_selected, wizard_visible_length, wizard_wrap, WizardCard, WizardColor, WizardFrame,
-    WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
+    wizard_selected, wizard_url, wizard_visible_length, wizard_wrap, WizardCard, WizardColor,
+    WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
@@ -937,6 +937,21 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     Ok(frame.lines.len())
 }
 
+fn reanchor_shrinking_live_frame(
+    out: &mut impl Write,
+    previous_rows: usize,
+    next_rows: usize,
+    terminal_rows: usize,
+) -> Result<()> {
+    if next_rows < previous_rows {
+        execute!(
+            out,
+            cursor::MoveTo(0, terminal_rows.saturating_sub(next_rows) as u16)
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Live-area frame ──────────────────────────────────────────────────────────
 
 /// Columns the input prompt (`❯ `) and its continuation (`  `) both occupy.
@@ -1279,7 +1294,7 @@ pub(crate) fn plan_live_frame(
     // span-free lines keep their legacy bytes.
     for line in &viewport_content {
         frame.push(
-            span_render::lower_rendered_line(line)
+            span_render::lower_rendered_line(line, None)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -1517,6 +1532,8 @@ pub struct TuiRenderer {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: Option<String>,
 
+    pub hovered_row: Option<finch_ui_model::RowId>,
+
     // How many rows the live area currently occupies at the bottom of the
     // terminal (WorkUnit + separator + input + status).  Cleared before each
     // redraw.
@@ -1739,6 +1756,7 @@ impl TuiRenderer {
             command_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            hovered_row: None,
             active_rows: 0,
             pending_viewport_size: None,
             last_live_frame_rows: 0,
@@ -1830,6 +1848,7 @@ impl TuiRenderer {
             command_history,
             history_index: None,
             history_draft: None,
+            hovered_row: None,
 
             active_rows: 0,
             pending_viewport_size: None,
@@ -2195,6 +2214,8 @@ impl TuiRenderer {
                 term_h,
                 term_width,
             );
+            let rows = frame.lines.len();
+            reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
             let rows = write_tiny_live_frame(out, &frame)?;
             execute!(out, EndSynchronizedUpdate)?;
             self.flush_attention_bell(out)?;
@@ -2224,64 +2245,33 @@ impl TuiRenderer {
         // focused reader are field borrows disjoint from the autocomplete
         // state the planner mutates.
         let frame = {
-            let vm = live_view_model(
+            let mut vm = live_view_model(
                 &sources,
                 term_width,
                 term_h,
                 active_dialog.as_ref(),
                 expanded_lines.as_deref(),
             );
+            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             plan_live_frame(&vm, &mut self.autocomplete_state)
         };
 
-        // A shrinking live area (#1293) invalidates any active selection
-        // instead of repositioning the write to compensate for it.
-        //
-        // `rebuild_transcript_hit_regions` (below) builds `SelectionIndex`
-        // assuming the live area's absolute rows are always
-        // `term_height - this_frame's_row_count .. term_height` — true
-        // immediately after a full `redraw_full_viewport_inner` repaint
-        // (which does an explicit `cursor::MoveTo(0, plan.transcript_top)`),
-        // but never re-verified on an ordinary tick. `write_live_frame`
-        // otherwise just continues from wherever `erase_live_area` (based on
-        // the *previous* frame's own row count) left the terminal cursor: a
-        // growing frame overflows the bottom and a native terminal scroll
-        // happens to re-bottom-anchor everything for free, but a shrinking
-        // frame (e.g. the "/" completion pane closing) simply lands higher
-        // on the physical screen than the formula assumes, and nothing ever
-        // notices or corrects the resulting drift. From that tick on,
-        // `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`
-        // would target whatever `row` the (now physically wrong)
-        // `SelectionIndex` reports, stamping stale selected text onto
-        // unrelated content — typically the status line, once its row
-        // happens to fall where the drift says old transcript content still
-        // lives.
-        //
-        // An earlier version of this fix instead recomputed and reapplied a
-        // bottom-anchored `cursor::MoveTo` on every size-changing tick, so
-        // physical and assumed geometry could never diverge. That is
-        // correct in isolation, but a live-session regression (traced
-        // through a reconnect/replay production test, `named_brain_attach`)
-        // showed it corrupting the live area under rapid successive
-        // grow/shrink ticks — the interaction with `erase_live_area`'s own,
-        // separately-tracked relative bookkeeping was not fully understood
-        // and the risk of shipping a half-diagnosed repositioning fix
-        // outweighed fixing the narrower, better-understood problem: a
-        // selection surviving into geometry it no longer describes. Since
-        // growth always self-corrects (the paragraph above), only a
-        // detected *shrink* needs to act, and clearing the selection here
-        // is exactly the same invalidation `redraw_full_viewport_inner`
-        // already performs on every full repaint (any full repaint clears
-        // it) — extended to cover the one case a full repaint does not run
-        // for. `self.last_live_frame_rows` (not `self.active_rows`, which
-        // `erase_live_area` always zeroes just before this function runs as
-        // part of its own, unrelated bookkeeping) is the previous tick's
-        // row count.
+        // The erase ends at the previous frame's top. If the replacement is
+        // smaller, painting from there strands the whole frame above blank
+        // rows. Re-anchor only shrinking frames (#1472): growth must remain
+        // relative so overflowing the bottom scrolls retained terminal
+        // content upward. `last_live_frame_rows` survives erase bookkeeping;
+        // `active_rows` does not. A shrink also invalidates any selection
+        // whose absolute rows described the old geometry (#1293).
         let this_frame_rows = frame.physical_rows(term_width.max(1));
-        if this_frame_rows < self.last_live_frame_rows && self.selection.is_some() {
-            self.selection = None;
-            self.selection_press_candidate = None;
-            self.previous_highlighted_rows.clear();
+        reanchor_shrinking_live_frame(out, self.last_live_frame_rows, this_frame_rows, term_h)?;
+        if this_frame_rows < self.last_live_frame_rows {
+            if self.selection.is_some() {
+                self.selection = None;
+                self.selection_press_candidate = None;
+                self.previous_highlighted_rows.clear();
+            }
         }
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
@@ -2348,8 +2338,12 @@ impl TuiRenderer {
         // highlighted background the logical selection no longer covers.
         for row in stale_rows {
             if let Some(entry) = self.selection_index.row(row) {
-                execute!(out, cursor::MoveTo(0, row))?;
-                execute!(out, Print(&entry.text))?;
+                execute!(
+                    out,
+                    cursor::MoveTo(0, row),
+                    Clear(ClearType::CurrentLine),
+                    Print(&entry.text)
+                )?;
             }
         }
         let style = span_render::selection_highlight_style();
@@ -2358,11 +2352,11 @@ impl TuiRenderer {
             let prefix: String = chars[..start].iter().collect();
             let highlighted: String = chars[start..end].iter().collect();
             let suffix: String = chars[end..].iter().collect();
-            execute!(out, cursor::MoveTo(0, row))?;
+            execute!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             if !prefix.is_empty() {
                 execute!(out, Print(&prefix))?;
             }
-            let span = finch_ui_model::Span::styled(highlighted, style);
+            let span = finch_ui_model::Span::styled(highlighted, style.clone());
             execute!(out, Print(span_render::lower_span(&span)))?;
             if !suffix.is_empty() {
                 execute!(out, Print(&suffix))?;
@@ -2549,24 +2543,55 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
 /// The canonical record keeps the raw program exactly once:
 /// `commit_complete_messages` iterates messages without neighbour context and
 /// is untouched by this rule.
+fn programs_match(response_text: &str, program_lines: &[String]) -> bool {
+    let resp_trimmed = response_text.trim();
+    if resp_trimmed.is_empty() {
+        return program_lines.is_empty() || program_lines.iter().all(|line| line.trim().is_empty());
+    }
+    let resp_lines = response_text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'));
+    let prog_lines = program_lines.iter().map(|line| line.trim_end_matches('\r'));
+    resp_lines.eq(prog_lines)
+}
+
+/// The viewport source-group row a component-owned say turn consolidates away
+/// (stage 2 of docs/TUI_DESIGN.md, #882): the Program-source unit
+/// preceding a say-VM unit whose response text matches the turn's program.
+/// The search looks backward from each say turn to the nearest preceding
+/// matching ProgramSource unit (across any intervening non-say messages such
+/// as notices, runner events, or memory recalls).
+/// Empty programs pair the same way (#1185): a degenerate wire turn whose
+/// source trims to "" leaves both sides empty, so both match and the legacy
+/// row for that same empty source never co-renders.
+/// The canonical record keeps the raw program exactly once:
+/// `commit_complete_messages` iterates messages without neighbour context and
+/// is untouched by this rule.
 fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
     let mut suppressed = HashSet::new();
-    for pair in messages.windows(2) {
-        let Some(view) = pair[1].say_turn_view() else {
+    for (i, message) in messages.iter().enumerate() {
+        let Some(view) = message.say_turn_view() else {
             continue;
         };
-        let program = view.vm.program.lines.join("\n");
-        let Some(head) = pair[0].work_unit_head() else {
-            continue;
-        };
-        if pair[0].status() == MessageStatus::Complete
-            && matches!(
+        for prev in messages[..i].iter().rev() {
+            if prev.say_turn_view().is_some() {
+                // Do not search across another say turn boundary
+                break;
+            }
+            if suppressed.contains(&prev.id()) {
+                continue;
+            }
+            let Some(head) = prev.work_unit_head() else {
+                continue;
+            };
+            if matches!(
                 head.presentation,
                 WorkUnitPresentation::ProgramSource { .. }
-            )
-            && head.response_text == program
-        {
-            suppressed.insert(pair[0].id());
+            ) && programs_match(&head.response_text, &view.vm.program.lines)
+            {
+                suppressed.insert(prev.id());
+                break;
+            }
         }
     }
     suppressed
@@ -2875,6 +2900,8 @@ fn live_view_model<'a>(
         scroll_hint: sources.scroll_hint.as_deref(),
         dialog,
         expanded_lines,
+        hovered_row: None,
+        hover_bg: None,
         render_error: sources.render_error,
         task_rows: &sources.task_rows,
         tracked_rows: &sources.tracked_rows,
@@ -3410,9 +3437,33 @@ impl TuiRenderer {
     /// the offset against content growth while scrolled.
     fn scroll_window_committed_source(&mut self, width: usize) -> Vec<RenderedTranscriptLine> {
         let (union, live_start) = self.projected_scroll_union(width);
-        let (split, _skipped) = self.transcript_scroll.derive_window(&union, width);
+        let (split, skipped) = self.transcript_scroll.derive_window(&union, width);
         let committed_end = split.min(live_start);
-        union[..committed_end].to_vec()
+        let mut source = union[..committed_end].to_vec();
+
+        if skipped > 0 && split <= live_start && !source.is_empty() {
+            let width = width.max(1);
+            let omitted_rows: usize = union[split..]
+                .iter()
+                .map(|line| shadow_buffer::physical_rows(&line.text, width))
+                .sum();
+
+            let to_chop = skipped.saturating_sub(omitted_rows);
+            if to_chop > 0 {
+                if let Some(last) = source.last_mut() {
+                    let total = shadow_buffer::physical_rows(&last.text, width);
+                    if total > to_chop {
+                        let keep = total - to_chop;
+                        last.text = visible_prefix(&last.text, keep * width);
+                        last.spans.clear();
+                    } else {
+                        source.pop();
+                    }
+                }
+            }
+        }
+
+        source
     }
 
     fn rebuild_transcript_hit_regions(
@@ -3761,8 +3812,29 @@ impl TuiRenderer {
                 MouseEventKind::Down(MouseButton::Left) => self.handle_left_press(mouse),
                 MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(mouse),
                 MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(mouse),
+                MouseEventKind::Moved => self.handle_mouse_moved(mouse),
                 _ => self.handle_accordion_mouse(mouse),
             }
+        }
+    }
+
+    fn handle_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let hover_row =
+            if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
+                Some(region)
+            } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
+                Some(region.row_id.clone())
+            } else {
+                None
+            };
+
+        if self.hovered_row != hover_row {
+            self.hovered_row = hover_row;
+            self.live_area_dirty = true;
+            self.viewport_invalidated = true; // force full repaint to ensure hover is visible / cleared
+            true
+        } else {
+            false
         }
     }
 
@@ -4071,7 +4143,7 @@ impl TuiRenderer {
             row_id: row_id.clone(),
             title,
             saved_scroll,
-            scroll: saved_scroll.min(body.len().saturating_sub(1)),
+            scroll: saved_scroll,
             body_lines: body.len(),
         });
         self.viewport_invalidated = true;
@@ -4125,7 +4197,7 @@ impl TuiRenderer {
                 self.scroll_expanded_tool(-(PAGE_STEP_LINES as isize));
                 true
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.scroll_expanded_tool(PAGE_STEP_LINES as isize);
                 true
             }
@@ -4269,7 +4341,9 @@ impl TuiRenderer {
             let draw_width = usize::from(width).max(1);
             let sources = self.live_frame_sources(draw_width);
             let mut autocomplete = self.autocomplete_state.clone();
-            let vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
@@ -4292,13 +4366,15 @@ impl TuiRenderer {
         // planner, two consumers.
         let mut autocomplete = self.autocomplete_state.clone();
         let expanded_lines = self.focused_reader_lines(&sources, draw_width, draw_height, None);
-        let vm = live_view_model(
+        let mut vm = live_view_model(
             &sources,
             draw_width,
             draw_height,
             None,
             expanded_lines.as_deref(),
         );
+        vm.hovered_row = self.hovered_row.as_ref();
+        vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
@@ -4363,7 +4439,17 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
         let painted_transcript = transcript
             .iter()
-            .map(span_render::lower_rendered_line)
+            .map(|l| {
+                span_render::lower_rendered_line(
+                    l,
+                    if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
+                    {
+                        Some(finch_ui_model::SpanColor::DARK_GREY)
+                    } else {
+                        None
+                    },
+                )
+            })
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
@@ -6440,6 +6526,8 @@ mod tests {
     ) -> LiveFrame {
         let draft = vec![String::new()];
         let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &draft,
@@ -7869,6 +7957,60 @@ mod tests {
     }
 
     #[test]
+    fn test_expanded_tool_view_initializes_and_restores() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .map(|region| region.row_id.clone())
+            .expect("a painted tool-result region exists");
+
+        // Scroll the compact view
+        renderer.tool_viewports.scroll_child(&output_row_all, 5);
+
+        // Capture transcript before
+        let sources_before = renderer.live_frame_sources(80);
+        let transcript_before = renderer.focused_reader_lines(&sources_before, 80, 24, None);
+        assert!(transcript_before.is_none());
+
+        // 1. Open expanded view and assert it initializes scroll offset appropriately
+        renderer.open_expanded_tool(&output_row_all);
+        let view = renderer.expanded_tool.as_ref().unwrap();
+        assert_eq!(view.scroll, 5, "Tool view scroll inherits compact scroll");
+        assert_eq!(view.saved_scroll, 5, "Saved scroll is preserved");
+
+        // 2. Assert text is correctly bounded in physical rows
+        let sources_during = renderer.live_frame_sources(20); // Narrow width to force wrap
+        let lines_during = renderer
+            .focused_reader_lines(&sources_during, 20, 10, None)
+            .expect("Reader active");
+
+        let physical_rows_used: usize = lines_during
+            .iter()
+            .map(|l| shadow_buffer::physical_rows(l, 20))
+            .sum();
+        assert!(
+            physical_rows_used <= 10,
+            "Text is correctly bounded in physical rows"
+        );
+
+        // 3. Assert closing restores transcript view fully
+        renderer.close_expanded_tool();
+        let sources_after = renderer.live_frame_sources(80);
+        let transcript_after = renderer.focused_reader_lines(&sources_after, 80, 24, None);
+        assert!(
+            transcript_after.is_none(),
+            "Transcript view fully restored upon closing"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row_all),
+            5,
+            "Compact scroll restored"
+        );
+    }
+
+    #[test]
     fn test_expanded_tool_reader_renders_above_chrome_and_claims_wheel() {
         let (mut renderer, _output_row) = committed_tool_result_renderer(40);
         let output_row_all = renderer
@@ -7921,6 +8063,42 @@ mod tests {
             lines.last(),
             scrolled.last()
         );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_expanded_tool_consumes_space_key() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .map(|region| region.row_id.clone())
+            .expect("a painted tool-result region exists");
+        renderer.open_expanded_tool(&output_row_all);
+
+        let space_key = KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            kind: event::KeyEventKind::Press,
+            state: event::KeyEventState::empty(),
+        };
+
+        // Pass the key to the expanded tool handler directly, as it normally
+        // gets routed there by the main event loop when the view is open.
+        let handled = renderer.handle_expanded_tool_key(space_key);
+        assert!(
+            handled,
+            "Space key must be consumed by the expanded tool view"
+        );
+
+        // The viewport must scroll
+        let view = renderer.expanded_tool.as_ref().unwrap();
+        assert!(
+            view.scroll > 0,
+            "Space key must page down the expanded tool view"
+        );
+
         renderer.is_active = false;
     }
 
@@ -8398,13 +8576,15 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0]) == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0]).contains(&original_header),
+                && span_render::lower_rendered_line(&literal_state[0], None)
+                    == literal_state[0].text
+                && !span_render::lower_rendered_line(&literal_state[0], None)
+                    .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
             literal_state[0],
-            span_render::lower_rendered_line(&literal_state[0])
+            span_render::lower_rendered_line(&literal_state[0], None)
         );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
@@ -8845,6 +9025,72 @@ mod tests {
                 .map(|message| message.id().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+    }
+
+    #[test]
+    fn say_turn_consolidates_program_source_across_intervening_messages_and_newlines() {
+        // INVARIANT (#1499): A completed say turn consolidates its preceding
+        // ProgramSource unit even when:
+        // 1. Intervening messages (daemon notice, info message, recall notice)
+        //    are present between the source unit and the say card.
+        // 2. The source unit's response text contains trailing newlines or CRLF
+        //    while the say card program lines were trimmed by `lines()`.
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("wire program source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"type-4 answer\")\r\n");
+        source.set_complete();
+
+        // An intervening message (e.g. brain notice or participant message)
+        let notice = Arc::new(StaticMessage::plain("daemon lease confirmed"));
+
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"type-4 answer\")");
+        output.append_response("type-4 answer");
+        output.set_complete();
+
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+
+        let messages: Vec<MessageRef> = vec![
+            source.clone() as MessageRef,
+            notice.clone() as MessageRef,
+            output.clone() as MessageRef,
+        ];
+        let projected = renderer.projected_lines(messages.clone(), 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+
+        assert!(
+            !rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT (#1499): the legacy Program source row must not render even \
+             with intervening messages and trailing newlines; rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("type-4 answer")),
+            "INVARIANT: the card prose renders; rendered={rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("daemon lease confirmed")),
+            "INVARIANT: the intervening notice still renders; rendered={rendered:?}"
+        );
+
+        // Also verify projected_scroll_union consolidates the source row
+        renderer.output_manager.add_trait_message(source.clone());
+        renderer.output_manager.add_trait_message(notice.clone());
+        renderer.output_manager.add_trait_message(output.clone());
+        let (union, _) = renderer.projected_scroll_union(80);
+        let union_text: Vec<&str> = union.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            !union_text.iter().any(|line| line.contains("Program source")),
+            "INVARIANT (#1499): the scroll union must consolidate the Program source row; union={union_text:?}"
         );
     }
 
@@ -10527,7 +10773,7 @@ mod tests {
         );
         // The scroll-window source is the projection itself; the lowering the
         // full-viewport paint applies renders the same bytes as the seam.
-        let lowered = span_render::lower_rendered_line(&styled[0]);
+        let lowered = span_render::lower_rendered_line(&styled[0], None);
         assert_eq!(
             lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
             "the scrolled paint shows the styled row; got {lowered:?}"
@@ -10655,6 +10901,56 @@ mod tests {
             "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
         );
     }
+
+    /// DEFECT REGRESSION: user turn continuation lines retain foreground color
+    /// and theme-aware greyish background across all themes, even when scrolled
+    /// down past line 0.
+    #[test]
+    fn test_user_turn_continuation_lines_retain_color_and_theme_background() {
+        use finch_messages::UserQueryMessage;
+        use finch_theme::ColorTheme;
+        let mut renderer = headless_renderer();
+        let user = Arc::new(UserQueryMessage::new("first line\nsecond line\nthird line"));
+        let message: MessageRef = Arc::clone(&user) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let lines = renderer.projected_message_lines(&message, 80);
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].spans.is_empty(), "line 0 must carry spans");
+        assert!(!lines[1].spans.is_empty(), "line 1 must carry spans");
+        assert!(!lines[2].spans.is_empty(), "line 2 must carry spans");
+
+        // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
+        // Even when lowered in isolation (without line 0 having been painted),
+        // continuation lines MUST contain ANSI foreground and background escape sequences!
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None);
+
+        assert_ne!(lowered_line1, "second line");
+        assert_ne!(lowered_line2, "third line");
+        assert!(lowered_line1.contains("\x1b["));
+        assert!(lowered_line2.contains("\x1b["));
+
+        for theme in ColorTheme::all() {
+            let scheme = theme.to_scheme();
+            let palette = span_render::component_style_palette(&scheme);
+            let view = message
+                .component_view()
+                .expect("user query must have a component view");
+            let rendered = finch_ui_model::component_lines(&view, &palette);
+            let expected_band = scheme.message_band_style(finch_theme::MessageBand::LocalUser);
+            let expected_bg = match expected_band.bg.unwrap() {
+                ratatui::style::Color::Rgb(r, g, b) => finch_ui_model::SpanColor::Rgb(r, g, b),
+                _ => panic!("unexpected background color"),
+            };
+            for line in &rendered {
+                assert_eq!(line.spans[0].style.bg, Some(expected_bg.clone()));
+            }
+        }
+    }
+
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
@@ -11486,6 +11782,8 @@ mod tests {
         status: &'a str,
     ) -> view_model::LiveViewModel<'a> {
         view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -11565,6 +11863,8 @@ mod tests {
                 })
                 .collect();
             let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
                 input_lines: &input_lines,
@@ -11740,6 +12040,8 @@ mod tests {
             let draft = vec![String::new()];
             let status = "ready";
             let vm = view_model::LiveViewModel {
+                hover_bg: None,
+                hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
                 input_lines: &draft,
@@ -11831,6 +12133,8 @@ mod tests {
         let draft = vec![String::new()];
         let status = "ready";
         let vm = view_model::LiveViewModel {
+            hover_bg: None,
+            hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
             input_lines: &draft,
@@ -14244,6 +14548,7 @@ mod attention_bell_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use crate::vt_oracle::VtOracle;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use finch_messages::{StaticMessage, WorkUnit};
     use std::sync::Arc;
@@ -14595,7 +14900,7 @@ mod selection_tests {
             .draw_live_area_to(&mut retracted)
             .expect("live draw of the retracted drag must succeed");
         let retracted_bytes = String::from_utf8_lossy(&retracted).into_owned();
-        let restore = format!("{bottom_move_to}second line");
+        let restore = format!("{bottom_move_to}\x1b[2Ksecond line");
         assert!(
             retracted_bytes.contains(&restore),
             "the row that fell out of the selection must be repainted as \
@@ -14638,23 +14943,12 @@ mod selection_tests {
     /// longer has anything to do with what `write_live_frame` actually,
     /// physically painted there this tick.
     ///
-    /// The fix reacts to a detected shrink by clearing the selection
-    /// (`self.selection = None`, `self.previous_highlighted_rows.clear()`)
-    /// instead of forcing physical and assumed geometry to agree with an
-    /// explicit `cursor::MoveTo`. An earlier version of this fix took the
-    /// `MoveTo` approach; it was correct in isolation but, verified against
-    /// a live-session reconnect/replay production test
-    /// (`test_reconnected_completed_say_renders_the_component_card` in
-    /// `tests/named_brain_attach.rs`), corrupted the live area under rapid
-    /// successive grow/shrink ticks. Since growth always self-corrects (the
-    /// paragraph above), only a shrink needs to act, and dropping the
-    /// selection is exactly the same invalidation `redraw_full_viewport_inner`
-    /// already performs on every full repaint, extended to the one case a
-    /// full repaint does not cover. This means a selection does not survive
-    /// a shrinking live area with its highlight intact — a real UX
-    /// narrowing versus the `MoveTo` approach — but the row it pointed at is
-    /// never stamped with stale content, which is the actual invariant this
-    /// test (and the reported bug) cares about.
+    /// The completed fix reacts only to a detected shrink: it moves to the
+    /// smaller frame's absolute bottom-owned origin and clears the selection
+    /// whose rows described the old geometry. Growth remains relative so it
+    /// can scroll retained terminal content instead of overwriting it; that
+    /// distinction avoids the reconnect/replay corruption caused by an
+    /// earlier attempt to reposition every size change.
     ///
     /// This test drives the real `TuiRenderer` methods a live session uses —
     /// `handle_mouse`, `draw_live_area_to`, `update_ghost_text` (opening the
@@ -14809,13 +15103,8 @@ mod selection_tests {
              closes, not duplicated onto a stale row; occurrences={occurrences:?}\n{}",
             term.diagnostic()
         );
-        // The fix clears a survived selection on a detected shrink rather
-        // than forcing the live area to stay glued to the terminal's true
-        // bottom row (see this test's doc comment): a shrinking live area
-        // is free to end up higher on the physical screen than before,
-        // exactly as it already could pre-#1293, so the status line is
-        // located by its own content rather than assumed to sit at the
-        // last row.
+        // The shrink must both invalidate the old selection and put the
+        // smaller replacement frame at the physical bottom.
         let status_row = term.find_row("Tab complete").unwrap_or_else(|| {
             panic!(
                 "the idle status line must be on screen somewhere;\n{}",
@@ -14823,12 +15112,200 @@ mod selection_tests {
             )
         });
         assert_eq!(
+            status_row,
+            23,
+            "after the completion pane closes, the idle status line must be \
+             physically anchored to the terminal's final row; \
+             active_rows={} cursor_row_from_top={} last_live_frame_rows={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            renderer.last_live_frame_rows,
+            term.diagnostic()
+        );
+        assert_eq!(
             term.row(status_row),
             "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Esc cancel",
             "the idle status line must read its real content with no stale \
              selected-text prefix bleeding in from the row the selection used \
              to occupy before the completion pane opened and closed;\n{}",
             term.diagnostic()
+        );
+    }
+
+    fn paint_live_cycle_at(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        renderer
+            .erase_live_area_to(&mut bytes)
+            .expect("the production live-area erase must succeed");
+        renderer
+            .draw_live_area_to_at(&mut bytes, width, height, None)
+            .expect("the production live-area draw must succeed");
+        terminal.feed(&bytes);
+        bytes
+    }
+
+    fn seed_bottom_anchored_viewport(
+        renderer: &mut TuiRenderer,
+        terminal: &mut VtOracle,
+        width: usize,
+        height: usize,
+    ) {
+        renderer.pending_viewport_size = Some((width as u16, height as u16));
+        let mut bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .expect("the production full-viewport repaint must succeed");
+        terminal.feed(&bytes);
+    }
+
+    fn assert_live_chrome_is_bottom_anchored(
+        label: &str,
+        renderer: &TuiRenderer,
+        terminal: &VtOracle,
+        transition_bytes: &[u8],
+        width: usize,
+        height: usize,
+    ) {
+        let live_top = height.saturating_sub(renderer.active_rows);
+        let expected_move = format!("\x1b[{};1H", live_top + 1);
+        assert!(
+            transition_bytes
+                .windows(expected_move.len())
+                .any(|window| window == expected_move.as_bytes()),
+            "{label}: a shrinking live-frame transition must explicitly move to its \
+             new bottom-anchored origin; expected_move={expected_move:?} \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(transition_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            live_top + renderer.cursor_row_from_top,
+            "{label}: the physical cursor row must agree with the renderer's claimed \
+             bottom-anchored live rect; width={width} height={height} \
+             live_top={live_top} active_rows={} cursor_row_from_top={}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(height - 1),
+            "{label}: the final status row must occupy the terminal's final physical row; \
+             width={width} height={height} live_top={live_top} active_rows={}\n{}",
+            renderer.active_rows,
+            terminal.diagnostic()
+        );
+        if let Some((top, bottom)) = renderer.transcript_scroll.visible_row_bounds() {
+            assert!(
+                usize::from(top) <= live_top
+                    && live_top <= usize::from(bottom)
+                    && usize::from(bottom) < height,
+                "{label}: the transcript claim must contain the rendered transcript \
+                 tail at the top of the bottom-anchored live frame; claim={top}..={bottom} \
+                 live_top={live_top} height={height}\n{}",
+                terminal.diagnostic()
+            );
+        }
+    }
+
+    /// Production-boundary regression (#1472): every transient live surface
+    /// may grow the bottom-owned frame, but removing that surface must move
+    /// the smaller replacement frame down to the real terminal bottom. The
+    /// transition is exercised through the same renderer erase/draw methods
+    /// and VT byte stream as a live session, not through the pure planner.
+    #[test]
+    fn test_transient_live_surfaces_shrink_back_to_the_physical_terminal_bottom() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 24;
+
+        // Query/progress/retry status rows can disappear without changing the
+        // transcript. The fallback help status must return to the last row.
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.add_trait_message(Arc::new(StaticMessage::plain("retained transcript row")));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors);
+        let mut terminal = VtOracle::new(WIDTH, HEIGHT);
+        seed_bottom_anchored_viewport(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.set_operation_status("Analyzing…\nRetrying request…");
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        renderer.clear_operation_status();
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert_live_chrome_is_bottom_anchored(
+            "query/progress rows removed",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+        assert_eq!(
+            output.get_messages().len(),
+            1,
+            "removing transient status rows must not delete retained semantic components"
+        );
+
+        // Slash help is a completion pane. Enter submits the selected command,
+        // clears the composer, and removes the pane in the same transition.
+        renderer.input_textarea.insert_str("/");
+        renderer.update_ghost_text();
+        paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        let submitted = renderer
+            .take_submitted_input()
+            .expect("Enter on slash help must submit its selected command");
+        let bytes = paint_live_cycle_at(&mut renderer, &mut terminal, WIDTH, HEIGHT);
+        assert!(
+            submitted.starts_with('/'),
+            "slash-help submission must remain a command; submitted={submitted:?}"
+        );
+        assert_live_chrome_is_bottom_anchored(
+            "slash help submitted",
+            &renderer,
+            &terminal,
+            &bytes,
+            WIDTH,
+            HEIGHT,
+        );
+
+        // A terminal resize takes the absolute full-repaint path. It must
+        // retain the same bottom-row invariant after the preceding shrink.
+        const RESIZED_WIDTH: usize = 96;
+        const RESIZED_HEIGHT: usize = 30;
+        renderer
+            .handle_resize(RESIZED_WIDTH as u16, RESIZED_HEIGHT as u16)
+            .expect("resize invalidation must succeed");
+        terminal.resize(RESIZED_WIDTH, RESIZED_HEIGHT);
+        let mut resize_bytes = Vec::new();
+        renderer
+            .redraw_full_viewport_inner_to(&mut resize_bytes, false)
+            .expect("resize full repaint must succeed");
+        terminal.feed(&resize_bytes);
+        assert_eq!(
+            terminal.find_row("Tab complete"),
+            Some(RESIZED_HEIGHT - 1),
+            "resize must leave status on the new final physical row; \
+             active_rows={} cursor_row_from_top={} bytes={:?}\n{}",
+            renderer.active_rows,
+            renderer.cursor_row_from_top,
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
+        );
+        assert_eq!(
+            terminal.cursor().0,
+            RESIZED_HEIGHT - renderer.active_rows + renderer.cursor_row_from_top,
+            "resize must leave the physical cursor inside the newly claimed \
+             bottom-owned live rect; bytes={:?}\n{}",
+            String::from_utf8_lossy(&resize_bytes).escape_debug(),
+            terminal.diagnostic()
         );
     }
 
@@ -15450,5 +15927,64 @@ mod selection_tests {
                 term.diagnostic()
             );
         }
+    }
+
+    /// #1493 regression: selecting over a line carrying ANSI SGR escape sequences
+    /// (such as tool summaries or styled output) must not slice escape sequences,
+    /// emit raw escape parameters (like `;5;8m`), or leave overprinted character
+    /// artifacts when highlighted or unhighlighted.
+    #[test]
+    fn test_selection_over_ansi_styled_line_avoids_escape_slicing_and_overprinting() {
+        let raw_line = "\x1b[36m\x1b[1mGrep\x1b[0m\x1b[38;5;8m(Type[- ]4...)\x1b[0m";
+        let mut renderer = renderer_with_plain_line(raw_line);
+        let row = row_of(&renderer, "Grep(Type[- ]4...)");
+
+        // Drag across "Grep(Typ" (cols 0..=7)
+        renderer.handle_mouse(left_down(row, 0));
+        renderer.handle_mouse(left_drag(row, 7));
+
+        let mut frame = Vec::new();
+        renderer
+            .draw_live_area_to(&mut frame)
+            .expect("live draw with selection must succeed");
+
+        let mut term = vt_oracle::VtOracle::new(80, 24);
+        term.feed(&frame);
+
+        // The terminal line must display "Grep(Type[- ]4...)" without raw escape text like ";5;8m"
+        let line_text: String = (0..18)
+            .map(|col| term.cell(row as usize, col).character)
+            .collect();
+        assert_eq!(
+            line_text,
+            "Grep(Type[- ]4...)",
+            "terminal line must display clean text without broken ANSI fragments; screen:\n{}",
+            term.diagnostic()
+        );
+
+        // Columns 0..=7 must carry the selection highlight style
+        let expected_style = vt_oracle::VtStyle {
+            foreground: vt_oracle::VtColor::Indexed(15),
+            background: vt_oracle::VtColor::Indexed(4),
+            bold: true,
+            reverse: false,
+        };
+        for col in 0..=7 {
+            assert_eq!(
+                term.cell(row as usize, col).style,
+                expected_style,
+                "column {col} must carry selection highlight style"
+            );
+        }
+
+        // Release and verify copied text
+        renderer.handle_mouse(left_up(row, 7));
+        let released = renderer
+            .selection
+            .as_ref()
+            .expect("selection must survive release");
+        let text = selection::selected_text(&renderer.selection_index, released);
+        assert_eq!(text, "Grep(Typ");
+        assert!(!text.contains(";5;8m") && !text.contains('\x1b'));
     }
 }

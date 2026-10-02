@@ -292,6 +292,11 @@ pub struct EventLoop {
     /// Shared conversation history
     conversation: Arc<RwLock<ConversationHistory>>,
 
+    /// Committed summary of the shared conversation. `LlmLoop` assembles
+    /// requests from this handle; conversation-clearing commands invalidate
+    /// it while holding the conversation write boundary.
+    summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
+
     /// Persona used for request-local provider system instructions.
     active_persona: Arc<RwLock<crate::config::Persona>>,
 
@@ -1873,23 +1878,16 @@ fn project_remote_brain_live_run_event(
     if event.run_id.is_none() {
         return false;
     }
+    if let crate::brain::BrainEventKind::RunStarted { run } = &event.kind {
+        if local_runner == Some(run.initiating_attachment_id) {
+            say_projected_runs.insert(run.run_id);
+        }
+    }
     let observed = selected_brain_is_home
         .then(|| local_projections.front_mut())
         .flatten()
-        .map(|projection| {
-            let matched = projection.observe(event);
-            // A pure say turn renders entirely through its local card, so its
-            // daemon lifecycle events are suppressed for good once the turn
-            // completes. A tool-bearing turn keeps its run-group rows.
-            let pure_say = matched != LocalProjectionMatch::None
-                && projection.tool_ids.is_empty()
-                && projection.approval_ids.is_empty();
-            (matched, pure_say)
-        });
-    let projection_match = observed
-        .map(|(matched, _)| matched)
-        .unwrap_or(LocalProjectionMatch::None);
-    let pure_say = observed.map(|(_, pure_say)| pure_say).unwrap_or(false);
+        .map(|projection| projection.observe(event));
+    let projection_match = observed.unwrap_or(LocalProjectionMatch::None);
     if projection_match != LocalProjectionMatch::None {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
@@ -1918,9 +1916,7 @@ fn project_remote_brain_live_run_event(
         local_runner,
     );
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
-        if pure_say {
-            say_projected_runs.insert(event.run_id.expect("checked above"));
-        }
+        say_projected_runs.insert(event.run_id.expect("checked above"));
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
                 // Successful untitled `say` is already assistant prose (#350/#804).
@@ -2107,6 +2103,7 @@ impl EventLoop {
             },
             LlmSession {
                 conversation: Arc::clone(&self.conversation),
+                summary_cache: Arc::clone(&self.summary_cache),
                 active_persona: Arc::clone(&self.active_persona),
                 mode: Arc::clone(&self.mode),
                 query_states: Arc::clone(&self.query_states),
@@ -2202,6 +2199,9 @@ impl EventLoop {
         todo_journal_receiver.spawn();
         memory_commitment_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
 
         let agent_events = agent_scheduler.subscribe();
         let agent_event_tx = event_tx.clone();
@@ -2319,6 +2319,7 @@ impl EventLoop {
             event_tx,
             input_rx,
             conversation,
+            summary_cache,
             active_persona,
             query_states: Arc::new(QueryStateManager::new()),
             model_selection: ModelSelection::from_handle(
@@ -2772,6 +2773,7 @@ impl EventLoop {
                         ReplEvent::StreamingComplete { .. } => "StreamingComplete",
                         ReplEvent::QueryComplete { .. } => "QueryComplete",
                         ReplEvent::QueryFailed { .. } => "QueryFailed",
+                        ReplEvent::QueryContextInvalidated { .. } => "QueryContextInvalidated",
                         ReplEvent::ToolResult { .. } => "ToolResult",
                         ReplEvent::ToolCallsStarted { .. } => "ToolCallsStarted",
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
@@ -4284,7 +4286,7 @@ impl EventLoop {
         let position = self
             .locally_pushed_programs
             .iter()
-            .position(|pushed| pushed == source);
+            .position(|pushed| pushed == source || pushed.trim() == source.trim());
         let Some(position) = position else {
             return false;
         };

@@ -246,7 +246,10 @@ impl ToolViewportState {
         }));
         if truncated {
             windowed.push(RenderedTranscriptLine {
-                text: truncate_body_line(&status_text(scroll, end, body.len()), width),
+                text: truncate_body_line(
+                    &format!("      {}", status_text(scroll, end, body.len())),
+                    width,
+                ),
                 body_of: Some(row_id),
                 role: Some(NodeRole::ToolOutput),
                 ..RenderedTranscriptLine::default()
@@ -327,6 +330,9 @@ fn status_text(start: usize, end: usize, total: usize) -> String {
     if total == 0 {
         return String::new();
     }
+    if start >= end {
+        return format!("… 0 lines visible of {} — ↑/↓ scroll · Enter expand", total);
+    }
     format!(
         "… lines {}–{} of {} — ↑/↓ scroll · Enter expand",
         start + 1,
@@ -346,15 +352,15 @@ fn truncate_body_line(line: &str, width: usize) -> String {
 }
 
 /// The visible line window for a fully expanded (focused) surface.
-pub fn expanded_window(scroll: usize, total: usize, max_rows: usize) -> (usize, usize) {
-    let max_rows = max_rows.max(1);
-    let start = scroll.min(total.saturating_sub(1));
-    let end = (start + max_rows).min(total);
-    (start, end)
-}
 
 /// Plain-text state line for the expanded surface footer.
 pub fn expanded_status_text(start: usize, end: usize, total: usize) -> String {
+    if total == 0 {
+        return "empty — Esc close".to_string();
+    }
+    if start >= end {
+        return format!("0 lines visible of {} — ↑/↓ scroll · Esc close", total);
+    }
     format!(
         "lines {}–{} of {} — ↑/↓ scroll · Esc close",
         start + 1,
@@ -380,14 +386,46 @@ pub fn expanded_surface_lines(
     let width = width.max(1);
     let max_rows = max_rows.max(2);
     let body_budget = max_rows.saturating_sub(2);
-    let (start, end) = expanded_window(scroll, body.len(), body_budget);
+    let mut max_start = body.len();
+    let mut available_budget = body_budget;
+    for i in (0..body.len()).rev() {
+        let indented = format!("      {}", body[i]);
+        let rows = shadow_buffer::physical_rows(&indented, width);
+        if available_budget < rows {
+            break;
+        }
+        available_budget -= rows;
+        max_start = i;
+    }
+    if max_start == body.len() {
+        max_start = max_start.saturating_sub(1);
+    }
+
+    let start = scroll.min(max_start);
+    let mut end = start;
+    let mut forward_budget = body_budget;
+    for line in &body[start..] {
+        let indented = format!("      {}", line);
+        let rows = shadow_buffer::physical_rows(&indented, width);
+        if forward_budget < rows {
+            if end == start {
+                // Must show at least one line even if it exceeds the window bounds
+                end += 1;
+            }
+            break;
+        }
+        forward_budget -= rows;
+        end += 1;
+    }
+    let end = end.min(body.len());
+
     let mut lines = Vec::new();
-    lines.push(truncate_body_line(&format!("── {} ", title), width));
+    lines.push(truncate_body_line(&format!("      ── {} ", title), width));
     for line in &body[start..end] {
-        lines.push(line.clone());
+        lines.push(format!("      {}", line));
     }
     lines.push(truncate_body_line(
-        &expanded_status_text(start, end, body.len()),
+        &format!("      {}", expanded_status_text(start, end, body.len())),
         width,
     ));
     lines
@@ -974,14 +1012,103 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_expanded_surface_shows_sensible_status() {
+        let body: Vec<String> = Vec::new();
+        let lines = expanded_surface_lines("bash(true)", &body, 0, 80, 20);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("empty — Esc close"),
+            "INVARIANT: an empty expanded surface shows a sensible empty status, not \
+             a negative range like 'lines 1-0'; surface was:\n{joined}"
+        );
+        assert!(
+            !joined.contains("1–0"),
+            "INVARIANT: negative line ranges must not be displayed; surface was:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_zero_visible_lines_shows_sensible_status() {
+        // When the window truncates but the budget is so small (e.g. 1 row) that only
+        // the status text is visible, the status row must say 0 lines visible instead of a negative range.
+        let body: Vec<String> = (0..2).map(|n| format!("line {n}")).collect();
+        let mut state = ToolViewportState::default();
+        let (row_id, projected) = projected_tool_group(2);
+        // Force the budget to 1 row.
+        let bounded = state.project(projected, 80, 1);
+
+        let status = body_lines_of(&bounded)
+            .last()
+            .map(|line| line.text.clone())
+            .unwrap_or_default();
+        assert!(
+            status.contains("0 lines visible of 2"),
+            "INVARIANT: a viewport with 0 visible body lines shows 0 lines visible instead \
+             of a negative range; status was {:?}",
+            status
+        );
+        assert!(
+            !status.contains("1–0"),
+            "INVARIANT: negative line ranges must not be displayed; status was {:?}",
+            status
+        );
+    }
+
+    #[test]
     fn test_expanded_surface_window_clamps_past_the_end() {
         let body: Vec<String> = (0..5).map(|n| format!("line {n}")).collect();
         let lines = expanded_surface_lines("bash", &body, 100, 80, 20);
         assert!(
-            lines[1].contains("line 4"),
-            "an out-of-range scroll clamps to the last line instead of showing a blank \
-             surface; surface was:\n{}",
+            lines.iter().any(|l| l.contains("line 4")),
+            "an out-of-range scroll clamps to the last full page, showing the last line; \
+             surface was:\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn test_expanded_surface_maintains_height_when_scrolled_to_bottom() {
+        let body: Vec<String> = (0..20).map(|n| format!("line {n}")).collect();
+        let lines_start = expanded_surface_lines("bash", &body, 0, 80, 6);
+        assert_eq!(
+            lines_start.len(),
+            6,
+            "surface should occupy full allotted height at top"
+        );
+
+        let lines_bottom = expanded_surface_lines("bash", &body, 100, 80, 6);
+        assert_eq!(
+            lines_bottom.len(),
+            6,
+            "INVARIANT: the expanded surface must maintain its full allotted height \
+             even when scrolled past the end, rather than shrinking; surface was:\n{}",
+            lines_bottom.join("\n")
+        );
+        assert!(
+            lines_bottom[4].contains("line 19"),
+            "should display the end of the content; surface was:\n{}",
+            lines_bottom.join("\n")
+        );
+    }
+
+    #[test]
+
+    fn test_expanded_surface_lines_are_indented_with_six_spaces() {
+        let body: Vec<String> = (0..5).map(|n| format!("line {n}")).collect();
+        let lines = expanded_surface_lines("bash", &body, 0, 80, 20);
+        for line in lines {
+            assert!(
+                line.starts_with("      "),
+                "INVARIANT: expanded tool output lines are indented with exactly 6 spaces; \
+                 line was {:?}",
+                line
+            );
+            assert!(
+                !line.starts_with("       "),
+                "INVARIANT: expanded tool output lines are indented with exactly 6 spaces, not 7; \
+                 line was {:?}",
+                line
+            );
+        }
     }
 }

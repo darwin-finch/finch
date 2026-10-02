@@ -1,0 +1,7 @@
+interface:
+  display_name: "Backlog Grooming"
+  short_description: "Prepare a dependency- and scope-aware queue"
+  default_prompt: "Use $backlog-grooming to groom issues and produce the next safe worker queue."
+
+policy:
+  allow_implicit_invocation: true

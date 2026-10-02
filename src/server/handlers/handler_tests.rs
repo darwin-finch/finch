@@ -4763,7 +4763,8 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
             1_000,
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .delivered,
         1
     );
     assert_eq!(
@@ -4938,7 +4939,7 @@ async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() 
                 directory_listing(temp.path())
             )
         });
-        delivered.push((name.clone(), dispatched));
+        delivered.push((name.clone(), dispatched.delivered));
     }
     let head_after = store.next_schedule_due_ms();
 

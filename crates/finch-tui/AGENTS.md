@@ -351,40 +351,24 @@ and `test_drag_past_bottom_edge_autoscrolls_and_reveals_newer_content` in `src/l
 `selection_tests` module pin the direction and the row-range extension; `test_drag_autoscroll_delta_fires_at_or_past_each_edge_only`
 in `scroll_view.rs` pins the edge geometry.
 
-**A shrinking live area invalidates a stale selection instead of repositioning the write to
-compensate for it (#1293).** `SelectionIndex` (built by `rebuild_transcript_hit_regions`, consumed
-by `paint_selection_overlay`'s absolute `cursor::MoveTo(0, row)`) assumes the live area's rows are
-always `term_height - this_frame_row_count .. term_height`. That is true right after a full
-`redraw_full_viewport_inner` repaint (its `continue_full_viewport_paint` does an explicit
-`cursor::MoveTo(0, plan.transcript_top)`), but an ordinary tick's `erase_live_area` +
-`write_live_frame` cycle is otherwise purely relative: it just continues from wherever the
-*previous* tick's own row count left the terminal cursor. A frame that grows (e.g. the "/"
-completion pane opening, `+RESERVED_PANE_ROWS`) happens to re-anchor by accident — printing past
-the bottom of the terminal forces a native scroll, which is bottom-anchored by construction — but
-a frame that *shrinks* (the same pane closing) prints its smaller content from that same,
-now-too-high cursor position and nothing ever notices or corrects the resulting drift. From that
-tick on, `paint_selection_overlay` would keep targeting the row the (still logically valid, but now
-physically wrong) `SelectionIndex` reports, stamping a finalized selection's text onto whatever
-unrelated content — typically the status line — now really occupies that absolute row; a full
-repaint self-heals it only because `redraw_full_viewport_inner` re-anchors everything from scratch.
-Since growth already self-corrects, `draw_live_area_to` only needs to react to a detected *shrink*
-(this tick's row count below `self.last_live_frame_rows`, the previous tick's — not
-`self.active_rows`, which `erase_live_area` always zeroes first as part of its own, unrelated
-bookkeeping), and it reacts the same way `redraw_full_viewport_inner` already does on every full
-repaint: it clears the selection (`self.selection = None`,
-`self.previous_highlighted_rows.clear()`) rather than trying to keep it alive at a recomputed
-position. An earlier version of this fix instead recomputed and reapplied a bottom-anchored
-`cursor::MoveTo` on every size-changing tick; it was correct in isolation but a live-session
-reconnect/replay production test (`test_reconnected_completed_say_renders_the_component_card` in
-`tests/named_brain_attach.rs`) caught it corrupting the live area under rapid successive
-grow/shrink ticks, so the fix trades "a selection can survive a shrinking live area" for "a
-selection never points at geometry it no longer describes" — the actual invariant the reported bug
-and this test care about.
-`test_selection_does_not_bleed_into_status_after_completion_pane_closes` in `src/lib.rs`'s
-`selection_tests` module drives a real selection through `handle_mouse` and `draw_live_area_to`
-across an open-then-close completion-pane cycle and replays every emitted byte through `VtOracle`
-(a real VT100 parser), asserting the selection is cleared, the selected line appears in exactly one
-place, and the status row reads its own real content with no stale prefix.
+**Every shrinking live frame is explicitly re-anchored to the physical terminal bottom (#1472,
+completing #1293).** `SelectionIndex` and the widget claims both describe the live area as
+`term_height - this_frame_row_count .. term_height`; the emitted bytes must paint it there too.
+An ordinary erase leaves the cursor at the *previous* frame's top, so a smaller replacement would
+otherwise remain stranded above blank rows. `draw_live_area_to_at` compares the new measured row
+count with `last_live_frame_rows` and, only on shrink, emits `cursor::MoveTo(0,
+term_height - this_frame_rows)` before painting. Growth deliberately remains relative: overflowing
+the bottom is what scrolls retained terminal content upward, and an earlier attempt to reposition
+every size change corrupted reconnect/replay rendering. A shrink also clears any selection, as
+#1293 required, because its absolute row index described the old geometry.
+
+`test_selection_does_not_bleed_into_status_after_completion_pane_closes` and
+`test_transient_live_surfaces_shrink_back_to_the_physical_terminal_bottom` replay the real
+`TuiRenderer` erase/draw byte stream through `VtOracle`. They cover completion-pane close,
+slash-help submission, multi-row query/retry status removal, and a following resize; assertions pin
+the final status row to the terminal's last physical row, reconcile cursor and transcript claims,
+require the absolute move in the shrink bytes, and verify retained semantic messages are not
+deleted. Tiny-terminal frames use the same shrink-only anchor rule.
 
 **The erase-redraw a new press triggers on an old finalized selection must never outrun that same
 press (#1378).** `handle_left_press` clears any previously-finalized `self.selection` immediately,

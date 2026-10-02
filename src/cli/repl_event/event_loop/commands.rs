@@ -715,11 +715,7 @@ impl EventLoop {
                 }
             }
         } else {
-            match self
-                .provider_resolver
-                .resolve(Some(&entry.profile_name()), entry.model())
-                .await
-            {
+            match self.provider_resolver.resolve_entry(&entry).await {
                 Err(e) => {
                     self.output_manager
                         .write_info(format!("⚠️  Failed to create model '{}': {}", name, e));
