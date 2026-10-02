@@ -212,6 +212,13 @@ pub(super) fn handle_wizard_key(
         });
     }
 
+    if state.save_error.is_some() {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            state.save_error = None;
+        }
+        return Ok(WizardAction::Continue);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
@@ -374,8 +381,30 @@ pub(super) fn run_tabbed_wizard(
 
         match handle_wizard_key(&mut state, key)? {
             WizardAction::Continue => {}
-            WizardAction::Save => return build_setup_result(&state),
+            WizardAction::Save => {
+                if let Some(result) = handle_save_action(&mut state)? {
+                    return Ok(result);
+                }
+            }
             WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
+        }
+    }
+}
+
+pub(super) fn handle_save_action(state: &mut WizardState) -> Result<Option<SetupResult>> {
+    match build_setup_result(state) {
+        Ok(result) => {
+            let config = config_from_setup_result(&result);
+            if let Err(e) = config.validate() {
+                state.save_error = Some(e.to_string());
+                Ok(None)
+            } else {
+                Ok(Some(result))
+            }
+        }
+        Err(e) => {
+            state.save_error = Some(e.to_string());
+            Ok(None)
         }
     }
 }

@@ -8693,3 +8693,43 @@ fn test_wizard_checkboxes_use_one_glyph_convention_across_tabs() {
         );
     }
 }
+
+#[test]
+fn test_wizard_save_validation_error_shows_card_and_prevents_exit() {
+    let mut state = WizardState::new(None);
+    // Set an invalid cloud provider (OpenAI with empty key)
+    if let Some(SectionState::Models {
+        primary_model,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models) {
+        *primary_model = ModelConfig::Remote {
+            provider: "openai".into(),
+            name: "openai".into(),
+            api_key: "".into(),
+            model: "gpt-4".into(),
+            enabled: true,
+            persisted: None,
+        };
+    }
+
+    // Try to save
+    let result = handle_save_action(&mut state).unwrap();
+    
+    // It should return None because validation failed, and set the error
+    assert!(result.is_none());
+    assert!(state.save_error.is_some());
+    let err = state.save_error.as_ref().unwrap();
+    assert!(err.contains("key"), "expected API key error, got: {}", err);
+
+    let rendered = render_wizard_text_at(&state, 100, 24);
+    assert!(rendered.contains("Validation Error"));
+
+    // Pressing Enter dismisses it
+    let enter_event = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::empty(),
+    );
+    let action_dismiss = handle_wizard_key(&mut state, enter_event).unwrap();
+    assert_eq!(action_dismiss, WizardAction::Continue);
+    assert!(state.save_error.is_none());
+}
