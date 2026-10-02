@@ -8872,3 +8872,75 @@ fn test_settings_screen_avoids_technical_jargon() {
     );
     assert!(!frame.contains("REPL"), "must avoid 'REPL': {frame}");
 }
+
+#[test]
+fn test_device_dialog_advertises_browser_open_controls() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+        verification_uri: "https://auth.openai.com/activate".into(),
+        user_code: "CODE-1234".into(),
+        expires_in: Duration::from_secs(600),
+    })));
+    let outcome = Arc::new(Mutex::new(None));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if let Some(WizardSectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = Some(AddProviderStep::DeviceAuth {
+            provider_idx: 0,
+            name: "test".into(),
+            model: "test-model".into(),
+            reference: "test:ref".into(),
+            editing_idx: None,
+            pending,
+            outcome,
+            cancel,
+        });
+    }
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("O / Enter / Click: Open in browser | Esc: Cancel"),
+        "the dialog must advertise browser open and cancellation keys; rendered={rendered}"
+    );
+}
+
+#[test]
+fn test_wizard_mouse_click_handles_device_auth_url() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+        verification_uri: "https://example.com/oauth".into(),
+        user_code: "123".into(),
+        expires_in: Duration::from_secs(300),
+    })));
+    let outcome = Arc::new(Mutex::new(None));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if let Some(WizardSectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = Some(AddProviderStep::DeviceAuth {
+            provider_idx: 0,
+            name: "test".into(),
+            model: "test-model".into(),
+            reference: "test:ref".into(),
+            editing_idx: None,
+            pending,
+            outcome,
+            cancel,
+        });
+    }
+
+    let mouse_down = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 5,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+    handle_wizard_mouse(&mut state, mouse_down);
+}

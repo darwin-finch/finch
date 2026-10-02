@@ -357,36 +357,54 @@ pub(super) fn run_tabbed_wizard(
 
         // When scanning for network agents, poll with a short timeout so we can check
         // the background thread's results without blocking on keyboard input.
-        let key_opt: Option<crossterm::event::KeyEvent> = if is_scanning_state(&state) {
+        let event_opt: Option<Event> = if is_scanning_state(&state) {
             advance_scan_if_done(&mut state);
             advance_catalog_refresh_if_done(&mut state);
             if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) => Some(key),
-                    _ => None,
-                }
+                Some(event::read()?)
             } else {
                 None
             }
         } else {
-            match event::read()? {
-                Event::Key(key) => Some(key),
-                _ => None,
-            }
+            Some(event::read()?)
         };
 
-        let Some(key) = key_opt else {
+        let Some(ev) = event_opt else {
             continue;
         };
 
-        match handle_wizard_key(&mut state, key)? {
-            WizardAction::Continue => {}
-            WizardAction::Save => {
-                if let Some(result) = handle_save_action(&mut state)? {
-                    return Ok(result);
+        match ev {
+            Event::Key(key) => match handle_wizard_key(&mut state, key)? {
+                WizardAction::Continue => {}
+                WizardAction::Save => {
+                    if let Some(result) = handle_save_action(&mut state)? {
+                        return Ok(result);
+                    }
+                }
+                WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
+            },
+            Event::Mouse(mouse) => {
+                handle_wizard_mouse(&mut state, mouse);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn handle_wizard_mouse(state: &mut WizardState, mouse: crossterm::event::MouseEvent) {
+    if matches!(
+        mouse.kind,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        if let Some(WizardSectionState::Models {
+            adding_provider, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_ref() {
+                if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                    open_browser_silently(&presentation.verification_uri);
                 }
             }
-            WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
         }
     }
 }
