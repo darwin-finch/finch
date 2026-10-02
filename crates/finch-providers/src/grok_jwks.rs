@@ -692,6 +692,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::CredentialLifecycle;
     use crate::grok_oauth::XaiGrokOAuthDialect;
     use crate::oauth::{OAuthDialect, TokenValidationContext};
     use ring::rand::SystemRandom;
@@ -950,6 +951,195 @@ mod tests {
             verified.expires_at <= before + TimeDelta::seconds(301),
             "stored lifetime must not outlive the shorter signed access bearer: {}",
             verified.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn token_response_lifetime_bounds_real_opaque_and_signed_access_records() {
+        let (key_pair, jwk) = signing_fixture();
+        let identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            3600,
+            None,
+        );
+        let signed_access = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            900,
+            None,
+        );
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = Arc::new(
+            GrokJwksVerifier::new(
+                &origin,
+                GROK_REQUIRED_TOKEN_ISSUER,
+                XAI_PUBLIC_CLIENT_ID,
+                true,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let dialect = XaiGrokOAuthDialect::for_test(&origin, verifier).unwrap();
+
+        let before = Utc::now();
+        let opaque = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "opaque-access",
+                    "id_token": identity,
+                    "expires_in": 300,
+                }))
+                .unwrap(),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("signed identity must authorize a response-bounded opaque bearer");
+        assert!(
+            opaque.expires_at <= before + TimeDelta::seconds(301),
+            "opaque bearer lifetime must be bounded by expires_in: {}",
+            opaque.expires_at
+        );
+
+        let signed = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": signed_access,
+                    "id_token": opaque.id_token,
+                    "expires_in": 60,
+                }))
+                .unwrap(),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("signed bearer must also honor a shorter response lifetime");
+        server.abort();
+        assert!(
+            signed.expires_at <= Utc::now() + TimeDelta::seconds(60),
+            "signed bearer lifetime must take the minimum response deadline: {}",
+            signed.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn production_verifier_dialect_refresh_carries_only_verified_identity_lineage() {
+        let (key_pair, jwk) = signing_fixture();
+        let identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-work",
+            3600,
+            None,
+        );
+        let substituted_identity = signed_token_fixture(
+            &key_pair,
+            json!(XAI_PUBLIC_CLIENT_ID),
+            None,
+            "acct-other",
+            3600,
+            None,
+        );
+        let (origin, server) = verification_server(jwk).await;
+        let verifier = Arc::new(
+            GrokJwksVerifier::new(
+                &origin,
+                GROK_REQUIRED_TOKEN_ISSUER,
+                XAI_PUBLIC_CLIENT_ID,
+                true,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let dialect = XaiGrokOAuthDialect::for_test(&origin, verifier).unwrap();
+        let initial = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "initial-opaque-access",
+                    "refresh_token": "refresh-authority",
+                    "id_token": identity,
+                    "expires_in": 300,
+                }))
+                .unwrap(),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("initial device response must establish verified refresh lineage");
+        assert!(matches!(
+            initial.provider_credential("grok-sub:fixture").lifecycle,
+            CredentialLifecycle::Active {
+                refreshable: true,
+                ..
+            }
+        ));
+        let retained_identity = initial.id_token.clone();
+        let before = Utc::now();
+        let refreshed = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "refreshed-opaque-access",
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("official opaque refresh response must retain prior verified identity");
+        assert_eq!(refreshed.account, initial.account);
+        assert_eq!(refreshed.id_token, retained_identity);
+        assert_eq!(refreshed.refresh_token, initial.refresh_token);
+        assert!(matches!(
+            refreshed.provider_credential("grok-sub:fixture").lifecycle,
+            CredentialLifecycle::Active {
+                refreshable: true,
+                ..
+            }
+        ));
+        assert!(
+            refreshed.expires_at <= before + TimeDelta::seconds(121),
+            "refreshed bearer must be bounded by its own response lifetime: {}",
+            refreshed.expires_at
+        );
+
+        let substitution = dialect
+            .validate_token_response(
+                StatusCode::OK,
+                &serde_json::to_vec(&json!({
+                    "access_token": "substituted-opaque-access",
+                    "id_token": substituted_identity,
+                    "expires_in": 120,
+                }))
+                .unwrap(),
+                Some(&initial),
+                &TokenValidationContext::Refresh,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("refresh must reject a newly asserted different account identity");
+        server.abort();
+        assert!(matches!(
+            substitution.downcast_ref::<GrokAuthStageError>(),
+            Some(GrokAuthStageError::AccountEntitlement)
+        ));
+        assert!(
+            !format!("{substitution:#}").contains("substituted-opaque-access"),
+            "refresh identity diagnostics must remain secret-free: {substitution:#}"
         );
     }
 

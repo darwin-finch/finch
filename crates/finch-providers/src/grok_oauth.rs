@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -42,6 +42,7 @@ const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const MIN_DEVICE_LIFETIME: Duration = Duration::from_secs(1);
+const MAX_ACCESS_TOKEN_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 const GROK_DEVICE_WIRE_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write";
 
 /// Low-cardinality presentation surface required by the pinned Grok device protocol.
@@ -452,49 +453,36 @@ where
             }
             Some(_) => return Err(GrokAuthStageError::TokenExchangeContract.into()),
         };
-        let claims = self
-            .verifier
-            .verify(id_token.as_deref(), &access_token, cancel)
-            .await
-            .map_err(preserve_or_mark_verifier_stage)?;
         let now = Utc::now();
-        if claims.issuer != GROK_REQUIRED_TOKEN_ISSUER
-            || !claims.audiences.contains(&self.descriptor.client_id)
-            || (claims.audiences.len() > 1
-                && claims.authorized_party.as_deref() != Some(self.descriptor.client_id.as_str()))
-            || claims
-                .authorized_party
-                .as_deref()
-                .is_some_and(|party| party != self.descriptor.client_id)
-            || claims.expires_at <= now
-            || claims.not_before.is_some_and(|not_before| not_before > now)
-        {
-            return Err(GrokAuthStageError::ClientBinding.into());
-        }
-        validate_public_claim(&claims.subject, "subject")
-            .context(GrokAuthStageError::ClientBinding)?;
-        validate_public_claim(&claims.account_id, "account identifier")
-            .context(GrokAuthStageError::AccountEntitlement)?;
-        if let Some(principal_type) = claims.principal_type.as_deref() {
-            validate_public_claim(principal_type, "principal type")
-                .context(GrokAuthStageError::AccountEntitlement)?;
-        }
-        match context {
-            TokenValidationContext::Browser { expected_nonce, .. }
-                if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
-            {
-                return Err(GrokAuthStageError::ClientBinding.into())
+        let response_expiry = token_response_expiry(&body, now)?;
+        let carry_refresh_lineage = matches!(context, TokenValidationContext::Refresh)
+            && id_token.is_none()
+            && !is_compact_jws_candidate(&access_token);
+        let (account, verified_expiry, stored_id_token) = if carry_refresh_lineage {
+            let previous = previous.ok_or(GrokAuthStageError::ClientBinding)?;
+            validate_refresh_lineage(previous, &self.descriptor)?;
+            let expiry = response_expiry.ok_or(GrokAuthStageError::TokenExchangeContract)?;
+            (previous.account.clone(), expiry, previous.id_token.clone())
+        } else {
+            let claims = self
+                .verifier
+                .verify(id_token.as_deref(), &access_token, cancel)
+                .await
+                .map_err(preserve_or_mark_verifier_stage)?;
+            validate_verified_claims(&claims, &self.descriptor, context, now)?;
+            if let Some(previous) = previous {
+                if previous.account != claims.account_id {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
             }
-            TokenValidationContext::Refresh if previous.is_none() => {
-                return Err(GrokAuthStageError::ClientBinding.into())
-            }
-            _ => {}
-        }
-        if let Some(previous) = previous {
-            if previous.account != claims.account_id {
-                return Err(GrokAuthStageError::AccountEntitlement.into());
-            }
-        }
+            let stored_id_token = id_token
+                .clone()
+                .or_else(|| previous.and_then(|record| record.id_token.clone()));
+            (claims.account_id, claims.expires_at, stored_id_token)
+        };
+        let expires_at = response_expiry
+            .map(|response_expiry| response_expiry.min(verified_expiry))
+            .unwrap_or(verified_expiry);
         Ok(OAuthTokenRecord {
             dialect_id: self.descriptor.dialect_id.clone(),
             protocol_revision: self.descriptor.protocol_revision.clone(),
@@ -503,14 +491,14 @@ where
             issuer: self.descriptor.issuer.clone(),
             audience: self.descriptor.audience.clone(),
             client_id: self.descriptor.client_id.clone(),
-            account: claims.account_id,
+            account,
             tenant: None,
             project: None,
             scopes: self.descriptor.scopes.clone(),
             access_token,
             refresh_token,
-            id_token,
-            expires_at: claims.expires_at,
+            id_token: stored_id_token,
+            expires_at,
             generation: Uuid::new_v4().to_string(),
             revoked: false,
             mutation_pending: false,
@@ -536,6 +524,96 @@ where
         self.validate_tokens(status, body, previous, context, cancel)
             .await
     }
+}
+
+fn token_response_expiry(
+    body: &Value,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    let Some(value) = body.get("expires_in") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let seconds = value
+        .as_i64()
+        .filter(|seconds| *seconds > 0 && *seconds <= MAX_ACCESS_TOKEN_LIFETIME_SECONDS)
+        .ok_or(GrokAuthStageError::TokenExchangeContract)?;
+    now.checked_add_signed(TimeDelta::seconds(seconds))
+        .map(Some)
+        .ok_or_else(|| GrokAuthStageError::TokenExchangeContract.into())
+}
+
+fn is_compact_jws_candidate(token: &str) -> bool {
+    let mut segments = token.split('.');
+    segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_none()
+}
+
+fn validate_verified_claims(
+    claims: &VerifiedGrokClaims,
+    descriptor: &OAuthDialectDescriptor,
+    context: &TokenValidationContext,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    if claims.issuer != GROK_REQUIRED_TOKEN_ISSUER
+        || !claims.audiences.contains(&descriptor.client_id)
+        || (claims.audiences.len() > 1
+            && claims.authorized_party.as_deref() != Some(descriptor.client_id.as_str()))
+        || claims
+            .authorized_party
+            .as_deref()
+            .is_some_and(|party| party != descriptor.client_id)
+        || claims.expires_at <= now
+        || claims.not_before.is_some_and(|not_before| not_before > now)
+    {
+        return Err(GrokAuthStageError::ClientBinding.into());
+    }
+    validate_public_claim(&claims.subject, "subject").context(GrokAuthStageError::ClientBinding)?;
+    validate_public_claim(&claims.account_id, "account identifier")
+        .context(GrokAuthStageError::AccountEntitlement)?;
+    if let Some(principal_type) = claims.principal_type.as_deref() {
+        validate_public_claim(principal_type, "principal type")
+            .context(GrokAuthStageError::AccountEntitlement)?;
+    }
+    match context {
+        TokenValidationContext::Browser { expected_nonce, .. }
+            if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
+        {
+            Err(GrokAuthStageError::ClientBinding.into())
+        }
+        TokenValidationContext::Refresh => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn validate_refresh_lineage(
+    previous: &OAuthTokenRecord,
+    descriptor: &OAuthDialectDescriptor,
+) -> Result<()> {
+    if previous.dialect_id != descriptor.dialect_id
+        || previous.protocol_revision != descriptor.protocol_revision
+        || previous.provider != descriptor.provider
+        || previous.kind != descriptor.credential_kind
+        || previous.issuer != descriptor.issuer
+        || previous.audience != descriptor.audience
+        || previous.client_id != descriptor.client_id
+        || previous.scopes != descriptor.scopes
+        || previous.refresh_token.as_deref().is_none_or(str::is_empty)
+        || previous.access_token.trim().is_empty()
+        || previous.generation.trim().is_empty()
+        || previous.account.trim().is_empty()
+        || previous.account.len() > 256
+        || previous.account.chars().any(char::is_control)
+        || previous.revoked
+        || previous.mutation_pending
+    {
+        return Err(GrokAuthStageError::ClientBinding.into());
+    }
+    Ok(())
 }
 
 fn preserve_or_mark_verifier_stage(error: anyhow::Error) -> anyhow::Error {
@@ -985,6 +1063,11 @@ mod tests {
         for body in [
             json!({"access_token": "opaque-access", "refresh_token": 7}),
             json!({"access_token": "opaque-access", "id_token": {"not": "a token"}}),
+            json!({"access_token": "opaque-access", "expires_in": "3600"}),
+            json!({"access_token": "opaque-access", "expires_in": 0}),
+            json!({"access_token": "opaque-access", "expires_in": -1}),
+            json!({"access_token": "opaque-access", "expires_in": 2_592_001}),
+            json!({"access_token": "opaque-access", "expires_in": 9_223_372_036_854_775_808_u64}),
         ] {
             let error = dialect
                 .validate_tokens(
@@ -1207,7 +1290,7 @@ mod tests {
                 json!({
                     "access_token": "access-secret",
                     "refresh_token": "refresh-secret",
-                    "expires_in": "unrequested-metadata",
+                    "expires_in": 300,
                     "scope": "openid profile email offline_access"
                 }),
                 None,
@@ -1216,7 +1299,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(record.expires_at, signed_expiry);
+        assert!(record.expires_at <= signed_expiry);
+        assert!(record.expires_at <= Utc::now() + TimeDelta::seconds(300));
         assert_eq!(record.scopes, grok_required_scopes());
     }
 

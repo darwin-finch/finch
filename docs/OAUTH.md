@@ -26,7 +26,11 @@ Console API-key provider (`api.x.ai`):
   `ui`, an interactive `finch auth login grok-sub` uses `cli`, and redirected/headless CLI output
   uses `headless`. Polling does not repeat the referrer.
 - The pinned token response permits an optional `refresh_token`. Without one, Finch stores an
-  expiring, non-refreshable credential rather than inventing refresh authority.
+  expiring, non-refreshable credential rather than inventing refresh authority. A present
+  `expires_in` must be a positive bounded integer and shortens (never extends) the verified token
+  deadline. The official refresh response may omit a new ID token: for an opaque replacement
+  bearer, Finch retains only the exact already-verified account/client lineage and requires the
+  response's bounded lifetime; a signed replacement bearer is independently verified and bound.
 - An opaque access bearer is accepted only when a separate ES256 ID token has been verified
   against the exact xAI issuer/JWKS authority and pinned client audience. When no ID token is
   present, the access token itself must be a verified compact JWS. If both are signed, their

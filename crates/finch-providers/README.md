@@ -15,7 +15,9 @@ surface (`ui`, `cli`, or `headless`). The official token shape permits an opaque
 an optional refresh token, so Finch derives identity only from a separately verified ES256 ID
 token (or, when no ID token exists, from a verified signed access token). A protocol-revision
 change never migrates bearer material: the one recognized predecessor is converted to a
-secret-cleared tombstone and requires explicit sign-in.
+secret-cleared tombstone and requires explicit sign-in. A bounded `expires_in` always shortens,
+never extends, signed authority. An official opaque refresh response may retain only the exact
+already-verified account/client lineage and must provide its own bounded bearer lifetime.
 
 Claude subscription (`claude_oauth.rs`/`claude_subscription.rs`) authenticates a claude.ai
 Pro/Max/Team subscription via Anthropic's browser authorization-code + PKCE OAuth flow, reusing
