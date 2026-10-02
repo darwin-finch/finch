@@ -543,7 +543,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
         terminal
             .rows()
             .iter()
-            .any(|row| row.contains("recall quality than the fallback below.")),
+            .any(|row| row.contains("concepts and finds past context more accurately.")),
         "sanity check: the ON description's second wrapped row must actually \
          reach the terminal before the toggle flips, or this test proves \
          nothing; screen:\n{}",
@@ -566,7 +566,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
     assert!(
         screen
             .iter()
-            .any(|row| row.contains("Off: built-in hashed n-gram embeddings")),
+            .any(|row| row.contains("Off: Uses basic keyword matching")),
         "the OFF description must reach the terminal after the toggle; \
          screen:\n{}",
         screen.join("\n")
@@ -574,7 +574,7 @@ fn test_local_helpers_toggle_off_does_not_strand_the_on_descriptions_second_row(
     assert!(
         !screen
             .iter()
-            .any(|row| row.contains("recall quality than the fallback below.")),
+            .any(|row| row.contains("concepts and finds past context more accurately.")),
         "REGRESSION (#1297): the ON description's stale second wrapped row \
          must not survive after toggling to the shorter OFF description; \
          full screen contents:\n{}",
@@ -8396,16 +8396,54 @@ fn test_local_helpers_memory_checkbox_carries_selection_contrast() {
     state.current_section = WizardSection::LocalHelpers;
     let bytes = wizard_frame_bytes(&state, 100, 30);
     assert!(
-        bytes.contains("Memory embeddings: use the neural model"),
+        bytes.contains("Smart memory: enable enhanced search"),
         "the checkbox text itself must be present in the rendered frame: {bytes:?}"
     );
-    let active_run = "\x1b[1;97;40m>>> ☑ Memory embeddings: use the neural model <<<";
+    let active_run = "\x1b[1;97;40m>>> ☑ Smart memory: enable enhanced search <<<";
     assert!(
         bytes.contains(active_run),
         "the memory-embeddings checkbox must paint bold bright-white on \
          black (the #1140 selection style), not a bare foreground colour \
          invisible on a light terminal; frame: {bytes:?}"
     );
+}
+
+#[test]
+fn test_local_helpers_screen_avoids_technical_jargon() {
+    let state = WizardState::new(None);
+    let view_on = wizard_view_with_permission_target(&state, "", 100, 30);
+    let frame_on = crate::cli::tui::plan_wizard_frame(&view_on, 100, 30)
+        .lines
+        .join("\n");
+
+    let mut state_off = WizardState::new(None);
+    if let Some(SectionState::LocalHelpers {
+        use_neural_embeddings,
+    }) = state_off.sections.get_mut(&WizardSection::LocalHelpers)
+    {
+        *use_neural_embeddings = false;
+    }
+    let view_off = wizard_view_with_permission_target(&state_off, "", 100, 30);
+    let frame_off = crate::cli::tui::plan_wizard_frame(&view_off, 100, 30)
+        .lines
+        .join("\n");
+
+    for frame in [&frame_on, &frame_off] {
+        assert!(
+            !frame.contains("embeddings"),
+            "must avoid 'embeddings': {frame}"
+        );
+        assert!(
+            !frame.contains("neural model"),
+            "must avoid 'neural model': {frame}"
+        );
+        assert!(!frame.contains("GGUF"), "must avoid 'GGUF': {frame}");
+        assert!(
+            !frame.contains("llama.cpp"),
+            "must avoid 'llama.cpp': {frame}"
+        );
+        assert!(!frame.contains("n-gram"), "must avoid 'n-gram': {frame}");
+    }
 }
 
 /// REGRESSION (#1140, tab highlight): the `selected_tab` prop decides which
