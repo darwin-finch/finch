@@ -1279,6 +1279,21 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
     }
 }
 
+pub(super) fn validation_error_card(error: &str) -> WizardCard {
+    WizardCard {
+        title: "Validation Error".to_string(),
+        body: vec![
+            wizard_plain(error),
+            WizardLine::blank(),
+        ],
+        controls: Some(wizard_line(
+            "Enter / Esc: Back to setup",
+            Color::Yellow,
+        )),
+        accent: Color::Red,
+    }
+}
+
 /// Split a failure summary at sentence boundaries so each line stays whole
 /// on the card — a wrap inside "Console API-key billing" would read as a
 /// different sentence to a screen reader.
@@ -1938,7 +1953,9 @@ pub(super) fn wizard_view_with_permission_target(
     };
 
     // The open overlay is a claimed card; the help yields while it owns keys.
-    let card = if state.confirming_cancel {
+    let card = if let Some(error) = &state.save_error {
+        Some(validation_error_card(error))
+    } else if state.confirming_cancel {
         Some(cancel_confirm_card())
     } else {
         match state.sections.get(&WizardSection::Models) {
