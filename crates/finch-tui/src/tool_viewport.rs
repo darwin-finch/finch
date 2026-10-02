@@ -1082,4 +1082,25 @@ mod tests {
             lines_bottom.join("\n")
         );
     }
+
+    #[test]
+
+    fn test_expanded_surface_lines_are_indented_with_six_spaces() {
+        let body: Vec<String> = (0..5).map(|n| format!("line {n}")).collect();
+        let lines = expanded_surface_lines("bash", &body, 0, 80, 20);
+        for line in lines {
+            assert!(
+                line.starts_with("      "),
+                "INVARIANT: expanded tool output lines are indented with exactly 6 spaces; \
+                 line was {:?}",
+                line
+            );
+            assert!(
+                !line.starts_with("       "),
+                "INVARIANT: expanded tool output lines are indented with exactly 6 spaces, not 7; \
+                 line was {:?}",
+                line
+            );
+        }
+    }
 }
