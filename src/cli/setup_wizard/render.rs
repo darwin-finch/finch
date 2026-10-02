@@ -408,7 +408,8 @@ fn models_section_lines(
     const GEMINI_SUB_DETAIL: &str = "Gemini subscription uses Google Gemini via device sign-in; AI Studio API keys are a separate provider and are never used automatically.";
     const GROK_SUB_DETAIL: &str = "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically.";
     const CHATGPT_DETAIL: &str = "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate.";
-    const NO_KEY_DETAIL: &str = "Paste your API key below (E), or add a provider with A.\n\
+    const NO_KEY_DETAIL: &str =
+        "Press Enter or E to Paste your API key, or add a provider with A.\n\
          No key yet? Get one at console.anthropic.com/keys";
     let has_key_detail = format!(
         "Primary provider configured. Press A to add more providers ({} total).",
