@@ -1017,7 +1017,11 @@ async fn main() -> Result<()> {
     // as its own MCP server subprocess, run only the stdio MCP bridge and
     // exit — never the normal startup/CLI/logging path below. Checked before
     // clap parsing because this is not a public flag.
-    if std::env::args().nth(1).as_deref() == Some(finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG) {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG,
+        ))
+    {
         return finch::cli::run_claude_cli_mcp_bridge().await;
     }
 

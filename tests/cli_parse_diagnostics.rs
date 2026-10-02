@@ -156,3 +156,58 @@ fn test_root_cli_invalid_utf8_diagnostic_remains_non_reflective() {
         output.stderr
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_root_cli_invalid_utf8_in_argv1_remains_non_panicking_and_non_reflective() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let output = run_finch([OsString::from_vec(vec![b'b', b'a', b'd', 0xff, b'x'])]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid UTF-8 in argv[1] must retain Clap exit status 2; status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.is_empty()
+            && String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
+        "invalid UTF-8 in argv[1] must remain stderr-only and must not reflect raw bytes; stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains(&0xff),
+        "invalid UTF-8 in argv[1] must not be reflected into stderr; stderr={:?}",
+        output.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_root_cli_near_miss_mcp_bridge_flag_with_invalid_utf8_falls_through_to_clap() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut bad_flag = finch_providers::CLAUDE_CLI_MCP_BRIDGE_FLAG
+        .as_bytes()
+        .to_vec();
+    bad_flag.push(0xff);
+    let output = run_finch([OsString::from_vec(bad_flag)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "near-miss MCP bridge flag with invalid UTF-8 must retain Clap exit status 2; status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.is_empty()
+            && String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
+        "near-miss MCP bridge flag must remain stderr-only; stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+}
