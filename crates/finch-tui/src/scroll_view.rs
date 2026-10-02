@@ -254,10 +254,11 @@ impl TranscriptScrollView {
 /// the newest `offset` physical rows are excluded.
 ///
 /// Returns `(split_index, skipped_rows)`: `lines[..split_index]` is the
-/// prefix to window over, and `skipped_rows <= offset` counts the whole lines
-/// actually hidden (the split never cuts a wrapped line in half). Callers
-/// store `skipped_rows` back as the honest offset, which also bounds the
-/// state when content shrank since the last paint.
+/// prefix to window over, and `skipped_rows <= offset` is the exact physical
+/// offset hidden below the viewport. The offset tracks partial wrapped lines
+/// to allow smooth physical scrolling without blocking. Callers store
+/// `skipped_rows` back as the honest offset, which also bounds the state
+/// when content shrank since the last paint.
 pub(crate) fn scroll_window_split(
     lines: &[RenderedTranscriptLine],
     width: usize,
@@ -272,7 +273,13 @@ pub(crate) fn scroll_window_split(
     while index > 0 {
         let rows = shadow_buffer::physical_rows(&lines[index - 1].text, width);
         if skipped + rows > offset {
-            break;
+            let total_rows = skipped
+                + rows
+                + lines[..index - 1]
+                    .iter()
+                    .map(|line| shadow_buffer::physical_rows(&line.text, width))
+                    .sum::<usize>();
+            return (index, offset.min(total_rows));
         }
         skipped += rows;
         index -= 1;
@@ -324,23 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_window_split_never_cuts_a_wrapped_line() {
+    fn test_scroll_window_split_allows_scrolling_through_wrapped_lines() {
         // "toolongline" wraps into three physical rows at width 5; "short"
-        // fits one. An offset of two cannot hide the wrapped line without
-        // cutting it, so it quantises to hiding nothing; an offset of three
-        // hides the whole line.
+        // fits one. An offset of two should be preserved accurately to allow
+        // scrolling smoothly through the physical rows of the wrapped line.
         let all = lines(&["short", "toolongline"]);
         let (split, skipped) = scroll_window_split(&all, 5, 2);
         assert_eq!(
             (split, skipped),
-            (2, 0),
-            "an offset that would cut a wrapped line hides nothing instead"
+            (2, 2),
+            "an offset inside a wrapped line accurately reflects physical rows hidden"
         );
         let (split, skipped) = scroll_window_split(&all, 5, 3);
         assert_eq!(
             (split, skipped),
             (1, 3),
-            "the whole wrapped line is skipped, not cut"
+            "the whole wrapped line is excluded when offset reaches its height"
         );
     }
 
