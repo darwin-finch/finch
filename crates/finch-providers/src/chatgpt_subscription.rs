@@ -1746,6 +1746,38 @@ fn parse_event(
             )?;
             Ok(None)
         }
+        "response.reasoning_text.done" => {
+            validate_reasoning_text_event(
+                object,
+                "text",
+                "content_index",
+                "response reasoning text event",
+            )?;
+            Ok(None)
+        }
+        "response.reasoning_part.added" | "response.reasoning_part.done" => {
+            exact_event_keys(
+                object,
+                &[
+                    "type",
+                    "sequence_number",
+                    "item_id",
+                    "output_index",
+                    "content_index",
+                    "part",
+                ],
+                "response reasoning part event",
+            )?;
+            required_sequence(object)?;
+            required_identifier(object, "item_id", 256)?;
+            required_index(object, "output_index")?;
+            required_index(object, "content_index")?;
+            object
+                .get("part")
+                .and_then(Value::as_object)
+                .context("ChatGPT reasoning part was invalid")?;
+            Ok(None)
+        }
         "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
             exact_event_keys(
                 object,
@@ -1792,7 +1824,7 @@ fn parse_event(
         "response.failed" | "response.incomplete" => {
             bail!("ChatGPT subscription response failed before completion")
         }
-        _ => bail!("ChatGPT subscription stream contained an unknown event type"),
+        _ => bail!("ChatGPT subscription stream contained an unknown event type: {kind}"),
     }
 }
 

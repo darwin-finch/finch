@@ -2740,14 +2740,19 @@ fn test_terminal_output_rejects_semantic_drift_after_passive_normalization() {
 fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
     let mut accumulator = StreamAccumulator::default();
     let unknown = json!({"type":"response.future","sequence_number":1});
-    assert!(parse_event(
+    let error = parse_event(
         unknown,
         DEFAULT_MODEL,
         None,
         &empty_tool_bindings(),
         &mut accumulator,
     )
-    .is_err());
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("unknown event type: response.future"),
+        "unknown event error must name the event type, got {error}"
+    );
     let malformed = json!({
         "type":"response.output_text.delta",
         "sequence_number":1,
@@ -2778,6 +2783,83 @@ fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
         &mut accumulator,
     )
     .is_err());
+}
+
+#[test]
+fn test_reasoning_text_delta_and_done_and_part_events_are_accepted() {
+    let mut accumulator = StreamAccumulator::default();
+
+    let part_added = json!({
+        "type": "response.reasoning_part.added",
+        "sequence_number": 1,
+        "item_id": "item-1",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "reasoning_text", "text": ""}
+    });
+    let parsed = parse_event(
+        part_added,
+        DEFAULT_MODEL,
+        None,
+        &empty_tool_bindings(),
+        &mut accumulator,
+    )
+    .expect("response.reasoning_part.added must be accepted");
+    assert!(parsed.is_none());
+
+    let delta = json!({
+        "type": "response.reasoning_text.delta",
+        "sequence_number": 2,
+        "item_id": "item-1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "reasoning in progress"
+    });
+    let parsed = parse_event(
+        delta,
+        DEFAULT_MODEL,
+        None,
+        &empty_tool_bindings(),
+        &mut accumulator,
+    )
+    .expect("response.reasoning_text.delta must be accepted");
+    assert!(parsed.is_none());
+
+    let done = json!({
+        "type": "response.reasoning_text.done",
+        "sequence_number": 3,
+        "item_id": "item-1",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "reasoning complete"
+    });
+    let parsed = parse_event(
+        done,
+        DEFAULT_MODEL,
+        None,
+        &empty_tool_bindings(),
+        &mut accumulator,
+    )
+    .expect("response.reasoning_text.done must be accepted");
+    assert!(parsed.is_none());
+
+    let part_done = json!({
+        "type": "response.reasoning_part.done",
+        "sequence_number": 4,
+        "item_id": "item-1",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "reasoning_text", "text": "reasoning complete"}
+    });
+    let parsed = parse_event(
+        part_done,
+        DEFAULT_MODEL,
+        None,
+        &empty_tool_bindings(),
+        &mut accumulator,
+    )
+    .expect("response.reasoning_part.done must be accepted");
+    assert!(parsed.is_none());
 }
 
 #[test]
