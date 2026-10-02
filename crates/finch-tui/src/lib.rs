@@ -10641,10 +10641,12 @@ mod tests {
     }
 
     /// DEFECT REGRESSION: user turn continuation lines retain foreground color
-    /// even when scrolled down past line 0.
+    /// and theme-aware greyish background across all themes, even when scrolled
+    /// down past line 0.
     #[test]
-    fn test_user_turn_continuation_lines_retain_color_when_scrolled_down() {
+    fn test_user_turn_continuation_lines_retain_color_and_theme_background() {
         use finch_messages::UserQueryMessage;
+        use finch_theme::ColorTheme;
         let mut renderer = headless_renderer();
         let user = Arc::new(UserQueryMessage::new("first line\nsecond line\nthird line"));
         let message: MessageRef = Arc::clone(&user) as MessageRef;
@@ -10658,8 +10660,9 @@ mod tests {
         assert!(!lines[1].spans.is_empty(), "line 1 must carry spans");
         assert!(!lines[2].spans.is_empty(), "line 2 must carry spans");
 
-        // When line 0 rolls off-screen, lines 1 and 2 are lowered independently.
-        // Each lowered continuation line MUST carry ANSI color escape sequences.
+        // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
+        // Even when lowered in isolation (without line 0 having been painted),
+        // continuation lines MUST contain ANSI foreground and background escape sequences!
         let lowered_line1 = span_render::lower_rendered_line(&lines[1]);
         let lowered_line2 = span_render::lower_rendered_line(&lines[2]);
 
@@ -10667,6 +10670,23 @@ mod tests {
         assert_ne!(lowered_line2, "third line");
         assert!(lowered_line1.contains("\x1b["));
         assert!(lowered_line2.contains("\x1b["));
+
+        for theme in ColorTheme::all() {
+            let scheme = theme.to_scheme();
+            let palette = span_render::component_style_palette(&scheme);
+            let view = message
+                .component_view()
+                .expect("user query must have a component view");
+            let rendered = finch_ui_model::component_lines(&view, &palette);
+            let expected_band = scheme.message_band_style(finch_theme::MessageBand::LocalUser);
+            let expected_bg = match expected_band.bg.unwrap() {
+                ratatui::style::Color::Rgb(r, g, b) => finch_ui_model::SpanColor::Rgb(r, g, b),
+                _ => panic!("unexpected background color"),
+            };
+            for line in &rendered {
+                assert_eq!(line.spans[0].style.bg, Some(expected_bg));
+            }
+        }
     }
 
     fn paint_slash_completions(renderer: &mut TuiRenderer) {

@@ -207,6 +207,10 @@ pub struct ComponentStylePalette {
     pub static_warning: SpanStyle,
     /// User turn foreground colour.
     pub user_foreground: SpanColor,
+    /// User turn background colour.
+    pub user_background: SpanColor,
+    /// Participant background colours (indexed 0..7).
+    pub participant_backgrounds: [SpanColor; 8],
 }
 
 impl Default for ComponentStylePalette {
@@ -225,6 +229,17 @@ impl Default for ComponentStylePalette {
             static_success: SpanStyle::fg(SpanColor::DARK_GREY),
             static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
             user_foreground: SpanColor::CYAN,
+            user_background: SpanColor::Rgb(28, 45, 64),
+            participant_backgrounds: [
+                SpanColor::Rgb(24, 49, 70),
+                SpanColor::Rgb(27, 55, 42),
+                SpanColor::Rgb(62, 44, 24),
+                SpanColor::Rgb(51, 36, 66),
+                SpanColor::Rgb(22, 53, 55),
+                SpanColor::Rgb(65, 34, 43),
+                SpanColor::Rgb(54, 52, 27),
+                SpanColor::Rgb(42, 47, 58),
+            ],
         }
     }
 }
@@ -534,13 +549,20 @@ fn memory_recalled_lines(
 }
 
 /// Render a user turn component: marker (and subject if present) on line 0,
-/// content lines 1..N beneath it. Every line is styled with the user foreground,
-/// ensuring continuation lines retain their styling even when scrolled down.
+/// content lines 1..N beneath it. Every line is styled with the user foreground
+/// and theme-aware background, ensuring continuation lines retain their styling
+/// even when scrolled down.
 fn user_turn_lines(
     view: &UserTurnView,
     palette: &ComponentStylePalette,
 ) -> Vec<RenderedTranscriptLine> {
-    let style = SpanStyle::fg(palette.user_foreground);
+    let bg = match view.participant_index {
+        Some(index) => {
+            palette.participant_backgrounds[index % palette.participant_backgrounds.len()]
+        }
+        None => palette.user_background,
+    };
+    let style = SpanStyle::fg(palette.user_foreground).with_bg(bg);
 
     let first_line_content = view.content_lines.first().map(|s| s.as_str()).unwrap_or("");
     let first_line_text = match &view.subject {
@@ -585,6 +607,17 @@ mod tests {
         static_success: SpanStyle::fg(SpanColor::DARK_GREY),
         static_warning: SpanStyle::fg(SpanColor::DARK_YELLOW),
         user_foreground: SpanColor::CYAN,
+        user_background: SpanColor::Rgb(28, 45, 64),
+        participant_backgrounds: [
+            SpanColor::Rgb(24, 49, 70),
+            SpanColor::Rgb(27, 55, 42),
+            SpanColor::Rgb(62, 44, 24),
+            SpanColor::Rgb(51, 36, 66),
+            SpanColor::Rgb(22, 53, 55),
+            SpanColor::Rgb(65, 34, 43),
+            SpanColor::Rgb(54, 52, 27),
+            SpanColor::Rgb(42, 47, 58),
+        ],
     };
 
     /// The say component rides the generalized accessor end to end: a say
@@ -1611,9 +1644,9 @@ mod tests {
         );
     }
 
-    /// User turn lines style every line with foreground colour.
+    /// User turn lines style every line with foreground and background.
     #[test]
-    fn test_user_turn_lines_style_every_line_with_foreground() {
+    fn test_user_turn_lines_style_every_line_with_foreground_and_background() {
         let view = UserTurnView {
             marker: '❯',
             subject: None,
@@ -1630,7 +1663,8 @@ mod tests {
         assert_eq!(lines[1].text, "second line");
         assert_eq!(lines[2].text, "third line");
 
-        let expected_style = SpanStyle::fg(PALETTE.user_foreground);
+        let expected_style =
+            SpanStyle::fg(PALETTE.user_foreground).with_bg(PALETTE.user_background);
         for (i, line) in lines.iter().enumerate() {
             assert_eq!(line.spans.len(), 1, "line {i} must have 1 span");
             assert_eq!(
@@ -1639,5 +1673,22 @@ mod tests {
             );
             assert_eq!(crate::spans_text(&line.spans), line.text);
         }
+    }
+
+    /// Participant turns use their assigned participant background from the palette.
+    #[test]
+    fn test_user_turn_lines_support_participant_background() {
+        let view = UserTurnView {
+            marker: '◆',
+            subject: Some("alice@box".into()),
+            content_lines: vec!["hello world".into()],
+            participant_index: Some(3),
+        };
+        let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, " ◆ alice@box: hello world");
+        let expected_style =
+            SpanStyle::fg(PALETTE.user_foreground).with_bg(PALETTE.participant_backgrounds[3]);
+        assert_eq!(lines[0].spans[0].style, expected_style);
     }
 }
