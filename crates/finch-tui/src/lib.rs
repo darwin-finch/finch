@@ -2407,17 +2407,6 @@ impl TuiRenderer {
         let input_lines = self.input_textarea.lines().to_vec();
         let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
-        let image_attachment_lines = self
-            .pending_images
-            .iter()
-            .map(|(index, _, media_type)| {
-                let format = media_type
-                    .strip_prefix("image/")
-                    .unwrap_or(media_type)
-                    .to_ascii_uppercase();
-                format!("  Attached image #{index} ({format})")
-            })
-            .collect();
         let mut effective_status = compute_effective_status(
             self.ghost_text.as_deref(),
             &raw_status,
@@ -2473,7 +2462,6 @@ impl TuiRenderer {
             input_cursor: self.input_textarea.cursor(),
             ghost_text: self.ghost_text.clone(),
             input_lines,
-            image_attachment_lines,
             effective_status,
             cwd_label,
             session_label,
@@ -2913,7 +2901,6 @@ fn find_parent_transcript_row<'a>(
 /// borrow it for the planning call.
 struct LiveFrameSources {
     input_lines: Vec<String>,
-    image_attachment_lines: Vec<String>,
     input_cursor: (usize, usize),
     ghost_text: Option<String>,
     effective_status: String,
@@ -2942,7 +2929,6 @@ fn live_view_model<'a>(
         terminal_width,
         terminal_height,
         input_lines: &sources.input_lines,
-        image_attachment_lines: &sources.image_attachment_lines,
         input_cursor: sources.input_cursor,
         ghost_text: sources.ghost_text.as_deref(),
         effective_status: &sources.effective_status,
@@ -4881,15 +4867,6 @@ impl TuiRenderer {
         true
     }
 
-    /// Add a clipboard image to the composer's attachment tray without changing
-    /// the text draft. Images are transmitted as structured content blocks.
-    pub(crate) fn attach_image(&mut self, data: String, media_type: String) {
-        self.image_counter += 1;
-        self.pending_images
-            .push((self.image_counter, data, media_type));
-        self.live_area_dirty = true;
-    }
-
     /// Apply any highlighted slash completion, then take the composer line.
     pub(crate) fn take_submitted_input(&mut self) -> Option<String> {
         let _ = apply_selected_completion_for_submit(
@@ -4898,13 +4875,11 @@ impl TuiRenderer {
             &mut self.ghost_text,
         );
         let input = self.input_textarea.lines().join("\n");
-        if input.trim().is_empty() && self.pending_images.is_empty() {
+        if input.trim().is_empty() {
             return None;
         }
         self.mention_port.retain_visible(&input);
-        if !input.trim().is_empty() {
-            self.command_history.push(input.clone());
-        }
+        self.command_history.push(input.clone());
         self.history_index = None;
         self.history_draft = None;
         self.input_textarea = Self::create_clean_textarea();

@@ -400,18 +400,29 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
         // or would exit Finch (needs a confirming second press, #1311) is
         // decided by the application from `pending_escape_cancel`.
         let content = tui.input_textarea.lines().join("");
-        if content.trim().is_empty() && tui.pending_images.is_empty() {
+        if content.trim().is_empty() {
             tui.pending_escape_cancel = true;
             (false, None)
         } else {
             tui.input_textarea = TuiRenderer::create_clean_textarea();
-            tui.pending_images.clear();
             (true, None)
         }
     } else if COMPOSER_PASTE_IMAGE.owns(&key) {
         // Cmd+V on macOS / Ctrl+V: check clipboard for images
         if let Some((b64, media_type)) = try_grab_clipboard_image() {
-            tui.attach_image(b64, media_type);
+            tui.image_counter += 1;
+            let idx = tui.image_counter;
+            tui.pending_images.push((idx, b64, media_type));
+
+            // Insert marker into textarea
+            let marker = format!("[Image #{}]", idx);
+            let current = tui.input_textarea.lines().join("\n");
+            let new_text = if current.trim().is_empty() {
+                marker
+            } else {
+                format!("{}\n{}", current, marker)
+            };
+            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&new_text);
             (true, None)
         } else {
             // No image - pass V to textarea for text paste
