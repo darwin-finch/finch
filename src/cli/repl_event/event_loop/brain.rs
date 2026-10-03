@@ -100,7 +100,7 @@ impl EventLoop {
             TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
         let mention_port = crate::cli::mention_session::MentionSession::new(".")
             as Arc<dyn crate::cli::tui::MentionPort>;
-        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
         let (_todo_writer, todo_target, todo_receiver) =
             crate::tools::todo_journal(Arc::clone(&todo_list));
         let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -228,7 +228,7 @@ impl EventLoop {
             TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
         let mention_port = crate::cli::mention_session::MentionSession::new(".")
             as Arc<dyn crate::cli::tui::MentionPort>;
-        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
         let (_todo_writer, todo_target, todo_receiver) =
             crate::tools::todo_journal(Arc::clone(&todo_list));
         let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -1153,7 +1153,7 @@ impl EventLoop {
                 );
                 self.todo_list
                     .write()
-                    .await
+                    .unwrap()
                     .replace_all(brain.tasks.clone());
                 // Hydrate the committed memory set wholesale from the
                 // snapshot -- this is what makes it survive `finch attach`
@@ -1444,7 +1444,7 @@ impl EventLoop {
                 .output_manager
                 .write_brain_participant(sender, text.clone(), false),
             BrainEventKind::TaskListReplaced { tasks } => {
-                self.todo_list.write().await.replace_all(tasks.clone());
+                self.todo_list.write().unwrap().replace_all(tasks.clone());
             }
             // Not transcript content, and not synced live from the event
             // stream (#940): the committed memory set is hydrated wholesale

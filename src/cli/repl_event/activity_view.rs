@@ -26,10 +26,10 @@ fn activity_usage(usage: &crate::scheduler::AgentUsage) -> crate::cli::tui::Acti
 }
 
 /// The session todo list, presented as rows the renderer can poll.
-pub struct TodoRows(Arc<tokio::sync::RwLock<TodoList>>);
+pub struct TodoRows(Arc<std::sync::RwLock<TodoList>>);
 
 impl TodoRows {
-    pub fn new(list: Arc<tokio::sync::RwLock<TodoList>>) -> Arc<dyn ActivityRows> {
+    pub fn new(list: Arc<std::sync::RwLock<TodoList>>) -> Arc<dyn ActivityRows> {
         Arc::new(Self(list))
     }
 }
@@ -134,7 +134,7 @@ mod tests {
             status: TodoStatus::InProgress,
             priority: TodoPriority::High,
         }]);
-        let rows = TodoRows(Arc::new(tokio::sync::RwLock::new(list))).rows();
+        let rows = TodoRows(Arc::new(std::sync::RwLock::new(list))).rows();
         assert_eq!(
             1,
             rows.len(),

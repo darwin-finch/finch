@@ -59,7 +59,7 @@ impl TodoJournalTarget {
 pub struct TodoJournalReceiver {
     rx: mpsc::UnboundedReceiver<TodoJournalRequest>,
     selected: Rc<RefCell<Option<crate::brain::AttachedBrainClient>>>,
-    projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
+    projection: std::sync::Arc<std::sync::RwLock<TodoList>>,
 }
 
 impl TodoJournalReceiver {
@@ -79,7 +79,7 @@ impl TodoJournalReceiver {
                             .await
                         {
                             Ok(()) => {
-                                self.projection.write().await.replace_all(tasks);
+                                self.projection.write().unwrap().replace_all(tasks);
                                 Ok(true)
                             }
                             Err(error) => Err(error),
@@ -94,7 +94,7 @@ impl TodoJournalReceiver {
 }
 
 pub fn todo_journal(
-    projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
+    projection: std::sync::Arc<std::sync::RwLock<TodoList>>,
 ) -> (TodoJournalWriter, TodoJournalTarget, TodoJournalReceiver) {
     let (tx, rx) = mpsc::unbounded_channel::<TodoJournalRequest>();
     let selected = Rc::new(RefCell::new(None::<crate::brain::AttachedBrainClient>));
@@ -189,7 +189,7 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
-            let projection = std::sync::Arc::new(tokio::sync::RwLock::new(TodoList::default()));
+            let projection = std::sync::Arc::new(std::sync::RwLock::new(TodoList::default()));
             let (writer, _target, receiver) = todo_journal(projection);
             receiver.spawn();
             assert!(!writer

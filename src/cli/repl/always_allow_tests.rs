@@ -116,7 +116,7 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
         ProviderResolver::new(Arc::new(NameAuditGenerator)),
         Arc::clone(&runtime),
     );
-    let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+    let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
 
     let mut registry = ToolRegistry::new();
     let background_tasks = std::sync::Arc::new(crate::brain::BackgroundTaskManager::new());

@@ -2,7 +2,7 @@
 //
 // The LLM uses these tools to manage a session-scoped task list that is
 // displayed in the TUI live area.  Both tools capture an
-// Arc<RwLock<TodoList>> directly — no ToolContext fields needed.
+// Arc<std::sync::RwLock<TodoList>> directly — no ToolContext fields needed.
 
 use crate::tools::todo::{TodoItem, TodoList};
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -18,12 +18,12 @@ use tokio::sync::RwLock;
 
 /// Replace the selected Brain's task list atomically.
 pub struct TodoWriteTool {
-    todo_list: Arc<RwLock<TodoList>>,
+    todo_list: Arc<std::sync::RwLock<TodoList>>,
     journal: Option<crate::tools::todo::TodoJournalWriter>,
 }
 
 impl TodoWriteTool {
-    pub fn new(todo_list: Arc<RwLock<TodoList>>) -> Self {
+    pub fn new(todo_list: Arc<std::sync::RwLock<TodoList>>) -> Self {
         Self {
             todo_list,
             journal: None,
@@ -31,7 +31,7 @@ impl TodoWriteTool {
     }
 
     pub fn journaled(
-        todo_list: Arc<RwLock<TodoList>>,
+        todo_list: Arc<std::sync::RwLock<TodoList>>,
         journal: crate::tools::todo::TodoJournalWriter,
     ) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl Tool for TodoWriteTool {
             false
         };
         if !persisted {
-            self.todo_list.write().await.replace_all(items);
+            self.todo_list.write().unwrap().replace_all(items);
         }
 
         Ok(format!(
@@ -156,11 +156,11 @@ impl Tool for TodoWriteTool {
 
 /// Return the selected Brain's current task-list projection as JSON.
 pub struct TodoReadTool {
-    todo_list: Arc<RwLock<TodoList>>,
+    todo_list: Arc<std::sync::RwLock<TodoList>>,
 }
 
 impl TodoReadTool {
-    pub fn new(todo_list: Arc<RwLock<TodoList>>) -> Self {
+    pub fn new(todo_list: Arc<std::sync::RwLock<TodoList>>) -> Self {
         Self { todo_list }
     }
 }
@@ -189,7 +189,7 @@ impl Tool for TodoReadTool {
     }
 
     async fn execute(&self, _params: Value, _context: &ToolContext<'_>) -> Result<String> {
-        let list = self.todo_list.read().await;
+        let list = self.todo_list.read().unwrap();
         let items = list.get_all();
 
         if items.is_empty() {
@@ -206,8 +206,8 @@ mod tests {
     use super::*;
     use crate::tools::todo::{TodoPriority, TodoStatus};
 
-    fn make_list() -> Arc<RwLock<TodoList>> {
-        Arc::new(RwLock::new(TodoList::default()))
+    fn make_list() -> Arc<std::sync::RwLock<TodoList>> {
+        Arc::new(std::sync::RwLock::new(TodoList::default()))
     }
 
     fn dummy_context() -> ToolContext<'static> {
@@ -237,7 +237,7 @@ mod tests {
             result.contains("0 tasks") || result.contains("0 task"),
             "{result}"
         );
-        assert!(list.read().await.is_empty());
+        assert!(list.read().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -260,7 +260,7 @@ mod tests {
         assert!(result.contains("2 tasks"), "{result}");
         assert!(result.contains("1 in_progress"), "{result}");
         assert!(result.contains("1 pending"), "{result}");
-        assert_eq!(list.read().await.len(), 2);
+        assert_eq!(list.read().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -275,7 +275,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(list.read().await.len(), 1);
+        assert_eq!(list.read().unwrap().len(), 1);
 
         tool.execute(
             serde_json::json!({
@@ -288,8 +288,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(list.read().await.len(), 2);
-        assert_eq!(list.read().await.get_all()[0].id, "2");
+        assert_eq!(list.read().unwrap().len(), 2);
+        assert_eq!(list.read().unwrap().get_all()[0].id, "2");
     }
 
     #[tokio::test]
@@ -380,7 +380,7 @@ mod tests {
     async fn test_todo_read_includes_completed_items() {
         let list = make_list();
         {
-            let mut l = list.write().await;
+            let mut l = list.write().unwrap();
             l.replace_all(vec![
                 TodoItem {
                     id: "1".to_string(),

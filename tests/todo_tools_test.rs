@@ -1,7 +1,7 @@
 // Integration tests for todo_write / todo_read tools.
 //
 // Verifies the cross-module interaction: both tools share the same
-// Arc<RwLock<TodoList>> and the list's active_items ordering is correct
+// Arc<std::sync::RwLock<TodoList>> and the list's active_items ordering is correct
 // for TUI display.
 
 use finch::tools::Tool;
@@ -11,8 +11,8 @@ use finch::tools::{TodoReadTool, TodoWriteTool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-fn make_list() -> Arc<RwLock<TodoList>> {
-    Arc::new(RwLock::new(TodoList::default()))
+fn make_list() -> Arc<std::sync::RwLock<TodoList>> {
+    Arc::new(std::sync::RwLock::new(TodoList::default()))
 }
 
 fn dummy_ctx() -> ToolContext<'static> {
@@ -108,7 +108,7 @@ async fn test_write_is_atomic_replacement() {
         .await
         .unwrap();
 
-    let items = list.read().await;
+    let items = list.read().unwrap();
     assert_eq!(items.len(), 2, "old item must be gone");
     assert_eq!(items.get_all()[0].id, "2");
 }
@@ -196,7 +196,7 @@ async fn test_active_items_ordering_for_tui_display() {
         .await
         .unwrap();
 
-    let guard = list.read().await;
+    let guard = list.read().unwrap();
     let active = guard.active_items();
 
     // Completed item must be excluded
@@ -235,7 +235,7 @@ async fn test_active_items_empty_when_all_completed() {
         .await
         .unwrap();
 
-    let guard = list.read().await;
+    let guard = list.read().unwrap();
     assert!(
         guard.active_items().is_empty(),
         "TUI should see no active items when all are completed"
