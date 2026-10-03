@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -19,13 +19,16 @@ use uuid::Uuid;
 
 use crate::oauth::{
     validate_secret_field, AuthorizationCodeGrant, DeviceAuthorization, DevicePoll, OAuthDialect,
-    OAuthDialectDescriptor, OAuthHttpRequest, OAuthRequestBody, OAuthTokenRecord,
-    TokenValidationContext,
+    OAuthDialectDescriptor, OAuthHttpRequest, OAuthPublicMetadata, OAuthRequestBody,
+    OAuthTokenRecord, TokenValidationContext,
 };
 use crate::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
 
 pub const GROK_OAUTH_PROTOCOL_REVISION: &str =
+    "xai-grok-build-public-client@482711333c7195dc16a272777f86086d615e2afb+finch-binding-v2";
+pub const GROK_PREVIOUS_OAUTH_PROTOCOL_REVISION: &str =
     "xai-grok-build-public-client@482711333c7195dc16a272777f86086d615e2afb+finch-binding-v1";
+pub const GROK_PUBLIC_CLIENT_VERSION: &str = "1.0.32";
 pub const GROK_SUBSCRIPTION_SERVICE_REVISION: &str =
     "xai-cli-chat-proxy@482711333c7195dc16a272777f86086d615e2afb";
 pub const XAI_PUBLIC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -34,12 +37,31 @@ pub(crate) const XAI_ACCOUNTS_ORIGIN: &str = "https://accounts.x.ai";
 pub const GROK_SUBSCRIPTION_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 pub const GROK_REQUIRED_TOKEN_ISSUER: &str = "https://auth.x.ai";
 pub const GROK_SESSION_TOKEN_HEADER: &str = "xai-grok-cli";
-const GROK_OAUTH_REFERRER: &str = "finch";
+const GROK_OAUTH_REFERRER: &str = "grok-build";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const MIN_DEVICE_LIFETIME: Duration = Duration::from_secs(1);
+const MAX_ACCESS_TOKEN_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 const GROK_DEVICE_WIRE_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write";
+
+/// Low-cardinality presentation surface required by the pinned Grok device protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokDeviceClientSurface {
+    Ui,
+    Cli,
+    Headless,
+}
+
+impl GrokDeviceClientSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ui => "ui",
+            Self::Cli => "cli",
+            Self::Headless => "headless",
+        }
+    }
+}
 
 /// Status-only xAI device endpoint failures. Upstream bodies are never
 /// retained in these typed causes.
@@ -60,6 +82,12 @@ pub enum GrokDeviceEndpointError {
 /// Secret-free stage markers for actionable device-login diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GrokAuthStageError {
+    #[error("Grok subscription device authorization request could not reach xAI")]
+    DeviceStartTransport,
+    #[error("Grok subscription device authorization response changed")]
+    DeviceStartContract,
+    #[error("Grok subscription device polling request could not reach xAI")]
+    DevicePollTransport,
     #[error("Grok subscription device polling response changed after browser authorization")]
     PollContract,
     #[error("Grok subscription token exchange was rejected (HTTP {0})")]
@@ -68,6 +96,10 @@ pub enum GrokAuthStageError {
     TokenExchangeContract,
     #[error("Grok subscription signed identity verification failed")]
     IdentityVerification,
+    #[error("Grok subscription identity signing keys could not be verified")]
+    JwksTransport,
+    #[error("Grok subscription identity signature or issuer is invalid")]
+    IdentitySignature,
     #[error("Grok subscription signed client binding failed")]
     ClientBinding,
     #[error("Grok subscription signed account entitlement is missing or invalid")]
@@ -139,16 +171,22 @@ fn unavailable_verifier_error<T>() -> Result<T> {
 pub struct XaiGrokOAuthDialect<V> {
     descriptor: OAuthDialectDescriptor,
     verifier: Arc<V>,
+    device_surface: GrokDeviceClientSurface,
 }
 
 #[cfg(feature = "grok_subscription")]
 impl XaiGrokOAuthDialect<crate::grok_jwks::GrokJwksVerifier> {
     pub fn production() -> Result<Self> {
+        Self::production_for_surface(GrokDeviceClientSurface::Headless)
+    }
+
+    pub fn production_for_surface(device_surface: GrokDeviceClientSurface) -> Result<Self> {
         Self::new(
             XAI_AUTH_ORIGIN,
             XAI_ACCOUNTS_ORIGIN,
             Arc::new(crate::grok_jwks::GrokJwksVerifier::production()?),
             false,
+            device_surface,
         )
     }
 }
@@ -162,6 +200,7 @@ where
         accounts_origin: &str,
         verifier: Arc<V>,
         allow_insecure_loopback: bool,
+        device_surface: GrokDeviceClientSurface,
     ) -> Result<Self> {
         let auth_origin = auth_origin.trim_end_matches('/').to_string();
         let accounts_origin = accounts_origin.trim_end_matches('/').to_string();
@@ -189,11 +228,20 @@ where
         Ok(Self {
             descriptor,
             verifier,
+            device_surface,
         })
     }
 
     pub fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self> {
-        Self::new(auth_origin, auth_origin, verifier, true)
+        Self::for_test_with_surface(auth_origin, verifier, GrokDeviceClientSurface::Headless)
+    }
+
+    pub fn for_test_with_surface(
+        auth_origin: &str,
+        verifier: Arc<V>,
+        device_surface: GrokDeviceClientSurface,
+    ) -> Result<Self> {
+        Self::new(auth_origin, auth_origin, verifier, true, device_surface)
     }
 }
 
@@ -218,6 +266,10 @@ where
                 ("scope".into(), GROK_DEVICE_WIRE_SCOPES.into()),
                 ("referrer".into(), GROK_OAUTH_REFERRER.into()),
             ]),
+            metadata: OAuthPublicMetadata::grok_client(
+                GROK_PUBLIC_CLIENT_VERSION,
+                self.device_surface.as_str(),
+            )?,
         })
     }
 
@@ -276,9 +328,9 @@ where
             }
             return Err(GrokDeviceEndpointError::StartRejected(status.as_u16()).into());
         }
-        let body = serde_json::from_slice(body)
-            .context("Grok subscription device authorization response was malformed JSON")?;
+        let body = serde_json::from_slice(body).context(GrokAuthStageError::DeviceStartContract)?;
         self.parse_device_authorization(status, body)
+            .context(GrokAuthStageError::DeviceStartContract)
     }
 
     fn device_poll_request(&self, pending: &DeviceAuthorization) -> Result<OAuthHttpRequest> {
@@ -289,6 +341,10 @@ where
                 ("device_code".into(), pending.device_code.clone()),
                 ("client_id".into(), self.descriptor.client_id.clone()),
             ]),
+            metadata: OAuthPublicMetadata::grok_client(
+                GROK_PUBLIC_CLIENT_VERSION,
+                self.device_surface.as_str(),
+            )?,
         })
     }
 
@@ -333,6 +389,7 @@ where
                 ("client_id".into(), self.descriptor.client_id.clone()),
                 ("code_verifier".into(), grant.verifier.clone()),
             ]),
+            metadata: Default::default(),
         })
     }
 
@@ -345,6 +402,7 @@ where
                 ("refresh_token".into(), refresh_token.to_string()),
                 ("client_id".into(), self.descriptor.client_id.clone()),
             ]),
+            metadata: Default::default(),
         })
     }
 
@@ -357,6 +415,7 @@ where
                 ("token_type_hint".into(), "refresh_token".into()),
                 ("client_id".into(), self.descriptor.client_id.clone()),
             ]),
+            metadata: Default::default(),
         })
     }
 
@@ -376,61 +435,73 @@ where
         }
         let access_token = required_string(&body, "access_token")
             .context(GrokAuthStageError::TokenExchangeContract)?;
-        let refresh_token = body
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| previous.and_then(|record| record.refresh_token.clone()))
-            .context(GrokAuthStageError::TokenExchangeContract)?;
-        validate_secret_field(&refresh_token, "refresh token")
-            .context(GrokAuthStageError::TokenExchangeContract)?;
-        let id_token = body
-            .get("id_token")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let claims = self
-            .verifier
-            .verify(id_token.as_deref(), &access_token, cancel)
-            .await
-            .context(GrokAuthStageError::IdentityVerification)?;
+        let refresh_token = match body.get("refresh_token") {
+            None | Some(Value::Null) => previous.and_then(|record| record.refresh_token.clone()),
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(GrokAuthStageError::TokenExchangeContract.into()),
+        };
+        if let Some(refresh_token) = refresh_token.as_deref() {
+            validate_secret_field(refresh_token, "refresh token")
+                .context(GrokAuthStageError::TokenExchangeContract)?;
+        }
+        let id_token = match body.get("id_token") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => {
+                validate_secret_field(value, "identity token")
+                    .context(GrokAuthStageError::TokenExchangeContract)?;
+                Some(value.clone())
+            }
+            Some(_) => return Err(GrokAuthStageError::TokenExchangeContract.into()),
+        };
         let now = Utc::now();
-        if claims.issuer != GROK_REQUIRED_TOKEN_ISSUER
-            || !claims.audiences.contains(&self.descriptor.client_id)
-            || (claims.audiences.len() > 1
-                && claims.authorized_party.as_deref() != Some(self.descriptor.client_id.as_str()))
-            || claims
-                .authorized_party
-                .as_deref()
-                .is_some_and(|party| party != self.descriptor.client_id)
-            || claims.expires_at <= now
-            || claims.not_before.is_some_and(|not_before| not_before > now)
-        {
-            return Err(GrokAuthStageError::ClientBinding.into());
-        }
-        validate_public_claim(&claims.subject, "subject")
-            .context(GrokAuthStageError::ClientBinding)?;
-        validate_public_claim(&claims.account_id, "account identifier")
-            .context(GrokAuthStageError::AccountEntitlement)?;
-        if let Some(principal_type) = claims.principal_type.as_deref() {
-            validate_public_claim(principal_type, "principal type")
-                .context(GrokAuthStageError::AccountEntitlement)?;
-        }
-        match context {
-            TokenValidationContext::Browser { expected_nonce, .. }
-                if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
-            {
-                return Err(GrokAuthStageError::ClientBinding.into())
+        let response_expiry = token_response_expiry(&body, now)?;
+        let carry_refresh_lineage = matches!(context, TokenValidationContext::Refresh)
+            && id_token.is_none()
+            && !is_compact_jws_candidate(&access_token);
+        let (account, verified_expiry, stored_id_token) = if carry_refresh_lineage {
+            let previous = previous.ok_or(GrokAuthStageError::ClientBinding)?;
+            validate_refresh_lineage(previous, &self.descriptor)?;
+            let expiry = response_expiry.ok_or(GrokAuthStageError::TokenExchangeContract)?;
+            (previous.account.clone(), expiry, previous.id_token.clone())
+        } else {
+            let claims = self
+                .verifier
+                .verify(id_token.as_deref(), &access_token, cancel)
+                .await
+                .map_err(preserve_or_mark_verifier_stage)?;
+            validate_verified_claims(&claims, &self.descriptor, context, now)?;
+            if matches!(context, TokenValidationContext::Refresh) {
+                let previous = previous.ok_or(GrokAuthStageError::ClientBinding)?;
+                validate_refresh_lineage(previous, &self.descriptor)?;
+                if previous.account != claims.account_id {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+                let previous_has_signed_identity =
+                    previous.id_token.is_some() || is_compact_jws_candidate(&previous.access_token);
+                if !previous_has_signed_identity {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+                let previous_claims = self
+                    .verifier
+                    .verify(previous.id_token.as_deref(), &previous.access_token, cancel)
+                    .await
+                    .map_err(preserve_or_mark_verifier_stage)?;
+                if previous_claims.subject != claims.subject {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
+            } else if let Some(previous) = previous {
+                if previous.account != claims.account_id {
+                    return Err(GrokAuthStageError::AccountEntitlement.into());
+                }
             }
-            TokenValidationContext::Refresh if previous.is_none() => {
-                return Err(GrokAuthStageError::ClientBinding.into())
-            }
-            _ => {}
-        }
-        if let Some(previous) = previous {
-            if previous.account != claims.account_id {
-                return Err(GrokAuthStageError::AccountEntitlement.into());
-            }
-        }
+            let stored_id_token = id_token
+                .clone()
+                .or_else(|| previous.and_then(|record| record.id_token.clone()));
+            (claims.account_id, claims.expires_at, stored_id_token)
+        };
+        let expires_at = response_expiry
+            .map(|response_expiry| response_expiry.min(verified_expiry))
+            .unwrap_or(verified_expiry);
         Ok(OAuthTokenRecord {
             dialect_id: self.descriptor.dialect_id.clone(),
             protocol_revision: self.descriptor.protocol_revision.clone(),
@@ -439,14 +510,14 @@ where
             issuer: self.descriptor.issuer.clone(),
             audience: self.descriptor.audience.clone(),
             client_id: self.descriptor.client_id.clone(),
-            account: claims.account_id,
+            account,
             tenant: None,
             project: None,
             scopes: self.descriptor.scopes.clone(),
             access_token,
-            refresh_token: Some(refresh_token),
-            id_token,
-            expires_at: claims.expires_at,
+            refresh_token,
+            id_token: stored_id_token,
+            expires_at,
             generation: Uuid::new_v4().to_string(),
             revoked: false,
             mutation_pending: false,
@@ -471,6 +542,108 @@ where
             serde_json::from_slice(body).context(GrokAuthStageError::TokenExchangeContract)?;
         self.validate_tokens(status, body, previous, context, cancel)
             .await
+    }
+}
+
+fn token_response_expiry(
+    body: &Value,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    let Some(value) = body.get("expires_in") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let seconds = value
+        .as_i64()
+        .filter(|seconds| *seconds > 0 && *seconds <= MAX_ACCESS_TOKEN_LIFETIME_SECONDS)
+        .ok_or(GrokAuthStageError::TokenExchangeContract)?;
+    now.checked_add_signed(TimeDelta::seconds(seconds))
+        .map(Some)
+        .ok_or_else(|| GrokAuthStageError::TokenExchangeContract.into())
+}
+
+fn is_compact_jws_candidate(token: &str) -> bool {
+    let mut segments = token.split('.');
+    segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_none()
+}
+
+fn validate_verified_claims(
+    claims: &VerifiedGrokClaims,
+    descriptor: &OAuthDialectDescriptor,
+    context: &TokenValidationContext,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    if claims.issuer != GROK_REQUIRED_TOKEN_ISSUER
+        || !claims.audiences.contains(&descriptor.client_id)
+        || (claims.audiences.len() > 1
+            && claims.authorized_party.as_deref() != Some(descriptor.client_id.as_str()))
+        || claims
+            .authorized_party
+            .as_deref()
+            .is_some_and(|party| party != descriptor.client_id)
+        || claims.expires_at <= now
+        || claims.not_before.is_some_and(|not_before| not_before > now)
+    {
+        return Err(GrokAuthStageError::ClientBinding.into());
+    }
+    validate_public_claim(&claims.subject, "subject").context(GrokAuthStageError::ClientBinding)?;
+    validate_public_claim(&claims.account_id, "account identifier")
+        .context(GrokAuthStageError::AccountEntitlement)?;
+    if let Some(principal_type) = claims.principal_type.as_deref() {
+        validate_public_claim(principal_type, "principal type")
+            .context(GrokAuthStageError::AccountEntitlement)?;
+    }
+    match context {
+        TokenValidationContext::Browser { expected_nonce, .. }
+            if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
+        {
+            Err(GrokAuthStageError::ClientBinding.into())
+        }
+        TokenValidationContext::Refresh => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn validate_refresh_lineage(
+    previous: &OAuthTokenRecord,
+    descriptor: &OAuthDialectDescriptor,
+) -> Result<()> {
+    if previous.dialect_id != descriptor.dialect_id
+        || previous.protocol_revision != descriptor.protocol_revision
+        || previous.provider != descriptor.provider
+        || previous.kind != descriptor.credential_kind
+        || previous.issuer != descriptor.issuer
+        || previous.audience != descriptor.audience
+        || previous.client_id != descriptor.client_id
+        || previous.scopes != descriptor.scopes
+        || previous.refresh_token.as_deref().is_none_or(str::is_empty)
+        || previous.access_token.trim().is_empty()
+        || previous.generation.trim().is_empty()
+        || previous.account.trim().is_empty()
+        || previous.account.len() > 256
+        || previous.account.chars().any(char::is_control)
+        || previous.revoked
+        || previous.mutation_pending
+    {
+        return Err(GrokAuthStageError::ClientBinding.into());
+    }
+    Ok(())
+}
+
+fn preserve_or_mark_verifier_stage(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
+        .is_some()
+        || error.downcast_ref::<GrokAuthStageError>().is_some()
+    {
+        error
+    } else {
+        error.context(GrokAuthStageError::IdentityVerification)
     }
 }
 
@@ -718,6 +891,7 @@ mod tests {
             &origin,
             Arc::new(GrokVerificationUnavailable),
             true,
+            GrokDeviceClientSurface::Headless,
         )
         .unwrap();
         let error = crate::oauth::OAuthClient::new(Arc::new(dialect), Arc::new(NoopStore))
@@ -738,6 +912,10 @@ mod tests {
             .descriptor()
             .protocol_revision
             .contains("482711333c71"));
+        assert!(dialect
+            .descriptor()
+            .protocol_revision
+            .ends_with("finch-binding-v2"));
         assert!(!dialect
             .descriptor()
             .allowed_origins
@@ -776,8 +954,16 @@ mod tests {
             OAuthRequestBody::Form(vec![
                 ("client_id".into(), XAI_PUBLIC_CLIENT_ID.into()),
                 ("scope".into(), GROK_DEVICE_WIRE_SCOPES.into()),
-                ("referrer".into(), "finch".into()),
+                ("referrer".into(), "grok-build".into()),
             ])
+        );
+        assert_eq!(
+            request.metadata.grok_headers().collect::<Vec<_>>(),
+            vec![
+                ("x-grok-client-version", GROK_PUBLIC_CLIENT_VERSION),
+                ("x-grok-client-surface", "headless"),
+            ],
+            "device initiation must carry the exact pinned public-client metadata"
         );
         let pending = dialect
             .parse_device_authorization(
@@ -794,6 +980,23 @@ mod tests {
         assert_eq!(pending.user_code, "ABCD-EFGH");
         let poll_request = dialect.device_poll_request(&pending).unwrap();
         assert_eq!(poll_request.endpoint, "http://127.0.0.1:12345/oauth2/token");
+        assert_eq!(
+            poll_request.body,
+            OAuthRequestBody::Form(vec![
+                ("grant_type".into(), DEVICE_GRANT_TYPE.into()),
+                ("device_code".into(), "device-secret".into()),
+                ("client_id".into(), XAI_PUBLIC_CLIENT_ID.into()),
+            ]),
+            "device polling must not repeat the initiation-only referrer"
+        );
+        assert_eq!(
+            poll_request.metadata.grok_headers().collect::<Vec<_>>(),
+            vec![
+                ("x-grok-client-version", GROK_PUBLIC_CLIENT_VERSION),
+                ("x-grok-client-surface", "headless"),
+            ],
+            "polling must preserve the initiation client metadata"
+        );
         let poll = dialect
             .parse_device_poll(
                 StatusCode::OK,
@@ -825,6 +1028,81 @@ mod tests {
         assert_eq!(metadata.account.as_deref(), Some("acct-work"));
         assert_eq!(metadata.secret_ref, "oauth-store:grok-sub:work");
         assert!(!format!("{tokens:?}").contains("access-secret"));
+    }
+
+    #[tokio::test]
+    async fn device_token_without_refresh_token_is_non_refreshable_not_rejected() {
+        let dialect = XaiGrokOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        let tokens = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                json!({
+                    "access_token": "opaque-access-secret",
+                    "id_token": "signed-identity-fixture",
+                    "expires_in": 3600
+                }),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect(
+                "the official token shape permits an expiring credential without refresh authority",
+            );
+
+        assert!(
+            tokens.refresh_token.is_none(),
+            "an absent refresh token must remain absent rather than inventing refresh authority"
+        );
+        assert!(
+            matches!(
+                tokens
+                    .provider_credential("grok-sub:non-refreshable")
+                    .lifecycle,
+                crate::CredentialLifecycle::Active {
+                    refreshable: false,
+                    ..
+                }
+            ),
+            "the projected credential must tell callers it cannot refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_but_non_string_optional_tokens_are_contract_failures() {
+        let dialect = XaiGrokOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        for body in [
+            json!({"access_token": "opaque-access", "refresh_token": 7}),
+            json!({"access_token": "opaque-access", "id_token": {"not": "a token"}}),
+            json!({"access_token": "opaque-access", "expires_in": "3600"}),
+            json!({"access_token": "opaque-access", "expires_in": 0}),
+            json!({"access_token": "opaque-access", "expires_in": -1}),
+            json!({"access_token": "opaque-access", "expires_in": 2_592_001}),
+            json!({"access_token": "opaque-access", "expires_in": 9_223_372_036_854_775_808_u64}),
+        ] {
+            let error = dialect
+                .validate_tokens(
+                    StatusCode::OK,
+                    body,
+                    None,
+                    &TokenValidationContext::Device,
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("a malformed optional token field must not be treated as absent");
+            assert!(matches!(
+                error.downcast_ref::<GrokAuthStageError>(),
+                Some(GrokAuthStageError::TokenExchangeContract)
+            ));
+        }
     }
 
     #[test]
@@ -1031,7 +1309,7 @@ mod tests {
                 json!({
                     "access_token": "access-secret",
                     "refresh_token": "refresh-secret",
-                    "expires_in": "unrequested-metadata",
+                    "expires_in": 300,
                     "scope": "openid profile email offline_access"
                 }),
                 None,
@@ -1040,7 +1318,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(record.expires_at, signed_expiry);
+        assert!(record.expires_at <= signed_expiry);
+        assert!(record.expires_at <= Utc::now() + TimeDelta::seconds(300));
         assert_eq!(record.scopes, grok_required_scopes());
     }
 
@@ -1075,10 +1354,18 @@ mod tests {
         body: String,
     }
 
+    #[derive(Clone)]
+    struct FakeObservedRequest {
+        path: String,
+        body: String,
+        client_version: Option<String>,
+        client_surface: Option<String>,
+    }
+
     #[derive(Default)]
     struct FakeState {
         replies: Mutex<BTreeMap<String, std::collections::VecDeque<FakeReply>>>,
-        requests: Mutex<Vec<(String, String)>>,
+        requests: Mutex<Vec<FakeObservedRequest>>,
     }
 
     struct FakeServer {
@@ -1124,8 +1411,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(actual, _)| actual == path)
-                .map(|(_, body)| body.clone())
+                .filter(|request| request.path == path)
+                .map(|request| request.body.clone())
+                .collect()
+        }
+
+        fn requests(&self, path: &str) -> Vec<FakeObservedRequest> {
+            self.state
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path == path)
+                .cloned()
                 .collect()
         }
     }
@@ -1141,11 +1439,26 @@ mod tests {
         request: axum::extract::Request,
     ) -> axum::http::Response<axum::body::Body> {
         let path = request.uri().path().to_string();
+        let client_version = request
+            .headers()
+            .get("x-grok-client-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let client_surface = request
+            .headers()
+            .get("x-grok-client-surface")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body).into_owned();
-        state.requests.lock().unwrap().push((path.clone(), body));
+        state.requests.lock().unwrap().push(FakeObservedRequest {
+            path: path.clone(),
+            body,
+            client_version,
+            client_surface,
+        });
         let reply = state
             .replies
             .lock()
@@ -1167,8 +1480,12 @@ mod tests {
     async fn fake_service_login_success_refresh_revoke_and_redaction() {
         let server = FakeServer::start().await;
         let dialect = Arc::new(
-            XaiGrokOAuthDialect::for_test(&server.origin, Arc::new(FixedVerifier(claims())))
-                .unwrap(),
+            XaiGrokOAuthDialect::for_test_with_surface(
+                &server.origin,
+                Arc::new(FixedVerifier(claims())),
+                GrokDeviceClientSurface::Ui,
+            )
+            .unwrap(),
         );
         let store = Arc::new(MemoryStore(Mutex::new(BTreeMap::new())));
         let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
@@ -1205,8 +1522,33 @@ mod tests {
 
         let start_body = &server.request_bodies("/oauth2/device/code")[0];
         assert!(start_body.contains("client_id"));
-        assert!(start_body.contains("referrer=finch") || start_body.contains("referrer=finch"));
+        assert!(start_body.contains("referrer=grok-build"));
         assert!(!start_body.contains("api.x.ai"));
+        let start_request = &server.requests("/oauth2/device/code")[0];
+        assert_eq!(
+            start_request.client_version.as_deref(),
+            Some(GROK_PUBLIC_CLIENT_VERSION),
+            "device initiation must carry the pinned Grok Build client version"
+        );
+        assert_eq!(
+            start_request.client_surface.as_deref(),
+            Some("ui"),
+            "the setup entry point's UI surface must reach device initiation"
+        );
+        let poll_request = &server.requests("/oauth2/token")[0];
+        assert_eq!(
+            poll_request.client_version, start_request.client_version,
+            "polling must retain the initiation client version"
+        );
+        assert_eq!(
+            poll_request.client_surface, start_request.client_surface,
+            "polling must retain the initiation surface"
+        );
+        assert!(
+            !poll_request.body.contains("referrer"),
+            "the initiation-only referrer must not leak into polling: {}",
+            poll_request.body
+        );
 
         server.push(
             "/oauth2/token",

@@ -29,6 +29,7 @@ pub(crate) mod test_projection;
 use finch_tui as tui;
 mod usage; // Phase 2: Terminal UI
 
+pub use crate::providers::GrokDeviceClientSurface;
 pub use chatgpt_auth::{
     render_status_line as render_chatgpt_auth_status_line,
     save_named_credential as save_chatgpt_named_credential, ChatGptAuthService,

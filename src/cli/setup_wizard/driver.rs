@@ -313,7 +313,9 @@ pub(super) fn run_tabbed_wizard(
             None
         }
     };
-    state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production() {
+    state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production_for_surface(
+        crate::providers::GrokDeviceClientSurface::Ui,
+    ) {
         Ok(service) => {
             Some(Arc::new(service)
                 as Arc<
