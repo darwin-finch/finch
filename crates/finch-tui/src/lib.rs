@@ -4383,7 +4383,7 @@ impl TuiRenderer {
             let mut autocomplete = self.autocomplete_state.clone();
             let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
             vm.hovered_row = self.hovered_row.as_ref();
-            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
+            vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
@@ -4414,7 +4414,7 @@ impl TuiRenderer {
             expanded_lines.as_deref(),
         );
         vm.hovered_row = self.hovered_row.as_ref();
-        vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
+        vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
