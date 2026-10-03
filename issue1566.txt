@@ -1,0 +1,23 @@
+## Summary
+Grok subscriptions integration is broken.
+
+## Impact
+Users cannot use Grok.
+
+## Acceptance criteria
+- Grok subscriptions work as intended.
+
+## Solution Contract
+- **Accepted Outcome**: Fix Grok subscriptions integration.
+- **Acceptance Criteria**: Grok subscriptions work as intended.
+- **Risk Tier**: low
+- **Model Lane**: strong
+- **Required Proof**: Automated auth tests and manual verification of the Grok subscription flow.
+- **Subsystem**: finch-providers/oauth
+- **owner**: none
+
+value: 3
+cost: 2
+certainty: 4
+unblocking: 1
+files: crates/finch-providers/src/grok_oauth.rs, crates/finch-providers/src/grok_subscription.rs

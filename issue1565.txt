@@ -1,0 +1,23 @@
+## Summary
+The Google PKCE Auth flow is still broken despite earlier scope fixes.
+
+## Impact
+Users cannot authenticate with Google subscriptions.
+
+## Acceptance criteria
+- Google PKCE Auth Flow completes successfully.
+
+## Solution Contract
+- **Accepted Outcome**: Fix the broken Google PKCE auth flow for Gemini subscriptions.
+- **Acceptance Criteria**: Google PKCE Auth Flow completes successfully.
+- **Risk Tier**: low
+- **Model Lane**: strong
+- **Required Proof**: Automated auth tests and manual verification of the PKCE flow.
+- **Subsystem**: finch-providers/oauth
+- **owner**: none
+
+value: 3
+cost: 2
+certainty: 4
+unblocking: 1
+files: crates/finch-providers/src/gemini_oauth.rs, crates/finch-providers/src/gemini_subscription.rs
