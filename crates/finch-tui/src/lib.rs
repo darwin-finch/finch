@@ -2058,6 +2058,10 @@ impl TuiRenderer {
         self.input_textarea = Self::create_clean_textarea_with_text(input);
         self.mark_dirty();
     }
+
+    pub fn get_input_draft(&self) -> String {
+        self.input_textarea.lines().join("\n")
+    }
 }
 
 // ─── Raw-mode canonical transcript commit ───────────────────────────────────

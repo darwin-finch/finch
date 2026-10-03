@@ -432,8 +432,22 @@ impl EventLoop {
                 // Release the turn so queued user input cannot wedge behind it.
                 if *self.active_query_id.read().await == Some(query_id) {
                     *self.active_query_id.write().await = None;
-                    if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
-                        self.execute_query_inner(next, echo, chat_only).await?;
+                    
+                    let mut restored = String::new();
+                    while let Some((next, _echo, _chat_only)) = self.pending_queries.pop_front() {
+                        if !restored.is_empty() {
+                            restored.push('\n');
+                        }
+                        restored.push_str(&next);
+                    }
+                    if !restored.is_empty() {
+                        let mut tui = self.tui_renderer.lock().await;
+                        let current_draft = tui.get_input_draft();
+                        if !current_draft.is_empty() {
+                            restored.push('\n');
+                            restored.push_str(&current_draft);
+                        }
+                        tui.restore_input_draft(&restored);
                     }
                 }
             }
