@@ -8795,6 +8795,7 @@ mod tests {
             &mut bytes,
             viewport_redraw_plan(8, 2, 1),
             &["final projection".into()],
+            crossterm::style::Color::Reset,
         )
         .unwrap();
         execute!(bytes, EndSynchronizedUpdate).unwrap();
