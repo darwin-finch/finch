@@ -1,6 +1,7 @@
 [package]
 name = "finch"
 version = "0.7.31"
+build = "build.rs"
 # The floor Finch actually pins and tests: rust-toolchain.toml channel.
 # Calamine 0.36.1 requires 1.88 (via zip 8.6); this is well above it, and
 # declaring the looser number would claim support nothing here exercises.

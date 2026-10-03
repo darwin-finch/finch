@@ -19,7 +19,7 @@ use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "finch")]
-#[command(about = finch::ABOUT, version)]
+#[command(about = finch::ABOUT, version = finch::VERSION)]
 struct Args {
     /// Run mode
     #[command(subcommand)]

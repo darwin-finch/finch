@@ -63,6 +63,7 @@ fn main() {
 
     let pkg_version = env!("CARGO_PKG_VERSION");
     let git_describe = get_git_describe();
+    println!("cargo:warning=GIT DESCRIBE FOUND: {:?}", git_describe);
 
     let version_string = if let Ok(override_ver) = std::env::var("FINCH_VERSION_OVERRIDE") {
         override_ver
