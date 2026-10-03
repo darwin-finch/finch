@@ -7,9 +7,10 @@ Brain, tool execution, provider request, or project-file discovery. The applicat
 those through message snapshots, status state, and narrow ports such as `MentionPort`.
 The diagnostic console follows the same boundary: the application supplies bounded, sanitised
 log snapshots through `DiagnosticConsolePort`, while the renderer owns its Ctrl+` reader in the
-transcript viewport, visible-range indicator, and keyboard/wheel scroll state. Focused diagnostic
-and tool-result readers replace the conversation rows above the separator rather than rendering
-inside the composer/status chrome below it.
+transcript viewport, visible-range indicator, and keyboard/wheel scroll state. Compact tool-result
+rows are fixed previews: clicking them or pressing Enter opens the focused, scrollable tool-result
+reader. Focused diagnostic and tool-result readers replace the conversation rows above the
+separator rather than rendering inside the composer/status chrome below it.
 
 Two callers show the boundary:
 

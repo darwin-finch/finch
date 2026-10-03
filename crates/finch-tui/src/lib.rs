@@ -4147,27 +4147,23 @@ impl TuiRenderer {
             return;
         };
         let title = self.tool_row_title(row_id);
-        let saved_scroll = self.tool_viewports.child_scroll(row_id);
         self.expanded_tool = Some(ExpandedToolView {
             row_id: row_id.clone(),
             title,
-            saved_scroll,
-            scroll: saved_scroll,
+            scroll: 0,
             body_lines: body.len(),
         });
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
     }
 
-    /// Close the expanded surface and restore the child scroll offset captured
-    /// at open time. Disclosure grouping and accordion focus were never
-    /// touched, so the surrounding conversation returns exactly as it was.
+    /// Close the expanded surface. Disclosure grouping, accordion focus, and
+    /// the compact output projection were never touched, so the surrounding
+    /// conversation returns exactly as it was.
     pub(crate) fn close_expanded_tool(&mut self) {
-        let Some(view) = self.expanded_tool.take() else {
+        if self.expanded_tool.take().is_none() {
             return;
-        };
-        self.tool_viewports
-            .set_child_scroll(&view.row_id, view.saved_scroll);
+        }
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
     }
@@ -7570,11 +7566,12 @@ mod tests {
         renderer.is_active = false;
     }
 
-    /// Keyboard equivalents (#656): F6 focuses the tool result's row, Up/Down
-    /// scroll its compact viewport, Enter opens the expanded surface. On rows
-    /// that are not tool results the keys stay unclaimed.
+    /// Keyboard equivalents (#656): F6 focuses the tool result's row and Enter
+    /// opens the expanded surface. Scroll keys always stay unclaimed while the
+    /// compact row is focused so the surrounding conversation or input can own
+    /// them; only the expanded surface owns tool-output scrolling (#1590).
     #[test]
-    fn test_keyboard_scroll_and_expand_of_focused_tool_result() {
+    fn test_keyboard_expands_focused_tool_result_without_inline_scrolling() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
         renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24, None);
 
@@ -7591,23 +7588,16 @@ mod tests {
             Some(&output_row),
             "the fourth F6 lands on the tool result row"
         );
-        assert!(
-            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            "Down scrolls the focused tool result"
-        );
+        for key in [KeyCode::Up, KeyCode::Down, KeyCode::PageUp, KeyCode::PageDown] {
+            assert!(
+                !renderer.handle_accordion_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                "INVARIANT (#1590): {key:?} must not scroll or be claimed by a compact tool result"
+            );
+        }
         assert_eq!(
             renderer.tool_viewports.child_scroll(&output_row),
-            1,
-            "INVARIANT: the keyboard scroll moved the child viewport one line"
-        );
-        assert!(
-            renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
-            "PageDown scrolls the focused tool result"
-        );
-        assert_eq!(
-            renderer.tool_viewports.child_scroll(&output_row),
-            5,
-            "PageDown moved the window by the page step"
+            0,
+            "INVARIANT (#1590): scroll keys left the compact tool viewport at its fixed offset"
         );
         assert!(
             renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -7623,17 +7613,10 @@ mod tests {
         );
         assert_eq!(
             renderer.tool_viewports.child_scroll(&output_row),
-            5,
-            "INVARIANT: closing restored the compact window's offset (5)"
+            0,
+            "INVARIANT (#1590): closing the modal leaves the compact viewport fixed at the top"
         );
 
-        // On a non-tool row the same keys are not claimed: history navigation
-        // keeps working.
-        renderer.accordion.focused = None;
-        assert!(
-            !renderer.handle_accordion_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            "Down without a focused tool result falls through to the input area"
-        );
         renderer.is_active = false;
     }
 

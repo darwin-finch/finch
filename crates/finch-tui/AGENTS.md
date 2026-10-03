@@ -210,18 +210,19 @@ committed portion above the hidden tail, and the live area paints only the suffi
 above the hidden tail (`union[live_start..split]`), so a scrolled reader sees one
 contiguous window and the live suffix scrolls away like native scrollback; in follow mode
 (offset 0) nothing is clipped and frames are byte-identical to the unscrolled shape.
-Wheel ticks land on the ScrollView inside the claim, on a nested tool-result control
-inside its rect, and on nothing over the bottom chrome; the claim is the wheel hitbox,
-stored from `frame.rects` by the same rebuild that rebuilds the accordion regions.
-Step sizes are the ScrollView's own (#897): a wheel tick moves `TRANSCRIPT_WHEEL_STEP_LINES`
-(3) rows and PageUp/PageDown move one page of the visible pane
-(`TranscriptScrollView::page_step`), independent of the bounded tool-result viewport's
-`WHEEL_STEP_LINES` (1) and `PAGE_STEP_LINES` (4), which keep serving the tool viewport and
-the expanded surface only. PageUp/PageDown scroll it from the keyboard, independent of
-mouse tracking. Mouse tracking is held by default (`mouse_capture.rs`) — the #441
-release-on-first-wheel hybrid is retired, native history stays the copyable record via
-`canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
-the reader.
+Wheel ticks inside the transcript claim always belong to the conversation ScrollView, including
+when the pointer is over a compact/truncated tool-result row (#1590); compact tool output is a
+fixed preview and never owns wheel or keyboard scrolling. Enter or a click opens the expanded
+full-screen tool reader, which is the only surface that owns tool-output scrolling. Chrome rows
+below the transcript claim belong to nobody. The claim is the wheel hitbox, stored from
+`frame.rects` by the same rebuild that rebuilds the accordion regions. Step sizes are the
+ScrollView's own (#897): a wheel tick moves `TRANSCRIPT_WHEEL_STEP_LINES` (3) rows and
+PageUp/PageDown move one page of the visible pane (`TranscriptScrollView::page_step`). The
+expanded tool surface keeps its own wheel and page steps. PageUp/PageDown scroll the conversation
+from the keyboard when no modal owns input, independent of mouse tracking. Mouse tracking is held
+by default (`mouse_capture.rs`) — the #441 release-on-first-wheel hybrid is retired, native history
+stays the copyable record via `canonical_commit`, and while scrolled up a commit anchors the window
+instead of dragging the reader.
 
 **A message's relative order in `OutputManager::get_messages()` is preserved end to end, by
 every stage this crate owns (#1248).** `plan_canonical_commit` and `commit_complete_messages`

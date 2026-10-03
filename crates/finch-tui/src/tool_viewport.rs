@@ -31,23 +31,21 @@ use super::shadow_buffer;
 /// nothing more, however long the output is.
 pub const DEFAULT_TOOL_OUTPUT_ROWS: usize = 4;
 
-/// Rows one wheel tick moves inside a bounded tool-result viewport.
+/// Rows one wheel tick moves inside the expanded tool-result reader.
 pub const WHEEL_STEP_LINES: usize = 1;
 
-/// Rows one PageUp/PageDown moves inside a bounded tool-result viewport.
+/// Rows one PageUp/PageDown moves inside the expanded tool-result reader.
 pub const PAGE_STEP_LINES: usize = 4;
 
 /// The focused surface that shows one tool result expanded.
 ///
-/// `saved_scroll` is the child viewport's scroll offset captured when the
-/// surface opened; closing writes it back, so the compact control shows the
-/// same window it did before the expansion. Disclosure grouping and accordion
-/// focus are never touched by the surface, so they restore by construction.
+/// Compact tool output is fixed at its first lines, so the expanded reader
+/// always opens at the beginning. Disclosure grouping and accordion focus are
+/// never touched by the surface, so they restore by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedToolView {
     pub row_id: RowId,
     pub title: String,
-    pub saved_scroll: usize,
     pub scroll: usize,
     /// Total body lines observed at the last surface draw.
     pub body_lines: usize,
