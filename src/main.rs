@@ -631,6 +631,8 @@ async fn run_direct_typed_source_with_json(
     json_output: bool,
 ) -> Result<()> {
     let runtime = finch::runtime::ProgramRuntime::new();
+    let _ = finch::cli::register_co_forth_tool_words(&runtime).await;
+
     runtime.grant_typed_capability(finch::vm::CapabilityRequirement {
         capability: finch::vm::CapabilityKind::SessionEmit,
         selector: finch::vm::ResourceSelector::None,
@@ -5063,5 +5065,22 @@ mod tests {
             "a normally-completing loader task must not have its state touched by the \
              supervisor, got {observed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod build_query_tool_executor_tests2 {
+    use super::*;
+    #[tokio::test]
+    async fn test_co_forth_executable_words() {
+        let runtime = finch::runtime::ProgramRuntime::new();
+        let _ = finch::cli::register_co_forth_tool_words(&runtime).await;
+        let outcome = execute_one_shot_wire_source(
+            &runtime,
+            "code_outline \"src/main.rs\"",
+        ).await.unwrap();
+        
+        let diags = format!("{:?}", outcome.diagnostics);
+        assert!(!diags.contains("E-LINK-002"));
     }
 }

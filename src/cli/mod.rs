@@ -95,3 +95,4 @@ pub use tui::{
     DialogResult, QuestionOptionView, QuestionView, TabbedDialog, TabbedDialogResult,
     TuiOutputPort, TuiRenderer, TuiStatusPort,
 };
+pub use repl::register_co_forth_tool_words;
