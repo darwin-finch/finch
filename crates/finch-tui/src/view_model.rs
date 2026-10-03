@@ -115,6 +115,8 @@ pub(crate) struct LiveViewModel<'a> {
     pub terminal_width: usize,
     pub terminal_height: usize,
     pub input_lines: &'a [String],
+    /// Structured clipboard images shown outside the editable text draft.
+    pub image_attachment_lines: &'a [String],
     pub input_cursor: (usize, usize),
     pub ghost_text: Option<&'a str>,
     pub effective_status: &'a str,
@@ -276,6 +278,14 @@ pub(crate) fn project_root(
         ));
     }
     if vm.dialog.is_none() {
+        if !vm.image_attachment_lines.is_empty() {
+            children.push((
+                Track::Natural,
+                Widget::Text {
+                    lines: vm.image_attachment_lines.to_vec(),
+                },
+            ));
+        }
         children.extend([
             (
                 Track::Natural,
