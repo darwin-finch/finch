@@ -2648,7 +2648,7 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
         .find(|(id, ..)| *id == "chatgpt")
         .unwrap();
     assert_eq!(chatgpt.1, "ChatGPT subscription");
-    assert_eq!(chatgpt.2, "gpt-5.6-sol");
+    assert_eq!(chatgpt.2, "gpt-6.1-sol");
     assert!(CLOUD_PROVIDERS
         .iter()
         .all(|(id, ..)| *id != "chatgpt_subscription"));
@@ -2662,7 +2662,7 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
     assert!(rendered.contains("OpenAI API"), "{rendered}");
     assert!(rendered.contains("ChatGPT subscription"), "{rendered}");
     assert!(
-        rendered.contains("Finch-native device sign-in"),
+        rendered.contains("Device sign-in starts after the wizard"),
         "{rendered}"
     );
     assert!(!rendered.contains("Codex"), "{rendered}");
@@ -7641,7 +7641,7 @@ fn cancelling_the_device_dialog_returns_to_the_provider_form() {
                 api_key: None,
                 editing_idx: None,
                 ..
-            }) if name == "chatgpt" && model == "gpt-5.6-sol"
+            }) if name == "chatgpt" && model == "gpt-6.1-sol"
         ),
         "Esc must return to the provider form with its fields intact, without abandoning the wizard; step={step:?}"
     );

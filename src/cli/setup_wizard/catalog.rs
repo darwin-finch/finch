@@ -137,8 +137,8 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
         "chatgpt",
         "ChatGPT subscription",
-        "gpt-5.6-sol",
-        "Finch-native device sign-in starts after the wizard; not an OpenAI API key",
+        "gpt-6.1-sol",
+        "Device sign-in starts after the wizard; no API key required",
     ),
     (
         "grok-sub",

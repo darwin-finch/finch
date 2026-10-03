@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn chatgpt_subscription_fallback_is_pinned_and_separate_from_platform() {
-        assert_eq!(static_fallback("chatgpt"), ["gpt-5.6-sol"]);
+        assert_eq!(static_fallback("chatgpt"), ["gpt-5.6-sol", "gpt-6.1-sol"]);
         assert_eq!(
             static_fallback("openai"),
             ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
