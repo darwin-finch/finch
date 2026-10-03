@@ -1374,8 +1374,13 @@ fn device_auth_card(
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
+                let display_url = if presentation.verification_uri.len() > 60 {
+                    "Google device sign-in"
+                } else {
+                    &presentation.verification_uri
+                };
                 body.push(wizard_url(
-                    &format!("Open: {}", presentation.verification_uri),
+                    &format!("Open: {}", display_url),
                     &presentation.verification_uri,
                     Some(Color::Cyan),
                 ));
