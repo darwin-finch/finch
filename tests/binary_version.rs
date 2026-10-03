@@ -25,4 +25,11 @@ fn finch_binary_reports_its_compiled_version() {
         stdout.contains(expected),
         "finch --version should report the compiled version {expected:?}; stdout={stdout:?}",
     );
+    if !finch::GIT_DESCRIBE.is_empty() {
+        assert!(
+            stdout.contains(finch::GIT_DESCRIBE),
+            "finch --version should include git describe {:?}; stdout={stdout:?}",
+            finch::GIT_DESCRIBE,
+        );
+    }
 }

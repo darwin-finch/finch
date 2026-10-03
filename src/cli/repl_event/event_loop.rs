@@ -2580,7 +2580,7 @@ impl EventLoop {
             tui.set_session_label(self.session_label.clone());
         }
         self.output_manager.write_info(TuiRenderer::startup_header(
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             crate::ABOUT,
             &model_name,
             &cwd,

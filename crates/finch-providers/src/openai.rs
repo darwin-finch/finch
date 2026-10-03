@@ -7573,13 +7573,16 @@ mod tests {
         let mut state = test_stream_state();
         state.rule = TransportRule::CompatibleChatCompletions;
         state.terminal_reason = Some("stop".to_string());
-        
+
         let data = r#"{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"qwen2.5:7b","system_fingerprint":"fp_44709d6fcb","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21,"eval_count":12,"eval_duration":1000000000,"load_duration":1000000000,"prompt_eval_count":9,"prompt_eval_duration":1000000000,"total_duration":3000000000,"some_new_metric":42}}"#;
-        
+
         let result = super::canonical_stream_data(&mut state, data);
         if let Err(e) = &result {
             println!("Error: {e}");
         }
-        assert!(result.is_ok(), "Stream parser should not crash on unknown keys (e.g. from Ollama)");
+        assert!(
+            result.is_ok(),
+            "Stream parser should not crash on unknown keys (e.g. from Ollama)"
+        );
     }
 }

@@ -147,7 +147,7 @@ fn register_repl_tool_aliases(registry: &mut ToolRegistry) {
 
 /// Shared identity for interactive and redirected startup banners.
 pub fn startup_identity_line() -> String {
-    format!("finch {} - {}", env!("CARGO_PKG_VERSION"), crate::ABOUT)
+    format!("finch {} - {}", crate::VERSION, crate::ABOUT)
 }
 
 #[cfg(test)]

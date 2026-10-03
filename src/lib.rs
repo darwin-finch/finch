@@ -4,6 +4,12 @@
 /// One-line description of what Finch is, shown by `finch --help`.
 pub const ABOUT: &str = "Terminal coding assistant with typed programs, named Brains, and tool use";
 
+/// The version string for Finch, including git tag and commit describe if available.
+pub const VERSION: &str = env!("FINCH_VERSION_STRING");
+
+/// The raw git describe string if built from a git checkout, or empty string.
+pub const GIT_DESCRIBE: &str = env!("FINCH_GIT_DESCRIBE");
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to `true` when the TUI event loop is active.
@@ -117,3 +123,16 @@ pub use finch_language as language; // Source compilation facade; returns Module
 pub use finch_ui_model as ui_model; // Terminal-independent application UI identity, widget data, and layout
 pub use finch_vm as vm; // Typed stack IR, verifier, capabilities, and language contracts
 pub(crate) mod workbook; // Compatibility facade over runtime-owned worksheet bounds (#282)
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn test_version_format() {
+        assert!(VERSION.starts_with(env!("CARGO_PKG_VERSION")));
+        if !GIT_DESCRIBE.is_empty() {
+            assert!(VERSION.contains(GIT_DESCRIBE));
+        }
+    }
+}
