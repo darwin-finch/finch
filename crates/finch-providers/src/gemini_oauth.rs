@@ -66,7 +66,7 @@ pub enum GeminiDeviceEndpointError {
 pub enum GeminiAuthStageError {
     #[error("Gemini subscription device polling response changed after browser authorization")]
     PollContract,
-    #[error("Gemini subscription token exchange was rejected (HTTP {0})")]
+    #[error("Google sign-in failed. Please try again.")]
     TokenExchangeRejected(u16),
     #[error("Gemini subscription token exchange response changed")]
     TokenExchangeContract,
@@ -243,9 +243,13 @@ impl GoogleGeminiOAuthDialect<GeminiTokenVerifierProduction> {
         let client_id = std::env::var("FINCH_GEMINI_CLIENT_ID")
             .or_else(|_| std::env::var("GOOGLE_CLIENT_ID"))
             .unwrap_or_else(|_| GOOGLE_PUBLIC_CLIENT_ID.to_string());
-        let client_secret = std::env::var("FINCH_GEMINI_CLIENT_SECRET")
+        let mut client_secret = std::env::var("FINCH_GEMINI_CLIENT_SECRET")
             .or_else(|_| std::env::var("GOOGLE_CLIENT_SECRET"))
             .ok();
+        
+        if client_id == GOOGLE_PUBLIC_CLIENT_ID {
+            client_secret = None;
+        }
         Self::new(
             GOOGLE_OAUTH2_ORIGIN,
             GOOGLE_ACCOUNTS_ORIGIN,

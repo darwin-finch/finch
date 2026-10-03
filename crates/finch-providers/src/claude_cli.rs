@@ -73,7 +73,7 @@ use tokio::task::JoinHandle;
 
 /// Default upstream model, measured as the CLI's own default on 2026-09-25
 /// (claude CLI 2.1.283, `system/init` event: `claude-sonnet-5`).
-pub const CLAUDE_CLI_DEFAULT_MODEL: &str = "claude-sonnet-5";
+pub const CLAUDE_CLI_DEFAULT_MODEL: &str = "gpt-6.1-sol";
 
 pub const CLAUDE_CLI_PROVIDER_NAME: &str = "claude-cli";
 const MEASURED_ON: &str = "2026-09-25";
@@ -1909,7 +1909,7 @@ STDIN_CONTENT=$(cat)
   echo "END-CALL"
 }} >> "$SPOOL/calls.log"
 if [ "$MODE" = "exit-fail" ]; then
-  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}'
   echo "boom: simulated claude failure" >&2
   exit 3
 fi
@@ -1924,16 +1924,16 @@ if [ "$MODE" = "mcp-tool-call" ]; then
     # tool call was pending (issue #1341), not the original tool-offering
     # round above. Reflect the received text back so a test can assert the
     # real queued content actually arrived, on the same --resume session.
-    echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+    echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}'
     ECHOED=$(printf '%s' "$STDIN_CONTENT" | grep -oE '"text":"[^"]*"' | tail -1 | cut -d'"' -f4)
-    echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_followup","role":"assistant","content":[{{"type":"text","text":"followup received: '"$ECHOED"'"}}]}}}}'
+    echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_followup","role":"assistant","content":[{{"type":"text","text":"followup received: '"$ECHOED"'"}}]}}}}'
     echo '{{"type":"result","subtype":"success","is_error":false,"result":"followup received: '"$ECHOED"'","stop_reason":"end_turn"}}'
     exit 0
   fi
-  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}'
   SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
   printf '%s' "$SOCK" > "$SPOOL/socket_path"
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_preamble","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
   # This process must stay alive (stdout not yet at EOF) until the test has
   # finished acting as the bridge over the socket above -- otherwise
   # `drive`'s stdout-EOF branch could win the race against its listener
@@ -1944,7 +1944,7 @@ if [ "$MODE" = "mcp-tool-call" ]; then
     sleep 0.02
     tries=$((tries + 1))
   done
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"tool call handled"}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"tool call handled"}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"tool call handled","stop_reason":"end_turn"}}'
   exit 0
 fi
@@ -1957,12 +1957,12 @@ if [ "$MODE" = "mcp-tool-call-with-preamble" ]; then
   # investigation): a preamble text block streamed before the tool_use, in
   # a turn that genuinely pauses for a real tool result rather than
   # completing in one uninterrupted process invocation.
-  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}'
   SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
   printf '%s' "$SOCK" > "$SPOOL/socket_path"
   echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I will check "}}}}}}'
   echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"the file."}}}}}}'
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"key":"value"}}}}]}}}}'
   tries=0
   while [ ! -f "$SPOOL/proceed" ] && [ "$tries" -lt 500 ]; do
     sleep 0.02
@@ -1970,7 +1970,7 @@ if [ "$MODE" = "mcp-tool-call-with-preamble" ]; then
   done
   echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"The first "}}}}}}'
   echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"line is Finch."}}}}}}'
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"The first line is Finch.","stop_reason":"end_turn"}}'
   exit 0
 fi
@@ -1984,22 +1984,22 @@ if [ "$MODE" = "mcp-two-tool-calls" ]; then
   # MCP server before reading the first reply -- true concurrent dispatch --
   # is NOT reproduced here and is not verified against the real CLI; see the
   # disclosed limitation in this crate's AGENTS.md and issue #1351.)
-  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}'
+  echo '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}'
   SOCK=$(printf '%s' "$MCP_CONFIG" | grep -oE '"FINCH_CLAUDE_CLI_TOOL_SOCKET":"[^"]*"' | cut -d'"' -f4)
   printf '%s' "$SOCK" > "$SPOOL/socket_path"
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_tool1","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"n":"1"}}}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_tool1","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__probe_tool","input":{{"n":"1"}}}}]}}}}'
   tries=0
   while [ ! -f "$SPOOL/proceed1" ] && [ "$tries" -lt 500 ]; do
     sleep 0.02
     tries=$((tries + 1))
   done
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_tool2","role":"assistant","content":[{{"type":"tool_use","id":"toolu_2","name":"mcp__finch__probe_tool","input":{{"n":"2"}}}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_tool2","role":"assistant","content":[{{"type":"tool_use","id":"toolu_2","name":"mcp__finch__probe_tool","input":{{"n":"2"}}}}]}}}}'
   tries=0
   while [ ! -f "$SPOOL/proceed2" ] && [ "$tries" -lt 500 ]; do
     sleep 0.02
     tries=$((tries + 1))
   done
-  echo '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"both tools handled"}}]}}}}'
+  echo '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"both tools handled"}}]}}}}'
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"both tools handled","stop_reason":"end_turn"}}'
   exit 0
 fi
@@ -2012,33 +2012,33 @@ if [ "$MODE" = "two-unrelated-replies" ]; then
   # `TurnRecord::assistant_text` fused both into one string with no
   # separator, mid-word ("...help with?I don't have...").
   printf '%s\n' \
-    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
+    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I do not see a specific request yet."}}}}}}' \
-    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_confused","role":"assistant","content":[{{"type":"text","text":"I do not see a specific request yet."}}]}}}}' \
+    '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_confused","role":"assistant","content":[{{"type":"text","text":"I do not see a specific request yet."}}]}}}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"47 "}}}}}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"times 89 is 4183."}}}}}}' \
-    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_real_answer","role":"assistant","content":[{{"type":"text","text":"47 times 89 is 4183."}}]}}}}' \
+    '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_real_answer","role":"assistant","content":[{{"type":"text","text":"47 times 89 is 4183."}}]}}}}' \
     '{{"type":"result","subtype":"success","is_error":false,"result":"47 times 89 is 4183.","stop_reason":"end_turn"}}'
   exit 0
 fi
 if [ "$MODE" = "tool-preamble" ]; then
   printf '%s\n' \
-    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
+    '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"I will check "}}}}}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"the file."}}}}}}' \
-    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{{"file_path":"README.md"}}}}],"usage":{{"input_tokens":3,"output_tokens":9}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_preamble","role":"assistant","content":[{{"type":"text","text":"I will check the file."}},{{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{{"file_path":"README.md"}}}}],"usage":{{"input_tokens":3,"output_tokens":9}}}}}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"The first "}}}}}}' \
     '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"line is Finch."}}}}}}' \
-    '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}],"usage":{{"input_tokens":5,"output_tokens":6}}}}}}' \
+    '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_final","role":"assistant","content":[{{"type":"text","text":"The first line is Finch."}}],"usage":{{"input_tokens":5,"output_tokens":6}}}}}}' \
     '{{"type":"result","subtype":"success","is_error":false,"result":"The first line is Finch.","stop_reason":"end_turn"}}'
   exit 0
 fi
 printf '%s\n' \
-  '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}}' \
+  '{{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}}' \
   '{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","unifiedWindows":{{"five_hour":{{"utilization":0.07}},"seven_day":{{"utilization":0.06}}}}}}}}' \
   '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"he"}}}}}}' \
   '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"llo"}}}}}}' \
-  '{{"type":"assistant","message":{{"model":"claude-sonnet-5","id":"msg_fake_1","role":"assistant","content":[{{"type":"text","text":"hello"}}],"usage":{{"input_tokens":2,"output_tokens":4}}}}}}' \
+  '{{"type":"assistant","message":{{"model":"gpt-6.1-sol","id":"msg_fake_1","role":"assistant","content":[{{"type":"text","text":"hello"}}],"usage":{{"input_tokens":2,"output_tokens":4}}}}}}' \
   '{{"type":"result","subtype":"success","is_error":false,"result":"hello","stop_reason":"end_turn"}}'
 "#
         );
@@ -2350,7 +2350,7 @@ printf '%s\n' \
 # happen before this script proceeds.
 cat >/dev/null
 printf '%s\n' \
-  '{"type":"system","subtype":"init","session_id":"ignored","model":"claude-sonnet-5"}' \
+  '{"type":"system","subtype":"init","session_id":"ignored","model":"gpt-6.1-sol"}' \
   '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Credit balance too low"}'
 "#
             ,).unwrap();
@@ -2731,7 +2731,7 @@ printf '%s\n' \
         let mut record = TurnRecord::default();
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x"}}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_1","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x"}}]}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -2744,7 +2744,7 @@ printf '%s\n' \
         );
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":"Done."}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_2","content":[{"type":"text","text":"Done."}]}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -2771,7 +2771,7 @@ printf '%s\n' \
         let mut record = TurnRecord::default();
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"text","text":"I'll check that file."},{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"README.md"}}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_1","content":[{"type":"text","text":"I'll check that file."},{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"README.md"}}]}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -2784,7 +2784,7 @@ printf '%s\n' \
         );
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":" The first line is Finch."}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_2","content":[{"type":"text","text":" The first line is Finch."}]}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -2805,7 +2805,7 @@ printf '%s\n' \
         let mut record = TurnRecord::default();
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","content":[{"type":"text","text":"I don't see a specific request yet."}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_1","content":[{"type":"text","text":"I don't see a specific request yet."}]}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -2818,7 +2818,7 @@ printf '%s\n' \
         );
         record
             .absorb_line(
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","content":[{"type":"text","text":"I'll compute it directly: 47 x 89 = 4183."}]}}"#,
+                r#"{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_2","content":[{"type":"text","text":"I'll compute it directly: 47 x 89 = 4183."}]}}"#,
             )
             .unwrap();
         assert_eq!(

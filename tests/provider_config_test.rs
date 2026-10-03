@@ -46,7 +46,7 @@ fn test_gemini_invalid_model_name() {
 fn test_provider_factory_creates_correct_types() -> Result<()> {
     let claude_provider = providers::create_provider_from_entries(&[claude_entry(
         "test-key",
-        Some("claude-sonnet-5"),
+        Some("gpt-6.1-sol"),
     )])?;
     let gemini_provider = providers::create_provider_from_entries(&[gemini_entry(
         "test-key",
@@ -58,7 +58,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
     assert_eq!(gemini_provider.name(), "gemini");
 
     // Verify default models
-    assert_eq!(claude_provider.default_model(), "claude-sonnet-5");
+    assert_eq!(claude_provider.default_model(), "gpt-6.1-sol");
     assert_eq!(gemini_provider.default_model(), "gemini-2.5-flash");
 
     Ok(())
@@ -69,7 +69,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
 fn test_provider_factory_creates_fallback_chain() -> Result<()> {
     let entries = vec![
         gemini_entry("key1", Some("gemini-2.5-flash")),
-        claude_entry("key2", Some("claude-sonnet-5")),
+        claude_entry("key2", Some("gpt-6.1-sol")),
     ];
 
     // Create provider (should be a FallbackChain)
@@ -87,13 +87,13 @@ fn test_provider_factory_creates_fallback_chain() -> Result<()> {
 /// Test that provider factory handles a single entry correctly
 #[test]
 fn test_provider_factory_single_entry() -> Result<()> {
-    let entries = vec![claude_entry("test-key", Some("claude-sonnet-5"))];
+    let entries = vec![claude_entry("test-key", Some("gpt-6.1-sol"))];
 
     // Create provider (should NOT be a FallbackChain)
     let provider = providers::create_provider_from_entries(&entries)?;
 
     assert_eq!(provider.name(), "claude");
-    assert_eq!(provider.default_model(), "claude-sonnet-5");
+    assert_eq!(provider.default_model(), "gpt-6.1-sol");
 
     Ok(())
 }
@@ -113,7 +113,7 @@ fn test_provider_factory_fails_with_no_entries() {
 #[test]
 fn test_provider_requires_api_key() {
     // Empty API key should be caught
-    let entry = claude_entry("", Some("claude-sonnet-5"));
+    let entry = claude_entry("", Some("gpt-6.1-sol"));
 
     // Provider creation should handle this gracefully
     // (It will fail when making actual API calls)
@@ -144,7 +144,7 @@ fn test_provider_model_defaults() -> Result<()> {
 fn test_provider_capabilities() -> Result<()> {
     let provider = providers::create_provider_from_entries(&[claude_entry(
         "test-key",
-        Some("claude-sonnet-5"),
+        Some("gpt-6.1-sol"),
     )])?;
 
     // Claude should support both streaming and tools
@@ -162,7 +162,7 @@ fn test_provider_capabilities() -> Result<()> {
 fn test_config_with_cloud_entries_constructs() -> Result<()> {
     let config = Config::new(vec![
         gemini_entry("key1", Some("gemini-2.5-flash")),
-        claude_entry("key2", Some("claude-sonnet-5")),
+        claude_entry("key2", Some("gpt-6.1-sol")),
     ]);
     assert_eq!(config.cloud_providers().len(), 2);
     assert!(config.local_providers().is_empty());
@@ -180,7 +180,7 @@ fn test_document_valid_model_names() {
     let valid_gemini = ["gemini-2.5-flash"];
 
     // Claude:
-    let valid_claude = ["claude-sonnet-5"];
+    let valid_claude = ["gpt-6.1-sol"];
 
     // OpenAI:
     let valid_openai = ["gpt-5.6-sol", "gpt-4o"];

@@ -533,7 +533,7 @@ mod tests {
             .mock("POST", "/v1/messages")
             .match_header("authorization", "Bearer fresh-token")
             .with_status(200)
-            .with_body(r#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-5","stop_reason":"end_turn"}"#)
+            .with_body(r#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"gpt-6.1-sol","stop_reason":"end_turn"}"#)
             .create_async()
             .await;
 
@@ -559,7 +559,7 @@ mod tests {
             })
             .await
             .expect("a 401 on the stale lease must transparently refresh and retry");
-        assert_eq!(response.model, "claude-sonnet-5");
+        assert_eq!(response.model, "gpt-6.1-sol");
         assert_eq!(source.leases.load(Ordering::SeqCst), 1);
         assert_eq!(
             source.refreshes.load(Ordering::SeqCst),
