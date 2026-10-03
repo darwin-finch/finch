@@ -1,0 +1,1496 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "description": "Sessions: several submissions against one persistent set of declarations, as a host keeps between turns of a REPL. Each turn gives its submission in every frontend spelling and the expected terminal, observable sequence, whether it committed, and the names visible afterwards with the revision each resolves to. A turn the compiler rejects has terminal kind `rejected` with its diagnostic code.",
+  "sessions": [
+    {
+      "id": "definitions-persist-across-turns",
+      "note": "A function declared in one turn is callable in the next.",
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (inc 1)",
+          "clike": "int inc(int x) plain { x + 1 } inc(1)",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; 1 inc",
+          "id": "definitions-persist-across-turns#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 1
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "d974d5b12582e706d3b0a823db83f36b3b9646a7b162a70b93dcf0f8b6161961",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                2
+              ]
+            },
+            "observable": [
+              "Complete([2])"
+            ],
+            "committed": true,
+            "visible": {
+              "inc": "inc@1"
+            }
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "definitions-persist-across-turns#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "77992e2f1ae1e7cb93f476281f96c978d9113dfcd196c14654a0f43698e97f33",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                42
+              ]
+            },
+            "observable": [
+              "Complete([42])"
+            ],
+            "committed": true,
+            "visible": {
+              "inc": "inc@1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "failed-turn-commits-nothing",
+      "note": "The first turn declares a function and then fails. Its declaration is not visible afterwards.",
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (throw 1)",
+          "clike": "int inc(int x) plain { x + 1 } throw 1",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; 1 throw",
+          "id": "failed-turn-commits-nothing#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "throw",
+                "value": {
+                  "form": "literal",
+                  "value": 1
+                }
+              }
+            ]
+          },
+          "semantic_digest": "329bb5507958234ef79207a4f3f63449bb785c95b3d5893c2d6c3bf0daf18707",
+          "expected": {
+            "terminal": {
+              "kind": "fail",
+              "diagnostic": "uncaught-exception",
+              "exception": {
+                "value": 1,
+                "provenance": 0,
+                "suppressed": []
+              }
+            },
+            "observable": [
+              "Raise(value:1)",
+              "Fail(uncaught-exception)"
+            ],
+            "committed": false,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "failed-turn-commits-nothing#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "f8ba7e96e2af48467f22a785d85e584c99808faec319b0348c73c5fdab2bc07d",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "trapped-turn-commits-nothing",
+      "note": "A protected outcome discards the turn's declarations like any other failure.",
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (/ 1 0)",
+          "clike": "int inc(int x) plain { x + 1 } 1 / 0",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; 1 0 /",
+          "id": "trapped-turn-commits-nothing#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "/",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 1
+                  },
+                  {
+                    "form": "literal",
+                    "value": 0
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "193a91fdc46a0829fa709663285702dcb4e975f3d7ca9fc07bd296e0518b1b3b",
+          "expected": {
+            "terminal": {
+              "kind": "protected",
+              "edge": "Trap",
+              "detail": "divide-by-zero",
+              "suppressed": []
+            },
+            "observable": [
+              "Trap(divide-by-zero)"
+            ],
+            "committed": false,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "trapped-turn-commits-nothing#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "531a11de3d0f830a7d09bd44915608948868f4dfe54378f53e98222da05eb9a6",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "rejected-turn-commits-nothing",
+      "note": "A turn the compiler rejects never runs, so nothing in it is committed, including its valid declarations.",
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (+ missing 1)",
+          "clike": "int inc(int x) plain { x + 1 } missing + 1",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; missing 1 +",
+          "id": "rejected-turn-commits-nothing#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "+",
+                "arguments": [
+                  {
+                    "form": "read",
+                    "place": "missing"
+                  },
+                  {
+                    "form": "literal",
+                    "value": 1
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "57583332dedaaef9e8c82faa34dad8ca734de8b33f18e4d02f7e4e9f4832027e",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "rejected-turn-commits-nothing#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "054eb08781259355137edcd5c030e1bfc3f5efaf3e173cf94b5a3d2895ee9daf",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "refused-turn-commits-nothing",
+      "note": "A turn refused at admission performs no transition and commits nothing.",
+      "context": {
+        "operations": {
+          "log": {
+            "kind": "emit",
+            "parameters": 1,
+            "result": false
+          },
+          "read-file": {
+            "kind": "effect",
+            "parameters": 1,
+            "result": true
+          },
+          "sleep": {
+            "kind": "await",
+            "parameters": 1,
+            "result": true
+          }
+        }
+      },
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (read-file \"f\")",
+          "clike": "int inc(int x) plain { x + 1 } readFile(\"f\")",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; \"f\" read-file",
+          "context": {
+            "host": {
+              "grants": {},
+              "admission": {
+                "mode": "preflight"
+              }
+            }
+          },
+          "id": "refused-turn-commits-nothing#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "read-file",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": "f"
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "6369e0369041626b115f57b209e9445a0aafcd9b43c4a52dded0d01fda9e8942",
+          "expected": {
+            "terminal": {
+              "kind": "not-admitted",
+              "refused": [
+                "read-file(\"f\")"
+              ]
+            },
+            "observable": [
+              "NotAdmitted(read-file(\"f\"))"
+            ],
+            "committed": false,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "refused-turn-commits-nothing#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "924ec4469b0b9be2b140ca92c88bf634a5775e60004564b0780b7ef91b7108e5",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "events-of-a-failed-turn-are-not-retracted",
+      "note": "The turn emits, then fails. The event already reached the host; only the declarations are discarded.",
+      "context": {
+        "operations": {
+          "log": {
+            "kind": "emit",
+            "parameters": 1,
+            "result": false
+          }
+        }
+      },
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1)) (log \"sent\") (throw 1)",
+          "clike": "int inc(int x) plain { x + 1 } log(\"sent\"); throw 1",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ; \"sent\" log 1 throw",
+          "id": "events-of-a-failed-turn-are-not-retracted#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "inc",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "x",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "x"
+                    },
+                    {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "log",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": "sent"
+                  }
+                ]
+              },
+              {
+                "form": "throw",
+                "value": {
+                  "form": "literal",
+                  "value": 1
+                }
+              }
+            ]
+          },
+          "semantic_digest": "c8daab6f539897e36e978c34801d857904afd219daba59a049926573ea518d39",
+          "expected": {
+            "terminal": {
+              "kind": "fail",
+              "diagnostic": "uncaught-exception",
+              "exception": {
+                "value": 1,
+                "provenance": 0,
+                "suppressed": []
+              }
+            },
+            "observable": [
+              "Emit(log:\"sent\")",
+              "Raise(value:1)",
+              "Fail(uncaught-exception)"
+            ],
+            "committed": false,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ (inc 41) 0)",
+          "clike": "inc(41) + 0",
+          "coforth": "41 inc 0 +",
+          "id": "events-of-a-failed-turn-are-not-retracted#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "inc",
+                "arguments": [
+                  {
+                    "form": "literal",
+                    "value": 41
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "9909c7bb4d54fce4e447d8778a0a971336a5a2fc04dc8ff8c161ed7dc9f03464",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "later-definition-shadows-without-changing-earlier-code",
+      "note": "base is declared again in turn two. twice was checked against the first base and keeps calling it; new code sees the second.",
+      "turns": [
+        {
+          "colisp": "(define (base) : int ! plain 1) (define (twice) : int ! plain (+ (base) (base))) (twice)",
+          "clike": "int base() plain { 1 } int twice() plain { base() + base() } twice()",
+          "coforth": ": base ( -- int ! plain ) 1 ; : twice ( -- int ! plain ) base base + ; twice",
+          "id": "later-definition-shadows-without-changing-earlier-code#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "base",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [],
+                "body": {
+                  "form": "literal",
+                  "value": 1
+                }
+              },
+              {
+                "form": "function",
+                "name": "twice",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [],
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "call",
+                      "callee": "base",
+                      "arguments": []
+                    },
+                    {
+                      "form": "call",
+                      "callee": "base",
+                      "arguments": []
+                    }
+                  ]
+                }
+              },
+              {
+                "form": "call",
+                "callee": "twice",
+                "arguments": []
+              }
+            ]
+          },
+          "semantic_digest": "cd98b5027e3e99b51ff9bc97c4030cd9a6e8835c90ca5a75f0e1873b19d24f6b",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                2
+              ]
+            },
+            "observable": [
+              "Complete([2])"
+            ],
+            "committed": true,
+            "visible": {
+              "base": "base@1",
+              "twice": "twice@1"
+            }
+          }
+        },
+        {
+          "colisp": "(define (base) : int ! plain 10) (+ (twice) (base))",
+          "clike": "int base() plain { 10 } twice() + base()",
+          "coforth": ": base ( -- int ! plain ) 10 ; twice base +",
+          "id": "later-definition-shadows-without-changing-earlier-code#2",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "base",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [],
+                "body": {
+                  "form": "literal",
+                  "value": 10
+                }
+              },
+              {
+                "form": "call",
+                "callee": "+",
+                "arguments": [
+                  {
+                    "form": "call",
+                    "callee": "twice",
+                    "arguments": []
+                  },
+                  {
+                    "form": "call",
+                    "callee": "base",
+                    "arguments": []
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "ee7334561e5496cb323ee1a6c54287193e2610f1075237054c4d94709decb5a0",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                12
+              ]
+            },
+            "observable": [
+              "Complete([12])"
+            ],
+            "committed": true,
+            "visible": {
+              "base": "base@2",
+              "twice": "twice@1"
+            }
+          }
+        },
+        {
+          "colisp": "(+ (base) 0)",
+          "clike": "base() + 0",
+          "coforth": "base 0 +",
+          "id": "later-definition-shadows-without-changing-earlier-code#3",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "base",
+                "arguments": []
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "95a23ff5ef32b7be2a7f21cdf1566890986a9ec0ce086a29d3cef7cd2bc2f683",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                10
+              ]
+            },
+            "observable": [
+              "Complete([10])"
+            ],
+            "committed": true,
+            "visible": {
+              "base": "base@2",
+              "twice": "twice@1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "failed-redefinition-leaves-the-earlier-one-visible",
+      "note": "A turn that redeclares a function and fails does not disturb the committed revision.",
+      "turns": [
+        {
+          "colisp": "(define (base) : int ! plain 1) (base)",
+          "clike": "int base() plain { 1 } base()",
+          "coforth": ": base ( -- int ! plain ) 1 ; base",
+          "id": "failed-redefinition-leaves-the-earlier-one-visible#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "base",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [],
+                "body": {
+                  "form": "literal",
+                  "value": 1
+                }
+              },
+              {
+                "form": "call",
+                "callee": "base",
+                "arguments": []
+              }
+            ]
+          },
+          "semantic_digest": "e75825d5c0821a60735e63f425e7a131f509987f7c473fba2ef842b1871c32df",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                1
+              ]
+            },
+            "observable": [
+              "Complete([1])"
+            ],
+            "committed": true,
+            "visible": {
+              "base": "base@1"
+            }
+          }
+        },
+        {
+          "colisp": "(define (base) : int ! plain 10) (throw (base))",
+          "clike": "int base() plain { 10 } throw base()",
+          "coforth": ": base ( -- int ! plain ) 10 ; base throw",
+          "id": "failed-redefinition-leaves-the-earlier-one-visible#2",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "base",
+                "result": "int",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [],
+                "body": {
+                  "form": "literal",
+                  "value": 10
+                }
+              },
+              {
+                "form": "throw",
+                "value": {
+                  "form": "call",
+                  "callee": "base",
+                  "arguments": []
+                }
+              }
+            ]
+          },
+          "semantic_digest": "55488ff5a3d94ed80f3247208cfac1612b9cad6c86445f1716530f1d004977aa",
+          "expected": {
+            "terminal": {
+              "kind": "fail",
+              "diagnostic": "uncaught-exception",
+              "exception": {
+                "value": 10,
+                "provenance": 0,
+                "suppressed": []
+              }
+            },
+            "observable": [
+              "Raise(value:10)",
+              "Fail(uncaught-exception)"
+            ],
+            "committed": false,
+            "visible": {
+              "base": "base@1"
+            }
+          }
+        },
+        {
+          "colisp": "(+ (base) 0)",
+          "clike": "base() + 0",
+          "coforth": "base 0 +",
+          "id": "failed-redefinition-leaves-the-earlier-one-visible#3",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "base",
+                "arguments": []
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          },
+          "semantic_digest": "f861a028bcef347c89c2d4542b6aed748e751d1826f4241256c4dc2738a7bb83",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                1
+              ]
+            },
+            "observable": [
+              "Complete([1])"
+            ],
+            "committed": true,
+            "visible": {
+              "base": "base@1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "declarations-in-one-turn-see-each-other-and-earlier-turns",
+      "note": "Two new functions call each other and an older one.",
+      "turns": [
+        {
+          "colisp": "(define (inc (x : int)) : int ! plain (+ x 1))",
+          "clike": "int inc(int x) plain { x + 1 }",
+          "coforth": ": inc ( x: int -- int ! plain ) x 1 + ;",
+          "id": "declarations-in-one-turn-see-each-other-and-earlier-turns#1",
+          "ast": {
+            "form": "function",
+            "name": "inc",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "x",
+                "type": "int",
+                "ownership": "borrow"
+              }
+            ],
+            "body": {
+              "form": "call",
+              "callee": "+",
+              "arguments": [
+                {
+                  "form": "read",
+                  "place": "x"
+                },
+                {
+                  "form": "literal",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "semantic_digest": "1253a0a300b89ace31820800a0a9ae26e0828eebca4e5e64611dd4096ca12493",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                null
+              ]
+            },
+            "observable": [
+              "Complete([unit])"
+            ],
+            "committed": true,
+            "visible": {
+              "inc": "inc@1"
+            }
+          }
+        },
+        {
+          "colisp": "(define (even? (n : int)) : bool ! plain (if (== n 0) true (odd? (- n 1)))) (define (odd? (n : int)) : bool ! plain (if (== n 0) false (even? (- n 1)))) (if (even? (inc 3)) 1 0)",
+          "clike": "bool `even?`(int n) plain { if (n == 0) true else `odd?`(n - 1) } bool `odd?`(int n) plain { if (n == 0) false else `even?`(n - 1) } if (`even?`(inc(3))) 1 else 0",
+          "coforth": ": even? ( n: int -- bool ! plain ) n 0 == if true else n 1 - odd? then ; : odd? ( n: int -- bool ! plain ) n 0 == if false else n 1 - even? then ; 3 inc even? if 1 else 0 then",
+          "id": "declarations-in-one-turn-see-each-other-and-earlier-turns#2",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "function",
+                "name": "even?",
+                "result": "bool",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "n",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "if",
+                  "condition": {
+                    "form": "call",
+                    "callee": "==",
+                    "arguments": [
+                      {
+                        "form": "read",
+                        "place": "n"
+                      },
+                      {
+                        "form": "literal",
+                        "value": 0
+                      }
+                    ]
+                  },
+                  "then": {
+                    "form": "literal",
+                    "value": true
+                  },
+                  "else": {
+                    "form": "call",
+                    "callee": "odd?",
+                    "arguments": [
+                      {
+                        "form": "call",
+                        "callee": "-",
+                        "arguments": [
+                          {
+                            "form": "read",
+                            "place": "n"
+                          },
+                          {
+                            "form": "literal",
+                            "value": 1
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "form": "function",
+                "name": "odd?",
+                "result": "bool",
+                "contract": "effects<> | nothrow | non-suspending",
+                "parameters": [
+                  {
+                    "form": "parameter",
+                    "name": "n",
+                    "type": "int",
+                    "ownership": "borrow"
+                  }
+                ],
+                "body": {
+                  "form": "if",
+                  "condition": {
+                    "form": "call",
+                    "callee": "==",
+                    "arguments": [
+                      {
+                        "form": "read",
+                        "place": "n"
+                      },
+                      {
+                        "form": "literal",
+                        "value": 0
+                      }
+                    ]
+                  },
+                  "then": {
+                    "form": "literal",
+                    "value": false
+                  },
+                  "else": {
+                    "form": "call",
+                    "callee": "even?",
+                    "arguments": [
+                      {
+                        "form": "call",
+                        "callee": "-",
+                        "arguments": [
+                          {
+                            "form": "read",
+                            "place": "n"
+                          },
+                          {
+                            "form": "literal",
+                            "value": 1
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "form": "if",
+                "condition": {
+                  "form": "call",
+                  "callee": "even?",
+                  "arguments": [
+                    {
+                      "form": "call",
+                      "callee": "inc",
+                      "arguments": [
+                        {
+                          "form": "literal",
+                          "value": 3
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "then": {
+                  "form": "literal",
+                  "value": 1
+                },
+                "else": {
+                  "form": "literal",
+                  "value": 0
+                }
+              }
+            ]
+          },
+          "semantic_digest": "f0422e37dfabe2a72f7cb1278f0e4598dea6f5731e9ab63a7342bb7bd9204ab2",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                1
+              ]
+            },
+            "observable": [
+              "Complete([1])"
+            ],
+            "committed": true,
+            "visible": {
+              "even?": "even?@2",
+              "inc": "inc@1",
+              "odd?": "odd?@2"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "variant-persists-and-cannot-be-redeclared",
+      "note": "A variant declared in a committed turn is usable later. Declaring it again is rejected: a nominal type has one identity in a session.",
+      "turns": [
+        {
+          "colisp": "(variant Shape (Empty) (Circle int)) (match (Circle 3) ((Circle r) r) ((Empty) 0))",
+          "clike": "variant Shape { Empty, Circle(int) } match (Circle(3)) { Circle(r) => r, Empty() => 0 }",
+          "coforth": "variant: Shape cases{ Empty Circle( int ) } ; 3 Circle match Circle( r ) of r endof Empty( ) of 0 endof endmatch",
+          "id": "variant-persists-and-cannot-be-redeclared#1",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "variant",
+                "name": "Shape",
+                "representation": "native",
+                "cases": [
+                  {
+                    "form": "case",
+                    "name": "Empty",
+                    "payload_kind": "unit",
+                    "payload": []
+                  },
+                  {
+                    "form": "case",
+                    "name": "Circle",
+                    "payload_kind": "tuple",
+                    "payload": [
+                      "int"
+                    ]
+                  }
+                ]
+              },
+              {
+                "form": "match",
+                "ownership": "borrow",
+                "scrutinee": {
+                  "form": "call",
+                  "callee": "Circle",
+                  "arguments": [
+                    {
+                      "form": "literal",
+                      "value": 3
+                    }
+                  ]
+                },
+                "arms": [
+                  {
+                    "form": "match-arm",
+                    "pattern": {
+                      "constructor": "Circle",
+                      "arguments": [
+                        {
+                          "bind": "r"
+                        }
+                      ]
+                    },
+                    "body": {
+                      "form": "read",
+                      "place": "r"
+                    }
+                  },
+                  {
+                    "form": "match-arm",
+                    "pattern": {
+                      "constructor": "Empty",
+                      "arguments": []
+                    },
+                    "body": {
+                      "form": "literal",
+                      "value": 0
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "semantic_digest": "d7707a26086c75438c66aa08000b046e425bf598f0a2fae060a38d5dbd7911aa",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                3
+              ]
+            },
+            "observable": [
+              "Complete([3])"
+            ],
+            "committed": true,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(match (Circle 4) ((Circle r) r) ((Empty) 0))",
+          "clike": "match (Circle(4)) { Circle(r) => r, Empty() => 0 }",
+          "coforth": "4 Circle match Circle( r ) of r endof Empty( ) of 0 endof endmatch",
+          "id": "variant-persists-and-cannot-be-redeclared#2",
+          "ast": {
+            "form": "match",
+            "ownership": "borrow",
+            "scrutinee": {
+              "form": "call",
+              "callee": "Circle",
+              "arguments": [
+                {
+                  "form": "literal",
+                  "value": 4
+                }
+              ]
+            },
+            "arms": [
+              {
+                "form": "match-arm",
+                "pattern": {
+                  "constructor": "Circle",
+                  "arguments": [
+                    {
+                      "bind": "r"
+                    }
+                  ]
+                },
+                "body": {
+                  "form": "read",
+                  "place": "r"
+                }
+              },
+              {
+                "form": "match-arm",
+                "pattern": {
+                  "constructor": "Empty",
+                  "arguments": []
+                },
+                "body": {
+                  "form": "literal",
+                  "value": 0
+                }
+              }
+            ]
+          },
+          "semantic_digest": "c03f132af8715eb765e412db9e84179d540419f4b4449c677f46eede1a73c559",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                4
+              ]
+            },
+            "observable": [
+              "Complete([4])"
+            ],
+            "committed": true,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(variant Shape (Empty)) 1",
+          "clike": "variant Shape { Empty } 1",
+          "coforth": "variant: Shape cases{ Empty } ; 1",
+          "id": "variant-persists-and-cannot-be-redeclared#3",
+          "ast": {
+            "form": "sequence",
+            "items": [
+              {
+                "form": "variant",
+                "name": "Shape",
+                "representation": "native",
+                "cases": [
+                  {
+                    "form": "case",
+                    "name": "Empty",
+                    "payload_kind": "unit",
+                    "payload": []
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 1
+              }
+            ]
+          },
+          "semantic_digest": "782b312c82b4ea90359ae07f0bf39a7e48f1f8670ed75f1fa084fcabbcae8afe",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-DUPLICATE-DECLARATION"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "a-local-binding-does-not-leak-into-the-session",
+      "note": "A let at the top of a submission scopes the rest of that submission only.",
+      "turns": [
+        {
+          "colisp": "(let [k : int 5] (+ k 1))",
+          "clike": "int k = 5; k + 1",
+          "coforth": "5 { k: int -- } k 1 +",
+          "id": "a-local-binding-does-not-leak-into-the-session#1",
+          "ast": {
+            "form": "let",
+            "name": "k",
+            "mutable": false,
+            "type": "int",
+            "initializer": {
+              "form": "literal",
+              "value": 5
+            },
+            "body": {
+              "form": "call",
+              "callee": "+",
+              "arguments": [
+                {
+                  "form": "read",
+                  "place": "k"
+                },
+                {
+                  "form": "literal",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "semantic_digest": "65318e2fc6a04a04c19b22dce9c2668d3a70117c37be4fb0019ae35f56e308f4",
+          "expected": {
+            "terminal": {
+              "kind": "complete",
+              "values": [
+                6
+              ]
+            },
+            "observable": [
+              "Complete([6])"
+            ],
+            "committed": true,
+            "visible": {}
+          }
+        },
+        {
+          "colisp": "(+ k 1)",
+          "clike": "k + 1",
+          "coforth": "k 1 +",
+          "id": "a-local-binding-does-not-leak-into-the-session#2",
+          "ast": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "read",
+                "place": "k"
+              },
+              {
+                "form": "literal",
+                "value": 1
+              }
+            ]
+          },
+          "semantic_digest": "1db341c65a48af0279b34ab7a073e48393e3e74f0565c8a27773f6a90b80db45",
+          "expected": {
+            "terminal": {
+              "kind": "rejected",
+              "code": "F-DIAG-UNBOUND-NAME"
+            },
+            "observable": [],
+            "committed": false,
+            "visible": {}
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "description": "What a checked program may ask of its host, as an artifact produced before the program runs, and the step that decides whether it may start. This is the mediated effect binding used when a host embeds the language, for example a REPL driven across turns.",
+  "manifest": {
+    "effects": "Every capability request in code reachable from the entry callable, as an operation and its arguments. Arguments are listed when every one is written as a literal directly in argument position; otherwise the entry stands for any arguments and is written operation(*). Entries are unique and sorted by that spelling.",
+    "awaits": "Every scheduler or timer operation reachable from the entry, by name.",
+    "events": "Every event the program may emit to the host, by name."
+  },
+  "rules": [
+    "Reachable means the entry body, every function it calls or names as a value, transitively, and every lambda and fiber body inside reachable code. A request on a branch that will not be taken is still reachable; a function nothing refers to is not.",
+    "The manifest contains at least the capability part of the entry callable's effect row. It also lists the requests of a closure or fiber that reachable code constructs and never runs, since construction is what makes them reachable. It is derivable from verified IR alone, and a host derives it there rather than trusting a frontend: a request instruction carries a static claim that the verifier checks against the constants before it. A compiler that omits the claim only widens what must be granted.",
+    "A static argument is a literal written directly as the argument. A literal wrapped in any other form, including a sequence or the unary negation a negative number reads as, is not static in 0.1.",
+    "A grant is absent, unrestricted, or a list of allowed argument lists. A request with static arguments is covered by an unrestricted grant or by a list that contains its arguments. A request with non-static arguments is covered only by an unrestricted grant, because nothing bounds what it will ask for; in the full language a refined argument type or selector supplies that bound statically.",
+    "Lazy admission starts the program at once. Preflight admission first tests every manifest effect against the grants. Every one not covered is put to the host as a prompt, in manifest order, and a refusal does not stop the later prompts, so the user sees the whole list. The host log records each prompt with its answer, or unanswered when the host gives none. An answer of allow adds exactly that request to the grants for this execution, which for a request with non-static arguments is the whole operation. If any request remains uncovered the program is not admitted.",
+    "A program that is not admitted does not start: no event is emitted, no request is journaled, no cleanup runs, and no VM-local mutation exists to discard. Its whole transition sequence is the single entry NotAdmitted, and its terminal has kind not-admitted and names the refused requests.",
+    "Admission does not replace the dispatch check. Every capability request is tested against the live grant with its actual arguments immediately before it is journaled, so a revoked grant or an argument outside an allowed list is Denied at that request even in an admitted program.",
+    "Events and awaits need no grant. They are listed so the host knows what it may be sent and what may suspend."
+  ],
+  "bindings": {
+    "mediated": "Each request is a message to a host broker: tested against the live grant, journaled, exposed as Await, and resumed through the replay automaton. Events are journaled before they are exposed. This is the binding the execution vectors assert.",
+    "direct": "Each request is a call to the provider the program was linked with. There is no grant test at the request, no journal, no replay acceptance, and no parking; grants are tested once against the manifest when the program is built or admitted. Effects occur in the same order with the same results, and cleanup, drops, and the terminal are unchanged."
+  },
+  "sessions": [
+    "A session holds the declarations committed by earlier turns. A turn's declarations are committed only when the turn reaches Complete.",
+    "A function declared again shadows the earlier revision for later turns. Functions committed earlier keep the revision they were checked against.",
+    "A nominal type declared again in the same session is F-DIAG-DUPLICATE-DECLARATION.",
+    "Events and requests made by a turn that later fails are not retracted."
+  ]
+}

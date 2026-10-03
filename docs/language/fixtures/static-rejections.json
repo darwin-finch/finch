@@ -1,0 +1,1159 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "description": "Programs a conforming compiler MUST reject before execution, each with the stable diagnostic code of its principal error. Both spellings must build the stored AST. The reference machine detects these only as violated execution invariants; a conforming implementation reports them statically and never starts the program.",
+  "vectors": [
+    {
+      "id": "break-outside-loop",
+      "code": "F-DIAG-LOOP-TARGET",
+      "colisp": "(break)",
+      "clike": "break",
+      "coforth": "break",
+      "ast": {
+        "form": "break"
+      },
+      "semantic_digest": "939e95fcdccdd36ba4c4b45ed6dfeb124260a5360858221275ad72f2dac2655b"
+    },
+    {
+      "id": "continue-outside-loop",
+      "code": "F-DIAG-LOOP-TARGET",
+      "colisp": "(continue)",
+      "clike": "continue",
+      "coforth": "continue",
+      "ast": {
+        "form": "continue-loop"
+      },
+      "semantic_digest": "c9739bd5e5e4e078289231d83fd61d24d044769f431e7e8a298676020b8284d7"
+    },
+    {
+      "id": "break-cannot-cross-function-boundary",
+      "code": "F-DIAG-LOOP-TARGET",
+      "colisp": "(define (f) : unit ! plain (break)) (while true (f))",
+      "clike": "unit f() plain { break } while (true) f()",
+      "coforth": ": f ( -- ! plain ) break ; begin true while f repeat",
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "f",
+            "result": "unit",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [],
+            "body": {
+              "form": "break"
+            }
+          },
+          {
+            "form": "while",
+            "condition": {
+              "form": "literal",
+              "value": true
+            },
+            "body": {
+              "form": "call",
+              "callee": "f",
+              "arguments": []
+            }
+          }
+        ]
+      },
+      "semantic_digest": "6a9f721251eb0ad7b210b4fddf3b4d5afeea16481174acb7665d96be842a634b"
+    },
+    {
+      "id": "break-cannot-leave-guard-body",
+      "code": "F-DIAG-LOOP-TARGET",
+      "colisp": "(while true (scope (on-exit (break)) 1))",
+      "clike": "while (true) scope { onExit break; 1 }",
+      "coforth": "begin true while scope on-exit [ ( -- ) | break ] 1 drop endscope repeat",
+      "ast": {
+        "form": "while",
+        "condition": {
+          "form": "literal",
+          "value": true
+        },
+        "body": {
+          "form": "scope",
+          "guards": [
+            {
+              "form": "guard",
+              "reason": "exit",
+              "body": {
+                "form": "break"
+              }
+            }
+          ],
+          "body": {
+            "form": "literal",
+            "value": 1
+          }
+        }
+      },
+      "semantic_digest": "bed5ff7c91cbf3e0bc89a9d5b50cf73922802937037212ba6d9ef65e02ef1e17"
+    },
+    {
+      "id": "return-outside-callable",
+      "code": "F-DIAG-RETURN-TARGET",
+      "colisp": "(return 1)",
+      "clike": "return 1",
+      "coforth": null,
+      "unpaired_reason": "A Co-Forth submission body has no result signature for `return` to consume.",
+      "ast": {
+        "form": "return",
+        "value": {
+          "form": "literal",
+          "value": 1
+        }
+      },
+      "semantic_digest": "11bad83e21a13d9fdb2f538b1e00ff202a7035c228580c193234ad95fe435d9e"
+    },
+    {
+      "id": "return-cannot-leave-guard-body",
+      "code": "F-DIAG-GUARD-ESCAPE",
+      "colisp": "(define (f) : int ! plain (scope (on-exit (return 2)) 1)) (+ (f) 0)",
+      "clike": "int f() plain { scope { onExit return 2; 1 } } f() + 0",
+      "coforth": null,
+      "unpaired_reason": "A Co-Forth guard is a quotation whose own signature bounds `return`.",
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "f",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [],
+            "body": {
+              "form": "scope",
+              "guards": [
+                {
+                  "form": "guard",
+                  "reason": "exit",
+                  "body": {
+                    "form": "return",
+                    "value": {
+                      "form": "literal",
+                      "value": 2
+                    }
+                  }
+                }
+              ],
+              "body": {
+                "form": "literal",
+                "value": 1
+              }
+            }
+          },
+          {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "f",
+                "arguments": []
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "semantic_digest": "8db70312f81128e33a0b4a2c27436e5eb3579e26e20275e63fd0431dba840995"
+    },
+    {
+      "id": "rethrow-outside-catch",
+      "code": "F-DIAG-RETHROW-TARGET",
+      "colisp": "(rethrow)",
+      "clike": "rethrow",
+      "coforth": "rethrow",
+      "ast": {
+        "form": "rethrow"
+      },
+      "semantic_digest": "07e603391b4918d92f47eb0ccd0fed37874557a8ddae1feeae79885ee5ff2ee9"
+    },
+    {
+      "id": "rethrow-cannot-cross-function-boundary",
+      "code": "F-DIAG-RETHROW-TARGET",
+      "colisp": "(define (f) : int ! inferred (rethrow)) (try (throw 1) (catch _ (+ (f) 0)))",
+      "clike": "int f() inferred { rethrow } try throw 1 catch (_) f() + 0",
+      "coforth": ": f ( -- int ! inferred ) rethrow ; try 1 throw catch _ of f 0 + endof endtry",
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "f",
+            "result": "int",
+            "contract": "effects-infer | throws-infer | suspends-infer",
+            "parameters": [],
+            "body": {
+              "form": "rethrow"
+            }
+          },
+          {
+            "form": "try",
+            "body": {
+              "form": "throw",
+              "value": {
+                "form": "literal",
+                "value": 1
+              }
+            },
+            "catches": [
+              {
+                "form": "catch",
+                "pattern": "_",
+                "body": {
+                  "form": "call",
+                  "callee": "+",
+                  "arguments": [
+                    {
+                      "form": "call",
+                      "callee": "f",
+                      "arguments": []
+                    },
+                    {
+                      "form": "literal",
+                      "value": 0
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "semantic_digest": "3c4b8601d9b8bed31e0be7f27c45cbddd9d196618bb9b0e426584ab7eb2c96fb"
+    },
+    {
+      "id": "assignment-to-immutable-local",
+      "code": "F-DIAG-ASSIGN-IMMUTABLE",
+      "colisp": "(let [x : int 1] (begin (set! x 2) x))",
+      "clike": "int x = 1; x = 2; x",
+      "coforth": "1 { x: int -- } 2 to x x",
+      "ast": {
+        "form": "let",
+        "name": "x",
+        "mutable": false,
+        "type": "int",
+        "initializer": {
+          "form": "literal",
+          "value": 1
+        },
+        "body": {
+          "form": "sequence",
+          "items": [
+            {
+              "form": "assign",
+              "place": "x",
+              "value": {
+                "form": "literal",
+                "value": 2
+              }
+            },
+            {
+              "form": "read",
+              "place": "x"
+            }
+          ]
+        }
+      },
+      "semantic_digest": "afa63e16949b6362e09e500a1c093da753eee90a36f16691b08f45f135485dee"
+    },
+    {
+      "id": "use-after-move",
+      "code": "F-DIAG-USE-AFTER-MOVE",
+      "colisp": "(let [a : Token (Token :id 1)] (let [b : Token a] (match a (_ 7))))",
+      "clike": "Token a = Token { id: 1 }; Token b = a; match (a) { _ => 7 }",
+      "coforth": "Token{ id: 1 } { a: Token -- } a { b: Token -- } a match _ of 7 endof endmatch",
+      "context": {
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "let",
+        "name": "a",
+        "mutable": false,
+        "type": "Token",
+        "initializer": {
+          "form": "record-construct",
+          "type": "Token",
+          "fields": [
+            {
+              "form": "field-init",
+              "name": "id",
+              "value": {
+                "form": "literal",
+                "value": 1
+              }
+            }
+          ]
+        },
+        "body": {
+          "form": "let",
+          "name": "b",
+          "mutable": false,
+          "type": "Token",
+          "initializer": {
+            "form": "read",
+            "place": "a"
+          },
+          "body": {
+            "form": "match",
+            "ownership": "borrow",
+            "scrutinee": {
+              "form": "read",
+              "place": "a"
+            },
+            "arms": [
+              {
+                "form": "match-arm",
+                "pattern": "_",
+                "body": {
+                  "form": "literal",
+                  "value": 7
+                }
+              }
+            ]
+          }
+        }
+      },
+      "semantic_digest": "c9f3bcfa2e8685e3a37f08f455581018529ee3375896662fc860799655b5f5fe"
+    },
+    {
+      "id": "tail-call-cannot-pass-loan-of-discarded-frame",
+      "code": "F-DIAG-LOAN-ESCAPES-FRAME",
+      "colisp": "(define (g (borrow-mut n : int)) : unit ! plain (set! n 1)) (define (f) : unit ! plain (let [mut x : int 0] (g x))) (f)",
+      "clike": "unit g(mut int n) plain { n = 1 } unit f() plain { mut int x = 0; g(x) } f()",
+      "coforth": ": g ( borrow-mut n: int -- ! plain ) 1 to n ; : f ( -- ! plain ) { -- mut x: int } 0 to x x g ; f",
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "g",
+            "result": "unit",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "n",
+                "type": "int",
+                "ownership": "borrow-mut"
+              }
+            ],
+            "body": {
+              "form": "assign",
+              "place": "n",
+              "value": {
+                "form": "literal",
+                "value": 1
+              }
+            }
+          },
+          {
+            "form": "function",
+            "name": "f",
+            "result": "unit",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [],
+            "body": {
+              "form": "let",
+              "name": "x",
+              "mutable": true,
+              "type": "int",
+              "initializer": {
+                "form": "literal",
+                "value": 0
+              },
+              "body": {
+                "form": "call",
+                "callee": "g",
+                "arguments": [
+                  {
+                    "form": "read",
+                    "place": "x"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "form": "call",
+            "callee": "f",
+            "arguments": []
+          }
+        ]
+      },
+      "semantic_digest": "6790d9e067f6513120d8384d3e98ebeb44128bba47a0a8b01d55da0650b100d4"
+    },
+    {
+      "id": "stealing-parameter-cannot-take-a-borrow",
+      "code": "F-DIAG-MOVE-FROM-BORROW",
+      "colisp": "(define (eat (steal t : Token)) : int ! plain 2) (define (pass (t : Token)) : int ! plain (+ (eat t) 0)) (+ (pass (Token :id 1)) 0)",
+      "clike": "int eat(move Token t) plain { 2 } int pass(Token t) plain { eat(t) + 0 } pass(Token { id: 1 }) + 0",
+      "coforth": ": eat ( steal t: Token -- int ! plain ) 2 ; : pass ( t: Token -- int ! plain ) t eat 0 + ; Token{ id: 1 } pass 0 +",
+      "context": {
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "eat",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "t",
+                "type": "Token",
+                "ownership": "steal"
+              }
+            ],
+            "body": {
+              "form": "literal",
+              "value": 2
+            }
+          },
+          {
+            "form": "function",
+            "name": "pass",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "t",
+                "type": "Token",
+                "ownership": "borrow"
+              }
+            ],
+            "body": {
+              "form": "call",
+              "callee": "+",
+              "arguments": [
+                {
+                  "form": "call",
+                  "callee": "eat",
+                  "arguments": [
+                    {
+                      "form": "read",
+                      "place": "t"
+                    }
+                  ]
+                },
+                {
+                  "form": "literal",
+                  "value": 0
+                }
+              ]
+            }
+          },
+          {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "pass",
+                "arguments": [
+                  {
+                    "form": "record-construct",
+                    "type": "Token",
+                    "fields": [
+                      {
+                        "form": "field-init",
+                        "name": "id",
+                        "value": {
+                          "form": "literal",
+                          "value": 1
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "semantic_digest": "48dc521550d9385f3994f25966a981e6bf0e693144b49dab820a867cff4d2b82"
+    },
+    {
+      "id": "spawned-callable-cannot-capture-a-loan",
+      "code": "F-DIAG-TRANSFER-REQUIRES-OWNED",
+      "colisp": "(let [n : int 1] (join (spawn (lambda () ! plain n))))",
+      "clike": "int n = 1; join(spawn(() plain => n))",
+      "coforth": "1 { n: int -- } [ ( -- int ! plain ) | n ] spawn join",
+      "ast": {
+        "form": "let",
+        "name": "n",
+        "mutable": false,
+        "type": "int",
+        "initializer": {
+          "form": "literal",
+          "value": 1
+        },
+        "body": {
+          "form": "call",
+          "callee": "join",
+          "arguments": [
+            {
+              "form": "call",
+              "callee": "spawn",
+              "arguments": [
+                {
+                  "form": "lambda",
+                  "capture_default": "borrow",
+                  "contract": "effects<> | nothrow | non-suspending",
+                  "captures": [],
+                  "parameters": [],
+                  "body": {
+                    "form": "read",
+                    "place": "n"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "semantic_digest": "995454e51a0b6fbd9149f89401a23bfb1de2934748f7728f5be6c764ecea6dd0"
+    },
+    {
+      "id": "join-of-consumed-task-handle",
+      "code": "F-DIAG-USE-AFTER-MOVE",
+      "colisp": "(let [t (spawn (lambda :move () ! plain 7))] (begin (cancel t) (join t)))",
+      "clike": "auto t = spawn([move]() plain => 7); cancel(t); join(t)",
+      "coforth": "[ captures: move ( -- int ! plain ) | 7 ] spawn { t -- } t cancel t join",
+      "ast": {
+        "form": "let",
+        "name": "t",
+        "mutable": false,
+        "initializer": {
+          "form": "call",
+          "callee": "spawn",
+          "arguments": [
+            {
+              "form": "lambda",
+              "capture_default": "move",
+              "contract": "effects<> | nothrow | non-suspending",
+              "captures": [],
+              "parameters": [],
+              "body": {
+                "form": "literal",
+                "value": 7
+              }
+            }
+          ]
+        },
+        "body": {
+          "form": "sequence",
+          "items": [
+            {
+              "form": "call",
+              "callee": "cancel",
+              "arguments": [
+                {
+                  "form": "read",
+                  "place": "t"
+                }
+              ]
+            },
+            {
+              "form": "call",
+              "callee": "join",
+              "arguments": [
+                {
+                  "form": "read",
+                  "place": "t"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "semantic_digest": "e089fed8bce4724bcdfd6bdbd0df9e95e68c4e21880683a241dd1f61c06ede53"
+    },
+    {
+      "id": "field-cannot-be-moved-out-of-aggregate",
+      "code": "F-DIAG-PARTIAL-MOVE",
+      "colisp": "(. (Pair :a (Token :id 1) :b 2) a)",
+      "clike": "Pair { a: Token { id: 1 }, b: 2 }.a",
+      "coforth": "Pair{ a: Token{ id: 1 } b: 2 } .a",
+      "context": {
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "member",
+        "name": "a",
+        "target": {
+          "form": "record-construct",
+          "type": "Pair",
+          "fields": [
+            {
+              "form": "field-init",
+              "name": "a",
+              "value": {
+                "form": "record-construct",
+                "type": "Token",
+                "fields": [
+                  {
+                    "form": "field-init",
+                    "name": "id",
+                    "value": {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "form": "field-init",
+              "name": "b",
+              "value": {
+                "form": "literal",
+                "value": 2
+              }
+            }
+          ]
+        }
+      },
+      "semantic_digest": "05c181f5d327885a0f617df267e6ec22d6f2d53426049af9c9c80cabb3ccc099"
+    },
+    {
+      "id": "constructor-arity-mismatch",
+      "code": "F-DIAG-CONSTRUCTOR-ARITY",
+      "colisp": "(variant Shape (Empty) (Circle int)) (match (Circle) ((Circle r) r) ((Empty) 0))",
+      "clike": "variant Shape { Empty, Circle(int) } match (Circle()) { Circle(r) => r, Empty() => 0 }",
+      "coforth": null,
+      "unpaired_reason": "Co-Forth applies a constructor to exactly its declared payload, so an arity mismatch is a stack error found during construction.",
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "variant",
+            "name": "Shape",
+            "representation": "native",
+            "cases": [
+              {
+                "form": "case",
+                "name": "Empty",
+                "payload_kind": "unit",
+                "payload": []
+              },
+              {
+                "form": "case",
+                "name": "Circle",
+                "payload_kind": "tuple",
+                "payload": [
+                  "int"
+                ]
+              }
+            ]
+          },
+          {
+            "form": "match",
+            "ownership": "borrow",
+            "scrutinee": {
+              "form": "call",
+              "callee": "Circle",
+              "arguments": []
+            },
+            "arms": [
+              {
+                "form": "match-arm",
+                "pattern": {
+                  "constructor": "Circle",
+                  "arguments": [
+                    {
+                      "bind": "r"
+                    }
+                  ]
+                },
+                "body": {
+                  "form": "read",
+                  "place": "r"
+                }
+              },
+              {
+                "form": "match-arm",
+                "pattern": {
+                  "constructor": "Empty",
+                  "arguments": []
+                },
+                "body": {
+                  "form": "literal",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "semantic_digest": "799f60bcfeb9a9e1f7adcf4073ac5c2c4a1dd35cc4daee69d1adcc7db7ab6eb0"
+    },
+    {
+      "id": "unknown-member",
+      "code": "F-DIAG-UNKNOWN-MEMBER",
+      "colisp": "(. (Point :x 3 :y 4) z)",
+      "clike": "Point { x: 3, y: 4 }.z",
+      "coforth": "Point{ x: 3 y: 4 } .z",
+      "ast": {
+        "form": "member",
+        "name": "z",
+        "target": {
+          "form": "record-construct",
+          "type": "Point",
+          "fields": [
+            {
+              "form": "field-init",
+              "name": "x",
+              "value": {
+                "form": "literal",
+                "value": 3
+              }
+            },
+            {
+              "form": "field-init",
+              "name": "y",
+              "value": {
+                "form": "literal",
+                "value": 4
+              }
+            }
+          ]
+        }
+      },
+      "semantic_digest": "2322e749d476c402c2ced621f5c5cd1735c207267dac3fec439bc6273b0b9afa"
+    },
+    {
+      "id": "non-exhaustive-match",
+      "code": "F-DIAG-MATCH-NOT-EXHAUSTIVE",
+      "colisp": "(match 2 (1 10))",
+      "clike": "match (2) { 1 => 10 }",
+      "coforth": "2 match 1 of 10 endof endmatch",
+      "ast": {
+        "form": "match",
+        "ownership": "borrow",
+        "scrutinee": {
+          "form": "literal",
+          "value": 2
+        },
+        "arms": [
+          {
+            "form": "match-arm",
+            "pattern": 1,
+            "body": {
+              "form": "literal",
+              "value": 10
+            }
+          }
+        ]
+      },
+      "semantic_digest": "15344fe2f4e2780208986001ea67134d83307a5000e4d496b4018d8bc98adfb8"
+    },
+    {
+      "id": "unbound-name",
+      "code": "F-DIAG-UNBOUND-NAME",
+      "colisp": "(+ missing 1)",
+      "clike": "missing + 1",
+      "coforth": "missing 1 +",
+      "ast": {
+        "form": "call",
+        "callee": "+",
+        "arguments": [
+          {
+            "form": "read",
+            "place": "missing"
+          },
+          {
+            "form": "literal",
+            "value": 1
+          }
+        ]
+      },
+      "semantic_digest": "03fd8077eb9d1e2ab9ede2cfa98bec8b75798589659de500969eabe52df59cc1"
+    },
+    {
+      "id": "exact-capture-list-omits-used-binding",
+      "code": "F-DIAG-CAPTURE-UNLISTED",
+      "colisp": "(let [n : int 5] (lambda (:captures) ((x : int)) ! plain (+ x n)))",
+      "clike": "int n = 5; [](int x) plain => x + n",
+      "coforth": "5 { n: int -- } [ captures: { } ( x: int -- int ! plain ) | x n + ]",
+      "ast": {
+        "form": "let",
+        "name": "n",
+        "mutable": false,
+        "type": "int",
+        "initializer": {
+          "form": "literal",
+          "value": 5
+        },
+        "body": {
+          "form": "lambda",
+          "capture_default": "exact",
+          "contract": "effects<> | nothrow | non-suspending",
+          "captures": [],
+          "parameters": [
+            {
+              "form": "parameter",
+              "name": "x",
+              "type": "int",
+              "ownership": "borrow"
+            }
+          ],
+          "body": {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "read",
+                "place": "x"
+              },
+              {
+                "form": "read",
+                "place": "n"
+              }
+            ]
+          }
+        }
+      },
+      "semantic_digest": "2c47dd06324e31924396efcf87ea62a37189d4e951825db4b64f19380736643b"
+    },
+    {
+      "id": "copy-capture-requires-copy-evidence",
+      "code": "F-DIAG-COPY-EVIDENCE",
+      "colisp": "(let [t : Token (Token :id 1)] (lambda (:captures (copy t)) () ! plain 1))",
+      "clike": "Token t = Token { id: 1 }; [copy t]() plain => 1",
+      "coforth": "Token{ id: 1 } { t: Token -- } [ captures: { copy t } ( -- int ! plain ) | 1 ]",
+      "context": {
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "let",
+        "name": "t",
+        "mutable": false,
+        "type": "Token",
+        "initializer": {
+          "form": "record-construct",
+          "type": "Token",
+          "fields": [
+            {
+              "form": "field-init",
+              "name": "id",
+              "value": {
+                "form": "literal",
+                "value": 1
+              }
+            }
+          ]
+        },
+        "body": {
+          "form": "lambda",
+          "capture_default": "exact",
+          "contract": "effects<> | nothrow | non-suspending",
+          "captures": [
+            {
+              "form": "capture",
+              "name": "t",
+              "ownership": "copy"
+            }
+          ],
+          "parameters": [],
+          "body": {
+            "form": "literal",
+            "value": 1
+          }
+        }
+      },
+      "semantic_digest": "ccc034f6ce707e1c2ea9cf0bf8318001d7e98db703b6a98814013856124b3a8a"
+    },
+    {
+      "id": "declaration-inside-an-expression",
+      "code": "F-DIAG-NESTED-DECLARATION",
+      "colisp": "(let [x : int 1] (begin (define (f) : int ! plain x) (f)))",
+      "clike": "int x = 1; { int f() plain { x } f() }",
+      "coforth": null,
+      "unpaired_reason": "The Co-Forth grammar admits a definition only among the top-level words, so it has no spelling for this program.",
+      "ast": {
+        "form": "let",
+        "name": "x",
+        "mutable": false,
+        "type": "int",
+        "initializer": {
+          "form": "literal",
+          "value": 1
+        },
+        "body": {
+          "form": "sequence",
+          "items": [
+            {
+              "form": "function",
+              "name": "f",
+              "result": "int",
+              "contract": "effects<> | nothrow | non-suspending",
+              "parameters": [],
+              "body": {
+                "form": "read",
+                "place": "x"
+              }
+            },
+            {
+              "form": "call",
+              "callee": "f",
+              "arguments": []
+            }
+          ]
+        }
+      },
+      "semantic_digest": "a88772354cab91875d5876a4650d6292574d0df4a36c35ad2e35d528b21da208"
+    },
+    {
+      "id": "contract-states-one-axis-only",
+      "code": "F-DIAG-CONTRACT-AXES",
+      "colisp": "(define (f) : int ! nothrow 1) (f)",
+      "clike": "int f() nothrow { 1 } f()",
+      "coforth": ": f ( -- int ! nothrow ) 1 ; f"
+    },
+    {
+      "id": "contract-states-an-axis-twice",
+      "code": "F-DIAG-CONTRACT-AXES",
+      "colisp": "(define (f) : int ! pure | nothrow | suspends | non-suspending 1) (f)",
+      "clike": "int f() pure nothrow suspends nonSuspending { 1 } f()",
+      "coforth": ": f ( -- int ! pure | nothrow | suspends | non-suspending ) 1 ; f"
+    },
+    {
+      "id": "tail-call-cannot-pass-a-closure-that-borrows-the-discarded-frame",
+      "code": "F-DIAG-LOAN-ESCAPES-FRAME",
+      "colisp": "(define (peek (t : Token)) : int ! plain 1) (define (apply (f : callable<() -> int ! effects<> | nothrow | non-suspending>)) : int ! plain (f)) (define (h) : int ! plain (let [a : Token (Token :id 1)] (apply (lambda () ! plain (peek a))))) (+ (h) 0)",
+      "clike": "int peek(Token t) plain { 1 } int apply(int function() plain f) plain { f() } int h() plain { Token a = Token { id: 1 }; apply(() plain => peek(a)) } h() + 0",
+      "coforth": ": peek ( t: Token -- int ! plain ) 1 ; : apply ( f: callable<() -> int ! effects<> | nothrow | non-suspending> -- int ! plain ) f ; : h ( -- int ! plain ) Token{ id: 1 } { a: Token -- } [ ( -- int ! plain ) | a peek ] apply ; h 0 +",
+      "context": {
+        "operations": {},
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "peek",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "t",
+                "type": "Token",
+                "ownership": "borrow"
+              }
+            ],
+            "body": {
+              "form": "literal",
+              "value": 1
+            }
+          },
+          {
+            "form": "function",
+            "name": "apply",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "f",
+                "type": "callable<()->int!effects<>|nothrow|non-suspending>",
+                "ownership": "borrow"
+              }
+            ],
+            "body": {
+              "form": "call",
+              "callee": "f",
+              "arguments": []
+            }
+          },
+          {
+            "form": "function",
+            "name": "h",
+            "result": "int",
+            "contract": "effects<> | nothrow | non-suspending",
+            "parameters": [],
+            "body": {
+              "form": "let",
+              "name": "a",
+              "mutable": false,
+              "type": "Token",
+              "initializer": {
+                "form": "record-construct",
+                "type": "Token",
+                "fields": [
+                  {
+                    "form": "field-init",
+                    "name": "id",
+                    "value": {
+                      "form": "literal",
+                      "value": 1
+                    }
+                  }
+                ]
+              },
+              "body": {
+                "form": "call",
+                "callee": "apply",
+                "arguments": [
+                  {
+                    "form": "lambda",
+                    "capture_default": "borrow",
+                    "contract": "effects<> | nothrow | non-suspending",
+                    "captures": [],
+                    "parameters": [],
+                    "body": {
+                      "form": "call",
+                      "callee": "peek",
+                      "arguments": [
+                        {
+                          "form": "read",
+                          "place": "a"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "form": "call",
+            "callee": "+",
+            "arguments": [
+              {
+                "form": "call",
+                "callee": "h",
+                "arguments": []
+              },
+              {
+                "form": "literal",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "semantic_digest": "cd11042969a517206ab8082a1589742b5f8cdd3205c96f7f5b2b5201b486332a"
+    },
+    {
+      "id": "yield-outside-a-function",
+      "code": "F-DIAG-YIELD-TARGET",
+      "colisp": "(yield 1)",
+      "clike": "yield 1",
+      "coforth": "1 yield",
+      "ast": {
+        "form": "yield",
+        "value": {
+          "form": "literal",
+          "value": 1
+        }
+      },
+      "semantic_digest": "be0dde17d718b64aa8b2ddd21f2da38c83f4887c5b85a8dc070746d16914de80"
+    },
+    {
+      "id": "generator-cannot-hold-a-borrowed-argument",
+      "code": "F-DIAG-TRANSFER-REQUIRES-OWNED",
+      "colisp": "(define (g (t : Token)) : unit ! inferred (yield 1)) (let [a : Token (Token :id 1)] (let [x (g a)] 0))",
+      "clike": "unit g(Token t) inferred { yield 1 } Token a = Token { id: 1 }; auto x = g(a); 0",
+      "coforth": ": g ( t: Token -- ! inferred ) 1 yield drop ; Token{ id: 1 } { a: Token -- } a g { x -- } 0",
+      "context": {
+        "operations": {},
+        "lifecycle": [
+          "Token"
+        ]
+      },
+      "ast": {
+        "form": "sequence",
+        "items": [
+          {
+            "form": "function",
+            "name": "g",
+            "result": "unit",
+            "contract": "effects-infer | throws-infer | suspends-infer",
+            "parameters": [
+              {
+                "form": "parameter",
+                "name": "t",
+                "type": "Token",
+                "ownership": "borrow"
+              }
+            ],
+            "body": {
+              "form": "yield",
+              "value": {
+                "form": "literal",
+                "value": 1
+              }
+            }
+          },
+          {
+            "form": "let",
+            "name": "a",
+            "mutable": false,
+            "type": "Token",
+            "initializer": {
+              "form": "record-construct",
+              "type": "Token",
+              "fields": [
+                {
+                  "form": "field-init",
+                  "name": "id",
+                  "value": {
+                    "form": "literal",
+                    "value": 1
+                  }
+                }
+              ]
+            },
+            "body": {
+              "form": "let",
+              "name": "x",
+              "mutable": false,
+              "initializer": {
+                "form": "call",
+                "callee": "g",
+                "arguments": [
+                  {
+                    "form": "read",
+                    "place": "a"
+                  }
+                ]
+              },
+              "body": {
+                "form": "literal",
+                "value": 0
+              }
+            }
+          }
+        ]
+      },
+      "semantic_digest": "f66dac6410dac856010071896742a0b595d6b342b8008b3d48335a2e418bdf33"
+    }
+  ]
+}

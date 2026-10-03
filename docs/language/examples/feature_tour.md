@@ -1,10 +1,11 @@
 # Feature tour — small programs, real composition
 
-Working CoLisp sketches, each exercising a cluster of features together rather than in isolation.
-Purpose: find places where two independently-specified features don't actually compose. Where a
-program needed something the spec doesn't define yet, that's called out inline as **GAP**, not
-guessed at. Where a piece of syntax below isn't actually confirmed against an established example
-elsewhere in the document, it's marked **UNVERIFIED** rather than presented as settled.
+Exploratory CoLisp sketches, each exercising a cluster of features together rather than in
+isolation. This file found design gaps; it is not normative syntax. Every inline **GAP**,
+**UNVERIFIED**, “still-open,” and “unresolved” label is historical, even outside the historical-gap
+section; none states current language policy. Their current disposition is in
+[`../DESIGN_REVIEW.md`](../DESIGN_REVIEW.md), and the accepted behavior is in
+[`../SPECIFICATION.md`](../SPECIFICATION.md).
 
 **Corrected 2026-09-17, whole file:** the first pass of every example here used an invented `fn`
 header, `->` for a return type, and `=>` before a body — none of which are CoLisp. Caught when
@@ -17,10 +18,9 @@ first pass — `Foo { x: a, y: b }` is Co-Forth's spelling; CoLisp's is `(Foo :x
 parity ledger. Rewritten throughout below.
 
 **Updated 2026-09-17: `let` bindings now use `[...]`, not doubled `(( ))`.** `[n 10]` for one
-binding, `[a 1 b 2]` for several — flat, Clojure-style, never nested pairs. `[...]`'s grammar is a
-strict superset of the JSON-array syntax it already handled, so this needed no new bracket and
-changes nothing about existing JSON literals — see the "binding lists... use `[...]`" addition in
-`FINCH_LANGUAGE_DESIGN.md`.
+binding, `[a 1 b 2]` for several — flat, Clojure-style, never nested pairs. The formalization audit
+later rejected parse-success fallback between Finch and JSON: JSON aggregates now use explicit
+`json[...]` / `json{...}` reader forms.
 
 ## 1. Records, construction, properties
 
@@ -85,6 +85,9 @@ a record *after* a concept implementation already exists can silently change whi
 reaches — same hazard Rust accepts for inherent-vs-trait methods, inherited deliberately.
 
 ## 2. Ownership tour — borrow default, `steal`, `Unique`/`Shared`/`Weak`, `match-type`
+
+**Current disposition:** the normative prelude provides explicit `weaken`, `retain-weak`, and
+`upgrade`; portable `strong-count` is intentionally absent. The sketches below predate that closure.
 
 ```lisp
 (define (describe (x : Foo)) : string                       ; unannotated = borrow, read-only, non-escaping
@@ -716,7 +719,11 @@ concrete CoLisp syntax anywhere — only "refined path argument" (the `path<work
 is ever shown worked out; composing two path fragments or narrowing an existing grant to a
 subdirectory has no example to check against.
 
-## 18. Open gaps, current as of this pass — what's still missing and why
+## 18. Historical gap ledger — superseded by the design review
+
+This list is retained as evidence of how the examples found problems. It is not current status.
+[`../DESIGN_REVIEW.md`](../DESIGN_REVIEW.md) resolves the core holes, freezes the portable-ABI safety
+contract for the FFI items, and explicitly defers SIMD/accelerator syntax to its own profile.
 
 - **Compile-time integer-range iteration for loop unrolling** (value-generic-parameters pass, new) —
   `ct-foreach` iterates a parameter pack, never a plain `0..N` range; §26's `matmul` typechecks with

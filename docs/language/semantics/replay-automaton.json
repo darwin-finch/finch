@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "state": ["generation", "next_sequence", "terminal", "requests", "outstanding"],
+  "event": ["kind", "generation", "sequence", "request_id", "fingerprint"],
+  "event_kinds": ["effect", "resume"],
+  "rules": [
+    {"rule": "F-REPLAY-TERMINAL", "when": ["terminal"], "actions": ["reject-post-terminal"]},
+    {"rule": "F-REPLAY-GENERATION", "when": ["generation-mismatch"], "actions": ["reject-stale-generation"]},
+    {"rule": "F-REPLAY-DUPLICATE", "when": ["request-exact-match"], "actions": ["replay-recorded-ack-without-dispatch"]},
+    {"rule": "F-REPLAY-CONFLICT", "when": ["request-id-conflict"], "actions": ["reject-conflicting-request"]},
+    {"rule": "F-REPLAY-SEQUENCE", "when": ["sequence-mismatch"], "actions": ["reject-out-of-order"]},
+    {"rule": "F-REPLAY-UNSOLICITED", "when": ["resume-unsolicited"], "actions": ["reject-unsolicited-resume"]},
+    {"rule": "F-REPLAY-ACCEPT", "when": ["active", "generation-match", "sequence-match", "request-new"], "actions": ["durably-record-request", "increment-next-sequence", "ack-then-dispatch-once"]}
+  ],
+  "invariants": [
+    "Rules are tested in array order; the first matching rule determines the outcome and the accept rule is the exhaustive fallback for a valid new event.",
+    "Durable request recording and sequence increment happen before acknowledgement or dispatch.",
+    "An execution keeps two instances of this state, one for each event kind: the requests it sends (kind effect) and the resumes the host delivers (kind resume). They share generation and terminal and nothing else, so an accepted request and the resume that answers it carry the same request identity without conflicting. When the execution parks on a request, the resume instance's next_sequence becomes that request's sequence and its outstanding becomes that request's identity: a resume carries the sequence of the request it answers.",
+    "An exact duplicate of a recorded event in the current generation of a live execution never dispatches; it replays the recorded acknowledgement. Once the execution is terminal every event is rejected as post-terminal, and an event from another generation is rejected as stale, whether or not it duplicates a recorded one.",
+    "A request identity is permanently bound to one generation, sequence, kind, and payload fingerprint.",
+    "`outstanding` is the identity of the one request the execution is parked on, or null. A resume is accepted only for that identity; a resume naming any other identity is unsolicited even when its generation and sequence are current.",
+    "Restart restores this state before accepting or dispatching an event."
+  ]
+}

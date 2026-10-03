@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/target-abi-v1.json",
+  "title": "Finch target C ABI identity",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "architecture", "operating_system", "environment", "object_format", "c_abi_revision", "pointer_width", "endianness", "scalar_layout_table", "aggregate_layout_algorithm", "calling_convention_set", "digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "architecture": {"type": "string", "pattern": "^arch:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "operating_system": {"type": "string", "pattern": "^os:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "environment": {"type": "string", "pattern": "^env:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "object_format": {"type": "string", "pattern": "^object:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "c_abi_revision": {"type": "string", "pattern": "^cabi:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "pointer_width": {"enum": [32, 64]},
+    "endianness": {"enum": ["little", "big"]},
+    "scalar_layout_table": {"type": "string", "pattern": "^scalar:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "aggregate_layout_algorithm": {"type": "string", "pattern": "^aggregate:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "calling_convention_set": {"type": "string", "pattern": "^ccset:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

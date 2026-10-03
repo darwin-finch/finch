@@ -1,9 +1,98 @@
 # Full-spec language implementation — epic tracker
 
-Read this file first when resuming this effort cold. It is the "where are we" view; it does not
-duplicate the plan itself (`IMPLEMENTATION_ROADMAP.md`) or per-issue ownership
+Read this file first when resuming this effort cold. Entries below the current-status block are a
+chronological design log and may describe gaps later resolved. It does not duplicate the normative
+specification (`SPECIFICATION.md`), the plan (`IMPLEMENTATION_ROADMAP.md`), or per-issue ownership
 (`finch-work-claim:v1` comments on each issue — see `CONTRIBUTING.md` and
 `.agents/skills/finch-backlog/references/work-claims.md`).
+
+## Current status — 2026-10-03
+
+- The fourth closure pass made the grammar and the dynamic semantics executable. The entries below
+  dated 2026-10-02 describe the state before it; where they say rules are pending, the fixture
+  subset is 10 programs, or grammar execution is outstanding, this entry supersedes them.
+  - Both grammars are interpreted directly (`scripts/language/grammar_engine.py`, notation
+    `Finch-PEG-1`) against `fixtures/grammar-corpus.json`: 36 accepted and 24 rejected sources,
+    every production of both frontends exercised.
+  - `scripts/language/elaborate.py` builds one normalized AST from each frontend's own parse tree,
+    with real byte spans; the two event streams are digested independently and must agree.
+  - `scripts/language/reference_machine.py` executes a program only by interpreting the rule
+    programs in `semantics/transitions.json`. All 36 rules are executable under
+    `semantics/transition-coverage.json`: every instruction run, every declared branch taken.
+  - `fixtures/execution-vectors.json` holds 132 vectors, each in CoLisp and C-like and 130 also in Co-Forth, asserting the full
+    trace, terminal, and final state; `fixtures/static-rejections.json` holds 23 programs that must
+    be rejected, each with a diagnostic code. These replace `source-to-ir.json` and
+    `machine-transitions.json`.
+  - Executing the artifacts found eleven new findings (57–67 in `DESIGN_REVIEW.md`): an unimplementable
+    lexer model, about twenty grammar ordering defects, unspecified scope-guard and Co-Forth
+    construction semantics, a digest that ignored patterns, a replay automaton that accepted an
+    unsolicited resume, and unspecified borrowed-argument lifetimes.
+  - A third, C-like syntax covers the executable core; every vector and rejection has CoLisp,
+    C-like, and Co-Forth spellings that build one AST (`grammar/clike.json`, specification 3.6).
+  - Ownership is decided before execution: `scripts/language/static_check.py` chooses copy, move,
+    or borrow for every read and agrees with the rule machine on every read the vectors execute.
+  - IR version 6 (`semantics/ir.json`) is the implemented version 5 plus regions, drops, slot
+    references, and tail calls. Every vector is lowered, structurally verified, executed, and must
+    match the rule machine (`ir_lower.py`, `ir_verify.py`, `ir_machine.py`).
+  - Finding 75 in `DESIGN_REVIEW.md` is the single list of open questions and unfinished work.
+  - Still open: the type checker proper has no executable form (finding 50); the generated prelude
+    AST has no independent consumer (47); callback lifecycle fixtures (52); stable payload identity
+    binding (53); two task vectors and the task combinators (56); the callable type's source
+    spelling (67); whether everyday words stay reserved (66); performance evidence, which needs an
+    implementation (48, 54). The owner settled guard semantics (59), Co-Forth callable invocation
+    (63), and tail-call temporaries (65) the same day.
+- `SPECIFICATION.md` is normative. The third closure pass checked in machine-readable grammars,
+  canonical semantic events and digests, a transition-rule corpus, target and portable
+  ABI schemas, and a generated signature-AST-bearing prelude. Finding 35 classifies all 28 source and
+  internal transition rules as pending because the rule programs are not the evaluator. The current
+  10-fixture subset now derives stack IR from normalized AST and executes it with exact stack, trace,
+  and terminal checks; a closed schema plus an all-path verifier checks instruction shapes, targets,
+  stack height, locals, handlers, and cleanup deltas. Operand type/ownership/effect certificates,
+  S0 corpus integration, and broader
+  hostile combinations, and reader coverage still gate
+  calling the implementation baseline complete. Finding 47 now has structural callable and concept
+  ASTs with negative mutation coverage, including named trusted-law expressions; an independent AST
+  consumer oracle remains open.
+- A seven-lens hostile panel on 2026-10-01/02 reopened frontend, type/effect, runtime, ABI, identity,
+  performance, and everyday-programming assumptions as findings 49–55. Policy-independent repairs
+  now include RFC JSON tokens, Co-Forth label/mode rules, non-left-recursive stack words, paired
+  fiber/yield and record construction, required operators, loan origins, non-suspending borrowed
+  ranges, explicit exception widening, cleanup-aware `return`/`break`/`continue`, inert library
+  roots, shared generic IR, and pay-for-use transactions. Runtime rules, grammar execution,
+  signature ASTs, split ABI/replay schemas, independent reader digests, and numeric benchmark gates
+  remain genuine closure work.
+- The continuing hostile pass added Finding 56: `spawn` now has one atomic handle/child
+  linearization, failure cleanup ownership, attenuated child authority, and an explicit no-hidden-
+  serialization/checkpoint/parent-continuation cost rule. Capacity, cancellation, and revocation
+  fixtures remain proof work.
+- `DESIGN_REVIEW.md` audits the design through type/effect, ownership, macro, coherence, tail-call,
+  concurrency, ABI, and compiler-implementability lenses. The rationale-reconciliation pass promoted
+  settled subtype/catch, capture, ownership/pinning, checkpoint, test, admission-mode, overload,
+  scalar, resumable-exception, namespace/path, ABI-identity, and dyn-erasability decisions. Findings
+  24 and 32 have policy closed, but finding 32's ABI artifact is reopened by findings 52–53;
+  finding 35 remains a checked but incomplete
+  formalization. The artifact audit also closed missing source
+  syntax for open effect rows, affine stream/fiber step results, refined-path type grammar, and
+  generated-prelude freshness and contract-axis enforcement (findings 36–39); finding 47 still
+  blocks complete signature-AST enforcement.
+- `IMPLEMENTATION_ROADMAP.md` is dependency-ordered from a new executable-specification harness
+  through the semantic kernel, staging/concepts, resumability, portable ABI/self-hosting, native
+  optimization, and a separately versioned accelerator extension.
+- The core decisions newly frozen are explicit JSON reader tags; exact CoLisp ownership parameters;
+  Co-Forth typed syntax capture without `macro:`; scope-set phase ordering; local-state effect
+  masking; place/loan/reborrow rules; weak upgrade/drop ordering; an orphan rule; `T::Item`
+  projection and concept-owned evidence versions; compile-time integer ranges; proper tail calls;
+  selector composition; safe concurrency evidence; the no-unwind/callback/reentry FFI boundary;
+  and whole-aggregate consuming destructures instead of source-visible partial moves.
+- The old gap list in `examples/feature_tour.md` is retained as design-history evidence and is not a
+  current blocker list.
+- Do not dispatch broad semantic feature implementation yet. The formal artifacts exist, but S0
+  must still connect them to the conformance corpus, add reader recovery/negative coverage, and
+  carry all artifact versions through compiler results.
+- No implementation ticket was claimed or changed. Live issue bodies were read for reconciliation;
+  several require contract updates before dispatch because they still describe superseded design.
+- The backlog triage scripts named by the repository skill are absent from this worktree, so the
+  dependency order was reconciled manually and that limitation is explicit in the plan.
 
 ## Where this lives
 
@@ -16,9 +105,10 @@ duplicate the plan itself (`IMPLEMENTATION_ROADMAP.md`) or per-issue ownership
   are done. This preserves per-issue review (Tier 3 for anything touching IR/verifier/checkpoints,
   per `SKILL.md`) instead of trading it away for a single unreviewable mega-diff — flagged once to
   Shammah 2026-09-17; his call to override if he wants a single final diff instead.
-- **Plan of record:** `docs/language/IMPLEMENTATION_ROADMAP.md` (milestones, rules, exit criteria)
-  and `docs/language/FINCH_LANGUAGE_DESIGN.md` (the spec itself). This file tracks status against
-  that plan; it is not a second plan.
+- **Plan of record:** `docs/language/SPECIFICATION.md` (normative behavior),
+  `docs/language/IMPLEMENTATION_ROADMAP.md` (milestones, rules, exit criteria), and
+  `docs/language/FINCH_LANGUAGE_DESIGN.md` (rationale/history). This file tracks status against
+  those documents; it is not a second plan.
 
 ## How to resume
 
@@ -55,19 +145,17 @@ item (`:113`) that wasn't built yet, and now is.
 | #66 | typed modules, immutable interfaces, decentralized imports | OPEN |
 | #67 | dependency-driven semantic compiler scheduler | OPEN |
 | #68 | bounded directional inference, interface publication | OPEN |
-| #674 | ownership, placement, deterministic drop, safety profiles | OPEN — **blocked on a spec gap, see below** |
+| #674 | ownership, placement, deterministic drop, safety profiles | OPEN — specification decision closed; implementation unstarted |
 | #675 | coherent text and sequence values | OPEN |
 | #677 | named tests, typed matchers, fixtures, mocks | OPEN |
 | #86 | scripting ergonomics / model-repair metrics gate | OPEN |
 
-**Open finding, not yet resolved:** `FINCH_LANGUAGE_DESIGN.md:2400` requires a shared conformance
-corpus expressing every ownership behavior in both CoLisp and Co-Forth. The Co-Forth surface is
-given (`:1620`, `consume-value`/`borrow`/`guarantees pure`/`suspends`); no CoLisp surface for
-*per-parameter* ownership mode is documented anywhere in the design doc (only CoLisp's *heap
-allocation* ownership syntax — `new unique`/`new shared`/`share`, `:2236` — a different feature).
-The paired fixture #674 needs cannot be authored until this is resolved. Either Shammah writes the
-missing CoLisp section, or it's logged as a blocking note on #674 for whoever picks it up. Not
-resolved as of this write-up.
+**Current ownership status:** the earlier CoLisp spelling gap recorded below is closed by
+`SPECIFICATION.md`: `(x : T)` is a readonly borrow, `(borrow-mut x : T)` is an exclusive borrow, and
+`(steal x : T)` transfers ownership. Co-Forth retains its source operand modes, while
+`consume-value` is lowering-only for CoLisp. Issue #674 (ownership, placement, deterministic drop,
+and safety profiles) remains blocked on S0 fixtures and implementation work, not a language-policy
+decision.
 
 ### M2 — concepts, effects, metaprogramming — not started, highest risk
 
@@ -94,7 +182,7 @@ enough to validate native output against (translation-validation style equivalen
 
 ## Conformance-suite state (the day-to-day artifact)
 
-`vocabulary/language/conformance/core.json` — currently 46 cases, all `level: "core"` (default),
+`vocabulary/language/conformance/core.json` — currently 48 cases, all `level: "core"` (default),
 all active and passing. This is the day-to-day signal: as each M1+ issue lands, add its paired
 fixtures here at a level tag matching the milestone (e.g. `"ownership"` once #674 has a resolvable
 CoLisp surface), and add that level to `ACTIVE_CONFORMANCE_LEVELS` in `runtime.rs` only once the
@@ -110,7 +198,7 @@ Not exhaustive — flag anything found later here rather than assuming this list
    originally spec-invalid while the entire shipping implementation and all 46 `core.json` fixtures
    used it exclusively — a real spec/implementation divergence. Resolution, reached while unifying
    the effect-row and predicate-clause syntax into one `!`-introduced list (see the design-pass log
-   below): `pure`/`total`/`deterministic`/`nothrow`/`throws`/`suspends` all now live inside the same
+   below): `pure`/`nothrow`/`throws`/`suspends` all now live inside the same
    `!`-list as capability effects, distinguished by shape rather than by a separate `guarantees`
    clause. Under that reading `! pure` was correct all along — the classic `guarantees pure` clause
    is what's retired, not `! pure`. **No implementation migration needed**; the existing parser and
@@ -151,7 +239,7 @@ Not exhaustive — flag anything found later here rather than assuming this list
 |---|---|---|---|
 | ~~`! pure` vs `guarantees pure`~~ | — | **Resolved 2026-09-17** — see findings list above. No action needed; spec now matches the shipping implementation. | — |
 | Stale module layout (`:4393-4414`) | Tier 1 | Rewrite to the actual crate layout or mark the section historical/superseded-by-roadmap. No contract, no review round needed. | anyone, immediately |
-| CoLisp ownership-parameter example missing | Decision needed | Shammah writes the missing worked example, or explicitly hands it to whoever picks up #674 as a stated blocker. | Shammah or #674's owner |
+| ~~CoLisp ownership-parameter example missing~~ | — | **Resolved by the normative specification:** readonly default, `borrow-mut`, and `steal`; paired executable fixtures remain S0 work. | — |
 
 ### Step 1 — M1 issues, dependency-ordered
 
@@ -187,7 +275,8 @@ section beyond the #674 scoping work above. Summary, not a repeat of the commit 
   and explicit `(borrow x : Foo)` as an alternative to unannotated — both changed nothing over the
   shorter form once checked, so both were cut rather than kept "for readability."
 - `Unique<T>` → `Shared<T>` by move; the reverse only via checked `try-into-unique`; `strong-count`
-  (diagnostic-only, pure-but-not-deterministic) and `get-mut` (borrow-not-consume) added alongside it.
+  (diagnostic-only; later corrected to carry a shared-state read effect rather than claim purity) and
+  `get-mut` (borrow-not-consume) added alongside it.
 - Move-vs-copy default corrected (plain records move, `Copy` types copy — not the reverse), with the
   mechanical nuance that move and copy are physically identical for pointer-free types, and why the
   invalidation rule still earns its keep even then (decoupling from field layout; non-trivial drop

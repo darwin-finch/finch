@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "registry_version": "2026-10-01",
+  "key_format": "namespace:name@vN",
+  "namespaces": {
+    "architecture": [
+      "arch:aarch64@v1",
+      "arch:x86_64@v1"
+    ],
+    "operating_system": [
+      "os:linux@v1",
+      "os:macos@v1",
+      "os:windows@v1"
+    ],
+    "environment": [
+      "env:gnu@v1",
+      "env:msvc@v1",
+      "env:musl@v1",
+      "env:none@v1"
+    ],
+    "object_format": [
+      "object:coff@v1",
+      "object:elf@v1",
+      "object:macho@v1"
+    ],
+    "c_abi_revision": [
+      "cabi:aapcs64@v1",
+      "cabi:darwin-arm64@v1",
+      "cabi:sysv-amd64@v1",
+      "cabi:win64@v1"
+    ],
+    "scalar_layout_table": [
+      "scalar:lp64-ieee754@v1",
+      "scalar:llp64-ieee754@v1"
+    ],
+    "aggregate_layout_algorithm": [
+      "aggregate:aapcs64@v1",
+      "aggregate:darwin-arm64@v1",
+      "aggregate:sysv-amd64@v1",
+      "aggregate:win64@v1"
+    ],
+    "calling_convention_set": [
+      "ccset:aapcs64@v1",
+      "ccset:darwin-arm64@v1",
+      "ccset:sysv-amd64@v1",
+      "ccset:win64@v1"
+    ]
+  },
+  "admitted_tuples": [
+    {
+      "architecture": "arch:aarch64@v1",
+      "operating_system": "os:macos@v1",
+      "environment": "env:none@v1",
+      "object_format": "object:macho@v1",
+      "c_abi_revision": "cabi:darwin-arm64@v1",
+      "pointer_width": 64,
+      "endianness": "little",
+      "scalar_layout_table": "scalar:lp64-ieee754@v1",
+      "aggregate_layout_algorithm": "aggregate:darwin-arm64@v1",
+      "calling_convention_set": "ccset:darwin-arm64@v1",
+      "digest": "e829caf04adda5b8836124eb74389972ca7ebbb4068f1be860b0eeb389ced9ed"
+    },
+    {
+      "architecture": "arch:aarch64@v1",
+      "operating_system": "os:linux@v1",
+      "environment": "env:gnu@v1",
+      "object_format": "object:elf@v1",
+      "c_abi_revision": "cabi:aapcs64@v1",
+      "pointer_width": 64,
+      "endianness": "little",
+      "scalar_layout_table": "scalar:lp64-ieee754@v1",
+      "aggregate_layout_algorithm": "aggregate:aapcs64@v1",
+      "calling_convention_set": "ccset:aapcs64@v1",
+      "digest": "28cb50e6406449a6a22970682dc2de288c83834159b60432ef136b832963daa4"
+    },
+    {
+      "architecture": "arch:x86_64@v1",
+      "operating_system": "os:linux@v1",
+      "environment": "env:gnu@v1",
+      "object_format": "object:elf@v1",
+      "c_abi_revision": "cabi:sysv-amd64@v1",
+      "pointer_width": 64,
+      "endianness": "little",
+      "scalar_layout_table": "scalar:lp64-ieee754@v1",
+      "aggregate_layout_algorithm": "aggregate:sysv-amd64@v1",
+      "calling_convention_set": "ccset:sysv-amd64@v1",
+      "digest": "e159b1ad027f43c0f38fc616390752f1aa0bac99be04027c234f728d7ed0d1e9"
+    },
+    {
+      "architecture": "arch:x86_64@v1",
+      "operating_system": "os:windows@v1",
+      "environment": "env:msvc@v1",
+      "object_format": "object:coff@v1",
+      "c_abi_revision": "cabi:win64@v1",
+      "pointer_width": 64,
+      "endianness": "little",
+      "scalar_layout_table": "scalar:llp64-ieee754@v1",
+      "aggregate_layout_algorithm": "aggregate:win64@v1",
+      "calling_convention_set": "ccset:win64@v1",
+      "digest": "75bf82a7849bae6167283c595afd6ef4ac664ca07e7ea5495b8f9bd53b770be2"
+    }
+  ],
+  "extension_rule": "A new key or tuple requires a new registry version and conformance fixture; existing keys never change meaning."
+}

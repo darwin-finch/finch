@@ -1,0 +1,1539 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "description": "Cases for the compile-time job scheduler in semantics/compile-scheduler.json. Each gives symbols with the requirements their signature and body issue, the goals demanded, and the expected final states, ordered diagnostics, and recorded dependency edges. Every case must produce the same outcome under every scheduling order the checker tries.",
+  "cases": [
+    {
+      "id": "call-needs-only-the-callee-contract",
+      "note": "f calls g: f is typed against g's signature; g's body never reaches f.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "g"
+            }
+          ]
+        },
+        "g": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "g",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "f",
+            "g",
+            "contract"
+          ]
+        ],
+        "states": {
+          "f": "FunctionCertified",
+          "g": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "mutual-recursion-is-not-a-cycle",
+      "note": "Each body needs only the other's signature.",
+      "symbols": {
+        "even": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "odd"
+            }
+          ]
+        },
+        "odd": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "even"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "even",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "odd",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "even",
+            "odd",
+            "contract"
+          ],
+          [
+            "odd",
+            "even",
+            "contract"
+          ]
+        ],
+        "states": {
+          "even": "FunctionCertified",
+          "odd": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "signature-constant-runs-a-recursive-function",
+      "note": "array<int, fib(10)>: fib must be certified before table's signature exists; fib calling itself is fine.",
+      "symbols": {
+        "table": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "fib"
+            }
+          ]
+        },
+        "fib": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "fib"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "table",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "fib",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "fib",
+            "fib",
+            "contract"
+          ],
+          [
+            "table",
+            "fib",
+            "body"
+          ]
+        ],
+        "states": {
+          "fib": "FunctionCertified",
+          "table": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "evaluation-certifies-executed-callees-on-demand",
+      "note": "Evaluating run executes helper but not the callee on its untaken path.",
+      "symbols": {
+        "table": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "run"
+            }
+          ]
+        },
+        "run": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "helper"
+            },
+            {
+              "kind": "calls",
+              "target": "rare",
+              "executed": false
+            }
+          ]
+        },
+        "helper": {
+          "signature": "explicit",
+          "requires": []
+        },
+        "rare": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "table",
+          "state": "SignatureReady"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "run",
+            "helper",
+            "contract"
+          ],
+          [
+            "run",
+            "rare",
+            "contract"
+          ],
+          [
+            "table",
+            "helper",
+            "body"
+          ],
+          [
+            "table",
+            "run",
+            "body"
+          ]
+        ],
+        "states": {
+          "helper": "FunctionCertified",
+          "rare": "SignatureReady",
+          "run": "FunctionCertified",
+          "table": "SignatureReady"
+        }
+      }
+    },
+    {
+      "id": "body-constant-runs-a-function",
+      "note": "A constant-required position or a mixin inside f's body calls size at compile time, so f's body cannot be typed until size is certified.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-body",
+              "target": "size"
+            }
+          ]
+        },
+        "size": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "f",
+            "size",
+            "body"
+          ]
+        ],
+        "states": {
+          "f": "FunctionCertified",
+          "size": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "signature-that-evaluates-itself-is-a-cycle",
+      "note": "f's signature cannot depend on running f.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "f"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "f:SignatureReady",
+              "f:FunctionCertified",
+              "f:Lowered",
+              "f:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "f",
+            "f",
+            "body"
+          ]
+        ],
+        "states": {
+          "f": "Declared"
+        }
+      }
+    },
+    {
+      "id": "evaluation-cycle-through-a-caller",
+      "note": "a's signature runs b, and b's body cannot be typed without a's signature.",
+      "symbols": {
+        "a": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "b"
+            }
+          ]
+        },
+        "b": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "a"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "a",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "b",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "a:SignatureReady",
+              "b:FunctionCertified",
+              "b:Lowered",
+              "b:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "a",
+            "b",
+            "body"
+          ],
+          [
+            "b",
+            "a",
+            "contract"
+          ]
+        ],
+        "states": {
+          "a": "Declared",
+          "b": "SignatureReady"
+        }
+      }
+    },
+    {
+      "id": "inferred-signature-may-not-be-recursive",
+      "note": "An inferred signature needs its callees' signatures, so recursion through it needs an explicit one.",
+      "symbols": {
+        "loop": {
+          "signature": "inferred",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "loop"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "loop",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "loop:SignatureReady"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "loop",
+            "loop",
+            "contract"
+          ]
+        ],
+        "states": {
+          "loop": "Declared"
+        }
+      }
+    },
+    {
+      "id": "inferred-signatures-in-a-cycle",
+      "note": "Two inferred definitions calling each other.",
+      "symbols": {
+        "p": {
+          "signature": "inferred",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "q"
+            }
+          ]
+        },
+        "q": {
+          "signature": "inferred",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "p"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "p",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "q",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "p:SignatureReady",
+              "q:SignatureReady"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "p",
+            "q",
+            "contract"
+          ],
+          [
+            "q",
+            "p",
+            "contract"
+          ]
+        ],
+        "states": {
+          "p": "Declared",
+          "q": "Declared"
+        }
+      }
+    },
+    {
+      "id": "inferred-signature-over-an-explicit-callee",
+      "note": "Inference through a call to an explicit signature is not a cycle.",
+      "symbols": {
+        "p": {
+          "signature": "inferred",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "q"
+            }
+          ]
+        },
+        "q": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "p"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "p",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "q",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "p",
+            "q",
+            "contract"
+          ],
+          [
+            "q",
+            "p",
+            "contract"
+          ]
+        ],
+        "states": {
+          "p": "FunctionCertified",
+          "q": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "unexecuted-callee-failure-does-not-block-evaluation",
+      "note": "rare's body has a type error, but the evaluation never runs it. rare still fails on its own when the module is verified.",
+      "symbols": {
+        "table": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "run"
+            }
+          ]
+        },
+        "run": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "rare",
+              "executed": false
+            }
+          ]
+        },
+        "rare": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "BodyTyped",
+            "code": "F-DIAG-TYPE-MISMATCH"
+          }
+        }
+      },
+      "demands": [
+        {
+          "symbol": "table",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "run",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "rare",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-TYPE-MISMATCH",
+            "goals": [
+              "rare:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "run",
+            "rare",
+            "contract"
+          ],
+          [
+            "table",
+            "run",
+            "body"
+          ]
+        ],
+        "states": {
+          "rare": "SignatureReady",
+          "run": "FunctionCertified",
+          "table": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "executed-callee-failure-blocks-evaluation",
+      "note": "The same program with the failing callee on the executed path.",
+      "symbols": {
+        "table": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "run"
+            }
+          ]
+        },
+        "run": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "rare"
+            }
+          ]
+        },
+        "rare": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "BodyTyped",
+            "code": "F-DIAG-TYPE-MISMATCH"
+          }
+        }
+      },
+      "demands": [
+        {
+          "symbol": "table",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "run",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "rare",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-TYPE-MISMATCH",
+            "goals": [
+              "rare:BodyTyped"
+            ]
+          },
+          {
+            "code": "F-DIAG-DEPENDENCY-FAILED",
+            "goals": [
+              "table:SignatureReady",
+              "rare:FunctionCertified"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "run",
+            "rare",
+            "contract"
+          ],
+          [
+            "table",
+            "rare",
+            "body"
+          ],
+          [
+            "table",
+            "run",
+            "body"
+          ]
+        ],
+        "states": {
+          "rare": "SignatureReady",
+          "run": "FunctionCertified",
+          "table": "Declared"
+        }
+      }
+    },
+    {
+      "id": "reading-a-body-needs-only-its-declaration",
+      "note": "A macro reads f's body as syntax. f's body does not type-check, which does not stop the macro, but the macro depends on that body.",
+      "symbols": {
+        "macro": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "reflects-body",
+              "target": "f"
+            }
+          ]
+        },
+        "f": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "BodyTyped",
+            "code": "F-DIAG-TYPE-MISMATCH"
+          }
+        }
+      },
+      "demands": [
+        {
+          "symbol": "macro",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-TYPE-MISMATCH",
+            "goals": [
+              "f:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "macro",
+            "f",
+            "body"
+          ]
+        ],
+        "states": {
+          "f": "SignatureReady",
+          "macro": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "reading-a-contract-depends-on-the-contract-only",
+      "note": "fields-of and function-spec-of without the body.",
+      "symbols": {
+        "derive": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "reflects-contract",
+              "target": "point"
+            },
+            {
+              "kind": "names",
+              "target": "point"
+            }
+          ]
+        },
+        "point": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "derive",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "point",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "derive": "FunctionCertified",
+          "point": "FunctionCertified"
+        },
+        "diagnostics": [],
+        "edges": [
+          [
+            "derive",
+            "point",
+            "contract"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "inlining-depends-on-the-inline-body",
+      "note": "Lowering f copies g's typed body.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "g"
+            },
+            {
+              "kind": "inlines",
+              "target": "g"
+            }
+          ]
+        },
+        "g": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "g",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "f",
+            "g",
+            "contract"
+          ],
+          [
+            "f",
+            "g",
+            "inline"
+          ]
+        ],
+        "states": {
+          "f": "FunctionCertified",
+          "g": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "dependents-of-a-cycle-are-secondary",
+      "note": "user calls a, which is in a cycle. The cycle is primary; user's failure is reported after it.",
+      "symbols": {
+        "a": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "b"
+            }
+          ]
+        },
+        "b": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "a"
+            }
+          ]
+        },
+        "user": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "a"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "user",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "a",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "b",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "a:SignatureReady",
+              "b:FunctionCertified",
+              "b:Lowered",
+              "b:BodyTyped"
+            ]
+          },
+          {
+            "code": "F-DIAG-DEPENDENCY-FAILED",
+            "goals": [
+              "user:BodyTyped",
+              "a:SignatureReady"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "a",
+            "b",
+            "body"
+          ],
+          [
+            "b",
+            "a",
+            "contract"
+          ],
+          [
+            "user",
+            "a",
+            "contract"
+          ]
+        ],
+        "states": {
+          "a": "Declared",
+          "b": "SignatureReady",
+          "user": "SignatureReady"
+        }
+      }
+    },
+    {
+      "id": "two-cycles-are-reported-in-symbol-order",
+      "note": "Independent cycles; the order of diagnostics does not depend on which is found first.",
+      "symbols": {
+        "z": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "z"
+            }
+          ]
+        },
+        "m": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "evaluates-in-signature",
+              "target": "m"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "z",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "m",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "m:SignatureReady",
+              "m:FunctionCertified",
+              "m:Lowered",
+              "m:BodyTyped"
+            ]
+          },
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "z:SignatureReady",
+              "z:FunctionCertified",
+              "z:Lowered",
+              "z:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "m",
+            "m",
+            "body"
+          ],
+          [
+            "z",
+            "z",
+            "body"
+          ]
+        ],
+        "states": {
+          "m": "Declared",
+          "z": "Declared"
+        }
+      }
+    },
+    {
+      "id": "modules-may-import-each-other-without-a-symbol-cycle",
+      "note": "alpha.f calls beta.g and beta.h calls alpha.f. Module-level import cycles are fine when no symbol goal waits on itself.",
+      "symbols": {
+        "alpha.f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "beta.g"
+            }
+          ]
+        },
+        "beta.g": {
+          "signature": "explicit",
+          "requires": []
+        },
+        "beta.h": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "alpha.f"
+            }
+          ]
+        }
+      },
+      "modules": {
+        "alpha": [
+          "alpha.f"
+        ],
+        "beta": [
+          "beta.g",
+          "beta.h"
+        ]
+      },
+      "demands": [
+        {
+          "module": "alpha",
+          "goal": "verify"
+        },
+        {
+          "module": "beta",
+          "goal": "verify"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [
+          [
+            "alpha.f",
+            "beta.g",
+            "contract"
+          ],
+          [
+            "beta.h",
+            "alpha.f",
+            "contract"
+          ]
+        ],
+        "states": {
+          "alpha.f": "FunctionCertified",
+          "beta.g": "FunctionCertified",
+          "beta.h": "FunctionCertified"
+        }
+      }
+    },
+    {
+      "id": "sealing-a-module-does-not-type-bodies",
+      "note": "Publishing interfaces needs signatures only; a body error does not stop a seal.",
+      "symbols": {
+        "lib.f": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "BodyTyped",
+            "code": "F-DIAG-TYPE-MISMATCH"
+          }
+        },
+        "lib.g": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "lib.f"
+            }
+          ]
+        }
+      },
+      "modules": {
+        "lib": [
+          "lib.f",
+          "lib.g"
+        ]
+      },
+      "demands": [
+        {
+          "module": "lib",
+          "goal": "seal"
+        }
+      ],
+      "expected": {
+        "diagnostics": [],
+        "edges": [],
+        "states": {
+          "lib.f": "SignatureReady",
+          "lib.g": "SignatureReady"
+        }
+      }
+    },
+    {
+      "id": "unbound-requirement-fails-the-requesting-symbol",
+      "note": "A name that does not exist is the requester's own failure.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "calls",
+              "target": "missing"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "diagnostics": [
+          {
+            "code": "F-DIAG-UNBOUND-NAME",
+            "goals": [
+              "f:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [],
+        "states": {
+          "f": "SignatureReady"
+        }
+      }
+    },
+    {
+      "id": "signature-mention-needs-the-named-header",
+      "note": "f takes a Pair<x>. Whether the bare x is a type or a constant is decided by Pair's generic header, so f's signature waits for it and fails with it; f is never certified against a header that does not exist.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "names",
+              "target": "Pair"
+            }
+          ]
+        },
+        "Pair": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "SignatureReady",
+            "code": "F-DIAG-ILL-FORMED"
+          }
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "Pair": "Declared",
+          "f": "Declared"
+        },
+        "diagnostics": [
+          {
+            "code": "F-DIAG-ILL-FORMED",
+            "goals": [
+              "Pair:SignatureReady"
+            ]
+          },
+          {
+            "code": "F-DIAG-DEPENDENCY-FAILED",
+            "goals": [
+              "f:SignatureReady",
+              "Pair:SignatureReady"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "f",
+            "Pair",
+            "contract"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "mutually-recursive-records-are-not-a-cycle",
+      "note": "Each record's fields mention the other. A mention in a member list needs only the other header, so both complete.",
+      "symbols": {
+        "A": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "names",
+              "target": "B",
+              "in": "body"
+            }
+          ]
+        },
+        "B": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "names",
+              "target": "A",
+              "in": "body"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "A",
+          "state": "FunctionCertified"
+        },
+        {
+          "symbol": "B",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "A": "FunctionCertified",
+          "B": "FunctionCertified"
+        },
+        "diagnostics": [],
+        "edges": [
+          [
+            "A",
+            "B",
+            "contract"
+          ],
+          [
+            "B",
+            "A",
+            "contract"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "signature-may-mention-its-own-symbol",
+      "note": "A header whose constraint mentions the type being declared does not wait on itself.",
+      "symbols": {
+        "Node": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "names",
+              "target": "Node"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "Node",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "Node": "FunctionCertified"
+        },
+        "diagnostics": [],
+        "edges": [
+          [
+            "Node",
+            "Node",
+            "contract"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "record-that-embeds-itself-is-a-layout-cycle",
+      "note": "A value that contains itself inline has no finite layout. Typing succeeds; the cycle is reported where layout is computed.",
+      "symbols": {
+        "Loop": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "names",
+              "target": "Loop",
+              "in": "body"
+            },
+            {
+              "kind": "embeds",
+              "target": "Loop"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "Loop",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "Loop": "BodyTyped"
+        },
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "Loop:Lowered"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "Loop",
+            "Loop",
+            "contract"
+          ],
+          [
+            "Loop",
+            "Loop",
+            "members"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "records-that-embed-each-other-are-a-layout-cycle",
+      "note": "The same through two types.",
+      "symbols": {
+        "A": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "embeds",
+              "target": "B"
+            }
+          ]
+        },
+        "B": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "embeds",
+              "target": "A"
+            }
+          ]
+        }
+      },
+      "demands": [
+        {
+          "symbol": "A",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "A": "BodyTyped",
+          "B": "BodyTyped"
+        },
+        "diagnostics": [
+          {
+            "code": "F-DIAG-COMPILE-CYCLE",
+            "goals": [
+              "A:Lowered",
+              "B:Lowered"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "A",
+            "B",
+            "members"
+          ],
+          [
+            "B",
+            "A",
+            "members"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "body-that-uses-members-waits-for-the-member-list",
+      "note": "f constructs a Point and reads a field. It needs Point's typed members, and a failure there reaches f as a secondary diagnostic.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "uses-members",
+              "target": "Point"
+            }
+          ]
+        },
+        "Point": {
+          "signature": "explicit",
+          "requires": [],
+          "fails": {
+            "at": "BodyTyped",
+            "code": "F-DIAG-ILL-FORMED"
+          }
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "FunctionCertified"
+        }
+      ],
+      "expected": {
+        "states": {
+          "Point": "SignatureReady",
+          "f": "SignatureReady"
+        },
+        "diagnostics": [
+          {
+            "code": "F-DIAG-ILL-FORMED",
+            "goals": [
+              "Point:BodyTyped"
+            ]
+          },
+          {
+            "code": "F-DIAG-DEPENDENCY-FAILED",
+            "goals": [
+              "f:BodyTyped",
+              "Point:BodyTyped"
+            ]
+          }
+        ],
+        "edges": [
+          [
+            "f",
+            "Point",
+            "members"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "reflection-in-a-signature-waits-for-members",
+      "note": "A where clause in f's header reads Point's fields, so the requirement is issued while f's signature is being sealed, not later.",
+      "symbols": {
+        "f": {
+          "signature": "explicit",
+          "requires": [
+            {
+              "kind": "reflects-members",
+              "target": "Point",
+              "in": "signature"
+            }
+          ]
+        },
+        "Point": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "SignatureReady"
+        }
+      ],
+      "expected": {
+        "states": {
+          "Point": "BodyTyped",
+          "f": "SignatureReady"
+        },
+        "diagnostics": [],
+        "edges": [
+          [
+            "f",
+            "Point",
+            "members"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "inferred-signature-waits-for-a-body-constant",
+      "note": "f's result type depends on a constant its body computes by calling n, so f's inferred signature is not sealed until n is certified.",
+      "symbols": {
+        "f": {
+          "signature": "inferred",
+          "requires": [
+            {
+              "kind": "evaluates-in-body",
+              "target": "n"
+            }
+          ]
+        },
+        "n": {
+          "signature": "explicit",
+          "requires": []
+        }
+      },
+      "demands": [
+        {
+          "symbol": "f",
+          "state": "SignatureReady"
+        }
+      ],
+      "expected": {
+        "states": {
+          "f": "SignatureReady",
+          "n": "FunctionCertified"
+        },
+        "diagnostics": [],
+        "edges": [
+          [
+            "f",
+            "n",
+            "body"
+          ]
+        ]
+      }
+    }
+  ]
+}

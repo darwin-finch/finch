@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "algorithm": "sha256",
+  "canonical_json": {
+    "encoding": "UTF-8",
+    "object_member_order": "ascending Unicode scalar sequence of NFC member names",
+    "array_order": "preserved",
+    "numbers": "base-10 shortest integers only; schemas forbid floating JSON numbers in digest inputs",
+    "strings": "Unicode NFC; escape only quotation mark, reverse solidus, and U+0000 through U+001F",
+    "whitespace": "none outside strings",
+    "duplicates": "reject before canonicalization",
+    "unknown_fields": "reject according to the owning schema",
+    "pointer_extension": "In excluded_json_pointers, * matches every element of exactly one array level. No other wildcard exists."
+  },
+  "domains": {
+    "semantic": {
+      "tag": "finch-semantic-v1",
+      "tag_terminator_hex": "00",
+      "input_schema": "../schemas/semantic-events.schema.json",
+      "excluded_json_pointers": ["/source/language", "/source/sha256", "/source/byte_length", "/events/*/origin"],
+      "reason": "Paired syntaxes and source locations must not change semantic identity."
+    },
+    "interface": {
+      "tag": "finch-interface-v1",
+      "tag_terminator_hex": "00",
+      "input_schema": "../schemas/module-interface.schema.json",
+      "excluded_json_pointers": []
+    },
+    "target_abi": {
+      "tag": "finch-target-abi-v1",
+      "tag_terminator_hex": "00",
+      "input_schema": "../schemas/target-abi.schema.json",
+      "excluded_json_pointers": ["/digest"]
+    },
+    "portable_abi": {
+      "tag": "finch-portable-abi-v1",
+      "tag_terminator_hex": "00",
+      "input_schema": "../schemas/portable-message-abi.schema.json",
+      "excluded_json_pointers": []
+    }
+  },
+  "construction_rules": [
+    "Validate the complete input against its owning schema.",
+    "Remove only the excluded pointer selections declared for the selected domain, expanding * exactly as specified above.",
+    "Serialize the remaining value with the canonical_json rules.",
+    "Hash the UTF-8 tag, its declared terminator byte, and then the canonical UTF-8 bytes.",
+    "Encode the 32-byte digest as lowercase hexadecimal."
+  ]
+}

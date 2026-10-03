@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "module_interface": {
+    "schema_version": 1,
+    "language_version": "0.1-draft",
+    "module": "fixtures.math",
+    "exports": [
+      {
+        "identity": "fixtures.math::add",
+        "namespace": "value",
+        "kind": "function",
+        "signature_ast": {
+          "generic_parameters": [],
+          "parameters": [
+            {
+              "ordinal": 0,
+              "ownership": "borrow",
+              "type": {
+                "kind": "named",
+                "identity": "core.int",
+                "arguments": []
+              }
+            },
+            {
+              "ordinal": 1,
+              "ownership": "borrow",
+              "type": {
+                "kind": "named",
+                "identity": "core.int",
+                "arguments": []
+              }
+            }
+          ],
+          "result": {
+            "kind": "named",
+            "identity": "core.int",
+            "arguments": []
+          },
+          "contract": {
+            "effects": [],
+            "exceptions": [],
+            "suspension": "non-suspending",
+            "return_loan_origin": null
+          },
+          "evidence": [],
+          "linkage": "finch"
+        },
+        "contract_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "layout_digest": null,
+        "target_abi_digest": null
+      }
+    ],
+    "dependencies": [],
+    "unsafe_summary": []
+  },
+  "module_interface_digest": "58e742b3b632b165bbeb943f3a2f1b73813d8f6630aedeb9b6847820293b3f41",
+  "portable_message": {
+    "schema_version": 2,
+    "message_kind": "result",
+    "interface_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "operation_key": "00000001",
+    "execution_id": "00000000000000000000000000000000",
+    "generation": "0000000000000000",
+    "sequence": "0000000000000000",
+    "status": "ok",
+    "result": {
+      "ownership": "inline",
+      "type_key": "core.int",
+      "value": {
+        "encoding": "i64-le",
+        "data": "2a00000000000000"
+      }
+    },
+    "diagnostic": null
+  },
+  "portable_message_digest": "466d010f0a0d2c9be138b39eda251a8a6dc10400ed9c9a9a2410832b3d72c32c",
+  "native_call": {
+    "schema_version": 1,
+    "target_abi_digest": "e159b1ad027f43c0f38fc616390752f1aa0bac99be04027c234f728d7ed0d1e9",
+    "interface_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "operation_key": "00000001",
+    "calling_convention": "cc:sysv-amd64@v1",
+    "parameters": [
+      {
+        "type_key": "core.int",
+        "ownership": "borrow",
+        "passing": "register",
+        "layout_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "type_key": "core.int",
+        "ownership": "borrow",
+        "passing": "register",
+        "layout_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "result": {
+      "type_key": "core.int",
+      "ownership": "inline",
+      "passing": "register",
+      "layout_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "unwind": "forbidden",
+    "callback_policy": "none"
+  },
+  "abi_operation_table": {
+    "schema_version": 1,
+    "interface_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "operations": [
+      {
+        "operation_key": "00000001",
+        "contract_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "parameters": [
+          {"ownership": "borrow", "type_key": "core.int"},
+          {"ownership": "borrow", "type_key": "core.int"}
+        ],
+        "result": {"ownership": "inline", "type_key": "core.int", "release_operation_key": null},
+        "admitted_message_kinds": ["call"],
+        "callback_policy": "none"
+      }
+    ]
+  }
+}

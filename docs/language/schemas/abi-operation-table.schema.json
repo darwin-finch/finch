@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/abi-operation-table-v1.json",
+  "title": "Finch sealed ABI operation table",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "interface_digest", "operations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "interface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}}
+  },
+  "$defs": {
+    "operation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation_key", "contract_digest", "parameters", "result", "admitted_message_kinds", "callback_policy"],
+      "properties": {
+        "operation_key": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
+        "contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "parameters": {"type": "array", "items": {"$ref": "#/$defs/value"}},
+        "result": {"$ref": "#/$defs/result"},
+        "admitted_message_kinds": {"type": "array", "items": {"enum": ["call", "effect"]}, "minItems": 1, "uniqueItems": true},
+        "callback_policy": {"enum": ["none", "attached-thread-only", "enqueue-root-invocation"]}
+      }
+    },
+    "value": {
+      "type": "object", "additionalProperties": false, "required": ["ownership", "type_key"],
+      "properties": {"ownership": {"enum": ["borrow", "borrow-mut", "steal"]}, "type_key": {"type": "string", "minLength": 1}}
+    },
+    "result": {
+      "type": "object", "additionalProperties": false, "required": ["ownership", "type_key", "release_operation_key"],
+      "properties": {"ownership": {"enum": ["inline", "owned", "none"]}, "type_key": {"type": ["string", "null"]}, "release_operation_key": {"type": ["string", "null"], "pattern": "^[0-9a-f]{8}$"}},
+      "allOf": [{"if": {"properties": {"ownership": {"const": "owned"}}}, "then": {"properties": {"release_operation_key": {"type": "string"}}}, "else": {"properties": {"release_operation_key": {"type": "null"}}}}]
+    }
+  }
+}

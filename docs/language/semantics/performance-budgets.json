@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "status": "acceptance-targets-not-yet-demonstrated",
+  "measurement_manifest_required": ["cpu_model", "logical_cores", "memory_bytes", "os", "filesystem", "power_mode", "compiler_revision", "optimization_profile", "corpus_digest", "sample_count", "warmup_count"],
+  "compile": {
+    "cold_10000_line_module_wall_ms_max": 2000,
+    "warm_single_function_incremental_p95_ms_max": 100,
+    "warm_no_change_p95_ms_max": 25,
+    "compiler_peak_rss_bytes_max": 536870912,
+    "shared_generic_body_code_growth_ratio_max": 1.25,
+    "specializations_per_generic_function_default_max": 32
+  },
+  "runtime_semantic_taxes": {
+    "non_suspending_direct_call_continuation_allocations": 0,
+    "pure_or_ephemeral_execution_journal_creations": 0,
+    "local_native_call_portable_encodings": 0,
+    "local_nondurable_spawn_portable_encodings": 0,
+    "local_nondurable_spawn_checkpoint_writes": 0,
+    "nonsuspending_spawn_parent_continuation_allocations": 0,
+    "unique_owner_atomic_reference_count_operations": 0,
+    "proven_bounds_check_failures_per_eliminated_check": 0
+  },
+  "responsiveness": {
+    "certified_max_instructions_between_cancellation_observations": 65536
+  },
+  "regression_policy": {
+    "minimum_samples": 30,
+    "fail_on_budget_excess": true,
+    "comparison_only_is_insufficient": true,
+    "semantic_assertions_required": true
+  }
+}

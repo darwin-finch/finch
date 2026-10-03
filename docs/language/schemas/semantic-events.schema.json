@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/semantic-events-v1.json",
+  "title": "Finch semantic-construction event stream",
+  "$comment": "Per-kind attribute closure is defined by semantic-event-kinds.json and is required in addition to this envelope schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "language_version", "source", "events"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "language_version": {"const": "0.1-draft"},
+    "source": {"$ref": "#/$defs/source"},
+    "events": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/event"}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "language", "sha256", "byte_length"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 1},
+        "language": {"enum": ["lisp", "forth", "c"]},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "byte_length": {"type": "integer", "minimum": 0}
+      }
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "start", "end"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0}
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["span", "expansion"],
+      "properties": {
+        "span": {"$ref": "#/$defs/span"},
+        "expansion": {"type": "array", "items": {"$ref": "#/$defs/span"}}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "origin", "payload"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 0},
+        "kind": {
+          "enum": [
+            "module-begin", "module-end", "function", "lambda", "parameter", "capture",
+            "record", "field", "variant", "case", "concept", "implementation", "constructor",
+            "getter", "setter", "operation", "associated", "axiom", "import", "export", "test-suite",
+            "test", "literal", "binding", "read", "write", "call", "sequence", "if", "while",
+            "match", "match-arm", "try", "catch", "throw", "rethrow", "scope", "guard", "mixin",
+            "ct-foreach", "unsafe", "extern", "record-construct", "variant-construct", "return",
+            "break", "continue-loop", "yield", "field-init", "member"
+          ]
+        },
+        "origin": {"$ref": "#/$defs/origin"},
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["node_id", "parent_id", "role", "index", "attributes"],
+          "properties": {
+            "node_id": {"type": "string", "pattern": "^n[0-9]+$"},
+            "parent_id": {"type": ["string", "null"], "pattern": "^n[0-9]+$"},
+            "role": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$"},
+            "index": {"type": ["integer", "null"], "minimum": 0},
+            "attributes": {
+              "type": "object",
+              "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+              "additionalProperties": {"$ref": "#/$defs/value"}
+            }
+          }
+        }
+      }
+    },
+    "value": {
+      "oneOf": [
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "boolean"},
+        {"type": "null"},
+        {"type": "array", "items": {"$ref": "#/$defs/value"}},
+        {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+          "additionalProperties": {"$ref": "#/$defs/value"}
+        }
+      ]
+    }
+  }
+}

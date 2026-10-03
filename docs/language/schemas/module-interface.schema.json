@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/module-interface-v1.json",
+  "title": "Finch sealed module interface digest input",
+  "$comment": "Before hashing, exports are sorted by (namespace, identity, kind), dependencies by (module, phase, interface_digest), and unsafe_summary by Unicode scalar order. Duplicate sort keys are invalid.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "language_version", "module", "exports", "dependencies", "unsafe_summary"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "language_version": {"const": "0.1-draft"},
+    "module": {"type": "string", "minLength": 1},
+    "exports": {"type": "array", "items": {"$ref": "#/$defs/export"}},
+    "dependencies": {"type": "array", "items": {"$ref": "#/$defs/dependency"}},
+    "unsafe_summary": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  },
+  "$defs": {
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "namespace", "kind", "signature_ast", "contract_digest", "layout_digest"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 1},
+        "namespace": {"enum": ["type", "value", "module", "member"]},
+        "kind": {"enum": ["type", "concept", "function", "constructor", "value", "module", "evidence", "layout"]},
+        "signature_ast": {"$ref": "#/$defs/signature"},
+        "contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "body_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "inline_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ctfe_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "layout_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "target_abi_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "phase", "interface_digest", "used_exports"],
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "phase": {"enum": ["Declared", "SignatureReady", "BodyTyped", "Lowered", "FunctionCertified", "ModuleParsed", "ModuleElaborated", "ModuleSealed", "ModuleVerified"]},
+        "interface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "used_exports": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["identity", "contract_digest"], "properties": {"identity": {"type": "string"}, "contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}}
+      }
+    },
+    "signature": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generic_parameters", "parameters", "result", "contract", "evidence", "linkage"],
+      "properties": {
+        "generic_parameters": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "bounds"], "properties": {"ordinal": {"type": "integer", "minimum": 0}, "kind": {"enum": ["Type", "Const", "EffectRow", "ExceptionSet", "Region", "StackRow", "TypePack", "ValuePack", "ParamPack", "Syntax"]}, "bounds": {"type": "array", "items": {"$ref": "#/$defs/type"}}}}},
+        "parameters": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["ordinal", "ownership", "type"], "properties": {"ordinal": {"type": "integer", "minimum": 0}, "ownership": {"enum": ["borrow", "borrow-mut", "steal", "copy"]}, "type": {"$ref": "#/$defs/type"}}}},
+        "result": {"$ref": "#/$defs/type"},
+        "contract": {"$ref": "#/$defs/contract"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/type"}},
+        "linkage": {"enum": ["private", "finch", "native", "portable-message", "comptime"]}
+      }
+    },
+    "type": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "identity", "arguments"], "properties": {"kind": {"const": "named"}, "identity": {"type": "string"}, "arguments": {"type": "array", "items": {"$ref": "#/$defs/type"}}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "ordinal"], "properties": {"kind": {"const": "parameter"}, "ordinal": {"type": "integer", "minimum": 0}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "mutable", "stable", "target"], "properties": {"kind": {"const": "borrow"}, "mutable": {"type": "boolean"}, "stable": {"type": "boolean"}, "target": {"$ref": "#/$defs/type"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "concept", "arguments", "associated"], "properties": {"kind": {"const": "projection"}, "concept": {"type": "string"}, "arguments": {"type": "array", "items": {"$ref": "#/$defs/type"}}, "associated": {"type": "string"}}}
+      ]
+    },
+    "contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effects", "exceptions", "suspension", "return_loan_origin"],
+      "properties": {
+        "effects": {"type": "array", "items": {"$ref": "#/$defs/effect"}},
+        "exceptions": {"type": "array", "items": {"$ref": "#/$defs/type"}},
+        "suspension": {"enum": ["non-suspending", "suspends"]},
+        "return_loan_origin": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "effect": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "operation", "selectors"], "properties": {"kind": {"const": "capability"}, "operation": {"type": "string"}, "selectors": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "root", "pattern"], "properties": {"name": {"type": "string"}, "root": {"type": "string"}, "pattern": {"type": "string"}}}}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "access", "target"], "properties": {"kind": {"const": "state"}, "access": {"enum": ["read", "write"]}, "target": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "ordinal"], "properties": {"kind": {"enum": ["parameter", "region"]}, "ordinal": {"type": "integer", "minimum": 0}}}, {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "result"}}}]}}}
+      ]
+    }
+  }
+}

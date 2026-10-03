@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "ir_version": 6,
+  "description": "Typed stack IR version 6 for the executable core. It is IR version 5 (crates/finch-vm-core/src/ir.rs) plus what the specified semantics need: region tables for handlers and cleanup, explicit lifecycle drops, slot references for exclusive borrows, and frame-replacing tail calls. Ownership is erased: no instruction records who owns a value or whether a place was moved from.",
+  "module": {
+    "version": "6",
+    "entry": "name of the function a root execution starts in",
+    "functions": "map from function name to function"
+  },
+  "function": {
+    "name": "its key in the module",
+    "parameters": "number of arguments; they occupy local slots 0..parameters-1 in order",
+    "locals": "total number of local slots, parameters included",
+    "entry": "id of the first block",
+    "blocks": "array of blocks; a block's id is its index",
+    "regions": "array of regions; a region's id is its index"
+  },
+  "block": {
+    "id": "index in the function's blocks",
+    "region": "innermost region covering every instruction of this block, or null",
+    "instructions": "non-empty; the last instruction, and only the last, is a terminator"
+  },
+  "region": {
+    "kind": "catch | cleanup | suppress",
+    "target": "block entered when a signal reaches this region",
+    "parent": "enclosing region, or null",
+    "depth": "operand-stack height above the frame base to truncate to before entering the target"
+  },
+  "frame_state": [
+    "function, block, instruction index, local slots, captures, and the operand-stack base, as in version 5",
+    "unwinds: signals currently being unwound through this frame, each with the region it entered by",
+    "active: exceptions whose catch arm is executing in this frame, each with a moved flag",
+    "adopted: values a tail call handed to this frame to drop when it exits, each with the parameter positions lent from it; dropped most recent first on return, on a signal that discards the frame, and on a tail call that does not forward them; empty unless used"
+  ],
+  "signals": {
+    "raise": "a typed exception with its value, provenance, and suppressed list",
+    "protected": "Trap, Cancel, Denied, or ResourceExhausted, with an optional detail and suppressed list"
+  },
+  "unwinding": [
+    "A signal raised in a block starts at that block's region and walks outward through parents.",
+    "A catch region takes a raise only: the stack is truncated to the region depth, the exception becomes active in the frame, its value is pushed, and execution continues at the target.",
+    "A cleanup region takes any signal: the stack is truncated, the signal and the region are pushed on the frame's unwinds, and execution continues at the target. `resume_unwind` pops them and continues outward from that region's parent.",
+    "A suppress region takes any signal while another is unwinding in the frame: the new signal is appended to the suppressed list of the frame's innermost unwinding signal, and execution continues at the target. A suppress region covers only cleanup code entered from a cleanup region, so a signal always is unwinding there; a module in which a signal can reach a suppress region with none unwinding is malformed.",
+    "When no region in the frame takes the signal the frame is discarded, its adopted values are dropped, and the walk continues in the caller from the region of the block holding its call.",
+    "A signal that leaves the outermost frame of a fiber or task ends that execution and continues in the execution that was stepping or joining it. A signal that leaves the root is the terminal outcome."
+  ],
+  "instructions": [
+    {"op": "constant", "fields": ["value"], "pops": 0, "pushes": 1, "since": 5, "meaning": "Push a literal."},
+    {"op": "drop", "fields": [], "pops": 1, "pushes": 0, "since": 5, "meaning": "Discard a value that has no lifecycle."},
+    {"op": "drop_value", "fields": [], "pops": 1, "pushes": 0, "since": 6, "meaning": "End an owned value's lifetime: run its lifecycle, then its parts' in reverse order. Dropping a dormant fiber drops its arguments. Dropping a suspended fiber drops its buffered item and then unwinds it with the signal Cancel(handle-dropped), running its cleanup regions here before the next instruction of the dropping frame. Dropping a task that has not finished hands it to the reaper."},
+    {"op": "local_get", "fields": ["index"], "pops": 0, "pushes": 1, "since": 5, "meaning": "Push a local slot's value."},
+    {"op": "local_set", "fields": ["index"], "pops": 1, "pushes": 0, "since": 5, "meaning": "Store into a local slot."},
+    {"op": "local_ref", "fields": ["index"], "pops": 0, "pushes": 1, "since": 6, "meaning": "Push a reference to a local slot of this frame: the run-time form of an exclusive borrow."},
+    {"op": "ref_get", "fields": [], "pops": 1, "pushes": 1, "since": 6, "meaning": "Replace a slot reference with the value in its slot."},
+    {"op": "ref_set", "fields": [], "pops": 2, "pushes": 0, "since": 6, "meaning": "Pop a slot reference, then a value, and store the value into the slot."},
+    {"op": "capture_get", "fields": ["index"], "pops": 0, "pushes": 1, "since": 5, "meaning": "Push a captured value of the running closure."},
+    {"op": "make_record", "fields": ["type", "fields"], "pops": "len(fields)", "pushes": 1, "since": 5, "meaning": "Build a nominal record from its field values in order."},
+    {"op": "record_get", "fields": ["field"], "pops": 1, "pushes": 1, "since": 5, "meaning": "Replace a record with one of its fields."},
+    {"op": "make_variant", "fields": ["case", "count"], "pops": "count", "pushes": 1, "since": 5, "meaning": "Build a variant case from its payload values in order."},
+    {"op": "make_closure", "fields": ["function", "modes"], "pops": "len(modes)", "pushes": 1, "since": 5, "meaning": "Build a callable over a function and its captures, popped in capture order. A steal capture is owned by the closure and dropped with it. A copy capture is an independent copy with no lifecycle. A borrow capture is the lent value and a borrow-mut capture is a slot reference; neither is dropped with the closure. The retain and weaken modes belong to Shared owners, which version 6 does not yet represent."},
+    {"op": "intrinsic", "fields": ["name", "arity"], "pops": "arity", "pushes": 1, "since": 5, "meaning": "Apply a checked operator. The names are + - * / and == != < <= > >= at arity 2, and - at arity 1 for negation. Overflow is the Trap integer-overflow and division by zero the Trap divide-by-zero; division truncates toward zero."},
+    {"op": "call", "fields": ["function", "arity"], "pops": "arity", "pushes": 1, "since": 5, "meaning": "Enter a function in a new frame; its result is pushed when it returns."},
+    {"op": "call_closure", "fields": ["arity"], "pops": "arity + 1", "pushes": 1, "since": 5, "meaning": "Enter a closure, which lies beneath its arguments."},
+    {"op": "capability_request", "fields": ["operation", "arity", "check", "static"], "pops": "arity", "pushes": 1, "since": 5, "meaning": "static declares that the arguments are the constants pushed by the arity instructions immediately before this one in the same block; the verifier rejects the claim otherwise, and the manifest lists those constants. A request without the claim stands for any arguments. With check set, signal Denied unless the execution's live grant allows the operation. Journal the request, expose Await, and suspend; the accepted resume pushes a value or raises a signal."},
+    {"op": "emit", "fields": ["operation"], "pops": 1, "pushes": 0, "since": 5, "meaning": "Journal an event, then expose Emit."},
+    {"op": "end_catch", "fields": [], "pops": 0, "pushes": 0, "since": 6, "meaning": "The innermost active exception is handled: remove it and drop its value unless a rethrow moved it."},
+    {"op": "unwind_is_cancel", "fields": [], "pops": 0, "pushes": 1, "since": 6, "meaning": "Push whether the frame's innermost unwinding signal is Cancel."},
+    {"op": "safepoint", "fields": [], "pops": 0, "pushes": 0, "since": 6, "meaning": "Observe a pending cancellation as a Cancel signal."},
+    {"op": "make_generator", "fields": ["function", "arity"], "pops": "arity", "pushes": 1, "since": 6, "meaning": "Build a dormant fiber over a generator function and its arguments, which it now owns. Nothing of the function runs."},
+    {"op": "generator_op", "fields": ["operation", "arity"], "pops": "arity + 1", "pushes": 1, "since": 6, "meaning": "Apply a range operation to the generator beneath the arity operands. That operand is a slot reference when the generator is held in a place, since every operation but start borrows it exclusively, and the handle itself otherwise. A dormant generator is first advanced to its first yield (primed). empty? pushes whether it has finished. front pushes the buffered item, or raises the value RangeEmpty when the generator has finished. pop-front drops the buffered item and advances with the reply none, pushing unit. reply drops the buffered item, advances with the reply some(arguments), and pushes the new buffered item, or raises RangeEmpty when there is none. pop-front and reply on a finished generator raise RangeEmpty as well. These are ordinary Raise signals that a catch region takes. start primes now and pushes the generator; a Raise during that priming is kept and raised by the next operation instead. A returned value other than unit becomes the last item."},
+    {"op": "yield", "fields": [], "pops": 1, "pushes": 1, "since": 5, "meaning": "Suspend this fiber, making the popped value its buffered item; when it is next advanced the reply option is pushed."},
+    {"op": "spawn", "fields": [], "pops": 1, "pushes": 1, "since": 6, "meaning": "Reserve a scheduler slot, or drop the callable and signal ResourceExhausted; otherwise move the callable into a child and push its handle."},
+    {"op": "join", "fields": [], "pops": 1, "pushes": 1, "since": 6, "meaning": "Consume a task handle and push the child's result; the child's signal continues here."},
+    {"op": "cancel", "fields": [], "pops": 1, "pushes": 1, "since": 6, "meaning": "Consume a task handle, cancel the child, and push unit."},
+    {"op": "jump", "fields": ["target"], "terminator": true, "pops": 0, "since": 5, "meaning": "Continue at a block."},
+    {"op": "branch", "fields": ["then", "else"], "terminator": true, "pops": 1, "since": 5, "meaning": "Continue at then when the popped Boolean is true, otherwise at else."},
+    {"op": "branch_variant", "fields": ["case", "count", "then", "else"], "terminator": true, "pops": 1, "since": 6, "meaning": "When the popped value is that case, push its payload values in declaration order, the last on top, and continue at then; otherwise push the value back and continue at else."},
+    {"op": "return", "fields": [], "terminator": true, "pops": 1, "since": 5, "meaning": "Leave the frame with its single result; the operand stack must otherwise be at the frame base. The frame's adopted values are dropped, most recent first, after the result is taken and before the caller continues."},
+    {"op": "tail_call", "fields": ["function", "arity", "adopt", "forward"], "terminator": true, "pops": "arity", "since": 6, "meaning": "Discard this frame and enter the function in its place. forward is a list of [parameter, argument] pairs: the argument is a loan this frame received through that parameter. Parameter -1 stands for the closure the frame is running and the loans it captured. An adopted value of this frame recorded against a forwarded parameter is carried to the new frame and recorded there against the argument positions it reaches; every other adopted value is dropped, most recent first, before the function is entered. The arguments at the adopt indexes then become further adopted values of the new frame, each recorded against its own position. An argument may be both: a closure built for the call is adopted, and what it borrowed through a parameter is forwarded with it. In tail_call_closure an adopt index of -1 is the closure being called, which the frame owned and which moves into the new frame."},
+    {"op": "tail_call_closure", "fields": ["arity", "adopt", "forward"], "terminator": true, "pops": "arity + 1", "since": 6, "meaning": "As tail_call, for a closure beneath its arguments. A forward pair whose argument is -1 names the closure itself: it was lent to this frame, and an adopted value recorded against that parameter is carried to the new frame, which drops it when it exits."},
+    {"op": "raise", "fields": [], "terminator": true, "pops": 1, "since": 6, "meaning": "Raise the popped value as an exception with fresh provenance."},
+    {"op": "rethrow", "fields": ["trace"], "terminator": true, "pops": 0, "since": 6, "meaning": "Raise the innermost active exception again with its envelope unchanged. With trace set this is a source rethrow and the exception stays active, marked moved; without it the catch declined and the exception is no longer active."},
+    {"op": "resume_unwind", "fields": [], "terminator": true, "pops": 0, "since": 6, "meaning": "End a cleanup handler: continue the frame's innermost unwinding signal outward."},
+    {"op": "trap", "fields": ["code"], "terminator": true, "pops": 0, "since": 5, "meaning": "Signal Trap with the given code."}
+  ],
+  "lowering": [
+    "A value that needs a drop never waits on the operand stack across an operation that may signal. It is held in a local slot covered by a cleanup region whose handler drops the slot and resumes unwinding.",
+    "A binding of such a value opens that region at its definition. A read the static pass decided is a move ends the region for all later code: the blocks after the move are created without it. A binding moved on one arm of a join is dropped inline on the other arms before the join.",
+    "Leaving a construct normally (falling out of it, break, continue, return, or a tail call) runs its cleanup inline, innermost first, in blocks that the construct's region no longer covers, so a failure there reaches the enclosing constructs.",
+    "A scope with several guards lowers as nested single-guard scopes, first guard outermost. A guard's handler runs its body inside a suppress region when the guard applies to the unwinding signal; `on-success` guards have an empty handler, and `on-cancel` guards test `unwind_is_cancel`. `on-exit` and `on-success` guards also run inline on normal exit.",
+    "A try lowers its body under a catch region. The handler tests each clause in order; a matching clause runs under a cleanup region that performs `end_catch`, and when none matches the handler rethrows without trace.",
+    "A match stores its scrutinee in a slot and tests arms in order with comparisons and `branch_variant`. An ownership match binds parts in declaration order, then drops the parts its pattern discards in reverse order.",
+    "An argument to an exclusive-borrow parameter is a slot reference. An argument to a readonly-borrow parameter is the value itself. A temporary lent to a borrowing parameter stays in the caller's slot and is dropped after the call; in a tail call it is listed in adopt instead.",
+    "A loop places `safepoint` on its back edge, and `continue` jumps to it.",
+    "A try body that moves an outer owned binding has that binding's drop obligation moved inside the catch region: the binding's own cleanup region is closed before the try, and a cleanup region for the same slot is opened as the first thing inside the catch region and ended at the move. A signal that arrives before the move therefore drops the binding before the handler block runs, and one that arrives after does not drop it again.",
+    "Paths that join agree on which bindings are still owed a drop. A path that did not move a binding another path moved drops it as its last act before the join: an if or match arm after releasing its own binders and the scrutinee, and the try body and each handler arm at their ends.",
+    "A capability_request is marked static only when every argument is a literal written directly in argument position."
+  ],
+  "version_5_instructions_outside_this_specification": [
+    "dup", "make_list", "make_map", "variant_get", "record_set", "swap", "output_open", "ui_effect", "defer_fiber", "next_fiber", "join_fiber", "cancel_fiber", "defer_cpu", "poll_cpu_fiber", "join_cpu_fiber", "cancel_cpu_fiber", "propagate_result"
+  ]
+}

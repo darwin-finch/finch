@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/native-call-abi-v1.json",
+  "title": "Finch target-bound native call descriptor",
+  "$comment": "A verification artifact, never a runtime JSON wire format.",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "target_abi_digest", "interface_digest", "operation_key", "calling_convention", "parameters", "result", "unwind", "callback_policy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "target_abi_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "interface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operation_key": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
+    "calling_convention": {"type": "string", "pattern": "^cc:[a-z0-9][a-z0-9._-]*@v[0-9]+$"},
+    "parameters": {"type": "array", "items": {"$ref": "#/$defs/slot"}},
+    "result": {"$ref": "#/$defs/slot"}, "unwind": {"const": "forbidden"},
+    "callback_policy": {"enum": ["none", "attached-thread-only", "enqueue-root-invocation"]}
+  },
+  "$defs": {
+    "slot": {
+      "type": "object", "additionalProperties": false, "required": ["type_key", "ownership", "passing", "layout_digest"],
+      "properties": {
+        "type_key": {"type": "string"}, "ownership": {"enum": ["inline", "borrow", "borrow-mut", "steal", "owned-result", "none"]},
+        "passing": {"enum": ["register", "stack", "indirect", "pointer-length-view", "opaque-handle", "void"]},
+        "layout_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "release_operation_key": {"type": "string", "pattern": "^[0-9a-f]{8}$"}
+      },
+      "allOf": [{"if": {"properties": {"ownership": {"const": "owned-result"}}}, "then": {"required": ["release_operation_key"]}, "else": {"not": {"required": ["release_operation_key"]}}}]
+    }
+  }
+}

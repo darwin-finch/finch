@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "description": "The compile-time job scheduler: how checking, lowering, verification, and compile-time evaluation of one declaration wait on another. It fixes which operation requires which state of which symbol, what dependency each requirement records, and what the outcome is when requirements cannot be met. The outcome is defined as a fixed point, so no scheduling order can change it.",
+  "states": ["Declared", "SignatureReady", "BodyTyped", "Lowered", "FunctionCertified"],
+  "module_goals": {
+    "seal": "every symbol of the module is SignatureReady",
+    "verify": "every symbol of the module is FunctionCertified"
+  },
+  "requirements": [
+    {"kind": "names", "issued_while_reaching": "SignatureReady", "requires": "SignatureReady", "records": "contract",
+     "meaning": "A type, concept, or function is mentioned by name. Resolving the mention needs the named symbol's sealed header, for example the kind of each generic parameter of a type constructor, so the header is required and a change to it rechecks the dependent. A mention of the symbol being declared is met by Declared."},
+    {"kind": "uses-members", "issued_while_reaching": "BodyTyped", "requires": "BodyTyped", "records": "members",
+     "meaning": "The body constructs a record or case, reads a field, or matches a case of the symbol, so the symbol's typed member list is needed."},
+    {"kind": "embeds", "issued_while_reaching": "Lowered", "requires": "Lowered", "records": "members",
+     "meaning": "The symbol's layout contains the other symbol's value inline, so that layout must exist first. A type that embeds itself is a cycle; a type that reaches itself through an owner with its own storage does not embed it."},
+    {"kind": "calls", "issued_while_reaching": "BodyTyped", "requires": "SignatureReady", "records": "contract",
+     "meaning": "The body calls the symbol at run time. Only its contract is needed, which is why mutual recursion is not a cycle."},
+    {"kind": "evaluates-in-signature", "issued_while_reaching": "SignatureReady", "requires": "FunctionCertified", "records": "body",
+     "meaning": "A constant in the signature (a value-generic argument, a where constraint, an array length) is computed by calling the symbol at compile time."},
+    {"kind": "evaluates-in-body", "issued_while_reaching": "BodyTyped", "requires": "FunctionCertified", "records": "body",
+     "meaning": "A constant-required position or a mixin in the body calls the symbol at compile time."},
+    {"kind": "reflects-contract", "issued_while_reaching": "BodyTyped", "requires": "SignatureReady", "records": "contract",
+     "meaning": "Compile-time code reads the symbol's signature or generic header."},
+    {"kind": "reflects-members", "issued_while_reaching": "BodyTyped", "requires": "BodyTyped", "records": "members",
+     "meaning": "Compile-time code reads the fields or cases of a type."},
+    {"kind": "reflects-body", "issued_while_reaching": "BodyTyped", "requires": "Declared", "records": "body",
+     "meaning": "Compile-time code reads the symbol's body as syntax. The body exists once the symbol is declared, but the reader now depends on it."},
+    {"kind": "inlines", "issued_while_reaching": "Lowered", "requires": "BodyTyped", "records": "inline",
+     "meaning": "Lowering copies the symbol's typed body into the caller."}
+  ],
+  "dependency_classes": {
+    "declaration": "The dependent is rechecked when the symbol is added or removed. Every other class implies it.",
+    "members": "The dependent is rechecked when the type's member list changes: the names, types, or order of its fields or cases.",
+    "contract": "The dependent is rechecked when the symbol's sealed signature changes. A change to the body alone does not reach it.",
+    "body": "The dependent is rechecked when the symbol's compile-time body identity changes.",
+    "inline": "The dependent is lowered again when the symbol's inline body identity changes; it is not rechecked."
+  },
+  "rules": [
+    "A symbol reaches a state only after it has reached every earlier state.",
+    "An explicit signature is SignatureReady from the declaration plus the requirements it issues. An inferred signature also issues every requirement of its body while reaching SignatureReady, because its types and effects come from typing that body.",
+    "For a function SignatureReady is its sealed signature, BodyTyped its typed body, Lowered its IR, and FunctionCertified that IR verified. For a type SignatureReady is its sealed generic header, BodyTyped its typed member list, Lowered its layout, and FunctionCertified is reached with Lowered.",
+    "The table gives the state at which each kind is normally issued. A requirement written in the other part of a declaration is issued there instead: a mention or a reflection inside a body is issued while reaching BodyTyped, and one inside a signature while reaching SignatureReady. What it requires and records does not change.",
+    "A job issues its requirements in the listed order and waits on the first that is not yet met. It issues nothing later until that one is met.",
+    "Compile-time evaluation certifies callees on demand: evaluating a symbol requires FunctionCertified of that symbol, then of each callee the evaluation actually executes, transitively. A callee on a path the evaluation does not take is not required and records no body dependency.",
+    "A requirement that is already met returns at once. Otherwise the scheduler ensures a job exists for the required goal and suspends the requesting job until that goal is met.",
+    "A symbol whose work fails for its own reasons (for example a type error in its body) fails at that state with its own diagnostic and keeps the last state it reached.",
+    "When no job can run, every unmet goal waits on exactly one other goal. Each cycle in that wait-for relation is one F-DIAG-COMPILE-CYCLE diagnostic listing the goals of the cycle, rotated to begin at its smallest goal in (symbol, state) order.",
+    "A goal that waits, directly or through other goals, on a failed or cyclic goal fails with F-DIAG-DEPENDENCY-FAILED naming the goal it waited on. That is a secondary diagnostic and never the primary one.",
+    "Diagnostics are ordered: own failures and cycles first, by their first goal in (symbol, state) order, then dependency failures by goal. The first diagnostic is the primary diagnostic.",
+    "Every requirement issued records a dependency from the requesting symbol to the required symbol with the requirement's class, whether or not it was met."
+  ],
+  "identities": [
+    "The result of a compile-time call is identified by the callee's compile-time body identity, its argument values, and the target facts it read.",
+    "An instantiation of a generic is identified by the generic's contract identity, its generic arguments, and the target facts it read.",
+    "Scheduling order, job count, and wall-clock time are not part of any identity."
+  ]
+}

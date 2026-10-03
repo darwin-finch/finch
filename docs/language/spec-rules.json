@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "language_version": "0.1-draft",
+  "families": [
+    {"prefix": "F-CONF", "section": 1, "title": "Scope and conformance"},
+    {"prefix": "F-TRUST", "section": 2, "title": "Compilation and trust boundary"},
+    {"prefix": "F-LEX", "section": 3, "title": "Source identity and lexical rules"},
+    {"prefix": "F-MOD", "section": 4, "title": "Modules and packages"},
+    {"prefix": "F-TYPE", "section": 5, "title": "Kinds, types, and values"},
+    {"prefix": "F-CALL", "section": 6, "title": "Functions, inference, and callable contracts"},
+    {"prefix": "F-EFFECT", "section": 7, "title": "Effects, exceptions, suspension, and purity"},
+    {"prefix": "F-OWN", "section": 8, "title": "Places, ownership, borrowing, and destruction"},
+    {"prefix": "F-DATA", "section": 9, "title": "Records, variants, patterns, and layout"},
+    {"prefix": "F-EVID", "section": 10, "title": "Concepts, evidence, and generics"},
+    {"prefix": "F-CTFE", "section": 11, "title": "CTFE, reflection, and hygienic syntax"},
+    {"prefix": "F-DYN", "section": 12, "title": "Control, cleanup, tail calls, and resumability"},
+    {"prefix": "F-IR", "section": 13, "title": "Typed stack IR and verification"},
+    {"prefix": "F-CAP", "section": 14, "title": "Capabilities and selector grammar"},
+    {"prefix": "F-MEM", "section": 15, "title": "Concurrency memory model"},
+    {"prefix": "F-ABI", "section": 16, "title": "Portable ABI and FFI profile"},
+    {"prefix": "F-DIAG", "section": 17, "title": "Diagnostics and conformance corpus"},
+    {"prefix": "F-PRELUDE", "section": 18, "title": "Required prelude and extension rule"}
+  ],
+  "rule_id_format": "F-<FAMILY>-<UPPERCASE-NAME>",
+  "stability": "A published rule ID never changes meaning. A replacement gets a new ID and records the retired ID."
+}

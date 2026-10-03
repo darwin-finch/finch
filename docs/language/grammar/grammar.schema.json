@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/grammar-v1.json",
+  "title": "Finch canonical grammar artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "language_version", "syntax", "entrypoint", "rule_id_template", "tokens", "productions", "reserved_words"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "language_version": {"const": "0.1-draft"},
+    "syntax": {"enum": ["common", "colisp", "coforth", "clike"]},
+    "entrypoint": {"type": "string", "minLength": 1},
+    "root_entrypoints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["library", "executable", "submission", "script"],
+      "properties": {
+        "library": {"type": "string", "minLength": 1},
+        "executable": {"type": "string", "minLength": 1},
+        "submission": {"type": "string", "minLength": 1},
+        "script": {"type": "string", "minLength": 1}
+      }
+    },
+    "rule_id_template": {"type": "string", "pattern": "^F-LEX-[A-Z]+-\\{production\\}$"},
+    "imports": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "tokens": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pattern"],
+        "properties": {
+          "pattern": {"type": "string"},
+          "skip": {"type": "boolean"},
+          "description": {"type": "string"}
+          ,"scanner": {"enum": ["regex", "balanced", "raw-string", "triple-string", "coforth-string"]}
+        }
+      }
+    },
+    "productions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["alternatives"],
+        "properties": {
+          "alternatives": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "semantic_node": {"type": "string"},
+          "recovery": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "reserved_words": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  }
+}

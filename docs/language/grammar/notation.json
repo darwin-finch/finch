@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "notation": "Finch-PEG-1",
+  "encoding": "UTF-8",
+  "regex_dialect": "PCRE2 UTF+UCP",
+  "metasyntax": {
+    "literal": "single-quoted UTF-8 terminal spelling; a double-quoted spelling is used only for a terminal that contains a single quote",
+    "symbol": "unquoted token or production name",
+    "sequence": "terms separated by ASCII whitespace",
+    "choice": "terms separated by | inside a parenthesized group; top-level choices are separate alternatives array entries",
+    "optional": "term?",
+    "zero_or_more": "term*",
+    "one_or_more": "term+",
+    "not_followed_by": "!term succeeds without consuming input exactly when term fails at this position",
+    "group": "( expression )",
+    "empty": "EPSILON",
+    "end_of_input": "EOF"
+  },
+  "parsing_model": [
+    "The grammar is a parsing expression grammar. Alternatives are ordered: the alternatives array and each parenthesized choice are tried first to last, and the first alternative that succeeds is the result of that production at that offset. A production is never re-entered at the same offset to try a later alternative after an earlier one succeeded.",
+    "Repetition and optional terms are greedy and do not give back input.",
+    "Left recursion, direct or indirect, is a grammar defect. A grammar that contains it is rejected when it is loaded.",
+    "A frontend grammar is its own tokens and productions merged over those of each imported grammar; a frontend definition replaces an imported definition of the same name.",
+    "The source envelope selects library, executable, submission, or script before reading, and reading starts at that root_entrypoints production. The source production is descriptive and is never a parse-success fallback."
+  ],
+  "terminals": [
+    "Reading is parser-directed. A terminal is matched only at an offset where a production asks for it; token definitions do not compete globally and carry no precedence. Every token except the frontend's delimiter class, which defines the word boundary, is referenced by at least one production.",
+    "Before every terminal the reader consumes skip tokens (whitespace and comments) repeatedly. The Co-Forth parenthesized_comment is not skipped when the terminal being matched is the literal '('; a production that asks for '(' therefore deterministically opens a signature, pattern, or grouping, and '(' anywhere else in a word sequence opens a comment.",
+    "A token symbol matches its regular expression, or its named scanner, anchored at the offset. A quoted terminal matches exactly its spelling.",
+    "Word boundary: when the last scalar of a matched terminal is XID_Continue or one of - ? !, the next scalar must be end of input, White_Space, a character of the frontend's delimiter token, or the start of a line comment. A contiguous word is therefore never split into several terminals.",
+    "Punctuation maximal munch: a quoted terminal whose first scalar is not alphabetic fails when a longer quoted punctuation terminal of the same frontend grammar begins with it and also matches at that offset.",
+    "The identifier token never matches a spelling listed in reserved_words of the frontend grammar or of a grammar it imports. A reserved form that begins and then violates its production is a reader error; it cannot fall back to a call or word because its head is not an identifier.",
+    "An identifier that is not in Unicode Normalization Form C is a reader error, not an alternative failure.",
+    "raw-string, triple-string, coforth-string, and balanced scanners are deterministic single-pass scanners. They never backtrack over content. A string or comment that is opened and not closed is a reader error at its opening offset.",
+    "Triple-quoted strings process the same escapes as escaped strings; the closing delimiter is the first unescaped triple quote.",
+    "A bare name in type_argument is emitted once as GenericArgument::Name and resolved as Type or Const only from the constructor's declared parameter kind."
+  ],
+  "errors": [
+    "F-LEX-INVALID-UTF8: the source is not valid UTF-8; offset is the first invalid byte.",
+    "F-LEX-IDENTIFIER-NOT-NFC: offset is the start of the identifier.",
+    "F-LEX-UNTERMINATED-STRING, F-LEX-INVALID-ESCAPE, F-LEX-UNBALANCED-COMMENT: offset is the opening delimiter, the backslash, or the opening parenthesis respectively.",
+    "F-LEX-SYNTAX: no alternative accepted the source; offset is the farthest byte offset at which any terminal was attempted and failed, after skipped tokens."
+  ],
+  "normalization": [
+    "Validate UTF-8 before reading.",
+    "Retain half-open UTF-8 byte spans for every terminal and production node.",
+    "Skipped tokens affect line/column projection but emit no syntax or semantic node.",
+    "A Co-Forth label token name: normalizes to identifier name followed by the colon terminal."
+  ]
+}

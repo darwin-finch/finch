@@ -2,11 +2,17 @@
 
 ## Status and relationship to existing plans
 
-This document specifies the intended design of one typed Finch language runtime with two initial
-source syntaxes. It deliberately describes future semantics so early implementation choices do not
-make the coherent version prohibitively expensive. Implementation order, current gaps, crate
-transitions, and deletion gates live in the separate
-[language implementation roadmap](IMPLEMENTATION_ROADMAP.md).
+This document records the rationale and decision history for one typed Finch language runtime with
+two initial source syntaxes. The normative compiler contract is the
+[Finch language specification](SPECIFICATION.md); its closure audit is
+[the design review](DESIGN_REVIEW.md). Historical proposals and illustrative spellings here do not
+override that specification. Implementation order, crate transitions, proof gates, and deletion
+gates live in the separate [language implementation plan](IMPLEMENTATION_ROADMAP.md).
+
+> **Historical/non-normative throughout.** Every syntax sketch, “open gap,” implementation phase,
+> and present-tense design statement below records the reasoning state when it was written. It is
+> current policy only when `SPECIFICATION.md` independently says the same thing; consult
+> `DESIGN_REVIEW.md` for each finding's disposition and `PROGRESS.md` for current work status.
 
 ```text
 typed Lisp source ────┐
@@ -61,8 +67,8 @@ source-text payload remains expressible without escaping or another string type.
 line comments. In an untagged compact provider stream,
 parenthesized Co-Forth comments are allowed only after a Co-Forth token because leading `(` is the
 Lisp shorthand. Explicitly tagged Co-Forth has no such transport ambiguity and may begin with a
-parenthesized comment. The normative language definition must give exact escaping and raw-delimiter
-examples.
+parenthesized comment. The normative escaping and raw-delimiter grammar is in
+[`SPECIFICATION.md`](SPECIFICATION.md#32-strings).
 
 Finch scripts are portable, self-contained source artifacts rather than shell wrappers. A script
 may carry an explicit language in its shebang/launcher metadata, for example
@@ -235,7 +241,7 @@ selected names     from codec.json import encode, decode as decode-json
 A whole-module import makes its public names available as imported candidates and retains a
 qualified module binding. A namespace alias exposes only the qualified alias. A selective import
 binds only the listed exported symbol identities or overload groups, optionally renamed. Selection
-can name functions, types, concepts, evidence, syntax transforms, or compile-time values; their
+can name functions, types, concepts, syntax transforms, or compile-time values; their
 phase and type remain those published by the immutable interface. There is no textual wildcard
 expansion, runtime reflection search, or import inferred merely because an unresolved spelling
 happens to exist in a dependency.
@@ -244,9 +250,8 @@ Name resolution searches direct lexical declarations before imported candidates,
 imports from the innermost lexical scope outward. Two imported candidates in the same selected
 scope are an ambiguity regardless of import order; qualification, selection, or renaming resolves
 it. An inner scoped import may hide an outer imported candidate but never silently replaces a direct
-local binding. Operator/concept coherence remains stricter: loading a module does not make all of
-its evidence ambient, and operator-default evidence still requires the explicit/default selection
-rules described below.
+local binding. Concept implementations are unnamed coherent declarations, not lexical candidates;
+their unique sealed identities enter dependency composition through the type/concept interface.
 
 Every reached import records the exact immutable module/interface identity and phase dependency in
 the semantic job graph and sealed module. Local scope reduces name pollution and compiler working
@@ -708,9 +713,9 @@ record{...}      named product type
 variant{...}     tagged sum type
 word<S,E>        callable word with stack signature S and effects E
 fn(P...)->R       lexical callable; P includes ownership modes and the full callable contract
-task<T>          scheduler-owned child/task handle
-stream<T>        scheduler-owned lazy sequence/cursor handle
-fiber<Y,Resume,R> resumable producer that yields Y, accepts Resume, and returns R once
+task<T,X>          scheduler-owned child/task handle whose join may raise exception set X
+stream<T,X>        scheduler-owned lazy sequence/cursor handle whose next may raise X
+fiber<Y,Resume,R,X> resumable producer that yields Y, accepts Resume, returns R, and may raise X
 resource<K>      generation-bound runtime handle
 capability<C>    unforgeable grant handle; never synthesized from text
 dynamic          explicitly tagged escape hatch
@@ -798,6 +803,10 @@ mutable vector operation that may grow invalidates outstanding views, which is a
 the exclusive-borrow rule. Persistent-list updates return a new list. Shared ownership never grants
 mutation.
 
+> **Superseded 2026-10-02.** The normative prelude has one cursor abstraction, `Range<Self>`;
+> `Sequence` was removed as a duplicate. Later `race` spellings in this history are now
+> `race-and-reap` when loser cleanup completes before return. See `SPECIFICATION.md` section 12.
+
 `Sequence<T>` provides finite readonly traversal. Independent concepts provide runtime sizing,
 `KnownLength<N>`, contiguity, random access, mutable access, growth, and ownership. Algorithms state
 only the evidence they require: equality needs two finite readable sequences and compatible element
@@ -834,7 +843,7 @@ array/vector/bytes value may implicitly lend a zero-copy slice because that adap
 Canonical paired spellings include:
 
 ```text
-CoLisp:   (array 1 2 3)    (vector 1 2 3)    (list 1 2 3)    (bytes #x00 #xff)
+CoLisp:   (array 1 2 3)    (vector 1 2 3)    (list 1 2 3)    (bytes 0x00 0xff)
 Co-Forth: array{ 1 2 3 }   vector{ 1 2 3 }   list{ 1 2 3 }   bytes{ 0x00 0xff }
 ```
 
@@ -878,7 +887,7 @@ the chosen fence but the resulting value is the same `string`; raw spelling does
 string type.
 
 Constant-pattern matching is generic semantics with representation-specific lowering. A constant
-arm uses certified pure, total, deterministic, non-suspending `PatternEqual` evidence; optional
+arm uses pure, non-suspending, nothrow `PatternEqual` evidence; optional
 consistent `PatternHash` evidence permits hashed dispatch. Closed variants may use tag jump tables,
 dense integers may use value jump tables, and strings may use length buckets, tries, or perfect/hash
 tables followed by equality for collision checks. Other library-defined key types can receive the
@@ -916,13 +925,13 @@ Binary concepts name both operand positions and may produce an associated result
 ```text
 concept Equal<L,R> symmetric {
     operation equal(borrow left: L, borrow right: R) -> bool
-        ! pure | total | deterministic | non-suspending | nothrow
+        ! pure | non-suspending | nothrow
 }
 
 concept Compare<L,R> {
     associated Ordering
     operation compare(borrow left: L, borrow right: R) -> Ordering
-        ! pure | total | deterministic | non-suspending | nothrow
+        ! pure | non-suspending | nothrow
 }
 
 concept Add<L,R> {
@@ -935,7 +944,7 @@ concept Add<L,R> {
 evidence-generation rule, not a guess based on an operation's name. One `Equal<A,B>` implementation
 supplies a compiler-generated `Equal<B,A>` adapter that swaps the arguments while retaining the same
 sealed evidence identity. Defining both directions independently is therefore an overlap error
-unless one is explicitly named non-default evidence. `commutative` is the distinct law for a binary
+with no alternate-evidence exception. `commutative` is the distinct law for a binary
 operation: `op(a,b) == op(b,a)`. Ordered concepts such as `Add<L,R>` and `Compare<L,R>` do not imply
 their reverse; a numeric library may declare commutativity only where that law is actually valid.
 `!=` is derived by negating selected equality evidence, and `<`, `<=`, `>`, and `>=` derive from one
@@ -951,21 +960,80 @@ holding erased values built against an older revision of the same concept. For t
 concept may opt in:
 
 ```text
-concept Range<T> stable-evidence {
-    associated Item = T
+concept Range stable-evidence evidence-version 1 {
+    associated Item
     operation empty?    #1 -> bool
-    operation front     #2 -> T
+    operation front     #2 -> Item
     operation pop-front #3
 }
 ```
+
+**Corrected 2026-09-23, twice in the same session — the first pass fixed the wrong half.** The first
+correction just moved `= T` out of the concept and into the implementation, on the assumption `Item`
+was an ordinary free associated type like `JsonSerializable`'s `Output`. Asked directly why that
+mattered — whether a concept should be able to alias an associated type to its own generic parameter
+so the item type is nameable without inference — surfaced the real issue underneath: `Range<T>`'s
+`<T>` and its `associated Item` were never two independent things to begin with. Every implementation
+in this document writes bare `: Range`, never `: Range<T>` — no implementation ever actually supplies
+`T` as a distinct type argument, only `Item`, and the concept's own `front #2 -> T` used the generic
+parameter directly where it should have said `Item`. A generic parameter earns its place when a
+concept genuinely wants multiple simultaneous instantiations for one type (`Equal<L,R>`,
+`Add<L,R>` — a type can validly compare against several different right-hand types at once).
+Iteration doesn't: a `List<Foo>` has exactly one natural element type, and letting `Range<T>` keep a
+free generic parameter would let a type implement `Range<int>` and, independently, `Range<string>`
+simultaneously — two different (concept, type) pairs under coherence's own keying rule ("Uniqueness
+is checked against the whole family," "Generics, concepts, dispatch, and metaprogramming," below) —
+a loophole coherence exists to close, not a feature. Dropping `<T>` and keeping only `associated
+Item` matches `JsonSerializable`'s own already-correct shape, and matches Rust's actual `Iterator`
+(an associated `Item`, deliberately no generic parameter, for this exact reason) rather than
+inventing a different answer. The underlying goal — naming the item type directly, no inference
+required — survives completely: that is exactly what an associated type already is, a directly
+projectable slot (`SomeRange::Item`, the same way `Output` already works), not something that needed
+a redundant generic-parameter alias to provide. `MyListRange<T>`'s own `<T>` is unrelated and
+unaffected — that is `MyListRange`'s own generic parameter as a record, supplying `associated Item =
+T` from its own type, exactly as legitimate as `Output = bytes` was. The real, frozen CoLisp form for
+this concept and its implementation now lives with the rest of the frozen concept/implementation
+syntax under "Generics, concepts, dispatch, and metaprogramming," below, rather than duplicated here.
+
+**Corrected 2026-09-22, retracting an `associated Effects` addition made minutes earlier in this same
+session: unnecessary machinery, caught by being asked directly why a range would have effects at
+all.** The instinct behind that question is right, and the fix is to remove ceremony, not add an
+explanation for it. Capability and suspension effects were never something this concept needed to
+declare or parametrize. `pop-front`'s `!` clause here is simply omitted, meaning exactly what an
+omitted `!` already means everywhere else in this document — "requests inference... never asserting
+emptiness" ("Typed stack signatures," above) — so each `implementation`'s own `pop-front` mapping
+(`operation pop-front = my-list-pop-front`) carries whatever effects `my-list-pop-front` actually,
+concretely has, checked the ordinary way any function is checked. A range over an in-memory list
+infers `{}`. A range whose `pop-front` happens to read a file infers `fs.read<R>`, the same as any
+other function that reads a file — nothing about *being a Range operation* imposes or forbids that;
+it was never a concept-level concern to begin with. A generic algorithm written over an unresolved
+`T : Range` inherits whatever bound its concrete instantiation needs through the same generic-effect
+propagation already established for ordinary calls ("If substitution cannot prove a narrower
+selector, the caller inherits that upper bound," "Resource selectors and templates," below; "a
+definition that... captures a capability, suspends... remains monomorphic unless its type parameters
+are explicit," "Functions and annotations," "Typed Lisp language definition," below) — not a second,
+concept-specific mechanism. This is why "Future ranges, cursors, and explicit erasure" (below) needs
+no separate `Stream`/`AsyncRange` concept: see the reversal there, itself corrected the same way.
+
+If an implementation ever needs to *pin* an effect explicitly rather than let it infer — publication
+generally requires this ("recursive and public definitions... require declared signatures," "Functions
+and annotations," above) — that is the ordinary `!` clause already used on every other callable,
+written on the operation's own body, not a new per-concept or per-implementation-block form:
+`operation pop-front = my-list-pop-front` already inherits whatever `!` `my-list-pop-front` itself
+declares or infers, and an inline adapter body takes an explicit `!` the same way any function
+signature does. No second effect-annotation grammar was needed here either — only the same one,
+attached at the same place (the callable), one level down from where the retracted `associated
+Effects` tried to attach it.
 
 The number is an arbitrary, author-assigned key, not a position — the same correction that applies
 to protobuf's actual field numbers, which this deliberately follows: reordering `empty?`, `front`,
 and `pop-front` in source changes nothing, gaps are unremarkable, and the keys need not be
 sequential. Once published, a key is permanently retired the moment its operation is removed and is
 never reused by a later operation, even a semantically similar one — checked against the concept's
-previously published, sealed revision, the same versioned-artifact machinery already described for
-exported generics. This is what actually lets old, already-compiled evidence-table lookups keep
+previously published, sealed `evidence-version`, the same versioned-artifact machinery already
+described for exported generics. The version belongs to the concept; implementation tables record it
+automatically and never declare a competing per-implementation version. This is what lets old,
+already-compiled evidence-table lookups keep
 addressing the right operation after the concept gains, loses, or reorders others, which declaration
 order alone cannot provide. A concept without `stable-evidence` has no `#NN` syntax available at
 all, keeping the ordinary case free of ceremony it will never use.
@@ -1029,12 +1097,12 @@ of checked arithmetic is invalid when it could change which operation traps. A s
 or fast-math policy may deliberately expose different evidence rather than weakening strict source
 semantics globally.
 
-Operator selection uses only operand types plus lexically explicit or uniquely canonical evidence.
+Operator selection uses only operand types plus uniquely canonical evidence.
 It never uses the expected result type, import order, receiver/member position, or speculative body
-compilation. At most one implementation for a concept/type tuple may be the operator default in a
-scope. Alternative policies remain available through an explicit `using` selection, a concept-
-qualified call, or a policy wrapper type. Thus two serialization or numeric policies can coexist
-without punctuation silently changing meaning.
+compilation. There is at most one implementation for a concept/type tuple. Alternative policies use
+a distinctly named callable, an explicit policy argument, or a wrapper type, not selected competing
+evidence. Thus two serialization or numeric policies can coexist without punctuation silently
+changing meaning or reopening coherence.
 
 Operator equality is allowed to be non-reflexive for domains such as IEEE floating point. A map key
 requires the stronger `Equivalence<T>` law (reflexive, symmetric, and transitive) together with a
@@ -1159,6 +1227,52 @@ mutating inherent `operation` stays pseudocode-only — not sketched with an inv
 both are named. Both belong with `borrow-mut` as one open item, not two, since a mutable-borrow
 keyword with nothing you can legally do through it once you have one is half a feature.
 
+**Resolved 2026-09-21: `record-set!`, the in-place counterpart to functional `record-set`, and
+`borrow-mut` as its receiver — named together, closing both halves of the gap above in one decision
+rather than two.** `record-set!` follows the `!`-suffix-means-mutates convention this same section
+already treats as ordinary Scheme precedent ("the same way `set!`... already are in Scheme
+convention," above) rather than inventing an unrelated name. This makes `set`'s previously
+pseudocode-only body real:
+
+```lisp
+(implementation Account
+  (constructor (open (id : string)) : Account
+    (Account :id id :balance 0))
+
+  (get (balance (self)) : int
+    (. self balance))
+
+  (set (balance (borrow-mut self) (value : int)) : unit
+    (record-set! self balance value)))
+```
+
+`record-set!` takes an exclusive-borrow receiver, a bare field-name atom resolved statically against
+the receiver's declared fields — the same compile-time field/offset resolution `.` access already
+uses, never a runtime string key ("a record field has a compile-time type and offset," above) — and
+a value of that field's declared type; it returns `unit` and mutates in place rather than
+constructing a new record. A `set` operation of the shape sketched above is now literally `(set
+(name (borrow-mut self) (value : T)) : unit (record-set! self name value))`, optionally preceded by
+validation, notification, or other effects the setter's own declared effect row already makes
+visible.
+
+No host-capability token is needed for this. "Mutation only through typed references with explicit
+`vm.write` effects" (the CoLisp semantic-profile bullet, corrected under "Typed Lisp language
+definition," below) named the wrong mechanism: `vm.write` denotes one specific *capability* — a
+host-authorized write to the VM's session dictionary ("Capability effects are authority
+requirements," above) — not general local mutation, and requiring a broker grant merely to mutate
+your own uniquely-owned or exclusively-borrowed local record would be exactly the ambient-authority
+confusion the capability system exists to keep distinct from ordinary computation ("Authority,
+availability, and effects remain distinct," above). `record-set!`'s exclusiveness is already fully
+enforced by `borrow-mut`'s own aliasing rule, with no capability involved.
+
+**Corrected 2026-10-01: uniquely scoped mutation need not make the enclosing function observably
+impure.** A place write introduces `state<r>` for its fresh lexical region. That label is masked when
+no result, borrow, closure, task, exception payload, or stored value escaping the scope refers to
+`r`; after masking, an otherwise-effect-free computation may satisfy `pure` and run in CTFE. Mutation
+reachable through shared or external state cannot be masked. This is the row-algebra account of why
+a local builder can implement a pure function without confusing ordinary mutation with the
+host-authorized `vm.write` capability.
+
 Co-Forth's shape for the part that *is* resolved:
 
 ```forth
@@ -1177,6 +1291,38 @@ maximal-munch step that could instead see `-` then `>` depending on context, bec
 exists in either reader. The actual defect in the original draft wasn't an ambiguity risk — it was
 using a token the language had never adopted for this purpose, when an unambiguous one (`: T`)
 already existed and was already load-bearing elsewhere in this same document.
+
+**Added 2026-09-23: nested generic closes (`Take<Range<T>>`) don't reopen C++'s `>>` problem —
+checked against the actual root cause, not assumed safe by analogy to `->` above.** C++'s bug isn't
+"the parser gets confused"; it's earlier than that. C++'s *lexer* greedily emits `>>` as one
+indivisible right-shift-operator token via maximal munch, before any parsing context exists to say
+"this is closing two generic argument lists, not shifting" — which is exactly why the real fix
+(C++11) lives in the *parser* (split a `>>` token back into two `>` when parsing a template argument
+list) rather than the lexer: the wrong token already existed and had to be un-made. Neither Finch
+reader ever produces that wrong token in the first place:
+
+- **Co-Forth** tokenizes purely by whitespace: `Take<Range<T>>` is one contiguous, non-whitespace
+  word, indivisible from the tokenizer's point of view, the same way `string->number` already is.
+  Whatever parses a generic word's internal structure does so afterward, over a string it already has
+  in hand complete — ordinary recursive-descent bracket counting, not streaming tokenization racing
+  against an operator lexer.
+- **CoLisp** cannot use that same trick unmodified: human-written CoLisp will put a space after a
+  comma (`Take<K, V>`), and CoLisp's base atom reader would otherwise split that at the space into two
+  unrelated atoms. The type-expression grammar is therefore its own dedicated sub-parser, entered the
+  moment a type expression is expected (after `:`, or wherever a generic argument list opens) — the
+  same technique already used for JSON literals inside `[...]` ("a completely separate parser with
+  its own, unrelated comma rules takes over the string, not the Lisp reader loosening its rule,"
+  "Closure conversion and capture ownership," above). Inside that sub-parser, `<`, `>`, `,`, and `:`
+  are each their own single-character token, never merged with a neighbor, whitespace-insensitive
+  between them the same way the JSON sub-parser already is. `>>` is simply two adjacent close-tokens
+  read one after another, identical to `> >` — there is no competing multi-character token to choose
+  between, because this sub-grammar has no shift operator to confuse it with.
+
+Either way, the fix is not a second pass reconsidering an already-wrong token; no step ever produces
+the wrong token to begin with. This also resolves the parity ledger's own vague "generic header,
+explicit type application" entry for CoLisp ("Canonical structured surface and parity ledger,"
+below) into something concrete: that header is read by this same dedicated sub-parser, not the
+general atom reader.
 
 **`constructor` replaces the earlier `@constructor` attribute; enforcement is unchanged.** Private
 fields plus an ordinary function is not, by itself, a real guarantee — anything with field
@@ -1290,13 +1436,12 @@ Pattern matching narrows and destructures a value; it does not imply heap boxing
 logically has a discriminant and storage large/aligned enough for its largest payload. The matcher
 tests that discriminant, proves which constructor is active on the selected edge, and binds fields
 at their statically known offsets and types. Matching a borrowed variant borrows its selected
-payload. Matching an owned variant moves non-copyable bindings or copies explicitly copyable ones
-as the pattern requests, disarms moved fields, and preserves exactly-once cleanup for every
-unselected or unbound field.
-Field-moving patterns are rejected for a type with a user-defined whole-value destructor unless an
-explicit consuming decomposition operation transfers both its fields and cleanup obligations;
-borrowed matching remains valid. This prevents a destructor from observing moved storage without
-silently skipping deterministic cleanup.
+payload. An ownership-pattern match consumes the complete variant, transfers selected non-copyable
+bindings, copies explicitly copyable bindings as requested, and immediately drops every unbound
+field. The original aggregate binding is unavailable on every selected arm; Finch never exposes it
+with only some fields disarmed. Borrowed matching remains valid without consuming the aggregate.
+This prevents a destructor from observing moved storage and keeps the source invariant that a named
+aggregate is either fully valid or fully consumed.
 
 Physical layout is an optimization contract separate from logical matching. The compiler may store
 an explicit compact tag, fold tags shared by nested variants, or use an invalid payload bit pattern
@@ -1323,7 +1468,7 @@ dup          forall A: Copy, S. (S consume-value A -- S A A) ! CopyEffects<A>
 drop         forall A: Drop, S. (S steal A -- S) ! DropEffects<A>
 +            forall S.   (S consume-value int consume-value int -- S int ! pure)
 file.read    forall R S. (S borrow path<R> -- S path<R> bytes) ! fs.read<R>
-agent.await  forall T S. (S steal task<T> -- S result<T,agent-error>) ! agent.await
+agent.await  forall T S. (S steal task<result<T,agent-error>,throws<>> -- S result<T,agent-error>) ! agent.await
 yield        forall Y Resume S. (S steal Y -- S Resume) ! yields<Y,Resume>
 ```
 
@@ -1343,13 +1488,14 @@ its cells: applying a borrowing callable to an owned top cell retains that owner
 distinct scoped borrow operand, whereas `steal` or `consume-value` consumes the indicated cell. The
 surface transform therefore also shows the borrowed owner in its output row; lowering creates a
 transient borrow cell for the callee and destroys only that cell on return. There is no word-specific
-implicit choice based on spelling. `dup` therefore requires explicit `Copy` evidence (and retaining
-a `Shared<T>` is its copy operation); it cannot duplicate a `Unique<T>`.
+implicit choice based on spelling. `dup` therefore requires explicit `Copy` evidence and cannot
+duplicate either a `Unique<T>` or a `Shared<T>`; producing another shared handle is the explicit
+`retain` operation.
 
 `!` introduces one unified clause for everything observable about a callable, replacing what earlier
 readings of this document split into a row plus separate keyword-clauses. Capability requirements,
-suspension, and mutation are open-ended, request-shaped members (the broker grants these); `pure`,
-`total`, `deterministic`, and the two mandatory symmetric contracts — `nothrow`/`throws A|B`/
+suspension, and mutation are open-ended, request-shaped members (the broker grants these); `pure`
+and the two mandatory symmetric contracts — `nothrow`/`throws A|B`/
 `throws infer`, and `non-suspending`/`suspends` — are the closed set of verifier-derived predicates.
 Both kinds live in the same `!`-introduced list, told apart by shape, not by which of two separate
 grammars they were written in: a request looks like `namespace.word(args)` or a generic effect token
@@ -1360,7 +1506,7 @@ predicate — never asserting emptiness or any particular value for any of them.
 **Added 2026-09-17: the closed predicate keywords are reserved and may never name a capability
 effect.** Telling requests from predicates "by shape" only works if the two vocabularies can never
 collide — a bare-word capability registered without a namespace could otherwise be mistaken for (or
-deliberately shadow) `pure`, `total`, `deterministic`, `nothrow`, `throws`, `suspends`, or
+deliberately shadow) `pure`, `nothrow`, `throws`, `suspends`, or
 `non-suspending`. The host capability registry must reject registering any of these bare names, and
 every worked capability example in this document is already namespaced (`fs.read<R>`, `vm.write`,
 `network.connect`) precisely so this collision cannot arise from ordinary use; this makes that
@@ -1375,13 +1521,13 @@ callable do and guarantee" — was real, avoidable mental load, and the shape ru
 shaped vs. closed-keyword-shaped) already tells `pure` apart from an actual row member without
 needing a second clause to do it. Concretely, `: add-two ( S int -- S int ! pure ) 2 + ;` — the form
 already used by every conformance fixture predating this revision — was correct all along under this
-reading; nothing here requires migrating that syntax. `total`, `deterministic`, `nothrow`, `throws
+reading; nothing here requires migrating that syntax. `nothrow`, `throws
 A|B`, `suspends`, and `non-suspending` all move into the same `!`-list the same way; `guarantees`
 as a distinct clause keyword is retired.
 
 **Added 2026-09-17: writing any predicate explicitly commits you to the complete, atomic contract —
-never a partial one.** `pure`, `total`, and `deterministic` are assert-only: no "impure," "partial,"
-or "nondeterministic" keyword exists, so their absence from an explicit list already has one
+never a partial one.** `pure` is assert-only: no "impure" keyword exists, so its absence from an
+explicit list already has one
 unambiguous meaning ("not claimed") regardless of what else is stated, and asserting one adds no
 ambiguity by itself. The two symmetric contracts are different: every callable truly is one or the
 other (`nothrow` or some `throws` bound; `non-suspending` or `suspends`), so leaving one unstated in
@@ -1394,9 +1540,26 @@ contradicts, the publication rule already given below ("a published callable mus
 an explicit `throws A | B` upper bound, or an explicit `throws infer` contract"): publication is
 simply the one case where "nothing written" is not an available option. Whichever form is chosen,
 private or published, the verifier proves every stated predicate against the resolved row and body —
-proof, not trust, exactly as `pure` already required before this revision. A deterministic function
-may throw and remain pure but partial. Generic constraints can require any of these predicates
+proof, not trust, exactly as `pure` already required before this revision. A pure function may throw
+and remain referentially transparent. Generic constraints can require any of these predicates
 explicitly.
+
+**Retired 2026-10-01: `total` is not a public version 0.1 predicate.** Its concrete use here was to
+license speculative or reordered evaluation, especially hashed constant-pattern dispatch. Exposing
+that optimization fact would require a conservative termination checker and user-facing proof
+surface in a language that otherwise bounds CTFE with fuel and permits general recursion. The
+compiler may still derive an internal termination certificate for intrinsics, bounded loops,
+structural recursion, and other mechanically proven cases. That fact combines with `pure`,
+`nothrow`, and `non-suspending` when an optimization needs it, but does not appear in
+source contracts or module interfaces.
+
+**Retired 2026-10-01: `deterministic` is likewise not a separate public predicate.** Finch `pure`
+means referentially transparent: clocks, randomness, scheduler state, shared mutable state, host
+state, and unstable identity are effects or explicit inputs. Repeating a pure call with the same
+inputs therefore has the same semantic behavior, though that is repeatability rather than the
+algebraic law `f(f(x)) = f(x)`. Execute-once delivery, retry policy, and stable event ordering belong
+to the runtime/effect protocol; trusted `commutative` laws remain concept-specific. None becomes a
+general callable keyword.
 
 **Added 2026-09-17: what a purity proof actually buys, consolidated from where it's used elsewhere
 in this document.** A `! pure` request is not documentation sealed against later
@@ -1407,9 +1570,9 @@ not a trusted assertion, and is unavailable without it:
   ("Optimizations may rely on certified laws... only when the rewrite also preserves operand
   evaluation, exceptions, ownership, and observable destruction" above).
 - **A hard precondition for specific features, not an optional annotation.** Constant-pattern
-  matching's hashed/jump-table dispatch requires "certified pure, total, deterministic,
-  non-suspending `PatternEqual` evidence" ("Typed values use a hybrid representation") — without the
-  proof that dispatch strategy is unavailable, not merely unoptimized.
+  matching's hashed/jump-table dispatch requires pure, non-suspending, nothrow
+  `PatternEqual` evidence plus an internal termination certificate — without those proofs that
+  dispatch strategy is unavailable, not merely unoptimized.
 - **A security/audit property.** A function proven pure cannot request a capability, touch host
   state, or trigger an approval dialog — the capability broker can be skipped for that call
   *statically*, and a human or the runtime can know, not assume, that the call is incapable of
@@ -1451,7 +1614,7 @@ The complete callable type and published signature include:
 - a suspension contract;
 - linkage, symbol/mangling contract, calling convention, fixed versus C-variadic status, target ABI,
   and parameter/result ABI classifications where externally visible;
-- optional `nothrow`, purity, totality, determinism, allocation, and numeric-overflow guarantees
+- optional `nothrow`, purity, allocation, and numeric-overflow guarantees
   useful to callers and optimization.
 
 Private callables infer suspension. A published callable chooses `non-suspending`, a `suspends`
@@ -1468,9 +1631,9 @@ core and user definitions. Core attributes live in explicit namespaces and may b
 short names; user attributes have the same typed reflection and bounded `syntax -> syntax`
 transformation contract. Callable inputs/outputs and `! EffectRow` are type structure rather than
 attributes. There is no D-style mixture of magic bare attributes and second-class user annotations.
-Reflection derives `pure`, `total`, `nothrow`, `deterministic`, and `non-suspending` as separate
+Reflection derives `pure`, `nothrow`, and `non-suspending` as separate
 properties. They are ordinary callable constraints, not `@` annotations: an inferred exceptional
-exit may satisfy `pure` while failing `total` and `nothrow`, and `yields<Y,Resume>` prevents
+exit may satisfy `pure` while failing `nothrow`, and `yields<Y,Resume>` prevents
 non-suspending transformations.
 
 Capability requirements should likewise become ordinary versioned typed descriptors rather than a
@@ -1500,28 +1663,29 @@ environment/Brain identity, grants, budget, status, cancellation state, and term
 diagnostic.
 
 That registry is an implementation substrate, not a promise that these constructs have the same
-language semantics. A `task<T>` yields one terminal result, a `stream<T>` exposes a bounded cursor,
-a `fiber<Y,Resume,R>` exposes producer progress, typed resumption, and a terminal result, and an agent is a separate
+language semantics. A `task<T,X>` yields one terminal result or typed exception, a `stream<T,X>`
+exposes a bounded cursor with the same explicit failure contract, a `fiber<Y,Resume,R,X>` exposes
+producer progress, typed resumption, a terminal result, and typed exceptions, and an agent is a separate
 ProgramRun with its own authority and provider protocol. No construct shares a parent operand
 stack or Rust thread/channel handle merely because it shares lifecycle machinery.
 
 ### Fibers, streams, deferred work, and repeated yields
 
-`task<T>` remains the existing opaque scheduler handle. Its `join` operation is terminal: it may
-suspend internally and returns one final `T`. A lazy `stream<T>` is the simpler multi-value
-abstraction; it owns a cursor
+`task<T,X>` is the opaque scheduler handle. Its `join` operation is terminal: it may suspend
+internally and returns one final `T` or raises `X`. A lazy `stream<T,X>` is the simpler multi-value
+abstraction; it owns a cursor and its `next` may raise `X`:
 and advances only when its consumer asks for the next value:
 
 ```text
-stream-next stream : option<T>  ; bounded pull; none means exhausted
+stream-next stream : option<T> throws X  ; bounded pull; none means exhausted
 stream-close-discarding stream : unit ; cancel producer and drop unread values
 ```
 
 The semantic primitive is a **private resumable execution**, not a generator or scheduler policy:
 
 ```text
-ResumableExecution<Y,Resume,R> = verified frames + private operand stack + locals/captures + PC
-                                 + transaction/effect prefix + lifecycle state
+ResumableExecution<Y,Resume,R,X> = verified frames + private operand stack + locals/captures + PC
+                                   + transaction/effect prefix + lifecycle state + exception set X
 ```
 
 A coroutine function may create an instance of that state. Suspension propagates normally through
@@ -1581,19 +1745,19 @@ The general resumable handle uses linear typestates. Generator, coroutine, fiber
 custom-scheduler APIs wrap these transitions rather than defining new continuation representations:
 
 ```text
-ready-fiber<Y,Resume,R>       dormant, not yet advanced
-suspended-fiber<Y,Resume,R>   stopped at one yield
-fiber-step<Y,Resume,R>        yielded(Y, suspended-fiber<Y,Resume,R>) | Done(R)
-fiber-state<H,R>              pending(H,FiberStatus) | Done(R)
+ready-fiber<Y,Resume,R,X>       dormant, not yet advanced
+suspended-fiber<Y,Resume,R,X>   stopped at one yield
+fiber-step<Y,Resume,R,X>        yielded(Y, suspended-fiber<Y,Resume,R,X>) | Done(R)
+fiber-state<H,R,X>              pending(H,FiberStatus) | Done(R)
 
-defer        : steal closure -> ready-fiber<Y,Resume,R>        ; throws ResumableLimit
+defer        : steal closure -> ready-fiber<Y,Resume,R,X>      ; throws ResumableLimit
 yield        : steal Y -> Resume
-fiber-start  : steal ready-fiber<Y,Resume,R> -> fiber-step<Y,Resume,R>
-fiber-resume : steal suspended-fiber<Y,Resume,R>, steal Resume -> fiber-step<Y,Resume,R>
-fiber-next   : steal ready-or-suspended<Y,unit,R> -> fiber-step<Y,unit,R>
+fiber-start  : steal ready-fiber<Y,Resume,R,X> -> fiber-step<Y,Resume,R,X> ; throws X
+fiber-resume : steal suspended-fiber<Y,Resume,R,X>, steal Resume -> fiber-step<Y,Resume,R,X> ; throws X
+fiber-next   : steal ready-or-suspended<Y,unit,R,X> -> fiber-step<Y,unit,R,X> ; throws X
 done-value   : steal Done<R> -> R                              ; ordinary library unwrap
-fiber-cancel : steal ready-or-suspended<Y,Resume,R> -> unit    ; throws CleanupFailure
-fiber-try-join : steal dynamic-handle<R> -> fiber-state<dynamic-handle<R>,R>
+fiber-cancel : steal ready-or-suspended<Y,Resume,R,X> -> unit  ; throws CleanupFailure
+fiber-try-join : steal dynamic-handle<R,X> -> fiber-state<dynamic-handle<R,X>,R,X>
 ```
 
 Here `steal` is a parameter mode in the illustrative signature, not a mandatory token at every call
@@ -1786,14 +1950,14 @@ pure synchronous range.
 
 Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
 its own private stack, verified module, capability attenuation, budget, ancestry, event journal,
-and durable `task<R>` handle. `agent.spawn`, `agent.poll`, `agent.await`, `agent.cancel`, and later
+and durable `task<R,X>` handle. `agent.spawn`, `agent.poll`, `agent.await`, `agent.cancel`, and later
 typed child-message/event operations are the only parent/child communication boundary. A child may
 publish progress events to its scheduler-owned task stream, but the parent never resumes a child
 through `yield`, receives its continuation, or shares mutable frame/stack state. This keeps agent
 streaming, authority auditing, cancellation, and multi-turn orchestration independent from the
 language's optional bidirectional-generator feature.
 
-An agent task may be **detached**: its parent stores or returns the `task<R>` handle instead of
+An agent task may be **detached**: its parent stores or returns the `task<R,X>` handle instead of
 awaiting it. The daemon then owns the child across provider calls, timer/I/O waits, approvals, and
 user input, publishing progress and a terminal result as ordered Brain events. This is autonomous
 long-running orchestration, not a periodic scheduled task: a timer is merely one awaitable event in
@@ -1811,7 +1975,8 @@ frontend therefore cannot turn a parked host-machine request into unattended mac
 CPU-bound work has a more direct source form and is not an agent or a generator. Initially Lisp
 uses `(defer :cpu (lambda () ...))`; Co-Forth lowers the equivalent quotation through
 `defer-cpu`. It captures immutable typed values, starts with a private stack, and returns a
-`task<T>` whose `poll`, `join`, and `cancel` operations are terminal task operations. The scheduler
+`task<T,X>` whose `poll`, `join`, and `cancel` operations are terminal task operations and whose
+`X` is inferred from the deferred callable. The scheduler
 may use OS worker threads for these tasks, but neither thread handles nor parent stacks are VM
 values. I/O waits and timer waits suspend a ProgramRun through the trampoline instead.
 
@@ -1822,11 +1987,49 @@ unsafe reflection prevent proof and require an explicit dynamic/unsafe boundary.
 ### Future ranges, cursors, and explicit erasure
 
 Ranges are a future source-language/library facility, not a compatibility constraint on the
-current scheduler-owned `stream<T>` handle. Keep a pure synchronous `Range`/`Cursor` family
+current scheduler-owned `stream<T,X>` handle. Keep a pure synchronous `Range`/`Cursor` family
 separate from `Stream` or `AsyncRange`, whose advancement may suspend, fail, consume a resource, or
 perform host effects. A range adaptor should be an ordinary composed value; it need not allocate a
 producer, own a scheduler record, or erase its concrete type merely because the type is inconvenient
 to spell.
+
+**Reversed 2026-09-22: no separate `Stream`/`AsyncRange` concept — worth being honest about
+reversing rather than silently restating, the same as the earlier named-implementations decision
+above.** Not because ranges need a new effect-parametrization mechanism (a same-session
+`associated Effects` addition tried that and was retracted, "Operators, comparison evidence, and
+segmented text," above, immediately after being asked why a range would have effects at all) — the
+simpler and correct reason is that capability effects were never a concept-level concern in the first
+place. A range whose `pop-front` happens to read a file is just an ordinary function with `fs.read<R>`
+in its inferred effect row, exactly like any other function that reads a file; nothing about
+implementing `Range` changes how that effect is inferred, checked, or propagated to a generic caller.
+That was already true before today's detour and needed no correction to the concept itself, only to
+the mistaken belief it needed one. Keeping a second, parallel `Stream` concept for the same operation
+shape would concretely reopen a problem this document already rejects elsewhere: "ordinary callers do
+not acquire `async`/`await` coloring merely because a callee can park on I/O... a caller must not need
+to know whether an ordinary callee parked... or completed without suspension" ("Fibers, streams,
+deferred work, and repeated yields," above). Refinements (`sized`, `random-access`, `contiguous`,
+below) already handle the one real asymmetry: an effectful implementation simply does not supply the
+refinement evidence a purely in-memory one can, the same independent opt-in every other refinement
+already is — not a reason for a second base concept.
+
+**Suspension specifically — not capability effects generally — is the one real, narrower wrinkle, and
+it resolves without touching the concept at all.** `empty?`/`front` are peekable and repeatable: read
+the current state without consuming or redoing work. A blocking capability effect (a file read) fits
+that shape fine — the call just blocks and returns, the same as any effectful function. A *suspending*
+source doesn't: the underlying resumable-execution substrate's natural shape is a single destructive
+step, `fiber-step<Y,Resume,R> = yielded(Y, suspended-fiber<...>) | Done(R)` ("Fibers, streams,
+deferred work, and repeated yields," above), the same shape `stream-next : option<T>` already has
+today, and you cannot peek at a suspended fiber's next value without resuming it. This is not a
+concept-level problem, only an adapter-level one: a stdlib wrapper type reconciles the two by
+buffering one element ahead — its own `pop-front` implementation actually drives the fiber/stream
+forward and caches the result (inferring whatever suspension/capability effects that needs, from its
+own concrete body, the same as any function), while its `empty?`/`front` stay pure, synchronous reads
+of that already-filled buffer. Constructing that wrapper primes the buffer with one initial step, so
+construction itself is effectful for that one wrapper type — an ordinary, visible fact about one
+concrete implementation, not a property `Range` as a concept had to be taught to expect. `foreach`'s
+"effectful stream pull loop" strategy ("No privileged collection or iteration overloads," below) is
+therefore just the ordinary case of lowering a loop whose body's inferred effects happen to be
+non-empty — ordinary effect-driven code generation, not a range-specific rule.
 
 Parsing over a range must make consumption explicit. A prefix parser returns the parsed value plus
 the remaining range/cursor; it does not claim whole-document success. A document parser consumes
@@ -1858,19 +2061,76 @@ type growth or compilation cost disappear.
 
 ### No privileged collection or iteration overloads
 
-Surface convenience must never create a standard-library-only fast path. A future `for`/`foreach`
-form may be compiler-owned syntax that selects an indexed loop, synchronous range loop, effectful
-stream pull loop, or collection-specific loop during lowering. Each selection must be justified by
-public concept evidence for the required cursor operations and refinements. A user-defined range
-maps those operations to the same stable word identities as a built-in range. The optimizer may
-inline, specialize, fuse, or eliminate allocations after that resolution, but it may not recognize
-only `list`, `map`, or a compiler-owned iterator type while treating equivalent user evidence as
-dynamic dispatch. A user-written `foreach`, traversal, or adaptor must remain eligible for the same
-optimizations as syntax supplied by Finch.
-There is one staged `foreach`, not a separate `static foreach`: when its range and pure body are
-compile-time values, bounded CTFE executes it; when the range is a runtime value, lowering emits the
-ordinary verified range loop. Partial evaluation may specialize known structure and leave residual
-runtime code, using the same public contracts in either stage.
+Surface convenience must never create a standard-library-only fast path. A user-defined range maps
+its operations to the same stable word identities as a built-in range. The optimizer may inline,
+specialize, fuse, or eliminate allocations after resolution, but it may not recognize only `list`,
+`map`, or a compiler-owned iterator type while treating equivalent user evidence as dynamic dispatch.
+A user-written `foreach`, traversal, or adaptor must remain eligible for the same optimizations as
+syntax supplied by Finch.
+
+**Revised 2026-09-23: `foreach` is library sugar, not compiler-owned syntax — checked against the
+`if-let` precedent ("Compile-time staging (CTFE)," "Typed Lisp language definition," above) and it
+holds up completely, which makes the "no privileged fast path" guarantee above structural rather than
+merely asserted.** A prior draft of this section had `foreach` as syntax the compiler itself "selects
+[a lowering strategy] for during lowering" — exactly the kind of whole-form, name-directed special
+case this document retired `define-syntax` over and has avoided everywhere else. It doesn't need to
+be: an ordinary `syntax -> syntax` CTFE function, with `syntax`-typed parameters capturing their
+arguments unevaluated (no registration, no compiler recognition of the name `foreach` at all), already
+expands it to a plain `while` loop over ordinary concept-dispatched `empty?`/`front`/`pop-front`
+calls:
+
+```lisp
+(define (foreach (binding : syntax) (body : syntax)) : syntax
+  (let [pattern (first binding)
+        source  (second binding)]
+    `(let [r ,source]
+       (while (not (empty? r))
+         (match (front r)
+           (,pattern ,body))
+         (pop-front r)))))
+```
+
+`(foreach (x some-range) (print x))` expands, before the verifier ever sees it, to exactly the
+`let`/`while`/`empty?`/`front`/`pop-front` form a hand-written loop would use — the same trick `?`
+and `if-let` already are.
+
+**Added 2026-09-23: binding through `match` rather than `let` generalizes `foreach` to any pattern —
+lists, maps, and anything else with a structured `Item` — for free, using CTFE matchers this document
+already has rather than adding an iteration-specific destructuring rule.** `match`'s pattern language
+already covers a bare identifier (`x`, an irrefutable one-arm match that always binds, behaving
+identically to the `let` version above) through arbitrary record/tuple/variant destructuring, so
+`foreach`'s macro body needed no new logic to gain that — only swapping which existing binding form it
+quasiquotes into. A plain `list<T>`/`vector<T>` gets an ordinary `Range<Item=T>` implementation from
+the standard library, ordinary in the sense that "Surface convenience must never create a
+standard-library-only fast path" (above) applies to it exactly as it would to any user type. A
+`map<K,V>` gets `Range<Item=tuple<K,V>>` (or a dedicated `Entry<K,V>` record, an implementation
+detail, not a language decision), so key/value iteration is ordinary tuple-pattern destructuring at
+the call site, no separate map-shaped `foreach`:
+
+```lisp
+(foreach (k v) my-map)
+  (print k v))
+```
+
+reads as `binding = ((k v) my-map)`, `pattern = (k v)`, and expands to `(match (front r) ((k v)
+(print k v)))` — the tuple pattern already established for `[k v]`-style construction ("Also closes a
+real, separate gap while it's here," "Closure conversion and capture ownership," above) matched the
+same way any other tuple pattern already is. Selecting "indexed loop, synchronous range loop, effectful
+stream pull
+loop, or collection-specific loop" is no longer a compiler decision at all: it is just ordinary
+concept-evidence resolution on whichever concrete `empty?`/`front`/`pop-front` the expanded `while`
+loop calls, ordinary optimizer inlining/fusion on the result, and ordinary effect inference for the
+"effectful pull" case ("Corrected 2026-09-22... capability and suspension effects were never a
+concept-level concern," "Operators, comparison evidence, and segmented text," above) — nothing left
+that needs `foreach` itself to be privileged. There is one staged `foreach`, not a separate `static
+foreach`, for the same reason there is only one staged `if`: expansion produces an ordinary `while`
+loop, and a `while` loop over compile-time-constant bounds is already unrolled by the general "CTFE
+of values" mechanism ("Lowering," "Typed Lisp language definition," above) — no `foreach`-specific
+unrolling rule is needed once `foreach` is not a distinct kernel form to begin with.
+
+The Co-Forth equivalent binds the same two-word macro shape to Co-Forth's own syntax-capturing
+convention rather than inventing a second `foreach` mechanism per frontend; both lower to identical
+IR once expanded, the same equivalence every other paired construct in this document already proves.
 
 The exception is the deliberately small execution substrate: verified branch/suspend instructions,
 managed allocation, and authorized host calls. Those are represented by public typed words and
@@ -2001,8 +2261,8 @@ duplicating Finch's authorization or agent orchestration logic.
 
 ## Typed Co-Forth language definition
 
-The exact surface grammar will be frozen through an RFC, but the language contract must include the
-following constructs.
+The exact surface grammar is frozen by [`SPECIFICATION.md`](SPECIFICATION.md). The following table is
+the rationale-era parity ledger; the specification owns any disagreement in spelling.
 
 ### Definitions and signatures
 
@@ -2033,7 +2293,7 @@ the same nodes without source-to-source CoLisp generation.
 
 | Semantic form | CoLisp | Co-Forth | Semantic construction / IR family |
 |---|---|---|---|
-| module identity | `(module name ...)` | `module: name ... ;` | module declaration, no runtime instruction |
+| module identity | no source form; owning-manifest-relative file path | same | loader-derived immutable module identity |
 | immutable import/export | lexical `(import ref ...)`, `(from ref :import ...)`, `(export ...)` | lexical `import: ref ;`, `from: ref import{ ... } ;`, `export: ... ;` | scoped import declaration and resolved module/symbol identity |
 | record/layout | `(record Foo ...)` | `record: Foo repr(...) fields{ ... } ;` | record schema/layout |
 | record construction/projection | `(Foo :x a :y b)`, `(. value x)` | `Foo{ x: a y: b }`, `value .x` | `RecordNew`, `FieldGet`/borrow projection |
@@ -2044,9 +2304,9 @@ the same nodes without source-to-source CoLisp generation.
 | text/collection literal | `string`, `array`, `vector`, `list`, `bytes` forms | string literal, `array{}`, `vector{}`, `list{}`, `bytes{}` | literal node plus public builder evidence |
 | view/index/slice | borrow, `.get`, index/slice forms | `borrow`, `.get`, `index`, `slice` words | borrow projection and checked access |
 | text traversal | `.bytes`, `.chars`, `.graphemes` | `text-bytes`, `text-chars`, `text-graphemes` | explicit range evidence |
-| operators/comparison | `(== a b)`, `(+ a b)`, explicit `using` | `a b ==`, `a b +`, explicit `using` | named binary-concept evidence call |
+| operators/comparison | `(== a b)`, `(+ a b)`, policy wrapper or named call | `a b ==`, `a b +`, policy wrapper or named call | unique binary-concept evidence call |
 | builder/freeze | builder operations and `freeze` | `*-builder`, mutation words, `freeze` | unique owner mutation then consuming conversion |
-| concept/evidence | `concept`, `implementation`, `using` | `concept:`, `implementation:`, `using` | named evidence and adapter thunk |
+| concept/evidence | `concept`, unnamed coherent `implementation` | `concept:`, unnamed coherent `implementation:` | unique evidence and adapter thunk |
 | dispatch type/view | `static C`, `dyn C`, `some C` | same type constructors; `as-static`, `as-dyn`, `as-some` words | evidence constant, erased view, opaque result |
 | exception region | `(try body (catch ...))` | `try ... catch { error } ... endtry` | `HandlerEnter`/`HandlerExit` and match |
 | exception transfer | `(throw e)`, `(rethrow e)` | `throw`, `rethrow` | `Throw`, `Rethrow` |
@@ -2056,7 +2316,7 @@ the same nodes without source-to-source CoLisp generation.
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
 | named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
-| macro/syntax | ordinary `define`, a `syntax`-typed parameter, syntax constructors | `macro:`, `syntax[ ... ]`, explicit mixin/fresh/context words — **GAP, flagged 2026-09-18**: CoLisp retired name-registered macros for parameter-typed capture (below); Co-Forth's `macro:` is the same name-registration shape and hasn't been reconciled to match, since that's a Co-Forth-side change nothing in this conversation verified | `Syntax` CTFE, then ordinary nodes |
+| macro/syntax | ordinary `define`, a statically resolved `syntax` parameter, syntax constructors | ordinary typed callable, balanced `syntax[ ... ]` retained argument, explicit mixin/fresh/context words; `macro:` is retired | `Syntax` CTFE, then ordinary nodes |
 | unsafe/FFI | `(unsafe ...)`, `(extern "C" ...)` | `unsafe[ ... ]`, `extern(C): ... ;` | marked unsafe/foreign call; unhosted only |
 
 Structured delimiters such as `Foo{...}`, `args{...}`, `match...endmatch`, and `unsafe[...]` are
@@ -2067,8 +2327,8 @@ explicit, so layout changes cannot silently reinterpret positional source.
 Representative forms are:
 
 ```forth
-module: reports.user
-import: codec.json@sha256:... { JsonSerializable UserJson } ;
+\ reports/user.coforth inside its manifest-owned package root; the path is the module identity
+import: codec.json@sha256:... import{ JsonSerializable UserJson } ;
 
 record: User repr(native) fields{
   id: int
@@ -2173,7 +2433,7 @@ suspend. If such a closure is returned, stored, deferred, dynamically erased, pa
 callee, or crosses suspension, compilation fails at that boundary and suggests `:move`, an explicit
 owning capture, or a `scoped` callback contract. `:move` captures each used free binding by value
 according to its existing type: `Copy` values copy, unique owners and other non-copyable values
-move, `Shared<T>` retains/copies its handle, and moving an existing borrow moves only that borrow
+move, `Shared<T>` explicitly retains its handle, and moving an existing borrow moves only that borrow
 without acquiring its referent. An exact `:captures` list rejects unlisted free bindings. Capture
 entries may explicitly borrow, mutably borrow, steal, retain, weaken, clone, or bind a computed
 expression under a capture name; each operation uses its ordinary ownership and effect contract.
@@ -2187,22 +2447,14 @@ Lexically nested record declarations are context-free and never gain a hidden ou
 enclosing-frame field merely because of their declaration location; required context must be an
 explicit field or closure capture.
 
-**Added 2026-09-17: binding lists (`let`, and any construct that introduces several names at once)
-use `[...]`, not doubled `(( ))` — one flat, Clojure-style vector, never nested pairs.** The doubled
-form existed only because `()` was the sole bracket available, and `()` cannot look different for
-"this is a list of bindings" versus "this is a call" — the same visual-overload complaint this
-document already has for records before they got their own `{...}`. The production CoLisp reader
-already tokenizes `[` and `]` as their own token, distinct from `(`/`)` — currently reserved for a
-JSON-array literal, parsed by handing the whole bracket-balanced span to a strict JSON parser. Rather
-than add a fourth bracket or make `[` mean different things in different positions (both considered
-and rejected — a position-dependent meaning reintroduces the exact "know where you are to know what
-this means" cost bracket-variety exists to remove), `[...]`'s grammar is extended, not replaced: it
-is a **strict superset of JSON-array syntax**. Content that parses as valid JSON is a JSON literal,
-exactly as today — that whole span is handed to the JSON sub-parser, where `,` is JSON's own
-mandatory element separator and never touches the Lisp reader at all. Content that doesn't parse as
-JSON is read the *other* way, the same way `(...)`'s contents already are, form by form, using the
-ordinary tokenizer — and there, `,` keeps its one existing, unconditional meaning as unquote sugar,
-exactly as everywhere else in this document, with no exception carved out for being inside `[...]`.
+**Revised 2026-10-01 after the formalization audit: binding lists (`let`, and any construct that
+introduces several names at once) use `[...]`, not doubled `(( ))`, but JSON no longer competes for
+the same untagged delimiter.** Parse-success fallback made a comma capable of changing the node kind
+of an entire balanced region: `[1 2]` could be a Finch tuple while `[1, 2]` became a JSON array, and
+a typo could remain valid with unrelated semantics. `[...]` is now always Finch sequence syntax in
+the production selected by its enclosing form. Embedded JSON is explicit `json[...]` or
+`json{...}` and enters the JSON sub-parser once, with no fallback. This preserves the visual
+binding/tuple improvement without speculative reinterpretation.
 
 **Corrected 2026-09-17, same addition, caught immediately by asking whether `,` could just be
 optional in any list:** an earlier draft of this paragraph said comma becomes "an insignificant
@@ -2213,18 +2465,16 @@ that example lives inside a `[...]` binding vector. If comma became blanket-insi
 `[...]`, `,body` would silently stop unquoting and instead bind `r` to the literal symbol `body` —
 exactly the "typo silently produces a different, still-valid program" failure mode found earlier with
 `ReturnType!`, just self-inflicted this time. There is no in-between mode where a `[...]` span is
-simultaneously "comma-optional" and "comma-still-means-unquote": it's one or the other, decided
-per-span by which sub-parser actually accepts it, never a blend. Comma is never optional in the
-general sense the question asked — it's exactly as meaningful inside `[...]` as everywhere else,
-right up until the moment the whole span happens to also be valid JSON, at which point a completely
-separate parser with its own, unrelated comma rules takes over the string, not the Lisp reader
-loosening its rule.
+simultaneously "comma-optional" and "comma-still-means-unquote": comma retains its Finch reader
+meaning there. Only explicit `json[...]`/`json{...}` gives comma its JSON meaning.
 
-This works cleanly because every JSON scalar already has an existing Lisp-atom reading in this
-reader — numbers, strings, `true`/`false` (already aliased to `#t`/`#f`), and `null` (already
-aliased to `nil`, per `parse_atom`) — so nothing JSON can express falls outside what ordinary
-atom-reading already covers; JSON is genuinely a subset, not a separate case needing its own
-fallback logic. A binding list is exactly this general sequence form, used in binding position: flat,
+Every JSON scalar also has an existing Lisp-atom reading — numbers, strings, `true`/`false` (already
+aliased to `#t`/`#f`), and `null` (its own
+literal atom — **not** an alias for any Lisp `nil` symbol; corrected under "Typed Lisp language
+definition," below, where "aliased to `nil`" previously invited exactly the classical
+false/nil/empty-list conflation this document otherwise avoids). The explicit tag distinguishes a
+JSON aggregate from a Finch tuple or binding vector; no scalar changes meaning. A binding list is
+the general sequence form used in binding position: flat,
 alternating name/value entries — `[n 10]` for one binding, `[a 1 b 2]` for several — never a nested
 `((n 10))` pair-of-pairs.
 
@@ -2409,10 +2659,12 @@ Handler selection only inspects or borrows the envelope and payload. It does not
 until an arm has been selected, so an unmatched catch can resume the original unwind with the same
 owned value, type identity, and provenance intact.
 
-After selection, ordinary move rules apply to bindings. An `as` pattern may borrow the whole value
-while moving a field, but it cannot create two owners: moving a non-copyable field marks that portion
-of the whole binding unavailable, and later whole-value use or `rethrow` is rejected unless the
-pattern retained an independent owner. Unmoved initialized fields retain exactly-once cleanup.
+After selection, ordinary move rules apply to bindings. A borrowing pattern leaves the complete
+exception value available for `rethrow`. An ownership pattern instead consumes the complete value
+and transfers or immediately drops every field; it cannot retain a whole-value binding alongside
+an owned field. Finch does not expose a partially moved exception or record. Unmatched handlers
+have not selected an ownership pattern, so they continue the original unwind with the complete
+value and provenance intact.
 
 An ordinary value `match` must be exhaustive. A catch matcher may be partial: an unmatched value
 continues unwinding automatically without reboxing or losing provenance. Inside `nothrow`, inferred
@@ -2970,7 +3222,7 @@ concept TryUniqueRecoverable<T> : ShareableOwner<T> {
 }
 
 Unique<T> : Owner<T>                          # movable, not copyable
-Shared<T> : ShareableOwner<T>, TryUniqueRecoverable<T>  # copying retains a strong handle
+Shared<T> : ShareableOwner<T>, TryUniqueRecoverable<T>  # explicit retain creates another handle
 Weak<T>                                       # upgrade returns option<Shared<T>>
 ```
 
@@ -3100,14 +3352,19 @@ still-owned carrier rather than losing it.
 `Shared<T>` additionally exposes two operations that must not be composed with each other as a
 manual "check, then act" substitute for `try-into-unique`:
 
+> **Superseded 2026-10-01.** This subsection records an earlier ownership API. The normative 0.1
+> prelude deliberately omits portable `strong-count`, and `get-mut` is defined only for
+> `&mut Unique<T>`. See `SPECIFICATION.md` section 8 and `spec-prelude.json`. The text below remains
+> history, not an API programmers should use.
+
 ```text
 strong-count = &Self -> uint            # diagnostic only; see below
 get-mut      = &mut Self -> option<&mut T>   # exclusive access without consuming Self
 ```
 
-`strong-count` is `pure` — it performs no effect and mutates nothing — but it is **not
-`deterministic`**: its result depends on concurrent activity on other workers holding the same
-`Shared<T>`, so a value read here can be stale before the next instruction runs. It exists for
+`strong-count` is not pure: it observes concurrently mutable control-block state and therefore
+carries that shared-state read effect even though it mutates nothing. Its result can be stale before
+the next instruction runs because other workers may retain or release the same `Shared<T>`. It exists for
 logging, assertions, and tests, never as the basis for a subsequent unchecked conversion; reading
 `strong-count` and then separately calling an unchecked "solo" operation would be exactly the
 TOCTOU race `try-into-unique` exists to avoid, since another worker can retain a strong handle
@@ -3131,11 +3388,14 @@ the destructor — this is what guarantees every other thread's writes to the po
 their own handle was released, are visible before this thread destroys it. Both operations remain
 fully atomic regardless of ordering — `relaxed` weakens cross-thread memory visibility, never the
 indivisibility of the increment or decrement itself; a torn or lost update is not a smaller version
-of this bug, it is the exact bug atomicity exists to rule out, unconditionally. `Weak<T>`'s count and
-its interaction with `upgrade` need their own careful pass — not specified here, and not to be
-inferred from the strong-count scheme by analogy, since the real proven implementations of this
-(`Arc`'s) have genuine additional subtlety there (a weak count that does not simply mirror the strong
-count) that deserves dedicated attention rather than a guess made alongside this.
+of this bug, it is the exact bug atomicity exists to rule out, unconditionally.
+
+**Resolved 2026-10-01: weak-count lifetime and ordering.** The weak count includes one implicit weak
+reference while the strong count is nonzero. The last strong release performs the acquire-before-drop
+step above, destroys `T`, then releases that implicit weak. The last weak release performs an acquire
+fence before deallocating the control block. `upgrade` uses the nonzero compare-exchange loop below,
+acquires on success, and may use relaxed failure ordering. Counts never wrap; overflow is a protected
+trap. These are semantic lower bounds rather than a mandated instruction sequence.
 
 **Added 2026-09-17: why `upgrade` specifically cannot be a plain increment, unlike `retain`.**
 `retain`'s `relaxed` increment above is sound because it can only be called on an already-live
@@ -3365,14 +3625,13 @@ and its handler and closure syntax lower to the same exceptional edges, match de
 capture records, and ownership transitions, so its direct operation mapping to typed IR loses no
 source-level guarantee. CoLisp lowers the same semantics rather than routing through Co-Forth text.
 
-**CoLisp per-parameter ownership spelling (draft — not yet frozen; flagged as missing during #674
-scoping, 2026-09-17).** CoLisp states the same mode as an explicit keyword before the binding,
-reusing the vocabulary already established for lambda `:captures` entries (`(borrow config)`,
-`(steal socket)`) and parameter-pack element modes (`(borrow Ts)` in "Parameter packs, runtime rest
-arguments, and C varargs"), rather than introducing a second notation:
+**Frozen 2026-10-01: CoLisp per-parameter ownership spelling.** CoLisp uses an unannotated binding
+for the default readonly borrow, `borrow-mut` for an exclusive borrow, and `steal` for ownership
+transfer. `consume-value` remains a typed-stack-IR/Co-Forth operand-cell mode and is not a CoLisp
+parameter keyword:
 
 ```lisp
-(define (square (consume-value x : int)) : int
+(define (square (x : int)) : int
   ! pure
   (* x x))
 ```
@@ -3387,13 +3646,13 @@ borrowed `path<...>` parameter in the output row (`-- S path<...> unit`) because
 cell that isn't consumed still occupies the stack and the signature must say so explicitly (see
 "the surface transform therefore also shows the borrowed owner in its output row" above). CoLisp
 has no shared operand stack to preserve, so a borrowed parameter never appears in its return type —
-`(define (save-report (borrow path : path<...>) (value string)) : unit ...)` returns only `unit`,
+`(define (save-report (path : path<...>) (contents : string)) : unit ...)` returns only `unit`,
 not the path. A literal field-for-field transliteration of the Co-Forth output row into CoLisp's
 return type would be wrong; the parity is in the ownership semantics, not the surface shape.
 
-**Steal, and the rest of #674's scope.** `square` above only exercises `consume-value`, which is
-itself a lowering-level cell mode for an already-`Copy` scalar ("Typed stack signatures" above) —
-the narrowest case in the ownership model, not a representative one. The declaration syntax for
+**Steal, and the rest of #674 (ownership, placement, deterministic drop, and safety profiles).**
+`square` above exercises the default borrow; lowering may copy its already-`Copy` scalar into a
+`consume-value` operand cell without changing the source parameter mode. The declaration syntax for
 `steal` still needed a worked example; "Borrowing and stealing" already gives the *call-site* behavior
 in CoLisp (`:2062`, the `retain`/`inspect`/`Foo` use-after-move example) but only pseudocode for the
 *declarations* being called (`:2046-2048`). Here are those two declarations, concretely, using the
@@ -3434,6 +3693,21 @@ which is exactly the kind of unreviewed invention this section exists to avoid. 
 narrower open item for #674 beyond the three already logged in the epic tracker — it needs an
 actual decision from Shammah (name and spell the mutation primitive), not a drafted guess.
 
+**Resolved 2026-09-21: `borrow-mut` takes the same per-parameter keyword spelling as `steal` and
+`consume-value` above, and the mutation primitive it needs is `record-set!` — named together in
+"Records, layout, placement, and member access," above, closing this and the setter gap noted there
+in one decision rather than two.**
+
+```lisp
+(define (deposit (borrow-mut acct : Account) (amount : int)) : unit
+  (record-set! acct balance (+ (. acct balance) amount)))
+```
+
+An unannotated parameter still defaults to `borrow`; `borrow-mut` is the one additional keyword this
+adds to the vocabulary already established for `steal`/`consume-value`, requiring the same exclusive-
+borrow guarantee `slice-mut<T>` and this document's other exclusive-borrow carriers already rely on
+elsewhere. This closes #674's fourth item.
+
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
 borrows, mutable aliasing, and borrows live across suspension. The interpreter and future Cranelift
@@ -3450,16 +3724,72 @@ versioned specification must state:
 
 - eager left-to-right argument evaluation;
 - lexical scope;
-- proper tail calls where marked by the IR;
-- exact behavior of truth and `nil` — **arithmetic overflow and numeric conversion are now specified**
-  ("Numeric types: widths, conversion, overflow, and casts," above): overflow traps unconditionally,
-  narrowing and signed/unsigned conversion require an explicit `cast` checked by value-range
-  propagation where possible; truth/`nil`/equality remain open;
+- proper tail calls for every structurally tail-position call, including mutual and indirect calls;
+- exact behavior of truth, `nil`, and equality — **now fully specified below** (arithmetic overflow
+  and numeric conversion were already resolved: overflow traps unconditionally, narrowing and
+  signed/unsigned conversion require an explicit `cast` checked by value-range propagation where
+  possible; "Numeric types: widths, conversion, overflow, and casts," above);
 - immutable-by-default collections;
-- mutation only through typed references with explicit `vm.write` effects;
+- mutation only through an exclusive `borrow-mut` reference, **not gated by any capability effect**
+  — "explicit `vm.write` effects" in an earlier draft of this bullet named the wrong mechanism;
+  `vm.write` is one specific host-authorized *capability* (the VM's session dictionary,
+  "Capability effects are authority requirements," above), not general local mutation, which is
+  fully specified below under "Compile-time staging (CTFE)" and "Records, layout, placement, and
+  member access" instead;
 - exceptions versus `result<T,E>` behavior;
 - supported macro phase and hygiene rules;
 - absence or presence of continuations, dynamic scope, multiple values, and reader extensions.
+
+**Resolved 2026-09-21: truth, `nil`, and equality — checked against JSON's own three-way model per
+direct instruction, rather than inheriting classical Lisp's `nil`/`#f`/`'()` conflation.** Common
+Lisp folds false, the empty list, and "no value" into one `NIL`; Scheme keeps `#f` and `'()` apart
+but still has nothing named for JSON's third citizen, `null`. This document already rejects one such
+conflation on the same grounds once, deliberately, in "Quote and quasiquote" above (`'`/`` ` `` split
+precisely because collapsing two genuinely different things into one spelling "fights the exact
+'regular Lisp should just work' goal this document keeps returning to"); the same reasoning applies
+here, and "match JSON" gives the disjoint three-way split for free rather than requiring a new one:
+
+- **`bool`** (already `unit | bool | i8...`, "Typed values use a hybrid representation," above) has
+  exactly its two values, `true`/`false`, already reader-aliased to `#t`/`#f`. Nothing else is a
+  `bool`, and nothing coerces into one: `if`'s test position requires a `bool`-typed expression, full
+  stop — not "falsy" for an empty list, a zero, an empty string, or an absent value, the same
+  no-implicit-coercion discipline "Functions and annotations" below already states ("do not achieve
+  convenience by silently inserting `dynamic`, unchecked coercions"). This is stricter than JSON
+  itself (JSON has no conditionals to be truthy or falsy *in*), but it is the reading of "match JSON"
+  consistent with everything else here: JSON's scalars stay genuinely disjoint types, not one
+  implicitly-converting bag of "maybe true-ish" values the way Lisp, Python, and JavaScript each
+  separately reinvented.
+- **The empty list is its own value of its list type** ("Text, arrays, slices, vectors, and lists,"
+  above), tested with ordinary pattern matching or an `empty?`-shaped operation, never truthiness. It
+  is not `false`, and it is not `null`.
+- **`null` is `option<T>::none`**, resolved the same way an empty collection literal already is:
+  "Expression-local expectations may type an empty collection constructor... when all choices are
+  within that expression" (below) applies verbatim — a JSON `null` literal synthesizes
+  `option<T>::none` under an expected `option<T>` type from its surrounding context (a record
+  field's declared type, a `let` binding's established type, a call's parameter type), exactly the
+  way `[]` already does, and is a compile error under the same "cannot resolve an ambiguous literal"
+  diagnostic when no such context exists. `option<T>` is already "an ordinary standard-library
+  definition over the general closed variant facility" ("Records, layout, placement, and member
+  access," above) — this needs no new type and no privileged compiler-known `null`/`nil` value
+  floating around untyped. The reader still needs one atom kind to represent a literal `null` token
+  before any type is known (corrected under "binding lists... use `[...]`," "Closure conversion and
+  capture ownership," above, where the JSON discussion previously described it as aliased to a bare
+  `nil` symbol); that atom is `Null`, not `nil`, and carries no value-level meaning of its own until
+  semantic analysis resolves it against an expected type.
+- **Equality** was already fully specified generically in "Operators, comparison evidence, and
+  segmented text," above, and needed no new mechanism here — only confirming that CoLisp's reader
+  words bind to what already exists, rather than inventing Common Lisp's `eq`/`eql`/`equal`/`equalp`
+  four-way split or Scheme's `eq?`/`eqv?`/`equal?` three-way one: `(= a b)`/`(equal? a b)` bind to the
+  concept-dispatched `Equal<L,R>`/`==` (structural, symmetric-derived); `(same-address? a b)` binds to
+  the already-added identity comparison `same-address` (borrows only, per its own borrow-window
+  soundness argument, above). Two disjoint named operations, already fully specified, cover exactly
+  the identity-versus-content distinction those classical Lisp predicate families exist for —
+  nothing was actually missing here, only the CoLisp binding was unstated.
+
+There is deliberately no bare, untyped `nil` anywhere in this model: `false` is `bool`'s own value,
+the empty list is the list type's own value, and "absent" is always a typed `option<T>::none` — never
+a fourth, ambient value standing in for any of the other three depending on context, which is exactly
+the wart this resolution exists to close rather than import.
 
 Initially exclude general continuations. There is no user-facing `eval` that runs an arbitrary
 tree in the current environment. Mix-back of generated syntax into a **module** is compile-time
@@ -3545,7 +3875,7 @@ constant its arguments are. **Corrected in the same edit that first tested this 
 example:** an earlier draft of this paragraph additionally excluded anything that `throws`, which
 contradicts the `!`-unification work above — `! pure` and `throws` are orthogonal axes, not
 mutually exclusive, so a `! pure throws ParseError` function (`json/parse`, say) is exactly as
-eligible as an unconditionally-total one. Throwing at compile time on bad input becomes an ordinary
+eligible as an unconditionally nonthrowing one. Throwing at compile time on bad input becomes an ordinary
 compile error, the same correctness signal it would be at runtime — nothing like the hazard a real
 capability effect (I/O, network) creates by actually touching something external. Purity alone
 doesn't guarantee termination, and requiring proven
@@ -3684,6 +4014,29 @@ it, with only the outermost one performing the actual splice-in. `@JSONSerializa
 @Foo (Record ...)` — stacked decorator sugar, floated in conversation, not yet given its own ratified
 spelling — would desugar to exactly this nested form, applied innermost-first, matching Python's real
 decorator-composition order (`@a @b def f()` is `a(b(f))`) rather than inventing a new convention.
+
+**Resolved 2026-09-21: adopted.** Every `@Name` spelling used illustratively in this document was
+always shorthand for `(mixin (Name form))`, never a proposal in its own right — ratified now as
+exactly that shorthand, made real, using the shape that reuses the most already-specified machinery:
+one more single-character reader macro, alongside
+`'`/`` ` ``/`,`/`,@` ("both readers tokenize purely by whitespace and a small fixed set of reader
+macro characters," "Records, layout, placement, and member access," above), where `@Name`
+immediately before a form `F` reads as `(mixin (Name F))`, reaching exactly as far as `'`/`` ` ``
+already reach — the next form, nothing block- or line-scoped. Stacking falls out for free rather than
+needing its own rule: `@A @B F` reads left-to-right the same way nested quote characters would, `@A
+(@B F)`, giving exactly the nesting above and the same Python-matching innermost-first order with no
+second composition rule. This adds zero new semantic constructs — it is pure reader sugar immediately
+converted to the same `mixin` form before any expansion or semantic analysis, the same promise
+"Classic S-expressions..." (below) already makes for sugar generally. Ordinary sugar can still change
+its exact spelling later without becoming a second mechanism to migrate away from, the same as any
+other convenience form in this document.
+
+**`@Name` where `Name` doesn't return `syntax` is already an ordinary type error, with no special
+case needed for it.** Because `@Name F` desugars to literally `(mixin (Name F))` and `mixin`'s
+parameter is `syntax`-typed ("the word `mixin` always takes `syntax`," above), a `Name` declared to
+return, say, `int` or `unit` makes `(Name F)`'s static type mismatch `mixin`'s declared parameter
+type — caught by the same ordinary call-site type-checking every other ill-typed argument already
+gets, before expansion runs and with no `@`-specific diagnostic path to keep correct separately.
 
 **Revised 2026-09-18: `define-syntax` is retired. A parameter typed `syntax` captures its argument
 automatically — no separate macro-registration mechanism needed.** The previous design needed two
@@ -3833,9 +4186,15 @@ stringly-moded hook would be exactly the `__traits` mistake this catalog exists 
 (fields-of Account :include-properties-readonly #t)            ; widen to get-only properties too
 ; ! comptime — returns an ordered list of {name, type, visibility, kind}
 ; kind: field | property-readonly | property-read-write
-; visibility: pub | private (for `kind = field`); a property's own visibility is whatever its
-;   get/set operations' own visibility is — UNVERIFIED, no example shows `pub` on an operation
+; visibility: pub | private — the same spelling and the same private-by-default rule for all three
+;   kinds alike, confirmed below
 ```
+
+**Resolved 2026-09-21, closing the UNVERIFIED flag this comment carried:** a `get`/`set`/`operation`
+member's visibility is not derived from anything else; it is governed by the same `pub`-or-private-
+by-default rule already stated for fields ("matching the general rule already stated for every other
+declaration," above), because `get`/`set`/`operation` are two of the same "three kinds of member"
+that rule already covers, not a fourth category needing its own decision.
 
 **Revised 2026-09-18, before this had a chance to ship with the wrong default:** the first draft
 returned everything unconditionally and expected every caller to filter afterward. That has a real
@@ -3859,6 +4218,30 @@ plain data in this list) into a `.`-access expression needs the already-establis
 to promote it into a syntax identifier — this is the narrower, single-symbol case that operation
 already covers, distinct from the still-open `ParameterSpec -> syntax` gap, which is specifically
 about reconstructing a whole *parameter list* with types and ownership modes, not one bare name.
+
+**Resolved 2026-09-21, narrowed rather than left flat open: most of what this gap seems to need is
+already there.** A `ParamEntry`'s pre-resolution fields already retain "the type expression as
+written" (above) — itself already `syntax`, not a semantic type value — so a transform working from
+an unresolved `ParameterSpec` (the common derive case: rewriting a `define` as it is written, before
+`mixin`) reconstructs a parameter list with ordinary quasiquote, splicing each entry's already-
+`syntax` name (via `datum->syntax`) and already-`syntax` type expression directly, `,@`-spread across
+the list — no new primitive needed for that case; it was already expressible with what this document
+specifies for CTFE, just not previously spelled out as an example. The remaining resolved-type case
+uses `type->syntax(type, context) -> syntax ! comptime`. It emits a canonical qualified type node
+carrying the resolved type identity and the supplied diagnostic origin; it does not flatten the type
+to a datum or reparse text.
+
+**Concretely:** a derive that wants to emit a *monomorphized* helper — say,
+specializing a generic `(define (identity (x : T)) : T x)` into a concrete `(define (identity-i64 (x
+: i64)) : i64 (identity x))` for a specific instantiation it discovered via `FunctionSpec`/generic
+introspection — needs to write `i64` into the generated parameter list. `i64` here was never written
+anywhere in the original source (the source only ever wrote `T`); it exists only as a resolved
+`Type` value the compiler produced during inference. `datum->syntax` promotes a bare *datum* (a
+symbol, a literal) into a scope-aware identifier; it has no defined behavior for a semantic `Type`
+value, which isn't a datum at all, so `type->syntax` is the deliberate bridge. A `ParamEntry` whose
+parameter was actually declared `(x : i64)`
+in source needs nothing new (its "type expression as written" is already `syntax`, reusable
+directly); a type with no prior surface spelling uses `type->syntax`.
 
 **Added 2026-09-18: `include-str`/`include-bytes`, compile-time-only hooks for embedding an
 external file's contents as a constant — not ordinary `! pure` functions that merely happen to be
@@ -3917,6 +4300,16 @@ reaches a module: whether `modules-of` defaults to public-surface modules only, 
 an explicit widening parameter (matching `fields-of`'s own `:include-private` shape), is not yet
 decided — flagged as the next concrete decision for this hook, not resolved here.
 
+**Resolved 2026-09-21: public-surface modules only by default, `:include-private #t` widens — the
+same shape `fields-of` already uses, applied here for the same reason rather than decided
+independently.** `fields-of`'s own default was chosen specifically so a third-party derive sees
+private fields only when it explicitly asks (above); a whole-program derive built on `modules-of` has
+the identical failure mode if it defaults wide — a library author's private, not-meant-for-external-
+discovery modules would be enumerable by any derive that merely forgot to narrow, not only one that
+deliberately asked to see them. `(modules-of Program)` returns public-surface modules only;
+`(modules-of Program :include-private #t)` widens to every module in the compilation unit, the same
+keyword doing the same job it already does for `fields-of`.
+
 **Added 2026-09-18: a derive's selection filter should name every condition a matching type
 actually needs to satisfy, not leave one as an unstated precondition a different check happens to
 enforce later.** Found by comparing an intent ("classes decorated with an `OpCoder` attribute") to
@@ -3944,6 +4337,21 @@ origins") — applied here too, so a private-field touch can always be traced to
 which module, produced it. Left explicitly open, not resolved: whether some *additional* sandboxing
 beyond this — restricting a mixin's access to less than full module membership — should exist. No
 resolution either way; flagged as a real question rather than quietly decided.
+
+**Resolved 2026-09-21: no additional sandboxing — the existing consent-and-audit story already
+covers this, and a separate mixin-privacy mechanism would be a second, competing access-control
+system rather than a missing check.** The dangerous shape would be a third-party library reaching
+into a module's private fields *without* that module's author choosing to invoke it — but that is
+not what happens here: `mixin`-applying a third-party derive is written by the module's own author,
+at the declaration site, the same explicit act as writing any other line of that module's own code
+("compiled as if they had been written at that site," above). The derive function never runs against
+a module it wasn't invited into; it has no ambient reach the way a capability effect without a grant
+would. Restricting it further would mean a private field is *less* accessible to code the module's
+own author explicitly pasted in than to code they wrote by hand — an inconsistency the visibility
+model doesn't have anywhere else, not a safety property. What the "additional sandboxing" instinct is
+actually reaching for — knowing *which* mixin, from *which* module, touched a given field — is
+exactly what the already-required audit trail (origin-tracking on every expansion, "Diagnostics,"
+above) already provides, so this resolves to "already covered," not "needs a second mechanism."
 
 Syntax values are not bare lists. They retain source origin, expansion ancestry, lexical scope
 marks, and stable module/symbol identity. Public syntax constructors and projections preserve those
@@ -4008,6 +4416,27 @@ gotcha above, now confirmed at the level of the compiler's own internal data str
 inferred from surface behavior. `require(symbol, stage)` giving every symbol one representation, one
 promise, regardless of what kind of symbol it is or which import path reached it, is what rules this
 specific bug class out structurally — not a specific fix for packages, a fix for the category.
+
+**Added 2026-09-21: a third, independent cause, distinct from either bug above — `__traits` has no
+specification to conform to, only a vendored reference frontend.** Checked directly rather than
+assumed: DMD, GDC, and LDC do not maintain three independent reimplementations that merely happen to
+diverge; GDC and LDC both vendor the actual DMD frontend source, diverging only in backend (GCC,
+LLVM). That sounds like it should make `__traits` consistent by construction, and for a frontend
+commit held still it would — but each downstream compiler pins its own vendored snapshot on its own
+release cadence, so "does `__traits(X, ...)` behave this way" depends on which frontend commit got
+vendored into that particular build, not on any written contract independent of all three. There is
+no D language specification `__traits` is checked against; there is only "matches the reference
+implementation," version-pinned per downstream compiler, and drifting whenever one lags the others.
+This is the failure mode that specifically threatens Finch's own multi-implementation goals — a
+second, self-hosted compiler stage ("stage 1 and stage 2 produce normalized equivalent compiler
+artifacts," "Eventual self-hosting," below) or a third-party embedder loading the portable ABI
+("one stable C ABI so Rust, Go, and other embedders can load the same verified compiler image,"
+below) reproduces exactly this problem the moment the comptime-hook catalog
+(`members-of`/`fields-of`/`modules-of`/`FunctionSpec`) is defined only as "whatever the one Rust
+compiler does." The fix is the same discipline this document already requires of CoLisp/Co-Forth
+parity: each hook needs conformance fixtures — a fixed input and its exact expected `{kind, name,
+spec}` (or equivalent) output — checked against every implementation that claims to speak the
+language/ABI, not documented only as the reference compiler's observed behavior.
 
 **Removed 2026-09-18:** this section previously described a transitional, capture-free `define-syntax`
 template mechanism (substitution before type checking, no CTFE body) as a bridge to be deleted once
@@ -4108,10 +4537,12 @@ visible sign at either the call sites or the original declaration. Rejected for 
 What remains legal is the same shape already established for evidence: only the original author, at
 the one place a name is declared, can opt a declaration into a CTFE transformation — illustratively,
 something like `@covered (define (require-pkg ...) ...)`, applying a `syntax -> syntax` function to
-the declaration as it is written, not to something already published elsewhere. The precise
-mechanism for invoking a named CTFE transform this way — what `@name` resolves to, how it differs
-from the record-scoped attributes retired earlier this session — is not yet specified; the
-illustration above shows the *shape* the safe answer takes, not a ratified spelling.
+the declaration as it is written, not to something already published elsewhere. **Resolved 2026-09-21
+by the now-adopted `@Name` rule** ("`mixin` vs `,@`," above): `@covered (define (require-pkg ...)
+...)` is exactly that rule applied, `Name = covered`, `F = (define (require-pkg ...) ...)` — no
+special case needed for the attribute-opt-in reading versus the stacked-derive reading (`@Foo (Record
+...)`); both are the same one rule, so nothing about the spelling was left open once `@Name` itself
+was.
 
 Classic S-expressions remain one exact, canonical structural reader, not a requirement that every
 human-facing Lisp spelling pay the full parenthesis cost. Later expression/indentation/call sugar
@@ -4134,11 +4565,9 @@ source spellings:
 ```text
 implementation MyListRange<T> : Range {
     associated Item = T
-    associated Effects = {}
     operation empty?    = my-list-empty?
     operation front     = my-list-front
     operation pop-front = my-list-pop-front
-    dynamic-evidence-version = 1
 }
 ```
 
@@ -4150,11 +4579,12 @@ function, free function, generated callable, or composed delegate. For example:
 
 ```text
 concept JsonSerializable {
-    associated Output = bytes
+    associated Output
     operation serialize(&self, options: &JsonOptions) -> Output
 }
 
 implementation User : JsonSerializable {
+    associated Output = bytes
     operation serialize(&self, options) =>
         UserCodec.serialize(options, self)
 }
@@ -4163,6 +4593,135 @@ implementation Widget : Drawable {
     operation draw(&self, canvas) =>
         Drawable.draw(&self.presentation, canvas)
 }
+```
+
+**Corrected 2026-09-23: the concept declaration above had `associated Output = bytes` — assigning a
+value inside `concept`, where only a requirement belongs.** A concept states that an *implementation*
+must supply `Output`; it does not itself supply one, the same distinction the Co-Forth pairing right
+below already got right (`associated: Output type ;` in the concept, `associated: Output = bytes ;`
+only in the implementation) while this CoLisp-shaped excerpt didn't. Fixed to match its own paired
+Co-Forth form rather than left as a second, disagreeing illustration.
+
+**Frozen 2026-09-23: real CoLisp syntax, closing "illustrative until the surface grammar is frozen"
+below for concept declarations and implementations.** The inherent-implementation form (`get`/`set`/
+`constructor`, "Records, layout, placement, and member access," above) already reuses `define`'s own
+`(name (params...)) : ReturnType` signature shape rather than the `&self`/`->`/`=>` pseudocode above,
+which was never real CoLisp (the same fix already applied there, "Corrected 2026-09-17," "Records,
+layout, placement, and member access," above, for the same reason). A concept-bound `implementation`
+gets the identical treatment — no third notation:
+
+```lisp
+(concept JsonSerializable
+  (associated Output)
+  (operation (serialize (self) (options : JsonOptions)) : Output))
+
+(implementation User : JsonSerializable
+  (associated Output bytes)
+  (operation (serialize (self) (options)) : Output
+    (UserCodec.serialize options self)))
+
+(implementation Widget : Drawable
+  (operation (draw (self) (canvas)) : unit
+    (Drawable.draw (. self presentation) canvas)))
+```
+
+`self` unannotated defaults to `borrow`, the same default every other parameter already uses
+(matching `get`'s own receiver, above); `(borrow-mut self)` or `(steal self)` spell the other two
+receiver forms already named ("An operation requirement defines one canonical receiver and call
+ABI," above), and an associated operation with no receiver simply omits `self` from the parameter
+list. `associated Slot` (no value) in a `concept` states a requirement; `(associated Slot Value)` in
+an `implementation` supplies it — two-element form, the same shape `operation` already uses for its
+own bare-target shorthand rather than a third, `=`-based notation CoLisp's S-expression reader has no
+established use for. The `stable-evidence` `#NN` key (above) attaches the same way, right after
+`operation`:
+
+```lisp
+(concept Range stable-evidence (evidence-version 1)
+  (associated Item)
+  (operation #1 (empty? (self)) : bool)
+  (operation #2 (front (self)) : Item)
+  (operation #3 (pop-front (borrow-mut self))))
+
+(implementation MyListRange<T> : Range
+  (associated Item T)
+  (operation empty? my-list-empty?)
+  (operation front my-list-front)
+  (operation pop-front my-list-pop-front))
+```
+
+**Added 2026-09-23: `my-list-empty?`/`my-list-front`/`my-list-pop-front` had never actually been
+given bodies anywhere in this document — a real, generic (templated) worked example, not the
+placeholder names alone.** A cursor over an already-owned `vector<T>` is the concrete case:
+
+```lisp
+(record MyListRange<T>
+  (field items : vector<T>)
+  (field index : int))
+
+(implementation MyListRange<T> : Range
+  (associated Item T)
+  (operation (empty? (self)) : bool
+    (== (. self index) (vector-length (. self items))))
+  (operation (front (self)) : T
+    (vector-get (. self items) (. self index)))
+  (operation (pop-front (borrow-mut self)) : unit
+    (record-set! self index (+ (. self index) 1))))
+```
+
+This is exactly the record/`record-set!`/`.`-access/ownership-default machinery already frozen
+elsewhere in this document, composed, not a new mechanism for ranges specifically — `pop-front`'s
+`(borrow-mut self)` receiver and `record-set!`'s in-place field mutation are the same two things
+"Records, layout, placement, and member access," above, already resolved. `evidence-version` belongs
+to the `stable-evidence` concept's sealed revision, not to each implementation; an implementation
+records that revision automatically. Ordinary static, same-compilation use never consults a stable
+table revision. `vector-length`/`vector-get` are the obvious, expected
+`vector<T>` primitives; this document has not frozen their exact names elsewhere, so treat them as
+placeholders for whatever the stdlib actually calls them, not a new ratified spelling.
+
+**A genuinely generic *adaptor* — parametric over another `Range`, not just over an element type —
+is the case that actually earns the word "templated":**
+
+```lisp
+(record Take<R>
+  (field remaining : int)
+  (field source : R))
+
+(implementation Take<R : Range> : Range
+  (associated Item R::Item)
+  (operation (empty? (self)) : bool
+    (or (== (. self remaining) 0) (empty? (. self source))))
+  (operation (front (self)) : Item
+    (front (. self source)))
+  (operation (pop-front (borrow-mut self)) : unit
+    (record-set! self remaining (- (. self remaining) 1))
+    (pop-front (borrow-mut (. self source)))))
+```
+
+`Take<R>` wraps any `Range` and limits it to its first `remaining` elements, reusing the wrapped
+range's own `Item` unchanged — `associated Item R::Item` projects `R`'s own associated type rather
+than restating it, exactly the "adaptor... preserves... but not..." shape "Future ranges, cursors,
+and explicit erasure," above, already described in prose without ever showing it. `R::Item` is the
+frozen projection spelling; projection requires unique evidence and bounded cycle-detecting
+normalization. `Take`'s bound —
+`Take<R : Range>` — reuses the exact conditional-implementation syntax and generic-parameter-bound
+mechanism already resolved for `List<T : Equal<T,T>>` ("Left open, not yet specified: conditional
+implementations," below); nothing new was needed to write a range adaptor generic over another range
+once that mechanism existed. `pop-front (borrow-mut (. self source))` nests an exclusive borrow
+through a field projection while already holding one on `self` — ordinary borrow projection through
+a mutable receiver, not a new capability.
+
+`(operation empty? my-list-empty?)` is the bare shorthand ("a direct `operation serialize =
+encode-user-json` shorthand is valid only when the callable already has the exact canonical
+signature," below) — two elements, no `=`, matching `associated`'s own shape; `User`'s `serialize`
+above needed the explicit-body form instead precisely because `UserCodec.serialize`'s real argument
+order (`options, self`) doesn't match the canonical receiver-first signature, the same reason the
+original pseudocode never used the shorthand for it either. The conditional-implementation example
+("Generics, concepts, dispatch, and metaprogramming," below) gets the same treatment:
+
+```lisp
+(implementation List<T : Equal<T,T>> : Equal<List<T>, List<T>>
+  (operation (equal (borrow left) (borrow right)) : bool
+    ... uses T's Equal<T,T> evidence per element ...))
 ```
 
 The canonical Co-Forth declaration shape carries the same fields rather than relying on matching
@@ -4179,7 +4738,6 @@ implementation: User : JsonSerializable
   operation: serialize { self options -- }
     options self UserCodec.serialize
   ;
-  dynamic-evidence-version: 1 ;
 ;
 
 user options JsonSerializable.serialize
@@ -4195,8 +4753,9 @@ adapter thunk. The verifier rejects an adapter that takes through `&self`, obtai
 exclusive access, lets a receiver-tied borrow escape, widens the operation's effects/exceptions, or
 performs an implicit representation conversion.
 
-These spellings are illustrative until the surface grammar is frozen. The declaration is evidence,
-not inherited implementation or an implicit method search. It may publish only static evidence, or
+The `text`/`forth` pairing above states the fields every concept and implementation carries; the
+frozen CoLisp form is given above, under the corrected `JsonSerializable` example. The declaration is
+evidence, not inherited implementation or an implicit method search. It may publish only static evidence, or
 additionally publish a versioned dynamic evidence table when the concept has a fixed runtime ABI. A
 derive tool may generate the declaration, but the compiler still consumes an explicit mapping
 rather than silently treating matching names as conformance.
@@ -4219,6 +4778,13 @@ Exported evidence is stable, addressed by its (concept, type) pair rather than b
 a given concept, full stop — never two, regardless of whether their bindings would differ. A second
 `implementation` of a concept already implemented for that type is rejected outright at its own
 declaration, unconditionally, not merely when its bindings happen to coincide with the first's.
+
+Separate compilation requires one additional locality rule: an implementation is legal only in the
+module that defines the concept or the module that defines the outermost nominal implemented type.
+Built-in types belong to the core module, and generated implementations inherit the module where the
+expansion lands. This rejects a foreign-concept/foreign-type implementation at its own declaration,
+so two independent dependencies cannot each compile a conflicting orphan and defer the surprise to a
+third link. An explicit wrapper/newtype is the escape hatch for a second policy.
 
 This was not the original design and is worth being honest about reversing rather than silently
 restating as though it were always the rule. Naming every implementation was first justified by
@@ -4243,12 +4809,40 @@ independent grounds at once: it is the per-instantiation specialization already 
 in this document, and it is a second implementation of the same concept for the same type family.
 Uniqueness is checked against the whole family, never per instantiation.
 
-**Left open, not yet specified: conditional implementations.** Whether a generic implementation may
-itself require a bound on its own type parameter — `implementation List<T : Equal<T,T>> :
-Equal<List<T>, List<T>> { ... }`, the shape of Rust's `impl<T: PartialEq> PartialEq for Vec<T>` — has
-no established syntax anywhere in this document. This is a real, separate gap from the specialization
-question above, not a restatement of it: it is not choosing between competing bodies for different
-`T`, only gating whether the single body is available at all for a given `T`.
+**Resolved 2026-09-21: yes — a generic implementation may bound its own type parameter**, using the
+same `<T : Concept>` constraint syntax already established for generic functions (Co-Forth's own
+`< types T... values N... > ... where ...` parity-ledger row, "Canonical structured surface and
+parity ledger," above) rather than inventing implementation-specific constraint grammar:
+
+```text
+implementation List<T : Equal<T,T>> : Equal<List<T>, List<T>> {
+    operation equal(borrow left, borrow right) -> bool =>
+        ... uses T's Equal<T,T> evidence per element ...
+}
+```
+
+This is a real, separate gap from the specialization question above, not a restatement of it: it is
+not choosing between competing bodies for different `T`, only gating whether the single body is
+available at all for a given `T`.
+
+**Coherence needs no new machinery either.** "Uniqueness is checked against the whole family, never
+per instantiation" (above) already settles the hard part: a concept implementation is keyed by
+(concept, type-family) regardless of any bound on that family's own parameters, so there may still be
+at most one `implementation List<T : ...> : Equal<List<T>, List<T>>` for the entire `List` family —
+never two competing conditional implementations for the same family under different, possibly-
+overlapping bounds. This sidesteps the actual open sore in Rust's own conditional-implementation
+story (specialization, negative bounds, years of unstabilized RFCs trying to let two conditional
+`impl`s coexist by proving their bounds don't overlap) by simply not permitting the situation that
+requires it: if two genuinely different bodies are needed depending on `T`'s structure, that is
+exactly what `match-type` inside one implementation is for ("Design rationale: optimize for the
+common case, not completeness," above), not two implementations.
+
+Discharging the bound at a call site is ordinary generic constraint-checking, already specified for
+functions, applied here unchanged: a call needing `List<Foo>`'s `Equal` evidence checks whether `Foo`
+itself has `Equal<Foo,Foo>` evidence at that call site — succeeding selects the conditional
+implementation's evidence for that instantiation; failing means `List<Foo>` simply has no `Equal`
+evidence at all, an ordinary "no implementation found" diagnostic, not a new error category for the
+conditional case.
 
 Concept evidence is never made ambient merely by loading or importing its defining module. A call
 either names the concept-qualified operation directly, since there is at most one implementation to
@@ -4899,7 +5493,7 @@ typed results/events through a daemon-owned handle; `join` resumes the parent ru
 returned value on its private working stack before it commits. This preserves no-GIL concurrency
 without turning positional Forth stack state into a data race.
 
-`fiber<Y,Resume,R>` and `task<R>` are first-class persistent values: their serialized form is a stable
+`fiber<Y,Resume,R,X>` and `task<R,X>` are first-class persistent values: their serialized form is a stable
 daemon task ID plus Brain/environment identity, owner/ancestry, expected types, creation revision,
 budget, and policy reference—not a Rust channel, OS thread handle, or child stack. A later program
 may keep such a handle on the persistent Brain stack, inspect/poll it, consume yielded values, join
@@ -5176,8 +5770,8 @@ test-suite: "JSON parser" {
 }
 ```
 
-The exact punctuation may evolve with the paired grammars, but names, lexical grouping, source
-origins, and the shared semantic nodes are normative. Co-located test declarations can access their
+The exact paired grammar is frozen by the specification; names, lexical grouping, source origins,
+and the shared semantic nodes are normative. Co-located test declarations can access their
 module's private interface. External test modules are black-box clients and see only published
 exports. Production sealing excludes test declarations and test-only evidence from the executable
 interface; a separate versioned test artifact links them under the test profile.
@@ -5662,10 +6256,11 @@ sandbox and whose typed effect contract remains independently authorized.
 
 ## Implementation work packages
 
-This is a dependency/acceptance map, not current implementation status. Phases 1–6 already have
-substantial implementations; the canonical checked/unchecked status and remaining gates live in
-`TODO.md`. Items below describe contracts that must still be true at each exit, not a claim that
-the phase has not started.
+This is a historical dependency/acceptance map, not current implementation status. Phases 1–6
+already had substantial implementations when it was written; the canonical current status and
+remaining gates now live in [`PROGRESS.md`](PROGRESS.md) and
+[`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md). Items below record contracts considered at
+the time, not a claim that a phase has not started or that its older wording remains normative.
 
 ### Phase 0: Freeze contracts and fixtures
 
@@ -5833,7 +6428,7 @@ Every phase adds tests at the layer where its invariant is enforced:
   to native frontends;
 - module-import tests for module/function/block scope, visibility only after a local declaration,
   whole/qualified/selective/renamed bindings, direct-local precedence, same-scope ambiguity,
-  explicit evidence selection, macro/CTFE phases, branch lexical scope, non-reexport of local
+  coherent evidence dependency, macro/CTFE phases, branch lexical scope, non-reexport of local
   imports, immutable dependency hashing/cycles, one parse/job under repeated and concurrent imports,
   cache eviction/reload equivalence, precise invalidation, independent artifact validation, and
   absence of runtime initialization or authority;
@@ -5860,9 +6455,9 @@ Every phase adds tests at the layer where its invariant is enforced:
 - text tests for exact UTF-8/scalar equality, invalid decoding, scalar-boundary slicing, distinct
   byte/scalar/grapheme units, versioned normalization/collation, raw delimiters and escapes, absence
   of ambiguous integer string indexing, and constant-pattern dispatch with collision checks;
-- operator tests proving operand-directed evidence selection, generated symmetric adapters,
-  rejection of ambiguous defaults and accidental ordered reversal, derivation of inequality and
-  ordering relations, explicit alternate-policy selection, and identical CoLisp/Co-Forth lowering;
+- operator tests proving operand-directed unique evidence resolution, generated symmetric adapters,
+  rejection of overlap and accidental ordered reversal, derivation of inequality and ordering
+  relations, explicit wrapper/named-call alternate policies, and identical CoLisp/Co-Forth lowering;
 - law-evidence tests distinguishing relational symmetry from operational commutativity, exercising
   associativity/distributivity/idempotence/involution and anti-homomorphism wiring, and proving an
   unchecked or false user law cannot authorize an optimization;
@@ -5886,10 +6481,10 @@ Every phase adds tests at the layer where its invariant is enforced:
   nontrivial-owner values, target ABI classification, fixed-call-site thunks, and hosted rejection;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
   equivalence, canonical receiver adapters for member/static/free/delegated callables, view-carried
-  evidence without record mutation, explicit-import/default evidence coherence, sealed selected
-  evidence identities, and runtime-factory tests;
+  evidence without record mutation, orphan/coherence enforcement, sealed unique evidence
+  identities, and runtime-factory tests;
 - derive-macro tests proving generated explicit concept evidence, hygienic same-named operations,
-  concept-qualified static selection, named same-concept ambiguity resolution, and equivalent
+  concept-qualified static calls, same-concept overlap rejection, and equivalent
   `dyn` evidence-table dispatch, plus rejection of generated-source reparsing/string mixins and
   provenance-preserving structured declaration composition;
 - record-layout tests for native/C/versioned-stable representations, opaque boundaries, inline and
@@ -6008,31 +6603,101 @@ defined migration, rejection, or invalidation path whenever semantics change.
 8. Keep the removed native Lisp evaluator from returning as a compatibility escape hatch; missing
    closure, macro, capability, persistence, or diagnostic semantics must be implemented in shared IR.
 
-## Initial module layout
+## Implementation ownership layout
 
-The exact names may change, but ownership should remain clear:
+The current crate ownership is authoritative; this replaces the stale pre-extraction `src/vm` /
+`src/coforth` / `src/lisp` sketch that previously appeared here:
 
 ```text
-src/vm/types.rs                 type/value model
-src/vm/signature.rs             typed stack rows and inference primitives
-src/vm/effects.rs               effect sets and capability requirements
-src/vm/selectors.rs             resource selector parsing and algebra
-src/vm/ir.rs                    versioned typed IR
-src/vm/verifier.rs              stack/type/effect verifier
-src/vm/interpreter.rs           verified IR interpreter
-src/vm/heap.rs                  managed values and roots
-src/vm/transaction.rs           VM deltas, revisions, commit/rollback
-src/vm/diagnostic.rs            structured errors and source origins
-src/vm/capability_broker.rs     authorization, suspension, invocation, audit
-src/coforth/frontend/           typed Co-Forth parser and lowering
-src/lisp/frontend/              expansion, inference, closure conversion, lowering
-src/jit/clif_lowering.rs       later Finch-IR-to-CLIF lowering
-src/jit/                       later Cranelift ABI, native cache, traps, source maps
-vocabulary/language/            canonical provider-facing definitions
+crates/finch-vm-core/           types, construction, typed IR, verifier, diagnostics
+crates/finch-colisp/            CoLisp reader and surface construction
+crates/finch-coforth/           Co-Forth reader and surface construction
+crates/finch-language/          compiler facade and semantic scheduler
+crates/finch-vm/                verified interpreter and execution runtime
+vocabulary/language/            provider artifacts and conformance corpus
 ```
 
 Keep `src/runtime` as orchestration around the VM: submissions, manifests, execution contexts,
 scheduler, provider resolution, and projection into session/UI events.
+
+## A third, C-like syntax as a wart detector
+
+Added 2026-10-03 as a sketch; the same day the owner asked for it to be built, and the executable
+core of this syntax is now normative in the specification (section 3.6, `grammar/clike.json`). The
+sketch is kept for its reasoning. The point is the discipline: define the language so that three unrelated surface syntaxes can all spell it,
+compile to the same module interfaces and ABI, and call one another freely. A feature that only one
+syntax can express, or that needs a special case to cross between them, is a wart in the language
+rather than a quirk of a reader. Two syntaxes can hide a wart by sharing an accident; a third that
+shares no accident with either is a cheap test.
+
+### Why this is cheap
+
+A frontend's job ends at the normalized AST. It reads source, keeps byte spans, and emits the same
+semantic-construction nodes; resolution, checking, IR, the verifier, and the VM are shared. A new
+frontend is therefore a grammar file, an elaborator to the existing nodes, and a third spelling on
+the execution vectors. The vectors become its conformance suite for free: if its spelling of a
+vector builds the same AST and semantic digest, everything downstream is already proven. It must
+emit nodes directly. Translating its text into CoLisp text is ruled out, because each source byte
+crosses exactly one reader.
+
+The exercise has already paid for itself once. Pairing CoLisp with Co-Forth is what exposed that a
+Co-Forth local carried a type CoLisp could not write, that Co-Forth could not call a callable held
+in a local or pass a defined word as a value, and that a callable's contract could not be written
+as a type at all.
+
+### Sketch: a D-flavoured surface
+
+The core is already D-flavoured (scope guards, `mixin`, `ct-foreach`, ranges as `empty?`, `front`,
+`pop-front`), so the natural C-like surface is close to D.
+
+**Identifiers.** Finch names allow `-`, `?`, and `!`; with infix operators `a-b` must mean
+subtraction. The reader maps camelCase to the canonical hyphenated name, so `raceAndReap` is
+`race-and-reap` in the AST and a function written `fooBar` is `foo-bar` to every other frontend.
+The mapping is not reversible in every case, because case is identity (`parseHTTP` is a legal
+name) and names may end in `?` or `!`. One raw-identifier escape covers those. Ownership modes are
+grammar keywords in every frontend, not identifiers, so `borrow-mut` is spelled however reads best
+(`mut`, `ref`, `inout`) and maps to the same mode.
+
+**Type arguments.** `<` as both less-than and the generic bracket is a standing source of ambiguity
+and slow parsing. D's answer is `name!(arguments)`, with `name!argument` for a single token:
+`vector!(int)`, `map!(string, int)`. It needs no lookahead and does not collide with prefix `!` for
+logical not, since the template bang only follows a name. CoLisp and Co-Forth have no infix
+operators and can keep `<...>`.
+
+**Contracts.** CoLisp and Co-Forth introduce a contract with `!`. A C-like signature would carry it
+as trailing attributes instead, as D does: `int f(int x) pure nothrow`. The three axes map directly.
+
+**Statements and operators.** The core is expression-oriented: `if` yields a value and the last item
+of a block is its value. The rule "a trailing expression without `;` is the block's value" maps
+onto that exactly. `&&` and `||` lower to `if`; `%` and the bitwise operators lower to prelude
+calls such as `remainder` and `shift-left`.
+
+**Metaprogramming.** No quasi-quotation is required. Three pieces cover it:
+
+- *Building code:* a parsed, parameterized syntax template whose instantiation yields a `syntax`
+  value, in the manner of D's `mixin template`. A bare `syntax { ... }` block with no parameters is
+  only a constant and earns little; the parameters are what make it compose with ordinary
+  compile-time functions. This is quasi-quotation in substance, with the holes declared by name up
+  front rather than marked inline.
+- *Inspecting code:* compiler hooks. `function-spec-of`, `members-of`, `fields-of`, and
+  `modules-of` already exist for this; a function's body is reached through `FunctionSpec`. A
+  template cannot do this job, so the reflection records must be specified precisely (design
+  review finding 69).
+- *Splicing code:* `mixin`, unchanged.
+
+D's string mixins have no counterpart: generated text never becomes source. Calling a macro needs
+nothing special in any frontend, because an argument to a callee with a `syntax` parameter is
+retained unevaluated. A macro written in CoLisp is callable from the C-like syntax once compiled.
+
+### What the exercise asks of the language
+
+- Types should be structured nodes in the AST rather than canonical text, so a frontend with a
+  different type spelling does not have to print another frontend's.
+- The source envelope's `language` field gains a value, and the compact provider shorthand (a
+  leading `(` selects CoLisp, anything else Co-Forth) cannot identify a third language, which must
+  always be tagged explicitly.
+- Every feature needs a spelling, or a stated reason for having none, in each syntax. The execution
+  vectors record the reason when a vector has one spelling only.
 
 ## Definition of done
 
@@ -6049,4 +6714,10 @@ The project reaches the intended architecture when:
 - independent executions and agents do not require a process-wide GIL;
 - the interpreter remains the reference implementation;
 - the optional Cranelift tier passes differential, security, cancellation, transaction, and
-  performance gates without changing observable language behavior.
+  performance gates without changing observable language behavior;
+- the comptime-hook catalog (`members-of`, `fields-of`, `modules-of`, `FunctionSpec`, and any later
+  addition) carries conformance fixtures — fixed input, exact expected output — checked against every
+  implementation that claims to speak the language/ABI, not documented only as one reference
+  compiler's observed behavior ("a third, independent cause... `__traits` has no specification to
+  conform to, only a vendored reference frontend," "Generics, concepts, dispatch, and
+  metaprogramming," above).

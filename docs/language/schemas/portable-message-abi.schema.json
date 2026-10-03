@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finch.dev/schema/language/portable-message-abi-v2.json",
+  "title": "Finch canonical serialized effect/RPC message",
+  "$comment": "Never used as the native in-process calling convention. Integer identities are fixed-width lowercase hex.",
+  "oneOf": [
+    {"$ref": "#/$defs/call"}, {"$ref": "#/$defs/result"},
+    {"$ref": "#/$defs/effect"}, {"$ref": "#/$defs/resume"}
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["schema_version", "message_kind", "interface_digest", "operation_key", "execution_id", "generation", "sequence"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "message_kind": {"enum": ["call", "result", "effect", "resume"]},
+        "interface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "operation_key": {"$ref": "#/$defs/u32"},
+        "execution_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "generation": {"$ref": "#/$defs/u64"}, "sequence": {"$ref": "#/$defs/u64"}
+      }
+    },
+    "call": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["schema_version", "message_kind", "interface_digest", "operation_key", "execution_id", "generation", "sequence", "arguments"],
+         "properties": {
+           "schema_version": {"const": 2}, "message_kind": {"const": "call"},
+           "interface_digest": {"type": "string"}, "operation_key": {"$ref": "#/$defs/u32"}, "execution_id": {"type": "string"},
+           "generation": {"$ref": "#/$defs/u64"}, "sequence": {"$ref": "#/$defs/u64"},
+           "arguments": {"type": "array", "items": {"$ref": "#/$defs/argument"}}
+         }}
+      ]
+    },
+    "result": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["schema_version", "message_kind", "interface_digest", "operation_key", "execution_id", "generation", "sequence", "status", "result", "diagnostic"],
+         "properties": {
+           "schema_version": {"const": 2}, "message_kind": {"const": "result"},
+           "interface_digest": {"type": "string"}, "operation_key": {"$ref": "#/$defs/u32"}, "execution_id": {"type": "string"},
+           "generation": {"$ref": "#/$defs/u64"}, "sequence": {"$ref": "#/$defs/u64"},
+           "status": {"enum": ["ok", "raised", "trap", "cancelled", "denied", "resource-exhausted", "locked-down"]},
+           "result": {"$ref": "#/$defs/result_value"}, "diagnostic": {"$ref": "#/$defs/diagnostic"}
+         },
+         "allOf": [
+           {"if": {"properties": {"status": {"const": "ok"}}}, "then": {"properties": {"diagnostic": {"type": "null"}}}, "else": {"properties": {"diagnostic": {"type": "object"}}}},
+           {"if": {"properties": {"status": {"const": "raised"}}}, "then": {"properties": {"result": {"$ref": "#/$defs/raised_value"}}}}
+         ]}
+      ]
+    },
+    "effect": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["schema_version", "message_kind", "interface_digest", "operation_key", "execution_id", "generation", "sequence", "request_id", "effect_sequence", "arguments"],
+         "properties": {
+           "schema_version": {"const": 2}, "message_kind": {"const": "effect"},
+           "interface_digest": {"type": "string"}, "operation_key": {"$ref": "#/$defs/u32"}, "execution_id": {"type": "string"},
+           "generation": {"$ref": "#/$defs/u64"}, "sequence": {"$ref": "#/$defs/u64"},
+           "request_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "effect_sequence": {"$ref": "#/$defs/u64"},
+           "arguments": {"type": "array", "items": {"$ref": "#/$defs/argument"}}
+         }}
+      ]
+    },
+    "resume": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["schema_version", "message_kind", "interface_digest", "operation_key", "execution_id", "generation", "sequence", "request_id", "effect_sequence", "resume"],
+         "properties": {
+           "schema_version": {"const": 2}, "message_kind": {"const": "resume"},
+           "interface_digest": {"type": "string"}, "operation_key": {"$ref": "#/$defs/u32"}, "execution_id": {"type": "string"},
+           "generation": {"$ref": "#/$defs/u64"}, "sequence": {"$ref": "#/$defs/u64"},
+           "request_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "effect_sequence": {"$ref": "#/$defs/u64"},
+           "resume": {"$ref": "#/$defs/result_value"}
+         }}
+      ]
+    },
+    "argument": {
+      "type": "object", "additionalProperties": false, "required": ["ownership", "type_key", "value"],
+      "properties": {"ownership": {"enum": ["borrow", "borrow-mut", "steal"]}, "type_key": {"type": "string", "minLength": 1}, "value": {"$ref": "#/$defs/wire_value"}}
+    },
+    "result_value": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["ownership", "type_key", "value"], "properties": {"ownership": {"const": "inline"}, "type_key": {"type": "string"}, "value": {"$ref": "#/$defs/wire_value"}}},
+        {"type": "object", "additionalProperties": false, "required": ["ownership", "type_key", "value", "release_operation_key"], "properties": {"ownership": {"const": "owned"}, "type_key": {"type": "string"}, "value": {"$ref": "#/$defs/opaque_handle"}, "release_operation_key": {"$ref": "#/$defs/u32"}}},
+        {"type": "object", "additionalProperties": false, "required": ["ownership"], "properties": {"ownership": {"const": "none"}}}
+      ]
+    },
+    "raised_value": {
+      "type": "object", "additionalProperties": false, "required": ["ownership", "type_key", "value", "provenance"],
+      "properties": {"ownership": {"const": "inline"}, "type_key": {"type": "string"}, "value": {"$ref": "#/$defs/wire_value"}, "provenance": {"type": "array", "items": {"type": "string"}}}
+    },
+    "diagnostic": {"oneOf": [{"type": "null"}, {"type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {"$ref": "#/$defs/wire_value"}}}]},
+    "u32": {"type": "string", "pattern": "^[0-9a-f]{8}$"}, "u64": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "wire_value": {"oneOf": [{"type": "null"}, {"type": "boolean"}, {"$ref": "#/$defs/scalar"}, {"$ref": "#/$defs/stable_record"}, {"$ref": "#/$defs/opaque_handle"}, {"type": "array", "items": {"$ref": "#/$defs/wire_value"}}]},
+    "scalar": {
+      "type": "object", "additionalProperties": false, "required": ["encoding", "data"],
+      "properties": {
+        "encoding": {"enum": ["i8-le", "u8-le", "i16-le", "u16-le", "i32-le", "u32-le", "i64-le", "u64-le", "f32-ieee-le", "f64-ieee-le", "unicode-scalar-le", "bytes-hex", "utf8-hex"]},
+        "data": {"type": "string", "pattern": "^(?:[0-9a-f]{2})*$"}
+      }
+    },
+    "stable_record": {
+      "type": "object", "additionalProperties": false, "required": ["encoding", "interface_digest", "type_key", "layout_digest", "version", "data"],
+      "properties": {"encoding": {"const": "stable-record"}, "interface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "type_key": {"type": "string"}, "layout_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "version": {"$ref": "#/$defs/u32"}, "data": {"type": "string", "pattern": "^(?:[0-9a-f]{2})*$"}}
+    },
+    "opaque_handle": {
+      "type": "object", "additionalProperties": false, "required": ["encoding", "resource_key", "handle_id", "generation"],
+      "properties": {"encoding": {"const": "opaque-handle"}, "resource_key": {"type": "string"}, "handle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "generation": {"$ref": "#/$defs/u64"}}
+    }
+  }
+}
