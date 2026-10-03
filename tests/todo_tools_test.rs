@@ -9,7 +9,6 @@ use finch::tools::ToolContext;
 use finch::tools::{TodoItem, TodoList, TodoPriority, TodoStatus};
 use finch::tools::{TodoReadTool, TodoWriteTool};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 fn make_list() -> Arc<std::sync::RwLock<TodoList>> {
     Arc::new(std::sync::RwLock::new(TodoList::default()))

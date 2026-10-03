@@ -684,7 +684,6 @@ fn test_committed_messages_reach_terminal_scrollback_under_mouse_capture() {
         &session.transcript_bytes(),
     );
 
-    println!("SCROLLBACK: {:#?}", vt.scrollback);
     let missing: Vec<&str> = MARKERS
         .iter()
         .copied()
