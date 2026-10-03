@@ -213,11 +213,7 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
             palette.participant_backgrounds[i] = span_color_from_ratatui_color(bg);
         }
     }
-    palette.hover_background = if colors.is_dark() {
-        SpanColor::Rgb(52, 54, 60)
-    } else {
-        SpanColor::Rgb(225, 225, 230)
-    };
+    palette.hover_background = span_color_from_ratatui_color(colors.hover_background());
     palette
 }
 
@@ -385,13 +381,13 @@ mod tests {
         );
         assert_eq!(
             palette.user_background,
-            SpanColor::Rgb(38, 38, 42),
-            "local user band maps to (38, 38, 42) in the dark scheme"
+            SpanColor::Rgb(24, 24, 27),
+            "local user band maps to the softened near-black in the dark scheme"
         );
         assert_eq!(
             palette.hover_background,
-            SpanColor::Rgb(52, 54, 60),
-            "hover background maps to (52, 54, 60) in the dark scheme"
+            SpanColor::Rgb(36, 38, 42),
+            "hover background maps to the softened dark-scheme hover color"
         );
     }
 
@@ -419,10 +415,9 @@ mod tests {
                 assert_eq!(palette.participant_backgrounds[i], expected_part_bg);
             }
 
-            let expected_hover = if scheme.is_dark() {
-                SpanColor::Rgb(52, 54, 60)
-            } else {
-                SpanColor::Rgb(225, 225, 230)
+            let expected_hover = match scheme.hover_background() {
+                ratatui::style::Color::Rgb(r, g, b) => SpanColor::Rgb(r, g, b),
+                _ => panic!("expected RGB hover background"),
             };
             assert_eq!(palette.hover_background, expected_hover);
         }
