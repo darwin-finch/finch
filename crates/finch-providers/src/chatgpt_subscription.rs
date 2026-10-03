@@ -942,7 +942,7 @@ fn catalog_model_matches_request(model: &CatalogModel, requested_model: &str) ->
 
 fn validate_model(model: &str) -> Result<()> {
     if !matches!(model, DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1") {
-        bail!("ChatGPT subscription supports only the pinned GPT-5.6 Sol and GPT-6.1 Sol catalog entries");
+        bail!("ChatGPT subscription only supports GPT-5.6 Sol and GPT-6.1 Sol");
     }
     Ok(())
 }

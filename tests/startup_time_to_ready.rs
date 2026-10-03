@@ -822,7 +822,7 @@ fn test_cli_help_reports_the_real_finch_identity() {
 
 #[test]
 fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
-    let expected = format!("finch {} - {}", env!("CARGO_PKG_VERSION"), EXPECTED_ABOUT);
+    let expected = format!("finch {} - {}", finch::VERSION, EXPECTED_ABOUT);
 
     let interactive_fixture = Fixture::new(0);
     let mut interactive = Session::spawn_with_args(&interactive_fixture, &["--raw"]);
@@ -1304,7 +1304,7 @@ fn test_interactive_startup_reports_every_phase_and_reaches_input_ready() {
     session.send_line("/exit");
     let status = session.wait_for_exit();
     let terminal = session.readable_transcript();
-    let expected_version = format!("finch v{}", env!("CARGO_PKG_VERSION"));
+    let expected_version = format!("finch v{}", finch::VERSION);
     assert!(
         status.success()
             && terminal.contains(&expected_version)
