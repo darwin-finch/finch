@@ -404,6 +404,12 @@ pub(super) fn handle_wizard_mouse(state: &mut WizardState, mouse: crossterm::eve
         {
             if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_ref() {
                 if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                    let code = presentation.user_code.replace("-", "");
+                    if !code.is_empty() {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(code);
+                        }
+                    }
                     open_browser_silently(&presentation.verification_uri);
                 }
             }

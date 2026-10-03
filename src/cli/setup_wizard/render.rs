@@ -1324,6 +1324,10 @@ fn cloud_provider_id(provider_idx: usize) -> &'static str {
 /// The add-time device sign-in card (#424/#705). Every state is plain,
 /// speakable text: starting, the one-time code with its verification URL, the
 /// authenticated account, or the terminal failure cause with recovery keys.
+fn display_device_code(code: &str) -> String {
+    code.replace('-', "")
+}
+
 fn device_auth_card(
     provider_idx: usize,
     provider_name: &str,
@@ -1379,9 +1383,10 @@ fn device_auth_card(
                     Some(Color::Cyan),
                 ));
                 if !presentation.user_code.is_empty() {
+                    let code = presentation.user_code.replace("-", "");
                     body.push(wizard_line(
-                        &format!("One-time code: {}", presentation.user_code),
-                        Color::White,
+                        &format!("One-time code: {}", code),
+                        Color::Cyan,
                     ));
                     body.push(WizardLine::blank());
                     body.push(wizard_plain(
@@ -1398,7 +1403,7 @@ fn device_auth_card(
                     ));
                 }
                 controls = wizard_line(
-                    "O / Enter / Click: Open in browser | Esc: Cancel",
+                    "O / Enter / Click: Open & Copy Code | Esc: Cancel",
                     Color::Yellow,
                 );
             }
