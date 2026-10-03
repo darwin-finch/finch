@@ -1728,7 +1728,7 @@ fn test_device_code_overlay_claims_a_card_with_chrome_inside_it() {
     let rows = frame.to_shadow_buffer(80, 24).rows_as_text();
     let card_text = rows[card.y..card.y + card.height].join("\n");
     assert!(
-        card_text.contains("One-time code: CODE-5678")
+        card_text.contains("One-time code: CODE5678")
             && card_text.contains("Open: https://auth.openai.com/activate"),
         "the device code and verification URL must blit through the shadow buffer; card:\n{card_text}"
     );
@@ -7726,7 +7726,7 @@ fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("One-time code: CODE-1234")
+        rendered.contains("One-time code: CODE1234")
             && rendered.contains("Open: https://auth.openai.com/activate"),
         "the dialog must present the code and verification URL as speakable text; rendered={rendered}"
     );
@@ -8903,7 +8903,7 @@ fn test_device_dialog_advertises_browser_open_controls() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("O / Enter / Click: Open in browser | Esc: Cancel"),
+        rendered.contains("O / Enter / Click: Open & Copy Code | Esc: Cancel"),
         "the dialog must advertise browser open and cancellation keys; rendered={rendered}"
     );
 }

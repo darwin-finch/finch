@@ -967,6 +967,12 @@ pub(super) fn handle_models_input(
                     {
                         if c == 'o' || c == 'O' {
                             if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                let code = presentation.user_code.replace("-", "");
+                                if !code.is_empty() {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(code);
+                                    }
+                                }
                                 open_browser_silently(&presentation.verification_uri);
                             }
                         }
@@ -1651,6 +1657,12 @@ pub(super) fn handle_models_input(
                                 // Still running: attempt to open the URL in the browser on Enter.
                                 None => {
                                     if let Some(presentation) = pending.lock().unwrap().as_ref() {
+                                        let code = presentation.user_code.replace("-", "");
+                                        if !code.is_empty() {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(code);
+                                            }
+                                        }
                                         open_browser_silently(&presentation.verification_uri);
                                     }
                                     Some(AddProviderStep::DeviceAuth {
