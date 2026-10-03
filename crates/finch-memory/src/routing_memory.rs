@@ -80,6 +80,16 @@ static ROUTING_LOAD_PAUSES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
+fn routing_load_pause_key(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|error| {
+        panic!(
+            "the routing-load pause requires an existing database path ({}): {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(test)]
 pub(crate) struct RoutingLoadPauseRegistration {
     path: std::path::PathBuf,
     pause: std::sync::Arc<RoutingLoadPause>,
@@ -108,21 +118,24 @@ pub(crate) fn register_routing_load_pause(
     RoutingLoadPauseRegistration,
     std::sync::Arc<RoutingLoadPause>,
 ) {
+    let key = routing_load_pause_key(&path);
     let pause = std::sync::Arc::new(RoutingLoadPause::default());
     let mut pauses = ROUTING_LOAD_PAUSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
         pauses
-            .insert(path.clone(), std::sync::Arc::clone(&pause))
+            .insert(key.clone(), std::sync::Arc::clone(&pause))
             .is_none(),
-        "a routing load pause is already registered for {}",
-        path.display()
+        "a routing load pause is already registered for existing-file identity {} \
+         (registered spelling {})",
+        key.display(),
+        path.display(),
     );
     drop(pauses);
     (
         RoutingLoadPauseRegistration {
-            path,
+            path: key,
             pause: std::sync::Arc::clone(&pause),
         },
         pause,
@@ -134,10 +147,11 @@ fn pause_after_routing_rows(conn: &Connection) {
     let Some(path) = conn.path().map(std::path::PathBuf::from) else {
         return;
     };
+    let key = routing_load_pause_key(&path);
     let pause = ROUTING_LOAD_PAUSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&path);
+        .remove(&key);
     if let Some(pause) = pause {
         pause.pause();
     }

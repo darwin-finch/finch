@@ -142,6 +142,11 @@ modules, including `memory_status`, are private.
   `test_concurrent_duplicate_brain_retry_projects_exactly_once_under_writer_fence`,
   `test_failed_stale_writer_keeps_installed_tree_and_token_then_recovers`, and
   `test_same_instance_insert_and_removal_do_not_self_reload` in `src/lib.rs` pin these guarantees.
+  The real-WAL load pauses use the database file's canonical existing-file identity, so equivalent
+  spellings such as macOS `/var/...` and `/private/var/...` reach the same registered boundary.
+  The distinct-writer regression explicitly finishes both instances' empty startup recovery passes
+  before enabling its embedding barrier, so each successful outcome belongs to its asserted caller
+  rather than to another instance's legal startup repair.
 - **`MemorySystem::remove_memory` (issue #1329)** is the first production caller of
   `RoutingTree::remove_point`, reached through `RoutingMemTree::remove_within`
   (`src/routing_memory.rs`) inside the fenced transaction `MemorySystem::remove_memory` owns. It
