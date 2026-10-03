@@ -662,21 +662,20 @@ mod tests {
         );
         unit.set_complete();
         let node = try_project_for_test(&unit, &colors()).expect("tool group projects");
-        let output = &node.children[0].children[1];
+        let call = &node.children[0];
         assert_eq!(
-            output.role,
+            call.role,
             NodeRole::ToolCall,
-            "the control must exercise a real tool output row; got {:?}",
-            node.children[0]
+            "the control must exercise a real tool call row; got {call:?}"
         );
         assert_eq!(
-            output.body,
+            call.body,
             &["```python", "print('x')", "```", "**literal**", "- stays",],
             "tool output is byte-exact raw text, never markdown-rendered: {:?}",
-            output.body
+            call.body
         );
         assert_eq!(
-            output.raw_body, None,
+            call.raw_body, None,
             "tool output gains no markdown raw-body split"
         );
     }

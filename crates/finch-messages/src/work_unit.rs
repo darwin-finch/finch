@@ -2008,11 +2008,7 @@ mod tests {
         let running = try_project_for_test(&unit, &colors()).unwrap();
         assert!(running.default_open);
         assert!(running.children[0].default_open);
-        assert_eq!(running.children[0].children.len(), 1);
-        assert_eq!(
-            running.children[0].children[0].role,
-            finch_ui_model::NodeRole::Input
-        );
+        assert_eq!(running.children[0].children.len(), 0);
 
         unit.fail_row(row, "catalog unavailable");
         unit.set_failed();
@@ -2022,7 +2018,7 @@ mod tests {
         assert!(failed
             .label
             .contains("catalog.validate provider=chatgpt failed: catalog unavailable"));
-        assert_eq!(failed.children[0].children.len(), 1);
+        assert_eq!(failed.children[0].children.len(), 0);
 
         let completed = WorkUnit::new("Tools");
         let row = completed.add_row("read config");
@@ -2031,7 +2027,8 @@ mod tests {
         let projected = try_project_for_test(&completed, &colors()).unwrap();
         assert!(!projected.default_open);
         assert!(!projected.children[0].default_open);
-        assert_eq!(projected.children[0].children.len(), 2);
+        assert_eq!(projected.children[0].children.len(), 0);
+        assert_eq!(projected.children[0].body.len(), 2);
     }
 
     #[test]
@@ -2230,12 +2227,6 @@ mod tests {
         let projected = try_project_for_test(&unit, &colors()).unwrap();
         assert!(projected.default_open);
         assert!(projected.children[0].default_open);
-        let output = projected.children[0]
-            .children
-            .iter()
-            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
-            .unwrap();
-        assert!(output.default_open);
     }
 
     #[test]
@@ -2642,19 +2633,11 @@ mod tests {
             "child must keep the bash label; got {}",
             call.label
         );
-        let output = call
-            .children
-            .iter()
-            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
-            .unwrap_or_else(|| {
-                panic!("loop body must be an expandable output child; call={call:?}")
-            });
         assert!(
-            output
-                .body
+            call.body
                 .iter()
                 .any(|line| line.contains("produced no new information")),
-            "expanding the failed call must show the full loop diagnostic; output={output:?}"
+            "expanding the failed call must show the full loop diagnostic; output={call:?}"
         );
     }
 

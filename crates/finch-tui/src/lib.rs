@@ -2235,7 +2235,11 @@ impl TuiRenderer {
                 }
                 if retained_window.is_none() {
                     self.viewport_invalidated = true;
-                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+                    return self.redraw_full_viewport_inner_to(
+                        out,
+                        true,
+                        Some((term_width, term_h)),
+                    );
                 }
             }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
@@ -3624,10 +3628,10 @@ impl TuiRenderer {
 
     /// Keyboard equivalents for a bounded tool-result control (#656).
     ///
-    /// When a `ToolOutput` row holds the accordion focus: Up/Down/PageUp/
-    /// PageDown scroll that result's child viewport, Enter/Space open the
-    /// expanded surface. Any other key, or a focused row that is not a tool
-    /// result, is left for the accordion and the input area.
+    /// When a `ToolCall` row holds the accordion focus: Up/Down/PageUp/
+    /// PageDown scroll that result's viewport, Enter/Space open the expanded
+    /// surface. Any other key, or a focused row that is not a tool call, is left
+    /// for the accordion and the input area.
     fn handle_tool_viewport_key(&mut self, key: KeyEvent) -> bool {
         let Some(focused) = self.accordion.focused.clone() else {
             return false;

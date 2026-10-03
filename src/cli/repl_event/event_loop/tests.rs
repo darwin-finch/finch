@@ -1160,19 +1160,11 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 "labeled bash row must be Error; got {}",
                 call.label
             );
-            let output_row = call
-                .children
-                .iter()
-                .find(|child| child.role == crate::cli::test_projection::NodeRole::ToolOutput)
-                .unwrap_or_else(|| {
-                    panic!("long loop diagnostic must be expandable output; call={call:?}")
-                });
             assert!(
-                output_row
-                    .body
+                call.body
                     .iter()
                     .any(|line| line.contains("produced no new information")),
-                "expanding the failed bash row must show the full loop diagnostic; output={output_row:?}"
+                "expanding the failed bash row must show the full loop diagnostic; call={call:?}"
             );
         })
         .await;
@@ -2475,18 +2467,8 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert_eq!(tool.role, crate::cli::test_projection::NodeRole::ToolCall);
     assert_eq!(tool.id.message_id, unit.id());
     assert_eq!(tool.id.path, vec![1, 1]);
-    assert_eq!(tool.children.len(), 2);
-    assert_eq!(
-        tool.children[0].role,
-        crate::cli::test_projection::NodeRole::Input
-    );
-    assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
-    assert_eq!(
-        tool.children[1].role,
-        crate::cli::test_projection::NodeRole::ToolOutput
-    );
-    assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
-    assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
+    assert!(tool.children.is_empty());
+    assert!(tool.body.iter().any(|line| line == "value=7"));
 
     let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
     assert!(canonical.contains("read_cache"));

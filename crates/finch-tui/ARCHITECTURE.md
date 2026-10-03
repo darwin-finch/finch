@@ -145,11 +145,12 @@ literal text. Program source/output, tool rows, and user input are structurally 
 path; the dialog-option `markdown` preview keeps its own rendering.
 
 **Bounded tool-result controls** (`crates/finch-tui/src/tool_viewport.rs`):
-- Every `ToolOutput` transcript row is a reusable semantic control with a bounded
-  child viewport (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is
-  truncated to the terminal width, so the bound is a hard row bound; one
-  plain-text status row names the visible range, the total, and the
-  scroll/expand affordances (`… lines 1–3 of 40 — ↑/↓ scroll · Enter expand`).
+- Every expanded `ToolCall` transcript row displays its result directly in a reusable semantic
+  control; verbose input JSON remains represented only by the compact call label instead of
+  consuming separate `Input`/`Output` tree rows. The result uses a bounded viewport
+  (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is truncated to the terminal width, so
+  the bound is a hard row bound; one plain-text status row names the visible range, the total, and
+  the scroll/expand affordances (`… lines 1–3 of 40 — ↑/↓ scroll · Enter expand`).
 - Per-row scroll offsets live in `ToolViewportState`, keyed by the append-stable
   `view_model::RowId` — interleaved tool updates never reset them. Hit regions are
   rebuilt from physical-row geometry after every frame and resize, mirroring the

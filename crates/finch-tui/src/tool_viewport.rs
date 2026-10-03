@@ -167,8 +167,8 @@ impl ToolViewportState {
 
     /// Apply the bound to one message's projected lines.
     ///
-    /// Consecutive body lines of a `ToolOutput` row are replaced by the
-    /// window selected by that row's child scroll offset, each line truncated
+    /// Consecutive body lines of a `ToolCall` row are replaced by the
+    /// window selected by that row's result scroll offset, each line truncated
     /// to the terminal width, plus one plain-text status row exposing the
     /// visible range, the total, and the scroll/expand affordances. Everything
     /// else passes through untouched, so this bound can never widen any other
