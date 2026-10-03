@@ -9297,16 +9297,24 @@ async fn test_pending_user_messages_restored_in_order_when_continuation_fails() 
                     .iter()
                     .map(|(text, _, _)| text.as_str())
                     .collect::<Vec<_>>(),
-                ["and also this"],
-                "QueryFailed must start the first restored turn and leave the rest queued; queued={:?}",
+                [] as [&str; 0],
+                "QueryFailed must drain the queue and restore to composer; queued={:?}",
                 event_loop.pending_queries
             );
+            
+            let restored = event_loop.tui_renderer.lock().await.get_input_draft();
+            assert_eq!(
+                restored,
+                "steer now\nand also this",
+                "the queued turns must be restored into the TUI input composer"
+            );
+
             let after_fail = event_loop.conversation.read().await.get_messages();
             assert!(
-                user_text_messages(&after_fail)
+                !user_text_messages(&after_fail)
                     .iter()
                     .any(|text| text == "steer now"),
-                "the first restored turn must start as its own query; messages={after_fail:?}"
+                "the first restored turn must not start as its own query; messages={after_fail:?}"
             );
         })
         .await;
