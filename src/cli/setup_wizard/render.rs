@@ -1325,7 +1325,7 @@ fn cloud_provider_id(provider_idx: usize) -> &'static str {
 /// speakable text: starting, the one-time code with its verification URL, the
 /// authenticated account, or the terminal failure cause with recovery keys.
 
-fn device_auth_card(
+pub(super) fn device_auth_card(
     provider_idx: usize,
     provider_name: &str,
     pending: &std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
@@ -1374,13 +1374,8 @@ fn device_auth_card(
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
-                let display_url = if presentation.verification_uri.len() > 60 {
-                    "Google device sign-in"
-                } else {
-                    &presentation.verification_uri
-                };
                 body.push(wizard_url(
-                    &format!("Open: {}", display_url),
+                    "Open in Browser",
                     &presentation.verification_uri,
                     Some(Color::Cyan),
                 ));
