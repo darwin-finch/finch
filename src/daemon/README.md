@@ -13,9 +13,12 @@ Two callers show the boundary:
    worker modes retain their operator-visible output. The executable owns server, provider,
    and model composition after this lifecycle gate.
 2. [`DaemonClient`](../client/daemon_client.rs) calls `ensure_daemon_running` when auto-spawn is
-   enabled, including a bounded retry after a connection failure. The daemon module probes
-   health and protocol compatibility before reusing or spawning a process; the client owns
-   request retries and whether auto-spawn is enabled.
+   enabled, including a bounded retry after a connection failure. That CLI-oriented wrapper uses
+   the current executable. A sibling frontend instead constructs `LocalDaemonAcquisition` with
+   the absolute path of the exact Finch executable it owns. The daemon module probes health and
+   protocol compatibility before reusing or spawning a process; the client owns request retries
+   and whether auto-spawn is enabled. Cold acquisitions are serialized separately from the
+   daemon's process-lifetime lock so concurrent frontends converge on one launch.
 
 Read [AGENTS.md](AGENTS.md) for isolation, log, and socket invariants, and [`mod.rs`](mod.rs)
 for the flat callable facade. The application-level upgrade preflight remains here because

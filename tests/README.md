@@ -110,7 +110,8 @@ Finch child PID and never sends a signal by process name.
 
 ### Daemon Tests (`daemon_integration_test.rs`)
 
-1. **`test_daemon_spawn_and_health`** - Verifies daemon can start and health endpoint responds
+1. **`test_daemon_spawn_and_health`** - Verifies the supervised daemon starts and its compatible
+   HTTP and IPC endpoints both accept a client handshake
 2. **`test_daemon_query`** - Tests full query flow through daemon
 3. **`test_daemon_config_parsing`** - Validates isolated endpoint configuration
 
