@@ -351,7 +351,7 @@ impl GeminiAuthService {
         let app = axum::Router::new()
             .route("/callback", get(callback_handler))
             .with_state(state);
-        let server_cancel = cancel.child_token();
+        let server_cancel = detached_loopback_server_cancel(&cancel);
         let serve_cancel = server_cancel.clone();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -593,6 +593,13 @@ struct CallbackState {
     result: Arc<Mutex<Option<oneshot::Sender<Result<String>>>>>,
 }
 
+fn detached_loopback_server_cancel(_flow_cancel: &CancellationToken) -> CancellationToken {
+    // The listener has a shorter lifetime than the OAuth operation. Shutting it
+    // down after the callback must not cancel the PKCE exchange or token
+    // verification that follows on the flow token.
+    CancellationToken::new()
+}
+
 async fn wait_for_callback(
     listener: tokio::net::TcpListener,
     redirect_uri: String,
@@ -607,7 +614,7 @@ async fn wait_for_callback(
     let app = axum::Router::new()
         .route("/callback", get(callback_handler))
         .with_state(state);
-    let server_cancel = cancel.child_token();
+    let server_cancel = detached_loopback_server_cancel(&cancel);
     let serve_cancel = server_cancel.clone();
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -851,6 +858,24 @@ mod tests {
             revoked: false,
             mutation_pending: false,
         }
+    }
+
+    #[test]
+    fn loopback_server_cancellation_is_detached_from_oauth_flow() {
+        let flow_cancel = CancellationToken::new();
+        let server_cancel = detached_loopback_server_cancel(&flow_cancel);
+
+        flow_cancel.cancel();
+
+        assert!(
+            !server_cancel.is_cancelled(),
+            "Gemini loopback listener cancellation must be independently owned so flow cancellation is handled explicitly"
+        );
+        server_cancel.cancel();
+        assert!(
+            server_cancel.is_cancelled(),
+            "Gemini loopback listener must remain directly cancellable after detaching it from the OAuth flow"
+        );
     }
 
     #[test]
