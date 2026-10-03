@@ -539,9 +539,7 @@ fn present_device_authorization(
         "This code expires in {} minutes. Press Ctrl+C to cancel.",
         expires_in.as_secs().div_ceil(60)
     );
-    println!(
-        "This uses SuperGrok / Grok Business entitlement. It is not an xAI Console API key and will not fall back to API billing."
-    );
+    println!("This uses your Grok subscription.");
     io::stdout().flush()?;
     if presentation.copy_code {
         let mut clipboard = arboard::Clipboard::new()

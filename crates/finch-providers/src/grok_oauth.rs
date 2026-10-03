@@ -40,7 +40,7 @@ pub const GROK_SESSION_TOKEN_HEADER: &str = "xai-grok-cli";
 const GROK_OAUTH_REFERRER: &str = "grok-build";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const MAX_DEVICE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const MIN_DEVICE_LIFETIME: Duration = Duration::from_secs(1);
 const MAX_ACCESS_TOKEN_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 const GROK_DEVICE_WIRE_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write";
@@ -972,12 +972,13 @@ mod tests {
                     "device_code": "device-secret",
                     "user_code": "ABCD-EFGH",
                     "verification_uri": "http://127.0.0.1:12345/device",
-                    "expires_in": 600,
+                    "expires_in": 1800,
                     "interval": 1
                 }),
             )
             .unwrap();
         assert_eq!(pending.user_code, "ABCD-EFGH");
+        assert_eq!(pending.expires_in, Duration::from_secs(1800));
         let poll_request = dialect.device_poll_request(&pending).unwrap();
         assert_eq!(poll_request.endpoint, "http://127.0.0.1:12345/oauth2/token");
         assert_eq!(
