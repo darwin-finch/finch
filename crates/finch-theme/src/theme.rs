@@ -35,6 +35,7 @@ impl ColorTheme {
 
     fn dark_scheme() -> ColorScheme {
         ColorScheme {
+            background: default_black(),
             status: StatusColors {
                 live_stats: default_green(),
                 training: default_dark_gray(),
@@ -67,6 +68,7 @@ impl ColorTheme {
 
     fn light_scheme() -> ColorScheme {
         ColorScheme {
+            background: ColorSpec::Named("white".to_string()),
             status: StatusColors {
                 live_stats: ColorSpec::Rgb(0, 128, 0), // Dark green
                 training: ColorSpec::Named("gray".to_string()),
@@ -99,6 +101,7 @@ impl ColorTheme {
 
     fn high_contrast_scheme() -> ColorScheme {
         ColorScheme {
+            background: default_black(),
             status: StatusColors {
                 live_stats: ColorSpec::Named("yellow".to_string()),
                 training: ColorSpec::Named("white".to_string()),
@@ -132,6 +135,7 @@ impl ColorTheme {
     fn solarized_scheme() -> ColorScheme {
         // Solarized Dark color palette
         ColorScheme {
+            background: ColorSpec::Rgb(0, 43, 54), // Solarized base03
             status: StatusColors {
                 live_stats: ColorSpec::Rgb(133, 153, 0), // Solarized green
                 training: ColorSpec::Rgb(88, 110, 117),  // Solarized base01
@@ -191,6 +195,10 @@ impl ColorTheme {
 /// Color scheme for TUI elements
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorScheme {
+    /// Terminal canvas background.
+    #[serde(default = "default_black")]
+    pub background: ColorSpec,
+
     /// Status bar colors
     #[serde(default = "default_status_colors")]
     pub status: StatusColors,
@@ -222,6 +230,7 @@ pub enum MessageBand {
 impl Default for ColorScheme {
     fn default() -> Self {
         Self {
+            background: default_black(),
             status: default_status_colors(),
             messages: default_message_colors(),
             ui: default_ui_colors(),
@@ -625,6 +634,17 @@ mod tests {
 
         // Check UI colors
         assert!(matches!(scheme.ui.border, ColorSpec::Named(_)));
+    }
+
+    #[test]
+    fn test_high_contrast_theme_forces_black_canvas_background() {
+        let scheme = ColorTheme::HighContrast.to_scheme();
+
+        assert_eq!(
+            scheme.background.to_color(),
+            Color::Black,
+            "High Contrast must force a black canvas instead of inheriting a light terminal background"
+        );
     }
 
     #[test]
