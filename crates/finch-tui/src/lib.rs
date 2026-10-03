@@ -2971,7 +2971,7 @@ impl TuiRenderer {
 
         if !plan.emit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(&mut stdout, self.colors.background.to_color())?;
+            prepare_canonical_commit_guarded(&mut stdout, self.colors.background.to_color().into())?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -4493,9 +4493,9 @@ impl TuiRenderer {
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
-            continue_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color())
+            continue_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
         } else {
-            begin_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color())
+            begin_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
         };
         if let Err(error) = paint {
             let _ = execute!(out, EndSynchronizedUpdate);

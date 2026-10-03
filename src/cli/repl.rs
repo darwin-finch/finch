@@ -2845,7 +2845,19 @@ impl Repl {
         drop(event_loop_phase);
 
         // Run the event loop
-        event_loop.run().await
+        let result = event_loop.run().await;
+
+        if result.is_err() {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                crossterm::cursor::Show
+            );
+        }
+
+        result
     }
 
     pub async fn run(&mut self) -> Result<()> {

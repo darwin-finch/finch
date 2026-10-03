@@ -1499,6 +1499,8 @@ fn install_panic_handler() {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
             cursor::Show,
             terminal::Clear(terminal::ClearType::FromCursorDown)
         );
