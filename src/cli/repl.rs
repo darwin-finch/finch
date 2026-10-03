@@ -1165,6 +1165,8 @@ impl Repl {
                 workspace_root.clone(),
             ),
         );
+        let _ = register_co_forth_tool_words(&program_runtime).await;
+
         #[cfg(target_os = "macos")]
         if config.features.gui_automation && is_interactive {
             let permission_context_matches =
@@ -5463,4 +5465,21 @@ mod model_download_status_tests {
             .iter()
             .all(|line| line.line_type != StatusLineType::DownloadProgress));
     }
+}
+
+pub async fn register_co_forth_tool_words(runtime: &crate::runtime::ProgramRuntime) -> anyhow::Result<()> {
+    runtime
+        .submit_typed_only(crate::runtime::ProgramSubmission {
+            language: finch_programs::ProgramLanguage::Forth,
+            source_id: Some("tool-words.forth".to_string()),
+            source: ": code_outline ( S path -- S text ! pure ) drop s\" \" ; \n: find_code ( S path S query -- S text ! pure ) drop drop s\" \" ;".to_string(),
+            intent: "tool words".to_string(),
+            effect: finch_programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: None,
+            budget: None,
+        })
+        .await?;
+    Ok(())
 }
