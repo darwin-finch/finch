@@ -1306,7 +1306,7 @@ pub(crate) fn plan_live_frame(
             None
         };
         frame.push(
-            span_render::lower_rendered_line(line, hover_bg)
+            span_render::lower_rendered_line(line, hover_bg, None)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -2121,7 +2121,7 @@ fn commit_complete_messages(
     Ok(content_rows)
 }
 
-fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
+fn prepare_canonical_commit(stdout: &mut impl Write, bg: crossterm::style::Color) -> Result<()> {
     // Previously committed rows are already in native history. Remove their
     // visible projection before the linefeed spool so a later commit cannot
     // append that projection to history a second time.
@@ -2129,8 +2129,10 @@ fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
     execute!(
         staged,
         BeginSynchronizedUpdate,
+        crossterm::style::SetBackgroundColor(bg),
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
+        crossterm::style::ResetColor,
         cursor::MoveTo(0, 0)
     )?;
     stdout.write_all(&staged)?;
@@ -2138,8 +2140,8 @@ fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn prepare_canonical_commit_guarded(stdout: &mut impl Write) -> Result<()> {
-    match prepare_canonical_commit(stdout) {
+fn prepare_canonical_commit_guarded(stdout: &mut impl Write, bg: crossterm::style::Color) -> Result<()> {
+    match prepare_canonical_commit(stdout, bg) {
         Ok(()) => Ok(()),
         Err(error) => {
             // BeginSynchronizedUpdate is the first command in preparation. A
@@ -2825,20 +2827,24 @@ fn begin_full_viewport_paint(
     stdout: &mut impl Write,
     plan: ViewportRedrawPlan,
     transcript: &[String],
+    bg: crossterm::style::Color,
 ) -> Result<()> {
     execute!(stdout, BeginSynchronizedUpdate)?;
-    continue_full_viewport_paint(stdout, plan, transcript)
+    continue_full_viewport_paint(stdout, plan, transcript, bg)
 }
 
 fn continue_full_viewport_paint(
     stdout: &mut impl Write,
     plan: ViewportRedrawPlan,
     transcript: &[String],
+    bg: crossterm::style::Color,
 ) -> Result<()> {
     execute!(
         stdout,
+        crossterm::style::SetBackgroundColor(bg),
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
+        crossterm::style::ResetColor,
         cursor::MoveTo(0, plan.transcript_top as u16)
     )?;
     for line in transcript {
@@ -2965,7 +2971,7 @@ impl TuiRenderer {
 
         if !plan.emit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(&mut stdout)?;
+            prepare_canonical_commit_guarded(&mut stdout, self.colors.background.to_color())?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -4481,14 +4487,15 @@ impl TuiRenderer {
                     } else {
                         None
                     },
+                    Some(span_render::span_color_from_spec(&self.colors.background)),
                 )
             })
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
-            continue_full_viewport_paint(out, plan, &painted_transcript)
+            continue_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color())
         } else {
-            begin_full_viewport_paint(out, plan, &painted_transcript)
+            begin_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color())
         };
         if let Err(error) = paint {
             let _ = execute!(out, EndSynchronizedUpdate);
@@ -6553,7 +6560,7 @@ mod tests {
         }
 
         lifecycle_bytes.clear();
-        prepare_canonical_commit(&mut lifecycle_bytes)
+        prepare_canonical_commit(&mut lifecycle_bytes, crossterm::style::Color::Reset)
             .expect("the production canonical transition must clear the visible projection");
         renderer.active_rows = 0;
         renderer.cursor_row_from_top = 0;
@@ -8535,7 +8542,7 @@ mod tests {
         let plan = viewport_redraw_plan(12, 6, 2);
         let mut bytes = Vec::new();
 
-        begin_full_viewport_paint(&mut bytes, plan, &["old".into(), "new".into()])
+        begin_full_viewport_paint(&mut bytes, plan, &["old".into(), "new".into()], crossterm::style::Color::Reset)
             .expect("paint commands");
 
         let commands = String::from_utf8(bytes).expect("ANSI commands are UTF-8");
@@ -8588,7 +8595,7 @@ mod tests {
             .collect::<Vec<_>>();
         let plan = viewport_redraw_plan(8, 2, 1);
         let mut bytes = Vec::new();
-        begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
+        begin_full_viewport_paint(&mut bytes, plan, &text, crossterm::style::Color::Reset).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
         assert!(
             !raw.contains("[collapsed]") && !raw.contains("[expanded]"),
@@ -8681,15 +8688,15 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0], None)
+                && span_render::lower_rendered_line(&literal_state[0], None, None)
                     == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0], None)
+                && !span_render::lower_rendered_line(&literal_state[0], None, None)
                     .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
             literal_state[0],
-            span_render::lower_rendered_line(&literal_state[0], None)
+            span_render::lower_rendered_line(&literal_state[0], None, None)
         );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
@@ -8772,7 +8779,7 @@ mod tests {
         assert_eq!(render_via_view_model(&state, &message, &colors), before);
 
         let mut bytes = Vec::new();
-        prepare_canonical_commit(&mut bytes).unwrap();
+        prepare_canonical_commit(&mut bytes, crossterm::style::Color::Reset).unwrap();
         let mut resize_printed = HashSet::new();
         commit_complete_messages(
             &mut bytes,
@@ -8921,7 +8928,7 @@ mod tests {
             bytes: Vec::new(),
             flushes: 0,
         };
-        assert!(prepare_canonical_commit_guarded(&mut output).is_err());
+        assert!(prepare_canonical_commit_guarded(&mut output, crossterm::style::Color::Reset).is_err());
 
         let raw = String::from_utf8(output.bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
@@ -10878,7 +10885,7 @@ mod tests {
         );
         // The scroll-window source is the projection itself; the lowering the
         // full-viewport paint applies renders the same bytes as the seam.
-        let lowered = span_render::lower_rendered_line(&styled[0], None);
+        let lowered = span_render::lower_rendered_line(&styled[0], None, None);
         assert_eq!(
             lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
             "the scrolled paint shows the styled row; got {lowered:?}"
@@ -11030,8 +11037,8 @@ mod tests {
         // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
         // Even when lowered in isolation (without line 0 having been painted),
         // continuation lines MUST contain ANSI foreground and background escape sequences!
-        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None);
-        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None);
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None, None);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None, None);
 
         assert_ne!(lowered_line1, "second line");
         assert_ne!(lowered_line2, "third line");
@@ -12864,7 +12871,7 @@ mod tests {
                 Vec::new()
             };
             let mut bytes = Vec::new();
-            begin_full_viewport_paint(&mut bytes, plan, &transcript).unwrap();
+            begin_full_viewport_paint(&mut bytes, plan, &transcript, crossterm::style::Color::Reset).unwrap();
             let mut active_rows = write_live_frame(&mut bytes, &frame, width).unwrap();
             execute!(bytes, EndSynchronizedUpdate).unwrap();
             terminal.feed(&bytes);

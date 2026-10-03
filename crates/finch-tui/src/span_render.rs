@@ -96,21 +96,32 @@ pub fn lower_spans(spans: &[Span]) -> String {
 /// itself carry SGR from an unmigrated projection — that path is unchanged).
 /// Measurement never runs on this string: SGR is zero-width and the plain
 /// `text` is what every row count reads.
-pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>) -> String {
-    let has_bg = force_bg.is_some() || line.spans.iter().any(|s| s.style.bg.is_some());
+pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>, canvas_bg: Option<SpanColor>) -> String {
+    let has_bg = force_bg.is_some() || canvas_bg.is_some() || line.spans.iter().any(|s| s.style.bg.is_some());
     let mut rendered = if line.spans.is_empty() {
-        if let Some(bg) = &force_bg {
-            let span = Span::styled(&line.text, SpanStyle::default().with_bg(bg.clone()));
+        let bg = force_bg.clone().or_else(|| canvas_bg.clone());
+        if let Some(bg) = bg {
+            let span = Span::styled(&line.text, SpanStyle::default().with_bg(bg));
             lower_span(&span)
         } else {
             line.text.clone()
         }
     } else {
-        if let Some(bg) = &force_bg {
+        if force_bg.is_some() || canvas_bg.is_some() {
             let spans = line
                 .spans
                 .iter()
-                .map(|s| Span::styled(&s.text, s.style.clone().with_bg(bg.clone())))
+                .map(|s| {
+                    let mut style = s.style.clone();
+                    if let Some(bg) = &force_bg {
+                        style.bg = Some(bg.clone());
+                    } else if style.bg.is_none() {
+                        if let Some(cbg) = &canvas_bg {
+                            style.bg = Some(cbg.clone());
+                        }
+                    }
+                    Span::styled(&s.text, style)
+                })
                 .collect::<Vec<_>>();
             lower_spans(&spans)
         } else {
@@ -141,7 +152,7 @@ pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanC
 /// Map a `ColorSpec` (the ColorScheme's serializable colour) to the span
 /// vocabulary's colour, with the same named-colour table the retired
 /// `format()` paths used.
-fn span_color_from_spec(spec: &finch_theme::ColorSpec) -> SpanColor {
+pub(crate) fn span_color_from_spec(spec: &finch_theme::ColorSpec) -> SpanColor {
     match spec {
         finch_theme::ColorSpec::Rgb(r, g, b) => SpanColor::Rgb(*r, *g, *b),
         finch_theme::ColorSpec::Named(name) => match name.to_lowercase().as_str() {
@@ -287,7 +298,7 @@ mod tests {
             ..RenderedTranscriptLine::default()
         };
         assert_eq!(
-            lower_rendered_line(&plain, None),
+            lower_rendered_line(&plain, None, None),
             "legacy \x1b[2mdim\x1b[0m",
             "span-free lines pass their bytes through untouched"
         );
@@ -296,7 +307,7 @@ mod tests {
             Span::plain(" Generating"),
         ]);
         assert_eq!(
-            lower_rendered_line(&styled, None),
+            lower_rendered_line(&styled, None, None),
             "\x1b[96m⏺\x1b[0m Generating"
         );
     }
@@ -309,14 +320,14 @@ mod tests {
             " ❯ hello",
             SpanStyle::fg(SpanColor::CYAN).with_bg(SpanColor::Rgb(38, 38, 42)),
         )]);
-        let lowered = lower_rendered_line(&user_line, None);
+        let lowered = lower_rendered_line(&user_line, None, None);
         assert!(
             lowered.ends_with("\x1b[K\x1b[0m"),
             "line with background must extend with \\x1b[K before reset; got {lowered:?}"
         );
 
         let hover_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
-        let hovered = lower_rendered_line(&hover_line, Some(SpanColor::Rgb(52, 54, 60)));
+        let hovered = lower_rendered_line(&hover_line, Some(SpanColor::Rgb(52, 54, 60)), None);
         assert!(
             hovered.ends_with("\x1b[K\x1b[0m"),
             "hovered line must extend background with \\x1b[K before reset; got {hovered:?}"
