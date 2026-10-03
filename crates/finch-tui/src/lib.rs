@@ -946,6 +946,13 @@ fn reanchor_shrinking_live_frame(
     if next_rows < previous_rows {
         execute!(
             out,
+            cursor::MoveTo(0, terminal_rows.saturating_sub(previous_rows) as u16)
+        )?;
+        for _ in 0..(previous_rows - next_rows) {
+            execute!(out, Clear(ClearType::CurrentLine), cursor::MoveDown(1))?;
+        }
+        execute!(
+            out,
             cursor::MoveTo(0, terminal_rows.saturating_sub(next_rows) as u16)
         )?;
     }
@@ -2220,6 +2227,17 @@ impl TuiRenderer {
                 term_width,
             );
             let rows = frame.lines.len();
+            if rows < self.last_live_frame_rows {
+                if self.selection.is_some() {
+                    self.selection = None;
+                    self.selection_press_candidate = None;
+                    self.previous_highlighted_rows.clear();
+                }
+                if retained_window.is_none() {
+                    self.viewport_invalidated = true;
+                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+                }
+            }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
             let rows = write_tiny_live_frame(out, &frame)?;
             execute!(out, EndSynchronizedUpdate)?;
@@ -2271,14 +2289,18 @@ impl TuiRenderer {
         // `active_rows` does not. A shrink also invalidates any selection
         // whose absolute rows described the old geometry (#1293).
         let this_frame_rows = frame.physical_rows(term_width.max(1));
-        reanchor_shrinking_live_frame(out, self.last_live_frame_rows, this_frame_rows, term_h)?;
         if this_frame_rows < self.last_live_frame_rows {
             if self.selection.is_some() {
                 self.selection = None;
                 self.selection_press_candidate = None;
                 self.previous_highlighted_rows.clear();
             }
+            if retained_window.is_none() {
+                self.viewport_invalidated = true;
+                return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+            }
         }
+        reanchor_shrinking_live_frame(out, self.last_live_frame_rows, this_frame_rows, term_h)?;
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
         self.flush_attention_bell(out)?;
@@ -4395,13 +4417,14 @@ impl TuiRenderer {
     }
 
     fn redraw_full_viewport_inner(&mut self, synchronized_update_open: bool) -> Result<()> {
-        self.redraw_full_viewport_inner_to(&mut io::stdout(), synchronized_update_open)
+        self.redraw_full_viewport_inner_to(&mut io::stdout(), synchronized_update_open, None)
     }
 
     fn redraw_full_viewport_inner_to(
         &mut self,
         out: &mut impl Write,
         synchronized_update_open: bool,
+        explicit_size: Option<(usize, usize)>,
     ) -> Result<()> {
         // A full repaint rewrites every row this function touches from
         // scratch (a new committed message, an explicit scroll, or a
@@ -4417,14 +4440,15 @@ impl TuiRenderer {
         // Every row this repaint touches is now plain again; nothing is left
         // for `paint_selection_overlay` to restore on its next call.
         self.previous_highlighted_rows.clear();
-        let (width, height) = self
-            .pending_viewport_size
-            .take()
-            .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((80, 24)));
-        let term_width = usize::from(width).max(1);
-        let term_height = usize::from(height);
+        let (term_width, term_height) = explicit_size.unwrap_or_else(|| {
+            let (width, height) = self
+                .pending_viewport_size
+                .take()
+                .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((80, 24)));
+            (usize::from(width).max(1), usize::from(height))
+        });
         let live_rows = self
-            .live_geometry(width, height)
+            .live_geometry(term_width as u16, term_height as u16)
             .map(|(rows, _)| rows)
             .unwrap_or(self.active_rows)
             .min(term_height);
@@ -4473,6 +4497,7 @@ impl TuiRenderer {
 
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
+        self.last_live_frame_rows = 0;
         self.viewport_invalidated = false;
         // The live draw closes the synchronized update begun above and uses
         // this exact retained window for hit-region reconstruction.
@@ -6414,7 +6439,8 @@ mod tests {
                 && !terminal.contains_visible("[collapsed]")
                 && terminal.cursor().2,
             "one continuous terminal must lose every dialog cell and gain the reconstructed \
-             disclosure marker after the real close erase/draw; bytes={lifecycle_bytes:?} {state}"
+             disclosure marker after the real close erase/draw; bytes={lifecycle_bytes:?} {state}\n{}",
+            terminal.diagnostic()
         );
         assert_eq!(
             renderer
@@ -6452,7 +6478,7 @@ mod tests {
                 .expect("the production resize handler must accept wide geometry");
             lifecycle_bytes.clear();
             renderer
-                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false, None)
                 .expect("the production full repaint must reconstruct at wide geometry");
             terminal.feed(&lifecycle_bytes);
             let marker = if expected_open { '▼' } else { '▶' };
@@ -6479,7 +6505,7 @@ mod tests {
                 .expect("the production resize handler must accept compact geometry");
             lifecycle_bytes.clear();
             renderer
-                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false, None)
                 .expect("the production full repaint must reconstruct compact geometry");
             terminal.feed(&lifecycle_bytes);
             assert_eq!(
@@ -6503,7 +6529,7 @@ mod tests {
                 .expect("the production resize handler must accept retained-row geometry");
             lifecycle_bytes.clear();
             renderer
-                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false)
+                .redraw_full_viewport_inner_to(&mut lifecycle_bytes, false, None)
                 .expect("the production resize repaint must reconstruct the retained row");
             terminal.feed(&lifecycle_bytes);
             let state = renderer.accordion.diagnostic_state();
@@ -6561,7 +6587,7 @@ mod tests {
         renderer.pending_viewport_size = Some((2, 8));
         renderer.viewport_invalidated = true;
         renderer
-            .redraw_full_viewport_inner_to(&mut lifecycle_bytes, true)
+            .redraw_full_viewport_inner_to(&mut lifecycle_bytes, true, None)
             .expect("the production full-viewport reconstruction must repaint after commit");
         terminal.feed(&lifecycle_bytes);
         let repaint_state = renderer.accordion.diagnostic_state();
@@ -6678,7 +6704,7 @@ mod tests {
         let mut bytes = Vec::new();
         renderer.pending_viewport_size = Some((width as u16, height as u16));
         renderer
-            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .redraw_full_viewport_inner_to(&mut bytes, false, None)
             .expect("the production full-viewport renderer must draw the write approval");
         let mut terminal = VtOracle::new(width, height);
         terminal.feed(&bytes);
@@ -6837,7 +6863,7 @@ mod tests {
         );
         renderer.pending_viewport_size = Some((80, 30));
         renderer
-            .redraw_full_viewport_inner_to(&mut Vec::new(), false)
+            .redraw_full_viewport_inner_to(&mut Vec::new(), false, None)
             .expect("the production full-viewport renderer must draw the short write approval");
         let body = renderer.dialog_mouse_regions.body;
         let before = dialog_wheel_state(&renderer);
@@ -9553,7 +9579,7 @@ mod tests {
             .expect("the production resize path must accept the source-state geometry");
         paint_bytes.clear();
         renderer
-            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false, None)
             .expect("the production full repaint must reconstruct the source state");
         assert_eq!(
             renderer.accordion.visible_order_count(&target),
@@ -9629,7 +9655,7 @@ mod tests {
             .expect("the production resize path must accept the output-state geometry");
         paint_bytes.clear();
         renderer
-            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false, None)
             .expect("the production full repaint must reconstruct the output state");
         let output_point = component_point(&renderer, &target, 80, 24);
         assert_eq!(
@@ -9716,7 +9742,7 @@ mod tests {
         renderer.viewport_invalidated = true;
         paint_bytes.clear();
         renderer
-            .redraw_full_viewport_inner_to(&mut paint_bytes, false)
+            .redraw_full_viewport_inner_to(&mut paint_bytes, false, None)
             .expect("post-commit reconstruction must repaint the retained say target");
         let retained_point = component_point(&renderer, &target, 80, 24);
         assert_eq!(
@@ -15237,7 +15263,7 @@ mod selection_tests {
         renderer.pending_viewport_size = Some((width as u16, height as u16));
         let mut bytes = Vec::new();
         renderer
-            .redraw_full_viewport_inner_to(&mut bytes, false)
+            .redraw_full_viewport_inner_to(&mut bytes, false, None)
             .expect("the production full-viewport repaint must succeed");
         terminal.feed(&bytes);
     }
@@ -15365,7 +15391,7 @@ mod selection_tests {
         terminal.resize(RESIZED_WIDTH, RESIZED_HEIGHT);
         let mut resize_bytes = Vec::new();
         renderer
-            .redraw_full_viewport_inner_to(&mut resize_bytes, false)
+            .redraw_full_viewport_inner_to(&mut resize_bytes, false, None)
             .expect("resize full repaint must succeed");
         terminal.feed(&resize_bytes);
         assert_eq!(
