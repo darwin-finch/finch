@@ -692,7 +692,7 @@ mod tests {
             ToolRegistry, WebFetchTool,
         };
 
-        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ReadTool));
         registry.register(Box::new(GlobTool));

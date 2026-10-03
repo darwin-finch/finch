@@ -274,7 +274,7 @@ fn session_local_tools_skip_host_effect_confirmation_at_approval_boundary() {
         AskUserQuestionTool, PresentPlanTool, TodoReadTool, TodoWriteTool, ToolRegistry,
     };
 
-    let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+    let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
     registry.register(Box::new(TodoReadTool::new(todo_list)));

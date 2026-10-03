@@ -663,7 +663,7 @@ pub struct Repl {
     memory_system: Option<Arc<finch_memory::MemorySystem>>,
 
     // Projection of the selected Brain task list (TodoWrite / TodoRead tools)
-    todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
+    todo_list: Arc<std::sync::RwLock<crate::tools::TodoList>>,
     todo_journal_target: crate::tools::TodoJournalTarget,
     todo_journal_receiver: Option<crate::tools::TodoJournalReceiver>,
 
@@ -1337,7 +1337,7 @@ impl Repl {
         // Session task list. Snake_case names are provider-facing; aliases
         // keep persisted/legacy provider turns executable without advertising
         // two tools for the same operation.
-        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let todo_list = Arc::new(std::sync::RwLock::new(crate::tools::TodoList::default()));
         let (todo_journal, todo_journal_target, todo_journal_receiver) =
             crate::tools::todo_journal(Arc::clone(&todo_list));
         {

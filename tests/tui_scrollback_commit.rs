@@ -66,7 +66,7 @@ const TRACKING_DEADLINE: Duration = Duration::from_secs(15);
 /// Failure deadline for a clean exit after `/exit`.
 const EXIT_DEADLINE: Duration = Duration::from_secs(30);
 
-const ROWS: u16 = 40;
+const ROWS: u16 = 24;
 const COLS: u16 = 120;
 
 const SUPERVISOR_AUTHORITY_FDS: &[i32] = &[9, 10, 11, 12, 108, 109, 110, 111, 112];

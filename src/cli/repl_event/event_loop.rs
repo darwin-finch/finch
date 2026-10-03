@@ -550,7 +550,7 @@ pub struct EventLoop {
     context_recall_k: usize,
 
     /// Projection of the selected Brain task list shared with Todo tools.
-    todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
+    todo_list: Arc<std::sync::RwLock<crate::tools::TodoList>>,
     todo_journal_target: crate::tools::TodoJournalTarget,
 
     /// Local mirror of the selected Brain's committed (byte-stable) memory

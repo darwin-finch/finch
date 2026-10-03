@@ -53,7 +53,7 @@ pub struct UiParts {
 pub struct ToolParts {
     pub definitions: Vec<crate::tools::ToolDefinition>,
     pub executor: Arc<Mutex<crate::tools::ToolExecutor>>,
-    pub todo_list: Arc<RwLock<crate::tools::TodoList>>,
+    pub todo_list: Arc<std::sync::RwLock<crate::tools::TodoList>>,
     pub todo_journal_target: crate::tools::TodoJournalTarget,
     pub todo_journal_receiver: crate::tools::TodoJournalReceiver,
     pub memory_commitment_target: super::memory_commitment::MemoryCommitmentTarget,

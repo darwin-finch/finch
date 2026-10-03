@@ -7529,7 +7529,7 @@ mod tests {
             .await;
         let mode = Arc::new(RwLock::new(ReplMode::Normal));
 
-        let todo_list = Arc::new(RwLock::new(TodoList::default()));
+        let todo_list = Arc::new(std::sync::RwLock::new(TodoList::default()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
         registry.register(Box::new(PresentPlanTool));
