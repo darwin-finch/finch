@@ -5539,6 +5539,10 @@ fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
 fn test_provider_editor_identity_table_matches_catalog() {
     let cases = [
         (crate::config::CredentialProvider::Anthropic, "claude"),
+        (
+            crate::config::CredentialProvider::ClaudeSubscription,
+            "claude-sub",
+        ),
         (crate::config::CredentialProvider::OpenaiPlatform, "openai"),
         (
             crate::config::CredentialProvider::ChatgptSubscription,
