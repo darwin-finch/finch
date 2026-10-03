@@ -665,7 +665,7 @@ mod tests {
         let output = &node.children[0].children[1];
         assert_eq!(
             output.role,
-            NodeRole::ToolOutput,
+            NodeRole::ToolCall,
             "the control must exercise a real tool output row; got {:?}",
             node.children[0]
         );

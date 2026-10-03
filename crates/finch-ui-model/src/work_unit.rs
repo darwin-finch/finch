@@ -260,36 +260,9 @@ fn project_tool_row(view: &WorkUnitView, index: usize, row: &WorkRowView) -> Tra
     let message_id = view.head.message_id;
     let summary = row_status_summary(&row.status);
     let actionable = tool_row_requires_default_expansion(row);
-    let input = TranscriptNode {
-        id: RowId {
-            message_id,
-            path: vec![1, index as u32, 0],
-        },
-        role: NodeRole::Input,
-        label: "Input".to_string(),
-        body: vec![row.label.clone()],
-        children: Vec::new(),
-        default_open: false,
-        raw_body: None,
-    };
     let mut output_body = row.body_lines.clone();
     if let Some(diffs) = &row.rendered_diffs {
         output_body.extend(diffs.iter().cloned());
-    }
-    let mut children = vec![input];
-    if !output_body.is_empty() {
-        children.push(TranscriptNode {
-            id: RowId {
-                message_id,
-                path: vec![1, index as u32, 1],
-            },
-            role: NodeRole::ToolOutput,
-            label: format!("Output ({})", output_body.len()),
-            body: output_body,
-            children: Vec::new(),
-            default_open: matches!(row.status, WorkRowStatus::Running) || actionable,
-            raw_body: None,
-        });
     }
     TranscriptNode {
         id: RowId {
@@ -298,8 +271,8 @@ fn project_tool_row(view: &WorkUnitView, index: usize, row: &WorkRowView) -> Tra
         },
         role: NodeRole::ToolCall,
         label: format!("{} — {summary}", row.label),
-        body: Vec::new(),
-        children,
+        body: output_body,
+        children: Vec::new(),
         default_open: matches!(row.status, WorkRowStatus::Running) || actionable,
         raw_body: None,
     }
