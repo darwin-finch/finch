@@ -128,6 +128,18 @@ pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanC
         }
     };
 
+    let extends_bg = canvas_bg.is_some() || line.spans.iter().any(|s| s.style.bg.is_some());
+    if extends_bg {
+        const EXTENDED_RESET: &str = "\x1b[K\x1b[0m";
+        if rendered.ends_with(SGR_RESET) {
+            let prefix_len = rendered.len() - SGR_RESET.len();
+            rendered.truncate(prefix_len);
+            rendered.push_str(EXTENDED_RESET);
+        } else if let Some(reset_pos) = rendered.rfind(SGR_RESET) {
+            rendered.insert_str(reset_pos, "\x1b[K");
+        }
+    }
+
     rendered
 }
 
@@ -294,6 +306,36 @@ mod tests {
         );
     }
 
+
+    /// When a line carries a background style (e.g. user turns or canvas background),
+    /// the background is extended to the right margin with \x1b[K before resetting.
+    /// However, forced backgrounds (like hover) do NOT extend.
+    #[test]
+    fn test_lower_rendered_line_extends_background_across_row() {
+        let user_line = RenderedTranscriptLine::from_spans(vec![Span::styled(
+            " ❯ hello",
+            SpanStyle::fg(SpanColor::CYAN).with_bg(SpanColor::Rgb(38, 38, 42)),
+        )]);
+        let lowered = lower_rendered_line(&user_line, None, None);
+        assert!(
+            lowered.ends_with("\x1b[K\x1b[0m"),
+            "line with background must extend with \\x1b[K before reset; got {lowered:?}"
+        );
+
+        let hover_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
+        let hovered = lower_rendered_line(&hover_line, Some(SpanColor::Rgb(52, 54, 60)), None);
+        assert!(
+            !hovered.ends_with("\x1b[K\x1b[0m"),
+            "hovered line must NOT extend background with \\x1b[K before reset; got {hovered:?}"
+        );
+
+        let canvas_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
+        let canvas_lowered = lower_rendered_line(&canvas_line, None, Some(SpanColor::Rgb(52, 54, 60)));
+        assert!(
+            canvas_lowered.ends_with("\x1b[K\x1b[0m"),
+            "canvas background must extend with \\x1b[K before reset; got {canvas_lowered:?}"
+        );
+    }
 
     /// The selection highlight lowers through the same span path as any
     /// other style — a fixed bold-white-on-blue run, not a hand-written
