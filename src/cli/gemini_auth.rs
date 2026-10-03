@@ -351,7 +351,7 @@ impl GeminiAuthService {
         let app = axum::Router::new()
             .route("/callback", get(callback_handler))
             .with_state(state);
-        let server_cancel = tokio_util::sync::CancellationToken::new();
+        let server_cancel = cancel.child_token();
         let serve_cancel = server_cancel.clone();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -750,11 +750,8 @@ fn status_from_record(
 }
 
 fn present_authorization_url(url: &str, presentation: BrowserLoginPresentation) -> Result<()> {
-    println!("Google Gemini subscription sign-in URL: \x1b]8;;{url}\x1b\\Click here to sign in\x1b]8;;\x1b\\");
+    println!("Google Gemini subscription sign-in URL: {url}");
     println!("Waiting for the browser sign-in to complete… Press Ctrl+C to cancel.");
-    println!(
-        "This uses Google OAuth 2.0 authorization for Gemini. It is not a Google AI Studio API key and will not fall back to API key billing."
-    );
     let _ = io::stdout().flush();
     if presentation.open_browser {
         if let Err(err) = open_browser(url) {

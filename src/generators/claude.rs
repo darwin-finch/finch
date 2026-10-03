@@ -764,9 +764,9 @@ for a in "$@"; do
 done
 cat >/dev/null
 printf '%s\n' \
-  '{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"gpt-6.1-sol"}' \
-  '{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_tool_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x.txt"}}]}}' \
-  '{"type":"assistant","message":{"model":"gpt-6.1-sol","id":"msg_final","role":"assistant","content":[{"type":"text","text":"The file says: file contents"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
+  '{"type":"system","subtype":"init","session_id":"'"$SID"'","model":"claude-sonnet-5"}' \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_tool_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__finch__read","input":{"file_path":"/tmp/x.txt"}}]}}' \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_final","role":"assistant","content":[{"type":"text","text":"The file says: file contents"}],"usage":{"input_tokens":2,"output_tokens":4}}}' \
   '{"type":"result","subtype":"success","is_error":false,"result":"The file says: file contents","stop_reason":"end_turn"}'
 "#;
         std::fs::write(&bin, script).unwrap();

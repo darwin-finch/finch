@@ -12213,13 +12213,13 @@ capacity: not configured";
                 (
                     crate::config::ProviderEntry::Claude {
                         api_key: "sk-ant-built-in-control".into(),
-                        model: Some("gpt-6.1-sol".into()),
+                        model: Some("claude-sonnet-5".into()),
                         base_url: None,
                         chat_path: None,
                         models_path: None,
                         name: Some("official-claude".into()),
                     },
-                    "provider: official-claude\nmodel: gpt-6.1-sol\nthinking: provider default\nsource: inherited global default",
+                    "provider: official-claude\nmodel: claude-sonnet-5\nthinking: provider default\nsource: inherited global default",
                 ),
             ] {
                 let mut control = super::EventLoop::new_provider_switch_test_runner(

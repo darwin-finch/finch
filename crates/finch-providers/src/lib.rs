@@ -138,7 +138,7 @@ pub use wire_types::{ContentBlock, ImageSource, Message};
 pub(crate) use validated_boundary::validate_provider_request;
 
 /// Default Claude model used when a transport does not override it.
-pub const DEFAULT_CLAUDE_MODEL: &str = "gpt-6.1-sol";
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default completion budget used by Anthropic request envelopes.
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
 
