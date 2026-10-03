@@ -1,18 +1,15 @@
-//! Bounded child viewports for tool-use output rows.
+//! Bounded compact views for tool-use output rows.
 //!
 //! A completed (or streaming) tool result is presented as one semantic control:
-//! its body occupies a small configured number of terminal rows, exposes
-//! truncation and scroll position in plain text, and owns the wheel events over
-//! those rows. Wheel X/Y is matched against the hit regions of the last painted
-//! frame — the same shadow-buffer ownership the accordion disclosure uses — so
-//! a wheel over the control scrolls that tool result only, never the parent
-//! console, and never releases mouse tracking to native scrollback.
+//! its body occupies a small configured number of terminal rows and exposes
+//! truncation in plain text. The compact view never owns wheel or scroll-key
+//! events: those continue to scroll the parent conversation. Activation (click
+//! on the window, or Enter with the row focused) opens a focused expanded
+//! surface that owns its own scrolling.
 //!
 //! The control is reusable: it applies to every row of
-//! [`NodeRole::ToolOutput`], not to one tool name. Activation (click
-//! on the window, or Enter with the row focused) opens a focused expanded
-//! surface; closing it restores the child scroll offset, disclosure grouping,
-//! and focus exactly as they were.
+//! [`NodeRole::ToolOutput`], not to one tool name. Closing the expanded surface
+//! restores disclosure grouping and focus exactly as they were.
 //!
 //! Permanent native scrollback is untouched by all of this: canonical commits
 //! still write the fully expanded projection exactly once
@@ -324,17 +321,17 @@ impl ToolViewportState {
     }
 }
 
-/// Plain-text state description for one bounded child viewport: the visible
-/// line range, the total, and the scroll/expand affordances.
+/// Plain-text state description for one bounded compact view: the visible
+/// line range, the total, and the expansion affordances.
 fn status_text(start: usize, end: usize, total: usize) -> String {
     if total == 0 {
         return String::new();
     }
     if start >= end {
-        return format!("… 0 lines visible of {} — ↑/↓ scroll · Enter expand", total);
+        return format!("… 0 lines visible of {} — Enter/click expand", total);
     }
     format!(
-        "… lines {}–{} of {} — ↑/↓ scroll · Enter expand",
+        "… lines {}–{} of {} — Enter/click expand",
         start + 1,
         end,
         total

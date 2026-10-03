@@ -2235,7 +2235,11 @@ impl TuiRenderer {
                 }
                 if retained_window.is_none() {
                     self.viewport_invalidated = true;
-                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+                    return self.redraw_full_viewport_inner_to(
+                        out,
+                        true,
+                        Some((term_width, term_h)),
+                    );
                 }
             }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
@@ -3584,8 +3588,9 @@ impl TuiRenderer {
         if self.handle_tool_viewport_key(key) {
             return true;
         }
-        // PageUp/PageDown scroll the conversation when no dialog, no expanded
-        // surface, and no focused tool-output row claims them first (#806).
+        // PageUp/PageDown scroll the conversation when no dialog or expanded
+        // surface claims them. Inline tool output never scrolls independently,
+        // even when its row has focus (#1590).
         // Mouse tracking is irrelevant on the keyboard path.
         if self.handle_transcript_scroll_key(key) {
             return true;
@@ -3622,12 +3627,12 @@ impl TuiRenderer {
         true
     }
 
-    /// Keyboard equivalents for a bounded tool-result control (#656).
+    /// Keyboard activation for a bounded tool-result control.
     ///
-    /// When a `ToolOutput` row holds the accordion focus: Up/Down/PageUp/
-    /// PageDown scroll that result's child viewport, Enter/Space open the
-    /// expanded surface. Any other key, or a focused row that is not a tool
-    /// result, is left for the accordion and the input area.
+    /// A focused `ToolOutput` row opens the expanded, scrollable surface with
+    /// Enter or Space. Inline output deliberately claims no scroll keys: page
+    /// keys continue to scroll the transcript, and arrow keys remain available
+    /// to the surrounding input/focus handling (#1590).
     fn handle_tool_viewport_key(&mut self, key: KeyEvent) -> bool {
         let Some(focused) = self.accordion.focused.clone() else {
             return false;
@@ -3635,22 +3640,10 @@ impl TuiRenderer {
         if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolOutput) {
             return false;
         }
-        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
-            self.open_expanded_tool(&focused);
-            return true;
-        }
-        let delta = match key.code {
-            KeyCode::Up => -1,
-            KeyCode::Down => 1,
-            KeyCode::PageUp => -(PAGE_STEP_LINES as isize),
-            KeyCode::PageDown => PAGE_STEP_LINES as isize,
-            _ => return false,
-        };
-        if !self.tool_viewports.scroll_child(&focused, delta) {
+        if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
             return false;
         }
-        self.viewport_invalidated = true;
-        self.live_area_dirty = true;
+        self.open_expanded_tool(&focused);
         true
     }
 
@@ -3734,12 +3727,12 @@ impl TuiRenderer {
         message.handle_transcript_action(&action)
     }
 
-    /// Wheel ticks scroll what the pointer is over (#806): the focused
-    /// expanded tool surface, a bounded tool-result control whose cells the
-    /// pointer is inside, or the conversation ScrollView — the transcript
-    /// claim of the 805 layout, the leftover frame under the bottom chrome.
-    /// Mouse tracking stays held; native history is the copyable record, not
-    /// the reader. Other mouse events keep the accordion click-to-toggle path.
+    /// Wheel ticks scroll the focused expanded tool surface or the conversation
+    /// ScrollView — the transcript claim of the 805 layout, the leftover frame
+    /// under the bottom chrome. Compact tool output is part of that transcript
+    /// and never captures wheel input independently (#1590). Mouse tracking
+    /// stays held; native history is the copyable record, not the reader. Other
+    /// mouse events keep the accordion click-to-toggle path.
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let mut stdout = io::stdout();
         self.handle_mouse_to(mouse, &mut stdout)
@@ -3805,24 +3798,10 @@ impl TuiRenderer {
                 self.scroll_expanded_tool(delta);
                 return true;
             }
-            if let Some(region) = self
-                .tool_viewports
-                .region_at(mouse.column, mouse.row)
-                .cloned()
-            {
-                // The child viewport owns this wheel: scroll that tool
-                // result and keep mouse tracking so the next tick keeps
-                // scrolling it.
-                if self.tool_viewports.scroll_child(&region.row_id, delta) {
-                    self.live_area_dirty = true;
-                }
-                return true;
-            }
             // The conversation ScrollView owns everything above the bottom
-            // chrome (#806). Chrome rows below the transcript claim belong to
-            // nobody, so a wheel there is claimed by neither the ScrollView
-            // nor a tool viewport. The transcript scrolls by its own step
-            // (#897), never the tool viewport's one-row tick.
+            // chrome (#806), including compact tool-output rows (#1590).
+            // Chrome rows below the transcript claim belong to nobody. The
+            // transcript always scrolls by its own step (#897).
             if !self.transcript_scroll.owns(mouse.column, mouse.row) {
                 return false;
             }
@@ -7006,15 +6985,15 @@ mod tests {
         (renderer, output_row)
     }
 
-    /// INVARIANT: a wheel whose X/Y lands on a bounded tool-result control
-    /// scrolls that result in place and never releases mouse tracking to
-    /// native scrollback (#656). The parent scrollback state is untouched:
-    /// no new canonical commit becomes eligible, no printed id changes, and a
-    /// neighbouring message's projection is byte-identical.
+    /// INVARIANT: compact tool results never capture the wheel. Even when the
+    /// pointer lands on a truncated result, the conversation ScrollView owns
+    /// the event and the inline result remains anchored at its first line.
     #[test]
-    fn test_wheel_over_tool_result_scrolls_it_without_touching_parent_scrollback() {
+    fn test_wheel_over_tool_result_scrolls_conversation_not_inline_output() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
         renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
+        let frame = plan_frame_for_test(80, 24, &[]);
+        renderer.transcript_scroll.set_claim(frame.rects.transcript);
         let top = renderer
             .tool_viewports
             .regions()
@@ -7022,14 +7001,9 @@ mod tests {
             .find(|region| region.row_id == output_row)
             .map(|region| region.top)
             .expect("the painted tool result registered a hit region");
-        let before_plan = plan_canonical_commit(
-            &renderer.output_manager.get_messages(),
-            &renderer.printed_ids,
-        );
-        let before_printed = renderer.printed_ids.clone();
 
         let wheel = MouseEvent {
-            kind: event::MouseEventKind::ScrollDown,
+            kind: event::MouseEventKind::ScrollUp,
             column: 0,
             row: top,
             modifiers: KeyModifiers::NONE,
@@ -7037,123 +7011,33 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(
             renderer.handle_mouse_to(wheel, &mut bytes),
-            "the wheel over the tool result must be dispatched to it, not dropped"
+            "INVARIANT: the transcript must claim a wheel over compact tool output"
         );
         assert_eq!(
             renderer.tool_viewports.child_scroll(&output_row),
-            1,
-            "INVARIANT: the wheel scrolled the targeted tool result by one line; child \
-             scroll was {:?}, hit region top was {top}",
+            0,
+            "INVARIANT: compact tool output cannot scroll inline; child scroll was {:?}, \
+             hit region top was {top}",
+            renderer.tool_viewports.child_scroll(&output_row)
+        );
+        assert!(
+            renderer.transcript_scroll.offset() > 0,
+            "INVARIANT: hovering a truncated tool result must not hijack transcript \
+             scrolling; conversation offset was {:?}, child offset was {:?}",
+            renderer.transcript_scroll.offset(),
             renderer.tool_viewports.child_scroll(&output_row)
         );
         assert_eq!(
             renderer.mouse_tracking,
             mouse_capture::MouseTracking::Held,
-            "INVARIANT: a wheel over a tool result keeps mouse tracking so the next tick \
-             keeps scrolling the result instead of falling to native scrollback; tracking \
+            "INVARIANT: a transcript wheel keeps mouse tracking held; tracking \
              was {:?}; terminal received {bytes:?}",
             renderer.mouse_tracking
         );
         assert!(
             bytes.is_empty(),
-            "INVARIANT: dispatching a wheel to a tool result must not emit \
+            "INVARIANT: dispatching a transcript wheel must not emit \
              DisableMouseCapture; terminal received {bytes:?}"
-        );
-        let after_plan = plan_canonical_commit(
-            &renderer.output_manager.get_messages(),
-            &renderer.printed_ids,
-        );
-        assert_eq!(
-            before_plan.emit.len(),
-            after_plan.emit.len(),
-            "INVARIANT: scrolling a tool result must not make a canonical commit eligible; \
-             plan before {before:?} vs after {after:?}",
-            before = before_plan.emit.len(),
-            after = after_plan.emit.len()
-        );
-        assert_eq!(
-            before_printed, renderer.printed_ids,
-            "INVARIANT: the set of messages written to native scrollback is unchanged by \
-             a child-viewport wheel"
-        );
-        renderer.is_active = false;
-    }
-
-    /// INVARIANT: the wheel dispatch is exact — two adjacent tool results are
-    /// separately addressable, and a wheel on the first never moves the second.
-    #[test]
-    fn test_wheel_dispatch_reaches_only_the_targeted_tool_result() {
-        use finch_messages::{MessageRef, WorkUnit};
-
-        let (mut renderer, _) = committed_tool_result_renderer(40);
-        let colors = renderer.colors.clone();
-        // A second tool result committed below the first.
-        let second = Arc::new(WorkUnit::new("Tools"));
-        let call = second.add_row("bash(other)");
-        second.complete_row_with_body(
-            call,
-            "",
-            (0..40).map(|n| format!("beta {n}")).collect::<Vec<_>>(),
-        );
-        second.set_complete();
-        let second_output = crate::view_model::try_project_for_test(second.as_ref(), &colors)
-            .expect("projected row")
-            .children[0]
-            .children[1]
-            .id
-            .clone();
-        renderer.add_trait_message(second.clone());
-        let second_id = second.id();
-        renderer.printed_ids.insert(second_id);
-        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24, None);
-
-        let first_scroll = {
-            let regions = renderer.tool_viewports.regions();
-            let first = regions
-                .iter()
-                .find(|region| region.row_id != second_output)
-                .cloned()
-                .expect("the first tool result registered a region");
-            first.row_id.clone()
-        };
-        let first_region = renderer
-            .tool_viewports
-            .regions()
-            .iter()
-            .find(|region| region.row_id == first_scroll)
-            .cloned()
-            .expect("first region present");
-        let wheel = MouseEvent {
-            kind: event::MouseEventKind::ScrollDown,
-            column: first_region.left,
-            row: first_region.top,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(renderer.handle_mouse_to(wheel, &mut Vec::new()));
-        assert_eq!(
-            renderer.tool_viewports.child_scroll(&first_scroll),
-            1,
-            "the targeted result scrolled"
-        );
-        assert_eq!(
-            renderer.tool_viewports.child_scroll(&second_output),
-            0,
-            "INVARIANT: the neighbouring result did not move; exact X/Y dispatch reaches \
-             only the targeted control"
-        );
-        let second_message: MessageRef = second.clone();
-        let second_projected = renderer.projected_message_lines(&second_message, 80);
-        assert!(
-            second_projected
-                .iter()
-                .any(|line| line.text.contains("beta 0")),
-            "INVARIANT: the untargeted result's window is unchanged (still starts at \
-             beta 0); projection was:\n{}",
-            second_projected
-                .iter()
-                .map(|line| line.text.clone())
-                .collect::<Vec<_>>()
-                .join("\n")
         );
         renderer.is_active = false;
     }
