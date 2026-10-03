@@ -402,6 +402,17 @@ impl EventLoop {
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                     self.agent_scheduler.set_active_brain_parent(None).await;
+                    // Mirror the completion path's eager status application
+                    // (#820): a locally executed run's own RunStatusChanged
+                    // events are suppressed by the local projection, so the
+                    // Failed outcome must be applied here — including a
+                    // failed wire-correction fallback (#1478) — or the run
+                    // group would keep wearing `running`.
+                    self.apply_named_brain_run_status(
+                        pending.run_id,
+                        crate::brain::BrainRunStatus::Failed,
+                        Some(error.as_str()),
+                    );
                     self.local_brain_projections
                         .push_back(failed_local_brain_projection(
                             pending.run_id,
@@ -576,13 +587,22 @@ impl EventLoop {
             }
 
             ReplEvent::VmOutputComplete { output_unit } => {
-                output_unit.set_complete();
-                if let Some(run_id) = self.pending_named_brain_run_id() {
-                    self.apply_named_brain_run_status(
-                        run_id,
-                        crate::brain::BrainRunStatus::Completed,
-                        None,
-                    );
+                // A failed terminal state is authoritative (#1478): a
+                // completion event that arrives after the failure settles
+                // must not restyle it as a completed turn — the failed
+                // wire-correction fallback keeps its Failed outcome and its
+                // component identity.
+                if crate::cli::messages::Message::status(output_unit.as_ref())
+                    != crate::cli::messages::MessageStatus::Failed
+                {
+                    output_unit.set_complete();
+                    if let Some(run_id) = self.pending_named_brain_run_id() {
+                        self.apply_named_brain_run_status(
+                            run_id,
+                            crate::brain::BrainRunStatus::Completed,
+                            None,
+                        );
+                    }
                 }
                 self.render_tui().await?;
             }

@@ -1923,12 +1923,29 @@ fn project_remote_brain_live_run_event(
         }
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
-                // Successful untitled `say` is already assistant prose (#350/#804).
-                // Dropping it here left the dump's expanded Program source with a
-                // collapsed `result` as the only copy of the greeting (#820).
-                if !output_unit.is_assistant_prose() {
-                    output_manager
-                        .remove_message(crate::cli::messages::Message::id(output_unit.as_ref()));
+                // The scrollback child list is append-only once the session
+                // starts (#1478): reconciliation never deletes a component
+                // this frontend rendered or replaces its identity. The
+                // matching durable result is an acknowledgement — adopt its
+                // terminal outcome into the existing component, and only
+                // while that component is still unsettled. An already
+                // terminal unit (a failed wire-correction fallback, a
+                // completed say card) is authoritative and must not be
+                // mutated post-terminal. A pure say turn's lifecycle events
+                // stay suppressed for good, so its locally rendered card
+                // remains the turn's only representation.
+                if crate::cli::messages::Message::status(output_unit.as_ref())
+                    == crate::cli::messages::MessageStatus::InProgress
+                {
+                    match &event.kind {
+                        crate::brain::BrainEventKind::Result { error: Some(_), .. } => {
+                            output_unit.set_failed();
+                        }
+                        crate::brain::BrainEventKind::Result { error: None, .. } => {
+                            output_unit.set_complete();
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

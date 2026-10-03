@@ -72,6 +72,33 @@ prefer showing instead. `test_repairable_rejection_diagnostic_reaches_debug_log_
 `query_processor.rs` cover the successful-repair, cancelled-before-repair, and cancelled-during-repair
 cases.
 
+**A failed wire execution is a typed failure that keeps its component (#1478).** `WireExecution`
+carries an explicit `WireExecutionOutcome::{Succeeded, Failed}`; every repair failure,
+cancellation before or during repair, rejected or errored repaired program, failed deterministic
+prose wrapper, and non-repairable rejection returns `Failed` and settles its output WorkUnit
+terminal-failed (`settle_failed_wire_output` completes the say card's own Running state first —
+the card has no failed variant — then marks the unit Failed, so the fallback never spins). The
+fallback text is a failure report, never real output. A named-Brain turn whose wire execution
+failed therefore terminalizes through the existing failure channel — the query processor sends
+`QueryFailed` (carrying the fallback as the error) instead of `StreamingComplete`; the dispatch
+handler emits the pending turn's `RunnerTurnError`, applies `BrainRunStatus::Failed` eagerly, and
+queues a failed local projection — and publishes no completion content. Local (non-Brain)
+sessions keep the historical publication path. `VmOutputComplete` never overwrites an
+already-failed terminal state as Complete. Reconciliation is append-only: the scrollback child
+list and component identities never lose a component once the session starts. When a durable
+terminal `Result` matches a queued local projection (`LocalProjectionMatch::SuppressAndComplete`),
+reconciliation pops the projection, inserts pure-say runs into `locally_say_projected_runs` so
+later snapshots cannot rebuild a duplicate projection, and ADOPTS the durable outcome into the
+existing component (settling it failed/complete only while it is still `InProgress`; an already
+terminal unit is authoritative and never mutated post-terminal). `OutputManager::remove_message`
+is not part of reconciliation. `failed_wire_correction_fallback_survives_reconciliation_later_turn_and_replay`,
+`vm_output_complete_keeps_failed_terminal_state`, and
+`failed_wire_repair_types_the_turn_failed_and_fails_the_output_unit` +
+`named_brain_failed_wire_repair_routes_queryfailed_not_streamingcomplete` cover the lifecycle;
+`snapshot_first_home_reconnect_reconciles_one_complete_work_unit` and
+`missing_final_wire_after_home_tool_rounds_reconciles_durable_error` are the
+update-without-deletion controls for successful and failed tool-bearing adoption.
+
 **A deterministic raw-prose fallback must caption unsupported completed filesystem mutation
 claims.** `claims_tool_grounded_fact` (`query_processor.rs`) recognizes a narrow completed-claim
 grammar for create/write/edit/update/patch/move/rename/delete assertions whose direct target is a

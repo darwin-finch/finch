@@ -1,5 +1,69 @@
 struct NeverCompletes;
 
+/// Scripted provider for the failed wire-correction lifecycle (#1478): the
+/// first response is an invalid, repairable Program; the correction round
+/// itself fails; the later turn produces a valid program.
+struct ScriptedWireTurnGenerator {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for ScriptedWireTurnGenerator {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        use std::sync::atomic::Ordering;
+        let scripted = |text: &str| crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: "scripted".to_string(),
+                model: "scripted".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        };
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(scripted("(say \"broken\"")),
+            1 => anyhow::bail!("corrected generation failed"),
+            _ => Ok(scripted("(say \"next\")")),
+        }
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "scripted-wire-turns"
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::generators::Generator for NeverCompletes {
     async fn generate(
@@ -3675,7 +3739,30 @@ impl crate::brain::LocalBrainTransport for StaleCursorTransport {
         })
     }
     async fn brain_snapshot(&self, _brain: &str) -> anyhow::Result<crate::brain::BrainSnapshot> {
-        unreachable!("fixture drives render_remote_brain_message directly")
+        // A run-status event drives the context recap's eager snapshot
+        // refresh (`render_remote_brain_message`'s Event arm); the fixture
+        // answers with an empty, valid snapshot.
+        Ok(crate::brain::BrainSnapshot {
+            brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
+            name: "shared".into(),
+            environment: crate::brain::BrainEnvironment {
+                machine: "box.local".into(),
+                workspace: std::path::PathBuf::from("/tmp"),
+                generation: 1,
+            },
+            revision: self.acknowledged_seq,
+            events: Vec::new(),
+            program_stack: Vec::new(),
+            attachments: Vec::new(),
+            runner_lease: None,
+            runner_handoff: None,
+            runs: Vec::new(),
+            tasks: Vec::new(),
+            committed_memories: Vec::new(),
+            schedules: Vec::new(),
+            pending_schedule_dues: Vec::new(),
+            effect_audits: Vec::new(),
+        })
     }
     async fn brain_submit(
         &self,
@@ -4674,7 +4761,9 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
 
     // No live canonical events arrive. A replacement snapshot containing
     // the acknowledged history must reconcile the local rows, adopt the
-    // durable Result, and retire transient VM output by itself.
+    // durable Result, and keep the locally rendered component in the
+    // append-only child list — reconciliation updates identity, it never
+    // deletes it (#1478).
     super::project_remote_brain_snapshot_runs(
         &output,
         &mut projections,
@@ -4687,8 +4776,21 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
     assert!(local_projections.is_empty());
 
     let messages = output.get_messages();
-    assert_eq!(messages.len(), 1);
-    let rendered = messages[0].format(&crate::theme::ColorScheme::default());
+    assert_eq!(
+        messages.len(),
+        2,
+        "invariant: the acknowledged snapshot leaves both the run group and the \
+         locally rendered VM output component; ids={:?}",
+        messages
+            .iter()
+            .map(|message| (message.id(), message.content()))
+            .collect::<Vec<_>>()
+    );
+    let rendered = messages
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
     for expected in [
         &format!("Speculative run {}", run_id.0),
         "inspect the cache",
@@ -4706,11 +4808,23 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
             "missing {expected:?} from projected WorkUnit:\n{rendered}"
         );
     }
+    // Each durable fact renders exactly once per component: the run group's
+    // legacy rows stay the canonical record, and the locally rendered card
+    // keeps its own content without being deleted or duplicated.
     assert_eq!(rendered.matches("inspect the cache").count(), 1);
     assert_eq!(rendered.matches("read_cache").count(), 1);
     assert_eq!(rendered.matches("approval (tool)").count(), 1);
     assert_eq!(rendered.matches("program (lisp)").count(), 1);
     assert_eq!(rendered.matches("result").count(), 1);
+    let transient = messages
+        .iter()
+        .find(|message| message.content() == "cache checked")
+        .expect("invariant: the locally rendered VM output card is retained");
+    assert_eq!(
+        crate::cli::messages::Message::status(transient.as_ref()),
+        crate::cli::messages::MessageStatus::Complete,
+        "invariant: adoption settles the retained component's terminal state"
+    );
 }
 
 #[test]
@@ -4911,8 +5025,21 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
     );
 
     let messages = output.get_messages();
-    assert_eq!(messages.len(), 1);
-    let rendered = messages[0].format(&crate::theme::ColorScheme::default());
+    assert_eq!(
+        messages.len(),
+        2,
+        "invariant (#1478): the locally rendered failed VM output card is retained in \
+         the append-only child list beside the durable run group; ids={:?}",
+        messages
+            .iter()
+            .map(|message| (message.id(), message.status(), message.content()))
+            .collect::<Vec<_>>()
+    );
+    let rendered = messages
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
     for expected in [
         "tool-one",
         "tool-two",
@@ -4923,13 +5050,664 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
             rendered.contains(expected),
             "missing {expected:?}:\n{rendered}"
         );
-        assert_eq!(
-            rendered.matches(expected).count(),
-            1,
-            "duplicated {expected:?}"
-        );
     }
+    // Durable rows stay exactly-once per component. The failure detail is
+    // the one deliberately-twice string: the run group's `result` row is
+    // the canonical durable record, and the retained local card (#1478) is
+    // the component this frontend rendered — neither may be deleted, and
+    // neither duplicates within its own component.
+    assert_eq!(rendered.matches("tool-one").count(), 1);
+    assert_eq!(rendered.matches("tool-two").count(), 1);
+    assert_eq!(rendered.matches("approval (tool)").count(), 1);
+    assert_eq!(
+        rendered
+            .matches("named Brain turn produced no wire source")
+            .count(),
+        2,
+        "invariant: the failure detail appears once in the durable result row and \
+         once on the retained local card; rendered=\n{rendered}"
+    );
+    let transient = messages
+        .iter()
+        .find(|message| message.content() == "named Brain turn produced no wire source")
+        .expect("invariant: the failed local card is retained");
+    assert_eq!(
+        crate::cli::messages::Message::status(transient.as_ref()),
+        crate::cli::messages::MessageStatus::Failed,
+        "invariant: the retained card keeps its Failed terminal state"
+    );
     assert_eq!(rendered.matches("result").count(), 1);
+}
+
+/// #1478 production boundary: a named-Brain turn whose wire-correction
+/// repair fails emits the existing `RunnerTurnError` (never a successful
+/// result for the fallback), and its failed Program output component keeps
+/// one stable identity across terminal failure, daemon Result/Failed
+/// reconciliation, a later user turn, forced repaint, and fresh replay.
+#[tokio::test]
+async fn failed_wire_correction_fallback_survives_reconciliation_later_turn_and_replay() {
+    // Local constant so the fail-before demonstration can run this test
+    // against the un-fixed base without the production `pub(crate)` export.
+    const FALLBACK: &str =
+        "Finch's response needed to be corrected, and the correction attempt did not succeed either.";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::{
+                AttachmentId, BrainApprovalAudience, BrainEventKind, BrainId, BrainRun,
+                BrainRunKind, BrainRunStatus, RunId,
+            };
+            use crate::cli::messages::MessageStatus;
+
+            let fallback = FALLBACK;
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("failed wire fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("failed wire fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> =
+                Arc::new(ScriptedWireTurnGenerator {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+            event_loop.runner_brain = Some("home".into());
+            event_loop.home_runner_lease_active = true;
+            let target =
+                crate::brain::RemoteBrainTarget::local("home", "http://127.0.0.1:0").unwrap();
+            let mut client = crate::brain::AttachedBrainClient::local(
+                target,
+                StaleCursorTransport {
+                    acknowledged_seq: 0,
+                },
+            );
+            client
+                .attach("shammah", crate::brain::AttachmentRole::Driver, None)
+                .await
+                .expect("fixture: home Brain client attaches");
+            event_loop.home_brain = Some(client);
+            event_loop.start_llm_worker();
+
+            let audience = |brain_id: BrainId| BrainApprovalAudience {
+                brain_id,
+                brain: "home".into(),
+                attachment_id: AttachmentId(Uuid::new_v4()),
+                subject: "runner".into(),
+                role: crate::brain::AttachmentRole::Runner,
+                environment_generation: 1,
+            };
+            let request_turn =
+                |run_id: RunId, request_seq: u64, prompt: &str| crate::server::RunnerTurnRequest {
+                    brain: "home".into(),
+                    run_id,
+                    request_seq,
+                    prompt: prompt.to_string(),
+                    context: vec![crate::providers::Message::user(prompt)],
+                    approval_audience: audience(BrainId(Uuid::new_v4())),
+                    approval_connection_id: None,
+                    grant_ceiling: crate::vm::TypedRuntime::intrinsic_grants(),
+                    approval_tx: None,
+                    effect_audit: None,
+                    response_tx: tokio::sync::oneshot::channel().0,
+                };
+
+            // ── Turn 1: the failed wire-correction turn ──────────────────
+            let run1 = RunId(Uuid::new_v4());
+            let (response_tx1, mut response_rx1) = tokio::sync::oneshot::channel();
+            let mut request1 = request_turn(run1, 7, "produce a report");
+            request1.response_tx = response_tx1;
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(request1))
+                .await
+                .expect("the failed turn must dispatch");
+
+            // Drive the real event bus through the real dispatch (the same
+            // loop `EventLoop::run` runs) until the turn terminalizes.
+            let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < drain_deadline,
+                    "the failed wire turn never terminalized; the QueryFailed routing \
+                     must reach the real dispatch handler"
+                );
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("the event bus must deliver the failed turn's terminal event")
+                .expect("the event bus must stay open");
+                let terminal = matches!(event, super::ReplEvent::QueryFailed { .. });
+                event_loop
+                    .handle_event(event)
+                    .await
+                    .expect("the failed turn's terminal event must dispatch");
+                if terminal {
+                    break;
+                }
+            }
+            let failure = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx1)
+                .await
+                .expect("the runner response must arrive")
+                .expect("the response channel must not be dropped");
+            match &failure {
+                Err(error) => assert_eq!(
+                    error.message, fallback,
+                    "invariant: the failed correction round emits the existing \
+                     RunnerTurnError carrying the safe fallback — never a successful \
+                     result whose output is the fallback text (#1478); got {failure:?}"
+                ),
+                Ok(result) => panic!(
+                    "invariant: the failed wire turn must not persist as a successful \
+                     RunnerTurnResult; output={:?}",
+                    result.output
+                ),
+            }
+
+            // The failed Program output component exists exactly once, failed.
+            // (`content() == fallback` — the failure channel also writes a
+            // `Query failed (…): {fallback}` error row whose content embeds
+            // the fallback, but that row is a separate component with its own
+            // identity, not the failed Program output.)
+            let failed_card_id = {
+                let messages = event_loop.output_manager.get_messages();
+                let cards = messages
+                    .iter()
+                    .filter(|message| message.content() == fallback)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cards.len(),
+                    1,
+                    "invariant: exactly one failed Program output component carries the \
+                     fallback; ids={:?}",
+                    messages
+                        .iter()
+                        .map(|message| (message.id(), message.content()))
+                        .collect::<Vec<_>>()
+                );
+                let card = cards[0];
+                assert_eq!(
+                    card.status(),
+                    MessageStatus::Failed,
+                    "invariant: the fallback's terminal state is Failed"
+                );
+                let projected = crate::cli::test_projection::try_project_for_test(
+                    card.as_ref(),
+                    &crate::theme::ColorScheme::default(),
+                )
+                .expect("the failed component projects a transcript node");
+                assert!(
+                    projected.role == crate::cli::test_projection::NodeRole::Output
+                        && !projected.label.contains('\u{23fa}'),
+                    "invariant: the failure stays ordinary Program output (the repair \
+                     path's own 'VM program rejected' handle), never restyled as \
+                     assistant prose; row={projected:?}"
+                );
+                assert!(
+                    event_loop.remote_brain_run_units.get(&run1).is_none(),
+                    "invariant: a locally executed turn projects no run group (#978), \
+                     failed or not"
+                );
+                assert_eq!(
+                    event_loop.local_brain_projections.len(),
+                    1,
+                    "invariant: the failed turn queued its reconciliation projection"
+                );
+                assert!(
+                    event_loop.local_brain_projections[0].failed,
+                    "invariant: the queued projection is the failure shape"
+                );
+                card.id()
+            };
+
+            // ── Daemon Result/Failed reconciliation ─────────────────────
+            // The journal shape `dispatch_named_brain_turn`'s error arm
+            // produces for a RunnerTurnError: the run's RunStarted (journaled
+            // at submission), an errored Result (no successful output), and
+            // the Failed run status.
+            let mut durable_events = {
+                let started_event = {
+                    let mut event = brain_event(
+                        1,
+                        "daemon",
+                        BrainEventKind::RunStarted {
+                            run: BrainRun {
+                                run_id: run1,
+                                kind: BrainRunKind::Interactive,
+                                parent_run_id: None,
+                                request_seq: 7,
+                                initiating_attachment_id: AttachmentId(Uuid::new_v4()),
+                                initiated_by: "shammah".into(),
+                                status: BrainRunStatus::Running,
+                                started_ms: 1,
+                                updated_ms: 1,
+                                detail: None,
+                            },
+                        },
+                    );
+                    event.run_id = Some(run1);
+                    event
+                };
+                let result_event = {
+                    let mut event = brain_event(
+                        2,
+                        "daemon",
+                        BrainEventKind::Result {
+                            request_seq: 7,
+                            output: String::new(),
+                            error: Some(fallback.to_string()),
+                            continuation_messages: Vec::new(),
+                            invocation_metadata: None,
+                        },
+                    );
+                    event.run_id = Some(run1);
+                    event
+                };
+                let terminal_event = {
+                    let mut event = brain_event(
+                        3,
+                        "daemon",
+                        BrainEventKind::RunStatusChanged {
+                            run_id: run1,
+                            status: BrainRunStatus::Failed,
+                            detail: Some(fallback.to_string()),
+                        },
+                    );
+                    event.run_id = Some(run1);
+                    event
+                };
+                vec![started_event, result_event, terminal_event]
+            };
+            for event in &durable_events {
+                event_loop
+                    .handle_event(super::ReplEvent::HomeBrainMessage {
+                        epoch: 0,
+                        message: crate::brain::BrainWireMessage::Event {
+                            event: event.clone(),
+                        },
+                    })
+                    .await
+                    .expect("durable reconciliation events must dispatch");
+            }
+            assert!(
+                event_loop.local_brain_projections.is_empty(),
+                "invariant: the durable result acknowledged the queued projection"
+            );
+            assert!(
+                event_loop.locally_say_projected_runs.contains(&run1),
+                "invariant: the locally rendered failed turn is marked so later \
+                 snapshots cannot rebuild a duplicate projection"
+            );
+            assert!(
+                event_loop.remote_brain_run_units.get(&run1).is_none(),
+                "invariant: reconciliation suppresses the duplicate durable group — \
+                 it must not create one for the failed run either"
+            );
+
+            // Identity checkpoint 1: same component, same Failed state.
+            let failed_card_snapshot = |event_loop: &super::EventLoop, expected_id| {
+                let messages = event_loop.output_manager.get_messages();
+                let cards = messages
+                    .iter()
+                    .filter(|message| message.id() == expected_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cards.len(),
+                    1,
+                    "invariant: the failed component stays in the append-only child \
+                     list exactly once; ids={:?}",
+                    messages
+                        .iter()
+                        .map(|message| message.id())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    cards[0].status(),
+                    MessageStatus::Failed,
+                    "invariant: the failed terminal state survives reconciliation"
+                );
+                assert!(
+                    cards[0].content().contains(fallback),
+                    "invariant: the fallback text survives reconciliation; content={:?}",
+                    cards[0].content()
+                );
+            };
+            failed_card_snapshot(&event_loop, failed_card_id);
+
+            // Hostile: a late duplicate of the durable Result must be an
+            // idempotent acknowledgement, never a second component.
+            event_loop
+                .handle_event(super::ReplEvent::HomeBrainMessage {
+                    epoch: 0,
+                    message: crate::brain::BrainWireMessage::Event {
+                        event: durable_events[1].clone(),
+                    },
+                })
+                .await
+                .expect("a late duplicate Result must dispatch");
+            failed_card_snapshot(&event_loop, failed_card_id);
+            assert_eq!(
+                event_loop
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .filter(|message| message.content() == fallback)
+                    .count(),
+                1,
+                "invariant: the late duplicate Result created no duplicate component"
+            );
+
+            // ── A later user turn (successful) ───────────────────────────
+            let run2 = RunId(Uuid::new_v4());
+            let (response_tx2, mut response_rx2) = tokio::sync::oneshot::channel();
+            let mut request2 = request_turn(run2, 11, "say hi again");
+            request2.response_tx = response_tx2;
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(request2))
+                .await
+                .expect("the later turn must dispatch");
+            let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < drain_deadline,
+                    "the later turn never completed"
+                );
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("the event bus must deliver the later turn's completion")
+                .expect("the event bus must stay open");
+                let terminal = matches!(event, super::ReplEvent::StreamingComplete { .. });
+                event_loop
+                    .handle_event(event)
+                    .await
+                    .expect("the later turn's events must dispatch");
+                if terminal {
+                    break;
+                }
+            }
+            let success = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx2)
+                .await
+                .expect("the later turn's runner response must arrive")
+                .expect("the response channel must not be dropped");
+            assert!(
+                matches!(&success, Ok(result) if result.output == "next"),
+                "invariant: the later turn completes successfully; got {success:?}"
+            );
+
+            // The failed card kept its identity across the later turn.
+            failed_card_snapshot(&event_loop, failed_card_id);
+
+            // Run 2's durable reconciliation: the successful-say control —
+            // adoption and acknowledgement WITHOUT deleting its card or
+            // duplicating a group.
+            let run2_events = {
+                let started = {
+                    let mut event = brain_event(
+                        4,
+                        "daemon",
+                        BrainEventKind::RunStarted {
+                            run: BrainRun {
+                                run_id: run2,
+                                kind: BrainRunKind::Interactive,
+                                parent_run_id: None,
+                                request_seq: 11,
+                                initiating_attachment_id: AttachmentId(Uuid::new_v4()),
+                                initiated_by: "shammah".into(),
+                                status: BrainRunStatus::Running,
+                                started_ms: 1,
+                                updated_ms: 1,
+                                detail: None,
+                            },
+                        },
+                    );
+                    event.run_id = Some(run2);
+                    event
+                };
+                let program = {
+                    let mut event = brain_event(
+                        5,
+                        "provider",
+                        BrainEventKind::Program {
+                            language: crate::brain::ProgramLanguage::Lisp,
+                            source: "(say \"next\")".into(),
+                        },
+                    );
+                    event.run_id = Some(run2);
+                    event
+                };
+                let result = {
+                    let mut event = brain_event(
+                        6,
+                        "daemon",
+                        BrainEventKind::Result {
+                            request_seq: 5,
+                            output: "next".into(),
+                            error: None,
+                            continuation_messages: Vec::new(),
+                            invocation_metadata: None,
+                        },
+                    );
+                    event.run_id = Some(run2);
+                    event
+                };
+                let terminal = {
+                    let mut event = brain_event(
+                        7,
+                        "daemon",
+                        BrainEventKind::RunStatusChanged {
+                            run_id: run2,
+                            status: BrainRunStatus::Completed,
+                            detail: None,
+                        },
+                    );
+                    event.run_id = Some(run2);
+                    event
+                };
+                vec![started, program, result, terminal]
+            };
+            for event in &run2_events {
+                event_loop
+                    .handle_event(super::ReplEvent::HomeBrainMessage {
+                        epoch: 0,
+                        message: crate::brain::BrainWireMessage::Event {
+                            event: event.clone(),
+                        },
+                    })
+                    .await
+                    .expect("run 2 reconciliation events must dispatch");
+            }
+            assert!(
+                event_loop.local_brain_projections.is_empty()
+                    && event_loop.remote_brain_run_units.get(&run2).is_none(),
+                "invariant: the successful turn's durable result is acknowledged \
+                 without deleting its card or creating a duplicate group"
+            );
+            assert_eq!(
+                event_loop
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .filter(|message| message.content() == "next")
+                    .count(),
+                1,
+                "invariant: the successful turn's output stays exactly once"
+            );
+            failed_card_snapshot(&event_loop, failed_card_id);
+
+            // ── Forced repaint / canonical commit pass ───────────────────
+            event_loop.render_tui().await.expect("repaint must succeed");
+            failed_card_snapshot(&event_loop, failed_card_id);
+            assert!(
+                event_loop
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .all(|message| message.say_turn_view().is_none_or(|view| {
+                        view.vm.status != crate::cli::messages::SayTurnStatus::Running
+                    })),
+                "invariant: no card keeps wearing `running` after the full lifecycle \
+                 (#820-class residue)"
+            );
+            let canonical = {
+                let messages = event_loop.output_manager.get_messages();
+                messages
+                    .iter()
+                    .find(|message| message.id() == failed_card_id)
+                    .expect("the failed component survives the repaint")
+                    .complete_transcript(&crate::theme::ColorScheme::default())
+            };
+            assert_eq!(
+                canonical.matches(fallback).count(),
+                1,
+                "invariant: the canonical commit record carries the fallback exactly \
+                 once; canonical=\n{canonical}"
+            );
+
+            // ── Replacement connection: a mid-session snapshot replay ─────
+            // A reconnected/replacement watch replays the full journal as a
+            // Snapshot; the locally rendered failed card must not be
+            // duplicated or re-created, and no run group may appear for it.
+            durable_events.extend(run2_events.iter().cloned());
+            event_loop
+                .render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
+                    brain: replayed_brain_snapshot(durable_events.clone()),
+                })
+                .await
+                .expect("a replacement snapshot must dispatch");
+            failed_card_snapshot(&event_loop, failed_card_id);
+            assert_eq!(
+                event_loop
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .filter(|message| message.content() == fallback)
+                    .count(),
+                1,
+                "invariant: the replacement snapshot did not duplicate the failed card"
+            );
+            assert!(
+                event_loop.remote_brain_run_units.get(&run1).is_none()
+                    && event_loop.remote_brain_run_units.get(&run2).is_none(),
+                "invariant: the replacement snapshot created no duplicate durable groups"
+            );
+
+            // ── Fresh replay (attach/replay boundary) ────────────────────
+            let fresh_output = replay_output_manager();
+            let mut fresh_projections = std::collections::HashMap::new();
+            let mut fresh_local_projections = std::collections::VecDeque::new();
+            let mut fresh_say_projected = std::collections::HashSet::new();
+            super::project_remote_brain_snapshot_runs(
+                &fresh_output,
+                &mut fresh_projections,
+                &mut fresh_local_projections,
+                true,
+                &durable_events,
+                &super::LocallyRenderedRuns::default(),
+                &mut fresh_say_projected,
+            );
+            let replayed = fresh_output.get_messages();
+            assert_eq!(
+                replayed.len(),
+                2,
+                "invariant: fresh replay renders exactly the failed run group and the \
+                 successful turn's group; ids={:?}",
+                replayed
+                    .iter()
+                    .map(|message| (message.id(), message.content()))
+                    .collect::<Vec<_>>()
+            );
+            let replayed_rendered = replayed
+                .iter()
+                .map(|message| {
+                    (
+                        message.id(),
+                        message.format(&crate::theme::ColorScheme::default()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replayed_rendered
+                    .iter()
+                    .map(|(_, rendered)| rendered.matches(fallback).count())
+                    .sum::<usize>(),
+                1,
+                "invariant: fresh replay shows the failed fallback exactly once; \
+                 rendered=\n{replayed_rendered:#?}"
+            );
+            for message in &replayed {
+                if let Some(view) = message.say_turn_view() {
+                    let rendered = message.format(&crate::theme::ColorScheme::default());
+                    assert!(
+                        !rendered.contains(fallback),
+                        "invariant: replay never reconstructs a successful say card for \
+                         the failed turn; view={view:?}"
+                    );
+                }
+            }
+            assert!(
+                fresh_local_projections.is_empty(),
+                "invariant: fresh replay leaves no unacknowledged local projections"
+            );
+        })
+        .await;
+}
+
+/// #1478 dispatch guard: `VmOutputComplete` arriving after a wire turn
+/// already settled as Failed must not overwrite that terminal state as
+/// Complete — a completion event can never restyle the failed
+/// wire-correction fallback into a completed turn.
+#[tokio::test]
+async fn vm_output_complete_keeps_failed_terminal_state() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("guard fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("guard fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            let unit = event_loop
+                .output_manager
+                .start_work_unit("VM program output");
+            unit.set_program_output();
+            unit.append_response("Finch's response needed to be corrected.");
+            unit.set_complete();
+            unit.set_failed();
+            event_loop
+                .handle_event(super::ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&unit),
+                })
+                .await
+                .expect("the completion event must dispatch");
+            assert_eq!(
+                unit.status(),
+                crate::cli::messages::MessageStatus::Failed,
+                "invariant: VmOutputComplete must not overwrite an already-failed \
+                 terminal state as Complete (#1478)"
+            );
+        })
+        .await;
 }
 
 #[test]

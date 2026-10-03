@@ -395,11 +395,44 @@ fn vm_manifest_query(messages: &[crate::providers::Message], query: &str) -> Str
         .to_string()
 }
 
+/// Terminal outcome of one wire execution (#1478).
+///
+/// `WireExecution.response` cannot distinguish a real rendered output from a
+/// plain-language fallback or raw diagnostic — both are `String` — so every
+/// construction site records the outcome explicitly. Failure branches
+/// (cancellation before or during repair, a failed repair round, a rejected
+/// or errored repaired program, a failed deterministic prose wrapper, and
+/// non-repairable rejections) return `Failed`; a Program that executed to
+/// `Completed` — first pass, repaired, or say-wrapped — returns `Succeeded`.
+/// A named-Brain turn whose wire execution failed terminalizes through the
+/// existing failure channel (`QueryFailed` → `RunnerTurnError` →
+/// `BrainRunStatus::Failed`) instead of persisting the fallback as a
+/// successful result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WireExecutionOutcome {
+    /// The turn's Program ran to completion; `response` is real output.
+    Succeeded,
+    /// The turn failed; `response` is a failure report, never real output.
+    Failed,
+}
+
 struct WireExecution {
+    outcome: WireExecutionOutcome,
     source_for_history: String,
     response: String,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     output_unit: Arc<crate::cli::messages::WorkUnit>,
+}
+
+/// Settle a failed wire turn's output component (#1478).
+///
+/// The say card's own Running state has no failed variant, so completion
+/// transitions it exactly once; the WorkUnit's terminal outcome is then
+/// Failed — the visible fallback is a failure report, never a completed
+/// turn. A later `VmOutputComplete` must observe Failed and leave it alone.
+fn settle_failed_wire_output(unit: &crate::cli::messages::WorkUnit) {
+    unit.set_complete();
+    unit.set_failed();
 }
 
 /// What a turn produced, as distinct from the wire program that produced it.
@@ -518,7 +551,7 @@ const UNVERIFIED_TOOL_CLAIM_CAVEAT: &str = "\n\n(unverified -- no tool was \
 /// `error[E-...]`, and `phase:` output) is internal detail that gives a
 /// non-technical user nothing actionable; it goes to `tracing::debug!` only,
 /// never the transcript (#1383).
-const WIRE_REPAIR_FAILED_MESSAGE: &str = "Finch's response needed to be \
+pub(crate) const WIRE_REPAIR_FAILED_MESSAGE: &str = "Finch's response needed to be \
     corrected, and the correction attempt did not succeed either.";
 
 /// Whether `text` asserts it is reporting on content obtained by consulting
@@ -727,6 +760,7 @@ async fn execute_wire_with_single_repair(
             });
             let effect_journal = runner_effect_records(&outcome);
             return WireExecution {
+                outcome: WireExecutionOutcome::Succeeded,
                 source_for_history: source,
                 response: outcome.output,
                 effect_journal,
@@ -769,10 +803,12 @@ async fn execute_wire_with_single_repair(
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
+        settle_failed_wire_output(&output_unit);
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
         return WireExecution {
+            outcome: WireExecutionOutcome::Failed,
             source_for_history: source,
             response: diagnostic,
             effect_journal,
@@ -783,8 +819,9 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
-        output_unit.set_complete();
+        settle_failed_wire_output(&output_unit);
         return WireExecution {
+            outcome: WireExecutionOutcome::Failed,
             source_for_history: source,
             response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
@@ -859,6 +896,7 @@ async fn execute_wire_with_single_repair(
                     outcome.output
                 };
                 WireExecution {
+                    outcome: WireExecutionOutcome::Succeeded,
                     source_for_history: wrapped,
                     response,
                     effect_journal,
@@ -881,11 +919,12 @@ async fn execute_wire_with_single_repair(
                 metric.terminal_failure = true;
                 record_wire_metric(metrics_logger, &metric);
                 wrapped_unit.append_response(&wrap_detail);
-                wrapped_unit.set_complete();
+                settle_failed_wire_output(&wrapped_unit);
                 let _ = event_tx.send(ReplEvent::VmOutputComplete {
                     output_unit: Arc::clone(&wrapped_unit),
                 });
                 WireExecution {
+                    outcome: WireExecutionOutcome::Failed,
                     source_for_history: wrapped,
                     response: wrap_detail,
                     effect_journal,
@@ -911,8 +950,9 @@ async fn execute_wire_with_single_repair(
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
-            output_unit.set_complete();
+            settle_failed_wire_output(&output_unit);
             return WireExecution {
+                outcome: WireExecutionOutcome::Failed,
                 source_for_history: source,
                 response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
@@ -926,8 +966,9 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
-        output_unit.set_complete();
+        settle_failed_wire_output(&output_unit);
         return WireExecution {
+            outcome: WireExecutionOutcome::Failed,
             source_for_history: source,
             response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
@@ -938,11 +979,12 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
-        output_unit.set_complete();
+        settle_failed_wire_output(&output_unit);
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
         return WireExecution {
+            outcome: WireExecutionOutcome::Failed,
             source_for_history: source,
             response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
@@ -953,11 +995,12 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
-        output_unit.set_complete();
+        settle_failed_wire_output(&output_unit);
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
         return WireExecution {
+            outcome: WireExecutionOutcome::Failed,
             source_for_history: source,
             response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
             effect_journal,
@@ -1015,6 +1058,7 @@ async fn execute_wire_with_single_repair(
                 output_unit: Arc::clone(&repair_output_unit),
             });
             WireExecution {
+                outcome: WireExecutionOutcome::Succeeded,
                 source_for_history: repaired_source,
                 response: outcome.output,
                 effect_journal,
@@ -1037,12 +1081,14 @@ async fn execute_wire_with_single_repair(
                 "repaired VM program still rejected (not shown in transcript)"
             );
             repair_output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
+            settle_failed_wire_output(&repair_output_unit);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
+                outcome: WireExecutionOutcome::Failed,
                 source_for_history: repaired_source,
                 response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
@@ -1057,12 +1103,14 @@ async fn execute_wire_with_single_repair(
                 "repaired VM program execution errored (not shown in transcript)"
             );
             repair_output_unit.append_response(WIRE_REPAIR_FAILED_MESSAGE);
+            settle_failed_wire_output(&repair_output_unit);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
+                outcome: WireExecutionOutcome::Failed,
                 source_for_history: repaired_source,
                 response: WIRE_REPAIR_FAILED_MESSAGE.to_string(),
                 effect_journal,
@@ -2363,6 +2411,32 @@ pub(crate) async fn process_query_with_tools(
                         )
                         .await;
                 }
+                // A failed wire turn is a failed turn (#1478): the rendered
+                // text is the plain-language fallback or a diagnostic, never
+                // real output, so it must not persist as a successful
+                // completion. A named-Brain turn terminalizes through the
+                // existing failure channel — `QueryFailed` → the pending
+                // turn's `RunnerTurnError` → `BrainRunStatus::Failed` — and
+                // publishes nothing. Local (non-Brain) sessions keep the
+                // historical publication path; they have no durable
+                // reconciliation that could delete or restyle the failure.
+                if wire_execution.outcome == WireExecutionOutcome::Failed
+                    && query_states
+                        .get_metadata(query_id)
+                        .await
+                        .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
+                {
+                    let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
+                        query_id,
+                        records: wire_execution.effect_journal,
+                    });
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: wire_execution.response.clone(),
+                        generator_name: Some(generator.name().to_string()),
+                    });
+                    return;
+                }
                 let wire_execution_rendered = wire_execution.rendered();
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
@@ -2624,6 +2698,24 @@ pub(crate) async fn process_query_with_tools(
                         Some(Arc::clone(&wire_execution.output_unit)),
                     )
                     .await;
+            }
+            // Same failed-turn routing as the streaming path above (#1478).
+            if wire_execution.outcome == WireExecutionOutcome::Failed
+                && query_states
+                    .get_metadata(query_id)
+                    .await
+                    .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
+            {
+                let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
+                    query_id,
+                    records: wire_execution.effect_journal,
+                });
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: wire_execution.response.clone(),
+                    generator_name: Some(generator.name().to_string()),
+                });
+                return;
             }
             let wire_execution_rendered = wire_execution.rendered();
             let rendered_response = wire_execution.response;
@@ -6088,7 +6180,14 @@ mod tests {
                         ));
                     }
                 }
-                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    // Mirror the real dispatch handler (#1478): a completion
+                    // event must not overwrite an already-failed terminal
+                    // state as Complete.
+                    if output_unit.status() != MessageStatus::Failed {
+                        output_unit.set_complete();
+                    }
+                }
                 _ => {}
             }
         }
@@ -6229,6 +6328,156 @@ mod tests {
         assert!(
             !row.label.contains('\u{23fa}'),
             "invariant: a failure must not wear the completed-prose glyph; row={row:?}"
+        );
+    }
+
+    /// A provider whose first response is a repairable near-miss and whose
+    /// correction round itself fails: the exact "Finch's response needed to
+    /// be corrected, and the correction attempt did not succeed either."
+    /// shape from the live report (#1478). The existing
+    /// `FailingRepairGenerator` fixture models the same provider.
+    #[tokio::test]
+    async fn failed_wire_repair_types_the_turn_failed_and_fails_the_output_unit() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(FailingRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = "(say \"incomplete".to_string();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source,
+            None,
+            None,
+            None,
+            Uuid::new_v4(),
+            &ToolCallHistory::default(),
+        )
+        .await;
+        drain_vm_events_as_event_loop(&mut event_rx);
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "the correction round must have been attempted exactly once"
+        );
+        assert_eq!(
+            execution.outcome,
+            WireExecutionOutcome::Failed,
+            "invariant: a failed correction round is a typed failure, never a \
+             successful execution (#1478); response={:?}",
+            execution.response
+        );
+        assert_eq!(
+            execution.response, WIRE_REPAIR_FAILED_MESSAGE,
+            "invariant: the rendered response is the plain-language fallback"
+        );
+        assert_eq!(
+            execution.output_unit.status(),
+            MessageStatus::Failed,
+            "invariant: the failed fallback's terminal state is Failed — a later \
+             VmOutputComplete must not restyle it as Complete (#1478); content={:?}",
+            execution.output_unit.content()
+        );
+        assert!(
+            execution
+                .output_unit
+                .content()
+                .contains(WIRE_REPAIR_FAILED_MESSAGE),
+            "invariant: the fallback text stays on the retained component; content={:?}",
+            execution.output_unit.content()
+        );
+        assert!(
+            !execution.output_unit.is_assistant_prose(),
+            "invariant: the failure is not restyled as assistant prose"
+        );
+        let card = execution
+            .output_unit
+            .say_turn_snapshot()
+            .expect("the wire output owns a say card");
+        assert_eq!(
+            card.vm.status,
+            crate::cli::messages::SayTurnStatus::Completed,
+            "invariant: the say card's own state settled — a failed turn must not \
+             keep wearing the running spinner"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_brain_failed_wire_repair_routes_queryfailed_not_streamingcomplete() {
+        let mut harness = StreamingQueryHarness::spawn("say hello").await;
+        // A repairable rejection (incomplete program), then the correction
+        // round fails: the paced fixture's non-streaming `generate` always
+        // errors, which is exactly the failed repair shape (#1478).
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"".to_string())))
+            .await;
+        harness.wait_for_content("(say \"").await;
+        harness.close_stream();
+        harness.task.await.expect("named-Brain query task panicked");
+
+        let mut query_failed = None;
+        let mut streaming_complete = None;
+        while let Ok(event) = harness.events.try_recv() {
+            match event {
+                ReplEvent::VmEffect { .. } => {}
+                ReplEvent::VmOutputComplete { .. } => {}
+                ReplEvent::QueryFailed { error, .. } => query_failed = Some(error),
+                ReplEvent::StreamingComplete { full_response, .. } => {
+                    streaming_complete = Some(full_response)
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            streaming_complete.is_none(),
+            "invariant: a failed wire-correction turn must not be published as a \
+             successful completion (#1478); got StreamingComplete={streaming_complete:?}"
+        );
+        assert_eq!(
+            query_failed.as_deref(),
+            Some(WIRE_REPAIR_FAILED_MESSAGE),
+            "invariant: the turn terminalizes through the failure channel carrying \
+             the safe fallback; query_failed={query_failed:?}"
+        );
+        let card = harness
+            .query_states
+            .brain_output_work_unit(harness.query_id)
+            .await
+            .expect(
+                "invariant: the failed turn's live output projection is retained \
+                     for the event loop's reconciliation",
+            );
+        assert_eq!(
+            card.status(),
+            MessageStatus::Failed,
+            "invariant: the retained component's terminal state is Failed; content={:?}",
+            card.content()
+        );
+        assert!(
+            card.content().contains(WIRE_REPAIR_FAILED_MESSAGE),
+            "invariant: the fallback text stays on the retained component; content={:?}",
+            card.content()
+        );
+        assert!(
+            !card.is_assistant_prose(),
+            "invariant: the failure is not restyled as assistant prose"
+        );
+        assert!(
+            !matches!(
+                harness.query_states.get_state(harness.query_id).await,
+                Some(QueryState::Completed { .. })
+            ),
+            "invariant: the failed turn published no completion content; state={:?}",
+            harness.query_states.get_state(harness.query_id).await
         );
     }
 
@@ -6411,11 +6660,17 @@ mod tests {
             1,
             "must have attempted exactly the one corrective repair retry"
         );
+        // #1478: the repair retry's failure is now a typed failure with a
+        // Failed terminal state on the output unit. The turn must still
+        // reach a terminal state so the UI resolves it — Failed settles the
+        // card exactly as Complete did, and the VmOutputComplete event
+        // below still notifies the event loop.
         assert_eq!(
             execution.output_unit.status(),
-            MessageStatus::Complete,
-            "the in-memory WorkUnit must still reach Completed even when the \
-             repair retry itself errors; status={:?}",
+            MessageStatus::Failed,
+            "the in-memory WorkUnit must reach a terminal state even when the \
+             repair retry itself errors — now the typed Failed outcome (#1478); \
+             status={:?}",
             execution.output_unit.status()
         );
 
