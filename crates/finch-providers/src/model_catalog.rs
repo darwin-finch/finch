@@ -107,7 +107,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
     let models: &[&str] = match provider {
         // Subscription provenance is deliberately separate from the OpenAI
         // Platform catalogue, even where a model slug overlaps.
-        "chatgpt" => &["gpt-5.6-sol"],
+        "chatgpt" => &["gpt-5.6-sol", "gpt-6.1-sol"],
         "claude" => &["claude-sonnet-5"],
         // Keep this deliberately short. Authenticated discovery is authoritative;
         // this offline snapshot only offers the three general-purpose API tiers
