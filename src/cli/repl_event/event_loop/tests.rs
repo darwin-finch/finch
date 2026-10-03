@@ -9301,11 +9301,10 @@ async fn test_pending_user_messages_restored_in_order_when_continuation_fails() 
                 "QueryFailed must drain the queue and restore to composer; queued={:?}",
                 event_loop.pending_queries
             );
-            
+
             let restored = event_loop.tui_renderer.lock().await.get_input_draft();
             assert_eq!(
-                restored,
-                "steer now\nand also this",
+                restored, "steer now\nand also this",
                 "the queued turns must be restored into the TUI input composer"
             );
 

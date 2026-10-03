@@ -2144,7 +2144,10 @@ fn prepare_canonical_commit(stdout: &mut impl Write, bg: crossterm::style::Color
     Ok(())
 }
 
-fn prepare_canonical_commit_guarded(stdout: &mut impl Write, bg: crossterm::style::Color) -> Result<()> {
+fn prepare_canonical_commit_guarded(
+    stdout: &mut impl Write,
+    bg: crossterm::style::Color,
+) -> Result<()> {
     match prepare_canonical_commit(stdout, bg) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -2241,7 +2244,11 @@ impl TuiRenderer {
                 }
                 if retained_window.is_none() {
                     self.viewport_invalidated = true;
-                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+                    return self.redraw_full_viewport_inner_to(
+                        out,
+                        true,
+                        Some((term_width, term_h)),
+                    );
                 }
             }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
@@ -2975,7 +2982,10 @@ impl TuiRenderer {
 
         if !plan.emit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(&mut stdout, self.colors.background.to_color().into())?;
+            prepare_canonical_commit_guarded(
+                &mut stdout,
+                self.colors.background.to_color().into(),
+            )?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -4497,9 +4507,19 @@ impl TuiRenderer {
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
-            continue_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
+            continue_full_viewport_paint(
+                out,
+                plan,
+                &painted_transcript,
+                self.colors.background.to_color().into(),
+            )
         } else {
-            begin_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
+            begin_full_viewport_paint(
+                out,
+                plan,
+                &painted_transcript,
+                self.colors.background.to_color().into(),
+            )
         };
         if let Err(error) = paint {
             let _ = execute!(out, EndSynchronizedUpdate);
@@ -8546,8 +8566,13 @@ mod tests {
         let plan = viewport_redraw_plan(12, 6, 2);
         let mut bytes = Vec::new();
 
-        begin_full_viewport_paint(&mut bytes, plan, &["old".into(), "new".into()], crossterm::style::Color::Reset)
-            .expect("paint commands");
+        begin_full_viewport_paint(
+            &mut bytes,
+            plan,
+            &["old".into(), "new".into()],
+            crossterm::style::Color::Reset,
+        )
+        .expect("paint commands");
 
         let commands = String::from_utf8(bytes).expect("ANSI commands are UTF-8");
         assert!(
@@ -8599,7 +8624,8 @@ mod tests {
             .collect::<Vec<_>>();
         let plan = viewport_redraw_plan(8, 2, 1);
         let mut bytes = Vec::new();
-        begin_full_viewport_paint(&mut bytes, plan, &text, crossterm::style::Color::Reset).expect("production viewport paint");
+        begin_full_viewport_paint(&mut bytes, plan, &text, crossterm::style::Color::Reset)
+            .expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
         assert!(
             !raw.contains("[collapsed]") && !raw.contains("[expanded]"),
@@ -8933,7 +8959,9 @@ mod tests {
             bytes: Vec::new(),
             flushes: 0,
         };
-        assert!(prepare_canonical_commit_guarded(&mut output, crossterm::style::Color::Reset).is_err());
+        assert!(
+            prepare_canonical_commit_guarded(&mut output, crossterm::style::Color::Reset).is_err()
+        );
 
         let raw = String::from_utf8(output.bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
@@ -12876,7 +12904,13 @@ mod tests {
                 Vec::new()
             };
             let mut bytes = Vec::new();
-            begin_full_viewport_paint(&mut bytes, plan, &transcript, crossterm::style::Color::Reset).unwrap();
+            begin_full_viewport_paint(
+                &mut bytes,
+                plan,
+                &transcript,
+                crossterm::style::Color::Reset,
+            )
+            .unwrap();
             let mut active_rows = write_live_frame(&mut bytes, &frame, width).unwrap();
             execute!(bytes, EndSynchronizedUpdate).unwrap();
             terminal.feed(&bytes);
