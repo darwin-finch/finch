@@ -70,6 +70,14 @@ where
     match probe_daemon_health(&base_url).await {
         HealthProbe::Compatible => {
             debug!("Daemon already running and healthy");
+            let lifecycle = lifecycle()?;
+            for _ in 0..20 {
+                if lifecycle.read_pid().is_ok() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            lifecycle.read_pid().map(|_| ())?;
             return Ok(());
         }
         HealthProbe::Incompatible(mismatch) => {
@@ -89,6 +97,13 @@ where
         match probe_daemon_health(&base_url).await {
             HealthProbe::Compatible => {
                 info!("Daemon now healthy");
+                for _ in 0..20 {
+                    if lifecycle.read_pid().is_ok() {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                lifecycle.read_pid().map(|_| ())?;
                 return Ok(());
             }
             HealthProbe::Incompatible(mismatch) => {
@@ -122,6 +137,16 @@ where
         match probe_daemon_health(&base_url).await {
             HealthProbe::Compatible => {
                 info!("Daemon started successfully");
+                // The health probe might succeed slightly before the OS flushes the
+                // child's PID file write. Ensure it exists before we return to
+                // callers like `daemon-start` that immediately read it.
+                for _ in 0..20 {
+                    if lifecycle.read_pid().is_ok() {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                lifecycle.read_pid().map(|_| ())?;
                 return Ok(());
             }
             HealthProbe::Incompatible(mismatch) => {

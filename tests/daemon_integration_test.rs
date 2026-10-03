@@ -967,3 +967,41 @@ mod kernel_state_capture_tests {
         );
     }
 }
+
+#[tokio::test]
+async fn test_daemon_start_exits_with_0_on_successful_startup() -> Result<()> {
+    let proof = finch::brain::isolated_test_proof()
+        .context("daemon integration test must be run through scripts/test_brain_isolation.sh")?;
+    let home = proof.home.clone();
+    let finch_dir = home.join(".finch");
+    std::fs::create_dir_all(&finch_dir)?;
+    let daemon_address = finch::config::DEFAULT_DAEMON_ADDR.to_string();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+    command
+        .arg("daemon-start")
+        .arg("--bind")
+        .arg(&daemon_address)
+        .env("FINCH_TEST_ISOLATED", "1")
+        .env("HOME", &home);
+
+    let output = command.output().expect("failed to execute finch daemon-start");
+    
+    assert!(
+        output.status.success(),
+        "daemon-start must exit with 0 on successful startup. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pid_file = finch_dir.join("daemon.pid");
+    assert!(pid_file.exists(), "daemon.pid must exist after daemon-start");
+
+    // Clean up
+    let mut stop = Command::new(env!("CARGO_BIN_EXE_finch"));
+    stop.arg("daemon-stop")
+        .env("FINCH_TEST_ISOLATED", "1")
+        .env("HOME", &home);
+    let _ = stop.output();
+
+    Ok(())
+}
