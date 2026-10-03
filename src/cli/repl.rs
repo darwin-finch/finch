@@ -5468,11 +5468,11 @@ mod model_download_status_tests {
 }
 
 pub async fn register_co_forth_tool_words(runtime: &crate::runtime::ProgramRuntime) -> anyhow::Result<()> {
-    runtime
+    let out = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
             language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("tool-words.forth".to_string()),
-            source: ": code_outline ( S path -- S text ! pure ) drop s\" \" ; \n: find_code ( S path S query -- S text ! pure ) drop drop s\" \" ;".to_string(),
+            source: ": code_outline ( S string -- S string ! pure ) drop s\" \" ; \n: find_code ( S string string -- S string ! pure ) drop drop s\" \" ;".to_string(),
             intent: "tool words".to_string(),
             effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),

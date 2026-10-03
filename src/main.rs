@@ -5054,9 +5054,9 @@ mod build_query_tool_executor_tests2 {
         let outcome = execute_one_shot_wire_source(
             &runtime,
             "code_outline \"src/main.rs\"",
-        ).await;
+        ).await.unwrap();
         
-        let err = outcome.unwrap_err();
-        assert!(!err.to_string().contains("E-LINK-002"));
+        let diags = format!("{:?}", outcome.diagnostics);
+        assert!(!diags.contains("E-LINK-002"));
     }
 }
