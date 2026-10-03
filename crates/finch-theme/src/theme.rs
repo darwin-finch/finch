@@ -236,6 +236,15 @@ impl ColorScheme {
         color_luminance(&self.messages.assistant) >= 0.5
     }
 
+    /// Return the subtle background used to identify interactive rows on hover.
+    pub fn hover_background(&self) -> Color {
+        if self.is_dark() {
+            Color::Rgb(36, 38, 42)
+        } else {
+            Color::Rgb(240, 240, 243)
+        }
+    }
+
     /// Return a subtle, contrast-safe full-row style for a transcript role.
     /// A light assistant foreground indicates a dark terminal palette (and
     /// vice versa), so custom schemes need no second theme discriminator.
@@ -264,7 +273,7 @@ impl ColorScheme {
         let dark_terminal = self.is_dark();
         let (foreground, background) = if dark_terminal {
             let background = match band {
-                MessageBand::LocalUser => (38, 38, 42),
+                MessageBand::LocalUser => (24, 24, 27),
                 MessageBand::Participant(index) => {
                     DARK_PARTICIPANTS[index % DARK_PARTICIPANTS.len()]
                 }
@@ -276,7 +285,7 @@ impl ColorScheme {
             (Color::Rgb(245, 247, 250), background)
         } else {
             let background = match band {
-                MessageBand::LocalUser => (238, 238, 242),
+                MessageBand::LocalUser => (247, 247, 249),
                 MessageBand::Participant(index) => {
                     LIGHT_PARTICIPANTS[index % LIGHT_PARTICIPANTS.len()]
                 }
@@ -701,6 +710,41 @@ mod tests {
         );
         assert!(contrast(dark_alice) >= 7.0);
         assert!(contrast(light.message_band_style(MessageBand::Participant(3))) >= 7.0);
+    }
+
+    #[test]
+    fn test_user_input_and_hover_backgrounds_are_subtle_and_readable() {
+        let dark = ColorTheme::Dark.to_scheme();
+        let light = ColorTheme::Light.to_scheme();
+
+        assert_eq!(
+            dark.message_band_style(MessageBand::LocalUser).bg,
+            Some(Color::Rgb(24, 24, 27)),
+            "dark user input should use a soft near-black background"
+        );
+        assert_eq!(
+            dark.hover_background(),
+            Color::Rgb(36, 38, 42),
+            "dark hover should remain visible without overpowering row text"
+        );
+        assert_eq!(
+            light.message_band_style(MessageBand::LocalUser).bg,
+            Some(Color::Rgb(247, 247, 249)),
+            "light user input should use a soft near-white background"
+        );
+        assert_eq!(
+            light.hover_background(),
+            Color::Rgb(240, 240, 243),
+            "light hover should remain visible without overpowering row text"
+        );
+        assert!(
+            contrast(dark.message_band_style(MessageBand::LocalUser)) >= 7.0,
+            "softened dark user input must retain AAA text contrast"
+        );
+        assert!(
+            contrast(light.message_band_style(MessageBand::LocalUser)) >= 7.0,
+            "softened light user input must retain AAA text contrast"
+        );
     }
 
     #[test]
