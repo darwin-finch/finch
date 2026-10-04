@@ -115,6 +115,12 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   `into_request_for`. Generic OpenAI-compatible clients do not use
   ChatGPT/Codex reserved namespaces. Provider-native tools are advertised
   only with a Finch handler and grant.
+- **A completed Claude CLI streaming round emits the usage the CLI reported (#1671, a whole
+  Claude CLI session read as zero input tokens).** `ClaudeCliProvider::send_message_stream_validated`
+  (`claude_cli.rs`) sends one `StreamChunk::Usage` built from the last `assistant` message's
+  `usage` before the terminal `ContentBlockComplete`, matching what the non-streaming
+  `response_from` already returned; a round that pauses for a tool call emits none.
+  `streaming_emits_text_deltas_then_a_complete_text_block` pins it.
 - **Claude CLI subscription tool calls run through Finch's own MCP bridge, never the CLI's own
   built-in tools (issue #1309), and the bridge is a pure translator, not an execution authority
   (issue #1341).** `claude_cli.rs` always spawns `claude` with `--tools ""` (its own

@@ -921,3 +921,247 @@ async fn test_a_turn_after_a_cancelled_turn_shows_exactly_one_indicator() {
         })
         .await;
 }
+
+// ── Issue #1671 (every Claude CLI reply was wrapped in two `(ran 0s)` rows,
+// the time was always 0, and the session counter claimed `0 in`) ───────────
+//
+// The Claude CLI bridge answers in plain prose rather than a Finch program,
+// streams it as text deltas followed by one completed text block, and (on
+// the streaming path) reported no usage at all.
+
+const PROSE: &str = "pong PROSE_SENTINEL_1671";
+
+/// Every completed-timing row on screen.
+fn timing_rows(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row.trim().to_string())
+        .filter(|row| row.contains("(ran "))
+        .collect()
+}
+
+impl IndicatorTurn {
+    /// Answer the waiting provider call the way the Claude CLI bridge does:
+    /// the prose as a text delta, then the same prose as one completed text
+    /// block, and no usage chunk.
+    async fn answer_in_bridge_prose(&mut self) {
+        self.release_provider_call();
+        self.send(StreamChunk::TextDelta(PROSE.into())).await;
+        self.send(StreamChunk::ContentBlockComplete(
+            crate::providers::ContentBlock::text(PROSE),
+        ))
+        .await;
+        self.end_stream();
+    }
+
+    /// The session-cumulative token readout on the status line.
+    fn session_usage_line(&self) -> String {
+        self.event_loop
+            .status_bar
+            .get_line(&crate::cli::status_bar::StatusLineType::SessionUsage)
+            .unwrap_or_default()
+    }
+}
+
+/// A bridge-style prose reply renders as the reply and one timing row.
+///
+/// Failed before the fix: the rejected first attempt to run the prose as a
+/// program kept its own, empty, completed row, so the screen showed a lone
+/// `(ran 0s)` above the reply and a second `(ran 0s)` beneath it.
+#[tokio::test]
+async fn test_bridge_prose_reply_renders_one_reply_row_and_one_timing_row() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(1);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.answer_in_bridge_prose().await;
+            turn.settle("the turn's terminal event", |turn| turn.terminal_seen)
+                .await;
+
+            let rows = turn.frame("complete").await;
+            let reply_rows: Vec<String> = rows
+                .iter()
+                .map(|row| row.trim().to_string())
+                .skip_while(|row| !row.contains("PROMPT_SENTINEL_1664"))
+                .skip(1)
+                .filter(|row| row.contains(PROSE) || row.contains("(ran "))
+                .collect();
+            assert_eq!(
+                reply_rows,
+                vec![PROSE.to_string(), "(ran 0s)".to_string()],
+                "INVARIANT: a prose reply renders as the reply followed by exactly one \
+                 completed-timing row, with no empty assistant row before it\n{}",
+                turn.report()
+            );
+            let say_turns = turn
+                .event_loop
+                .output_manager
+                .get_messages()
+                .iter()
+                .filter_map(|message| message.say_turn_view())
+                .map(|view| {
+                    view.vm
+                        .output
+                        .map(|output| output.lines)
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                say_turns,
+                vec![vec![PROSE.to_string()]],
+                "INVARIANT: a prose reply owns exactly one reply row in the transcript, and \
+                 it carries the reply; an output-less row is the empty assistant row\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// The completed-timing row reports how long the turn took, counted from
+/// the moment its request was sent.
+///
+/// Failed before the fix: the reply row's clock started when the finished
+/// reply was handed to the program runtime, after the whole provider wait,
+/// so a turn that took seven seconds said `(ran 0s)`.
+#[tokio::test]
+async fn test_completed_turn_reports_the_time_since_its_request_was_sent() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(1);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.advance(Duration::from_secs(7));
+            turn.answer_in_bridge_prose().await;
+            turn.settle("the turn's terminal event", |turn| turn.terminal_seen)
+                .await;
+
+            let rows = turn.frame("complete").await;
+            assert_eq!(
+                timing_rows(&rows),
+                vec!["(ran 7s)".to_string()],
+                "INVARIANT: a turn whose provider took 7 s reports 7 s, not the time its \
+                 finished reply took to print\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// The same, across a tool round: the figure covers the whole turn.
+///
+/// Failed before the fix for the same reason: `(ran 0s)`.
+#[tokio::test]
+async fn test_completed_turn_with_a_tool_round_reports_the_whole_turn_time() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(2);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.advance(Duration::from_secs(2));
+            turn.release_provider_call();
+            turn.send(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: TOOL_NAME.into(),
+                input: serde_json::json!({}),
+                provenance: provenance(),
+            })
+            .await;
+            turn.end_stream();
+            turn.settle("the tool to start", |turn| {
+                turn.tool_started.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            turn.advance(Duration::from_secs(3));
+            turn.tool_release.add_permits(1);
+            turn.settle("the continuation request to be sent", |turn| {
+                turn.provider_calls_started() == 2
+            })
+            .await;
+            turn.advance(Duration::from_secs(4));
+            turn.answer_in_bridge_prose().await;
+            turn.settle("the turn's terminal event", |turn| turn.terminal_seen)
+                .await;
+
+            let rows = turn.frame("complete").await;
+            assert_eq!(
+                timing_rows(&rows),
+                vec!["(ran 9s)".to_string()],
+                "INVARIANT: the completed-timing row covers the whole turn (2 s waiting, 3 s \
+                 in the tool, 4 s in the continuation), on one row\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// A provider that reports no input tokens must not be shown as having used
+/// zero; one that does report them is shown with its real figure.
+///
+/// Failed before the fix: the readout was `this session: 0 in / 2 out`.
+#[tokio::test]
+async fn test_session_token_line_omits_input_the_provider_never_reported() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(2);
+            turn.event_loop.reset_session_usage_for_tests(None);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.answer_in_bridge_prose().await;
+            turn.settle("the turn's terminal event", |turn| turn.terminal_seen)
+                .await;
+            let line = turn.session_usage_line();
+            assert_eq!(
+                line,
+                "this session: 2 out",
+                "INVARIANT: with no input tokens reported the readout names no input figure \
+                 (never `0 in`); ledger={:?}\n{}",
+                turn.event_loop.session_usage,
+                turn.report()
+            );
+
+            turn.terminal_seen = false;
+            turn.submit().await;
+            turn.settle("the second provider request to be sent", |turn| {
+                turn.provider_calls_started() == 2
+            })
+            .await;
+            turn.release_provider_call();
+            turn.send(StreamChunk::TextDelta(PROSE.into())).await;
+            turn.send(StreamChunk::Usage {
+                input_tokens: 1_200,
+                output_tokens: 5,
+            })
+            .await;
+            turn.send(StreamChunk::ContentBlockComplete(
+                crate::providers::ContentBlock::text(PROSE),
+            ))
+            .await;
+            turn.end_stream();
+            turn.settle("the second turn's terminal event", |turn| {
+                turn.terminal_seen
+            })
+            .await;
+            let line = turn.session_usage_line();
+            assert_eq!(
+                line,
+                "this session: 1.2k in / 7 out",
+                "INVARIANT: input tokens the provider reports are shown as reported; \
+                 ledger={:?}\n{}",
+                turn.event_loop.session_usage,
+                turn.report()
+            );
+        })
+        .await;
+}

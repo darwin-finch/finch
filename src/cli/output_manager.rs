@@ -462,6 +462,23 @@ impl OutputManager {
         wu
     }
 
+    /// Create and register the WorkUnit that shows a turn's reply. With the
+    /// turn's generation unit it counts elapsed time from that unit's start,
+    /// so the completed row reports the turn's duration; without one it is an
+    /// ordinary unit starting now.
+    pub fn start_reply_work_unit(
+        &self,
+        turn: Option<&WorkUnit>,
+        verb: impl Into<String>,
+    ) -> Arc<WorkUnit> {
+        let Some(turn) = turn else {
+            return self.start_work_unit(verb);
+        };
+        let wu = Arc::new(turn.continuing_turn(MessageId::new(), verb));
+        self.add_trait_message(Arc::clone(&wu) as MessageRef);
+        wu
+    }
+
     /// Register a replayable WorkUnit using identity derived from its
     /// canonical event envelope rather than frontend construction time.
     pub fn start_work_unit_with_id(&self, id: MessageId, verb: impl Into<String>) -> Arc<WorkUnit> {

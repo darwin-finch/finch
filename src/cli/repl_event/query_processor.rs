@@ -676,6 +676,7 @@ async fn execute_wire_with_single_repair(
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     query_id: Uuid,
     tool_call_history: &ToolCallHistory,
+    turn_unit: Option<&crate::cli::messages::WorkUnit>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -690,7 +691,7 @@ async fn execute_wire_with_single_repair(
         finch_programs::WireCorpusAttempt::FirstPass,
         &source,
     );
-    let output_unit = output_manager.start_work_unit("VM program output");
+    let output_unit = output_manager.start_reply_work_unit(turn_unit, "VM program output");
     output_unit.set_program_output();
     // The say card owns the turn from here (#882): the producer retains the
     // wire source in the component ViewModel so the reader can reveal it.
@@ -797,7 +798,11 @@ async fn execute_wire_with_single_repair(
         // one bad generation into a second; the correction needs no model
         // round-trip. Wrap the exact text it already produced as a `say`
         // effect deterministically.
-        output_unit.set_complete();
+        // The rejected attempt and its wrapped form are one reply, so they
+        // share one unit: completing the first and starting a second left an
+        // empty completed row -- a lone `(ran 0s)` -- above every prose
+        // reply (#1671). Nothing of the rejected attempt is shown on this
+        // path (its diagnostic is withheld above), so no row is lost.
         // Always resolves Forth here in practice: is_unattempted_prose
         // already requires `source` not to start with `(`, infer_source's
         // sole Lisp condition. wrap_prose_as_say's Lisp arm exists for its
@@ -805,8 +810,7 @@ async fn execute_wire_with_single_repair(
         // tests), not because this call site reaches it.
         let language = finch_programs::ProgramLanguage::infer_source(&source);
         let wrapped = finch_programs::wrap_prose_as_say(&source, language);
-        let wrapped_unit = output_manager.start_work_unit("VM program output");
-        wrapped_unit.set_program_output();
+        let wrapped_unit = Arc::clone(&output_unit);
         wrapped_unit.begin_say_turn(language.as_str(), &wrapped);
         return match execute_direct_wire_response(
             runtime,
@@ -982,7 +986,8 @@ async fn execute_wire_with_single_repair(
     repair_source_unit.set_response(repaired_source.clone());
     repair_source_unit.set_complete();
 
-    let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
+    let repair_output_unit =
+        output_manager.start_reply_work_unit(turn_unit, "VM repaired program output");
     repair_output_unit.set_program_output();
     repair_output_unit.begin_say_turn(
         finch_programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
@@ -2419,6 +2424,7 @@ pub(crate) async fn process_query_with_tools(
                     effect_audit,
                     query_id,
                     &tool_call_history,
+                    Some(work_unit.as_ref()),
                 )
                 .await;
                 if query_states
@@ -2700,6 +2706,7 @@ pub(crate) async fn process_query_with_tools(
                 effect_audit,
                 query_id,
                 &tool_call_history,
+                Some(work_unit.as_ref()),
             )
             .await;
             if query_states
@@ -5034,6 +5041,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -5472,6 +5480,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5583,6 +5592,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await;
                 let messages = output.get_messages();
@@ -5686,6 +5696,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         while event_rx.try_recv().is_ok() {}
@@ -5774,6 +5785,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -5941,6 +5953,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -6007,6 +6020,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -6059,6 +6073,7 @@ mod tests {
             None,
             query_id,
             &tool_call_history,
+            None,
         )
         .await;
 
@@ -6223,6 +6238,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -6281,6 +6297,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
         drain_vm_events_as_event_loop(&mut event_rx);
@@ -6352,6 +6369,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
@@ -6397,6 +6415,7 @@ mod tests {
                     None,
                     Uuid::new_v4(),
                     &ToolCallHistory::default(),
+                    None,
                 )
                 .await
             })
@@ -6497,6 +6516,7 @@ mod tests {
             None,
             Uuid::new_v4(),
             &ToolCallHistory::default(),
+            None,
         )
         .await;
 
