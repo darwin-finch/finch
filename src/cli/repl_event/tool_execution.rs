@@ -1143,4 +1143,317 @@ mod tests {
              disconnected execution authority inside the bridge process itself"
         );
     }
+
+    /// The frontend's link to an in-process Brain service: attach and submit
+    /// go to the same `BrainLifecycleService` calls the daemon's IPC handlers
+    /// make, so a submission meets the real execution lane. Nothing else is
+    /// reachable from a `todo_write`.
+    struct InProcessBrainService {
+        lifecycle: crate::server::BrainLifecycleService,
+        store: crate::brain::BrainStore,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::brain::LocalBrainTransport for InProcessBrainService {
+        async fn brain_attach(
+            &self,
+            brain: &str,
+            subject: &str,
+            role: crate::brain::AttachmentRole,
+            attachment_id: Option<crate::brain::AttachmentId>,
+        ) -> anyhow::Result<crate::brain::BrainAttachment> {
+            let pending = self.lifecycle.attach(brain, subject, role, attachment_id)?;
+            let connection_id = pending
+                .connection_id
+                .expect("a fresh attachment carries its connection");
+            self.store
+                .activate_connection(brain, pending.attachment_id, connection_id)
+        }
+        async fn brain_snapshot(&self, brain: &str) -> anyhow::Result<crate::brain::BrainSnapshot> {
+            self.lifecycle.snapshot(brain)
+        }
+        async fn brain_submit(
+            &self,
+            brain: &str,
+            attachment: &crate::brain::BrainAttachment,
+            kind: crate::brain::BrainEventKind,
+        ) -> anyhow::Result<()> {
+            let connection_id = attachment
+                .connection_id
+                .expect("an activated attachment carries its connection");
+            self.lifecycle
+                .submit(brain, attachment.attachment_id, connection_id, kind)
+                .await
+                .map(|_| ())
+                .map_err(|error| anyhow!("{error}"))
+        }
+        async fn brain_start_speculative(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _prompt: String,
+        ) -> anyhow::Result<crate::brain::BrainRun> {
+            unreachable!("todo_write starts no speculative run")
+        }
+        async fn brain_cancel_run(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _run_id: crate::brain::RunId,
+        ) -> anyhow::Result<crate::brain::BrainRun> {
+            unreachable!("todo_write cancels no run")
+        }
+        async fn brain_create_schedule(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _language: crate::brain::ProgramLanguage,
+            _source: &str,
+            _grant_ceiling: &crate::vm::EffectSet,
+            _next_due_ms: u64,
+            _interval_ms: Option<u64>,
+            _delivery_policy: &crate::brain::BrainScheduleDeliveryPolicy,
+        ) -> anyhow::Result<crate::brain::BrainSchedule> {
+            unreachable!("todo_write creates no schedule")
+        }
+        async fn brain_inspect_schedule(
+            &self,
+            _brain: &str,
+            _schedule_id: crate::brain::ScheduleId,
+        ) -> anyhow::Result<Option<crate::brain::BrainSchedule>> {
+            unreachable!("todo_write inspects no schedule")
+        }
+        async fn brain_cancel_schedule(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _schedule_id: crate::brain::ScheduleId,
+        ) -> anyhow::Result<bool> {
+            unreachable!("todo_write cancels no schedule")
+        }
+        async fn brain_schedule_initialization(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _next_due_ms: u64,
+        ) -> anyhow::Result<crate::brain::BrainSchedule> {
+            unreachable!("todo_write schedules no initialization")
+        }
+        async fn brain_acknowledge(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+            _seq: u64,
+        ) -> anyhow::Result<crate::brain::BrainAttachment> {
+            unreachable!("todo_write acknowledges nothing")
+        }
+        async fn brain_detach(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+        ) -> anyhow::Result<()> {
+            unreachable!("todo_write detaches nothing")
+        }
+        async fn brain_watch(
+            &self,
+            _brain: &str,
+            _attachment: &crate::brain::BrainAttachment,
+        ) -> anyhow::Result<mpsc::UnboundedReceiver<anyhow::Result<crate::brain::BrainWireMessage>>>
+        {
+            unreachable!("todo_write opens no watch")
+        }
+    }
+
+    /// Issue #1585 (`todo_write` timed out after 30 seconds) at the tool
+    /// boundary. The session's prompt is a Brain turn, so the Brain's
+    /// execution lane is held while the turn's tools run. `todo_write`
+    /// journals its list through the selected Brain before reporting success;
+    /// that submission used to queue behind the lane its own turn held.
+    #[tokio::test]
+    async fn test_todo_write_during_a_brain_turn_returns_success_through_the_real_tool_path() {
+        tokio::task::LocalSet::new()
+            .run_until(todo_write_during_a_brain_turn_scenario())
+            .await;
+    }
+
+    async fn todo_write_during_a_brain_turn_scenario() {
+        use crate::brain::{AttachmentRole, BrainEventKind};
+        use crate::tools::{TodoList, TodoWriteTool};
+
+        let tempdir = tempfile::tempdir().expect("isolated Brain and tool state");
+        let server = Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                crate::brain::BrainStore::with_root("box.local", Some(tempdir.path().into())),
+                crate::brain::BrainCredentialAuthority::ephemeral([85; 32]),
+                "test-password".into(),
+                tempdir.path(),
+            )
+            .expect("construct the in-process Brain service"),
+        );
+        let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+        let environment = lifecycle.snapshot("shared").unwrap().environment;
+        let lease = lifecycle
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
+
+        let target =
+            crate::brain::RemoteBrainTarget::local("shared", "http://127.0.0.1:0").unwrap();
+        let mut client = crate::brain::AttachedBrainClient::local(
+            target,
+            InProcessBrainService {
+                lifecycle: lifecycle.clone(),
+                store: server.brain_store().clone(),
+            },
+        );
+        client
+            .attach("alice", AttachmentRole::Driver, None)
+            .await
+            .expect("attach the session as the Brain's driver");
+
+        // The session's prompt: its turn is dispatched and left running, so
+        // the lane is held for the rest of the test, as it is while a real
+        // turn's tools execute.
+        let prompt_client = client.clone();
+        let prompt = tokio::task::spawn_local(async move {
+            prompt_client
+                .push(BrainEventKind::Prompt {
+                    text: "plan the work".into(),
+                    attached_mentions: Vec::new(),
+                })
+                .await
+        });
+        let turn = match tokio::time::timeout(std::time::Duration::from_secs(10), runner_rx.recv())
+            .await
+            .expect("the prompt hung before reaching its runner")
+            .expect("runner channel must stay open")
+        {
+            crate::server::RunnerRequest::Turn(turn) => turn,
+            other => panic!("a prompt must dispatch a turn, got {other:?}"),
+        };
+
+        // The production wiring from `Repl::new` and `EventLoop`: one shared
+        // list, a journaled tool, the worker on this LocalSet, and the
+        // selected Brain as the journal target.
+        let todo_list = Arc::new(std::sync::RwLock::new(TodoList::default()));
+        let (journal, journal_target, journal_receiver) =
+            crate::tools::todo_journal(Arc::clone(&todo_list));
+        journal_receiver.spawn();
+        journal_target.set(Some(client.clone()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TodoWriteTool::journaled(
+            Arc::clone(&todo_list),
+            journal,
+        )));
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct the tool executor");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::new(OutputManager::new(ColorScheme::default())),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+
+        let query_id = Uuid::new_v4();
+        let tool_use = ToolUse::new(
+            "todo_write".to_string(),
+            serde_json::json!({"todos": [
+                {"id": "1", "content": "write the plan", "status": "in_progress", "priority": "high"}
+            ]}),
+        );
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_use.id.clone(),
+                        name: "todo_write".into(),
+                        input: tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage the todo_write round");
+        let work_unit = coordinator.output_manager.start_work_unit("todo_write");
+        let row_idx = work_unit.add_row("todo_write");
+        coordinator.spawn_tool_execution(
+            query_id,
+            round_token,
+            tool_use,
+            work_unit,
+            row_idx,
+            None,
+            None,
+        );
+
+        // Liveness only, and well inside the tool's own 30-second timeout:
+        // expiry means todo_write is waiting for the turn that issued it.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await;
+        let snapshot = lifecycle.snapshot("shared").unwrap();
+        let event = event
+            .unwrap_or_else(|_| {
+                panic!(
+                    "todo_write issued during a Brain turn hung instead of completing (it waits \
+                     for the turn that issued it, then times out); durable tasks: {:?}, runs: {:?}",
+                    snapshot.tasks, snapshot.runs
+                )
+            })
+            .expect("tool event channel must stay open");
+        let result = match event {
+            ReplEvent::ToolResult { result, .. } => result,
+            other => panic!(
+                "todo_write must run without an approval dialog and publish its result, got \
+                 {other:?}"
+            ),
+        };
+        let content = result.unwrap_or_else(|error| {
+            panic!(
+                "todo_write during a Brain turn must succeed, got: {error:#}; durable tasks: \
+                 {:?}, runs: {:?}",
+                snapshot.tasks, snapshot.runs
+            )
+        });
+        assert!(
+            content.contains("Todo list updated: 1 task"),
+            "todo_write must report the list it wrote: {content}"
+        );
+        assert_eq!(
+            vec!["write the plan".to_string()],
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.content.clone())
+                .collect::<Vec<_>>(),
+            "the Brain must hold the list durably before the tool reports success"
+        );
+        assert_eq!(
+            1,
+            todo_list.read().unwrap().len(),
+            "the session's own list must show what the Brain accepted"
+        );
+        assert!(
+            snapshot
+                .runs
+                .iter()
+                .any(|run| run.run_id == turn.run_id && !run.status.is_terminal()),
+            "the turn that issued todo_write must still be running, so the tool did not simply \
+             wait for it: {:?}",
+            snapshot.runs
+        );
+        assert!(
+            !prompt.is_finished(),
+            "the session's prompt must still be waiting on its turn"
+        );
+        prompt.abort();
+    }
 }
