@@ -125,8 +125,8 @@ model = "llama-3.3-70b-versatile"  # optional
 type = "local"
 inference_provider = "llama_cpp"
 execution_target = "auto"     # "auto" (Metal on supported Macs) | "cpu"
-model_family = "qwen2"
-model_size = "medium"         # "small"=1.5B "medium"=3B "large"=7B "xlarge"=14B
+model_family = "Qwen2"        # "Qwen2" | "Gemma2" | "Llama3" | "Mistral" | "Phi" | "DeepSeek" (capitalised exactly so)
+model_size = "Medium"         # for Qwen2: "Small"=1.5B "Medium"=3B "Large"=7B "XLarge"=14B
 # Omit model_path for a supported managed download, or provide an existing absolute .gguf file.
 # model_path = "/absolute/path/to/chat-model.gguf"
 enabled = true
@@ -157,8 +157,8 @@ api_key = "sk-proj-..."
 type = "local"
 inference_provider = "llama_cpp"
 execution_target = "auto"
-model_family = "qwen2"
-model_size = "medium"
+model_family = "Qwen2"
+model_size = "Medium"
 enabled = true
 ```
 

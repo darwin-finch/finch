@@ -40,6 +40,15 @@ targeted loader tombstone that directs users to personas and does not rewrite ei
 the referenced file. Other unknown keys retain the existing compatibility behavior; do not replace
 this tombstone with a global `deny_unknown_fields` policy.
 
+**Documented local provider examples load as written.** Every `type = "local"` `[[providers]]`
+table shown in [`CONFIGURATION.md`](CONFIGURATION.md) and
+[`docs/MULTI_PROVIDER_CONFIG.md`](../../docs/MULTI_PROVIDER_CONFIG.md) is read out of the document
+and loaded through `load_config_from_path` by
+`test_documented_local_provider_examples_load_as_written` in `loader.rs` (#1653, the documented
+`model_family = "qwen2"` example was rejected). `model_family` and `model_size` values are
+case-sensitive (`Qwen2`, `Medium`); the loader does not accept lowercase spellings, so the
+documents must use the capitalised ones.
+
 **Instruction loading is an invariant.** The load order and deduplication rules live in
 [context assembly](../context/ASSEMBLY.md) and are pinned by the root
 [Context invariant](../../CLAUDE.md#context).

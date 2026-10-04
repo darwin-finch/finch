@@ -16,8 +16,8 @@ model = "claude-sonnet-4-6"   # optional override
 type = "local"
 inference_provider = "llama_cpp"
 execution_target = "auto"    # "auto" (Metal on supported Macs) | "cpu"
-model_family = "qwen2"
-model_size = "medium"         # descriptive size hint; GGUF file supplies the weights
+model_family = "Qwen2"       # "Qwen2" | "Gemma2" | "Llama3" | "Mistral" | "Phi" | "DeepSeek" (capitalised exactly so)
+model_size = "Medium"         # "Small" | "Medium" | "Large" | "XLarge"; descriptive size hint, GGUF file supplies the weights
 model_path = "/absolute/path/to/chat-model.gguf"
 enabled = true
 
