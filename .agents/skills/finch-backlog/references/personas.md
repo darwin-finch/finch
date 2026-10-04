@@ -335,3 +335,76 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   `kill -9`-and-reattach test on the same session, so plausibly leftover session state from that
   rather than a background-task-specific bug; below the bar for filing (not independently
   reproducible), noted here in case a future pass hits the same message after a reattach.
+- **2026-10-04**: self-hosting run (personas using Finch to work on Finch) against finch 0.7.31 /
+  commit `c0811778`, daemon restarted on that build. **No persona was dispatched.** The
+  coordinator's one-message smoke test, run before handing sessions to personas, found that
+  neither configured provider could carry a working session:
+  - The ChatGPT subscription entry (`chatgpt`, `gpt-6.1-sol`, and `gpt-5.6-sol` on one further
+    probe) answered every request with HTTP 429 "The usage limit has been reached". Finch
+    reported it as "wait a moment before retrying" with no reset time (filed as #1660, exhausted
+    allowance reported as a momentary rate limit).
+  - The agreed fallback, `local-qwen-2.5-3b`, answered a text-only prompt once and failed the
+    same prompt in a second Brain ("Finch's response needed to be corrected, and the correction
+    attempt did not succeed either"); any turn that used a tool failed on the round after the
+    tool call with the documented "Local models don't yet support continuing a conversation after
+    a tool call" 500. Evidence added to #1276 (real local-model tool-call support) and #1635 (a
+    local-model turn shows only "Program source (lisp)"). No fix was attempted: whether the local
+    path is completed or marked unsupported is an open owner question on #1635.
+  Also filed from the smoke test: #1659 (raw `[llama-cpp-2]` log lines painted into the
+  conversation on every message, on any provider, despite the load-output fix in #1626) and #1661
+  (`finch brain ls` shows ATTACHED 1 for 37 Brains with three clients running, across a daemon
+  restart).
+  **Lesson for future passes:** send one real message on each provider the wave depends on
+  before creating persona worktrees and sessions; a provider that is configured and signed in can
+  still have no allowance left, and `finch status`, `/providers` and the start screen all look
+  normal when it does. And because `ATTACHED` cannot be trusted (#1661), use the process list and
+  `tmux ls`, not `finch brain ls`, to decide whether someone else has a live session before a
+  daemon restart.
+- **2026-10-04 (retry on the Claude CLI bridge)**: one self-hosting wave, then stopped on a safety
+  finding. Provider `claude-cli` (`claude_cli_backend`, `claude` 2.1.289); the ChatGPT entry was
+  probed once and still returned HTTP 429 "The usage limit has been reached". Builds `7c889b74`
+  then `e51f732d`.
+  **Confirmed live:** the llama.cpp diagnostics fix (#1663, llama.cpp diagnostics stay out of the
+  conversation) holds: no `[llama-cpp-2]` line in the conversation in any capture, and the same
+  lines are present in the Ctrl+` console as `INFO llama-cpp-2: …`.
+  **Dana, bug fix with a regression test, through Finch:** asked Finch to fix #1650 (an unknown
+  slash command prints the whole help screen). Finch did the inspection, wrote
+  `test_unknown_command_prints_short_message`, ran it and saw it fail, made the fix, re-ran the
+  tests, ran `cargo fmt` and committed. The persona typed nine prompts, answered dialogs, and made
+  no edits. The coordinator added one follow-up by hand (name the whole typed input, so
+  `/patterns invalid` is not reported as "Unknown command: /patterns."). Merged as #1665 after an
+  independent review and green CI, then confirmed in the installed binary: `/bogus` prints
+  `Unknown command: /bogus. Type /help for the list.`
+  **Friction filed:** #1666 (Esc during a Claude CLI turn leaves "Cancellation requested…"
+  forever and later prompts vanish; one of them still ran a shell command unseen), #1667 (a bash
+  call is cut off after 30 seconds while the command keeps running, so builds and tests need
+  `nohup` workarounds), #1668 (approving a small edit to a 1 MB file shows "change omitted"
+  instead of the diff), #1669 (the bash approval dialog cuts the command off with "..."), #1670
+  (`> /dev/null` refused as "Direct device access is dangerous" after the user said Yes), #1671
+  (two "(ran 0s)" rows around every reply, always 0, and "0 in" tokens), #1672 (no activity
+  indicator on a long turn, and some turns show no tool rows for tools that ran), #1673 (the model
+  reports its own output coming back as "[Finch VM result for program event #...]"), #1674 (the
+  mode line says "tools require confirmation" while a saved allow-all pattern lets every bash
+  command run with no dialog). Evidence added to #1636 (corrupted memory routing tree): the same
+  "point 71 / leaf 14 / leaf 13" error hits every Brain on the machine, including one created
+  seconds earlier, so "index did not finish loading" never clears on a new Brain here.
+  **Why the run stopped after one wave:** the brief's safety rule was that personas approve only
+  actions inside their worktree. With the owner's real `~/.finch`, `tool_patterns.json` holds a
+  persistent allow-all for `bash`, so shell commands ran without any dialog, including
+  `git commit`, detached `setsid nohup` processes, and log files written to `/tmp`. A persona
+  cannot enforce an approval rule it is never asked about.
+  **Lessons for future passes:**
+  - Read `~/.finch/tool_patterns.json` before the first wave. If it allows `bash` wholesale, the
+    persona's approval decisions do not gate anything; get the owner's decision first, or run with
+    a separate HOME.
+  - Give the persona an explicit instruction never to press Esc mid-turn except as a deliberate,
+    last test (#1666), and to expect every build or test to exceed the bash limit (#1667).
+  - A coordinator must run `git` with `-C <absolute worktree path>` and check
+    `git rev-parse --show-toplevel` before any checkout or `cargo install`. In this run a worktree
+    disappeared between two commands and a `git checkout --detach origin/main` plus
+    `cargo install` ran in the owner's main checkout instead (put back with `git checkout main`;
+    nothing tracked was changed).
+  - Use an unfiltered `tmux ls` before and after every session kill and record it. During this
+    run the owner's four `finch-self-host-*` sessions ended at some point between 11:20 and 11:51;
+    no command recorded from the coordinator, the persona, or the Brain's own journal accounts for
+    it, and the cause was not established because nobody listed sessions in between.
