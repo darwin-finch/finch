@@ -5599,10 +5599,6 @@ fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
 fn test_provider_editor_identity_table_matches_catalog() {
     let cases = [
         (crate::config::CredentialProvider::Anthropic, "claude"),
-        (
-            crate::config::CredentialProvider::ClaudeSubscription,
-            "claude-sub",
-        ),
         (crate::config::CredentialProvider::OpenaiPlatform, "openai"),
         (
             crate::config::CredentialProvider::ChatgptSubscription,
@@ -5664,6 +5660,29 @@ fn test_provider_editor_identity_table_matches_catalog() {
         "wizard copy must name Gemini subscription versus AI Studio key billing: sub={gemini_sub:?} api={gemini_api:?}"
     );
 
+    // A Claude subscription is offered in setup as the Claude CLI bridge. The
+    // browser sign-in (`claude-sub`) is kept in the code base with its tests
+    // but is not a setup choice, so it has no editor here.
+    assert!(
+        CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "claude-cli")
+            && !CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "claude-sub"),
+        "setup must offer the Claude CLI bridge and not the browser sign-in; choices={:?}",
+        CLOUD_PROVIDERS
+            .iter()
+            .map(|(id, ..)| *id)
+            .collect::<Vec<_>>()
+    );
+    let cli_bridge = ProviderEntry::ClaudeCliBackend {
+        model: None,
+        binary: None,
+        name: None,
+    };
+    assert_eq!(
+        registered_editor_id(&cli_bridge),
+        Some("claude-cli"),
+        "a persisted Claude CLI bridge entry must select the claude-cli editor"
+    );
+
     for (credential_provider, expected_editor) in cases {
         let provider = ProviderEntry::Credentialed {
             provider: credential_provider,
@@ -5704,7 +5723,10 @@ fn test_provider_editor_identity_table_matches_catalog() {
     let registered: std::collections::BTreeSet<_> = CLOUD_PROVIDERS
         .iter()
         .map(|(editor, ..)| *editor)
-        .filter(|editor| *editor != "openai-compatible")
+        // Neither is a credentialed provider: the generic endpoint has its
+        // own entry type, and the Claude CLI bridge holds no credential in
+        // Finch (the CLI keeps its own login). Both are asserted separately.
+        .filter(|editor| !matches!(*editor, "openai-compatible" | "claude-cli"))
         .collect();
     assert_eq!(
         mapped, registered,
