@@ -108,7 +108,9 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         // Subscription provenance is deliberately separate from the OpenAI
         // Platform catalogue, even where a model slug overlaps.
         "chatgpt" => &["gpt-5.6-sol", "gpt-6.1-sol"],
-        "claude" | "claude-sub" => &["claude-sonnet-5"],
+        // `claude-cli` is the setup choice that proxies through the local
+        // Claude CLI; it has no discovery endpoint, so this is its whole list.
+        "claude" | "claude-sub" | "claude-cli" => &["claude-sonnet-5"],
         // Keep this deliberately short. Authenticated discovery is authoritative;
         // this offline snapshot only offers the three general-purpose API tiers
         // documented when STATIC_FALLBACK_AS_OF was reviewed.

@@ -8,6 +8,17 @@ provider-specific wire behavior without importing Finch application configuratio
 application maps `Config` onto these contracts and decides which provider profile to run;
 generation lifecycle and tool execution belong elsewhere.
 
+Grok subscription authorization is a versioned compatibility adapter for the open-source Grok
+Build public client, not xAI Console API-key authentication. Device initiation identifies
+`grok-build`; both initiation and polling carry the pinned public client version and one stable
+surface (`ui`, `cli`, or `headless`). The official token shape permits an opaque access bearer and
+an optional refresh token, so Finch derives identity only from a separately verified ES256 ID
+token (or, when no ID token exists, from a verified signed access token). A protocol-revision
+change never migrates bearer material: the one recognized predecessor is converted to a
+secret-cleared tombstone and requires explicit sign-in. A bounded `expires_in` always shortens,
+never extends, signed authority. An official opaque refresh response may retain only the exact
+already-verified account/client lineage and must provide its own bounded bearer lifetime.
+
 Claude subscription (`claude_oauth.rs`/`claude_subscription.rs`) authenticates a claude.ai
 Pro/Max/Team subscription via Anthropic's browser authorization-code + PKCE OAuth flow, reusing
 the audited Anthropic Messages wire protocol (`claude.rs`) with an OAuth bearer token in place of

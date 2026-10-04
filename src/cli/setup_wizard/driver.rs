@@ -325,7 +325,9 @@ pub(super) fn run_tabbed_wizard(
     state.chatgpt_account_models = Some(Arc::new(crate::providers::ProductionChatGptAccountModels)
         as Arc<dyn crate::providers::ChatGptAccountModels>);
     state.auto_catalog_refresh = true;
-    state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production() {
+    state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production_for_surface(
+        crate::providers::GrokDeviceClientSurface::Ui,
+    ) {
         Ok(service) => {
             Some(Arc::new(service)
                 as Arc<
