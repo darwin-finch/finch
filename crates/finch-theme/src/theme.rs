@@ -305,6 +305,68 @@ impl ColorScheme {
             .any(|theme| theme.to_scheme() == *self)
     }
 
+    /// This scheme's rendering of one of the 16 ANSI palette colours
+    /// (`index` 0–15: black, red, green, yellow, blue, magenta, cyan, gray,
+    /// then dark gray and the bright set, ending in white).
+    ///
+    /// Text that was styled with a bare ANSI colour rather than a scheme role
+    /// is mapped through this at paint, so it still follows the theme. A
+    /// colour the scheme itself uses by name keeps meaning itself; any other
+    /// maps to the role that colour conventionally signals (red is an error,
+    /// green success, yellow an operation in progress, cyan and blue the
+    /// accent, dark gray muted text, white and black the canvas pair).
+    pub fn ansi_color(&self, index: u8) -> ColorSpec {
+        let index = index % 16;
+        let own = self
+            .roles()
+            .into_iter()
+            .find(|spec| ansi_index(spec.to_color()) == Some(index));
+        if let Some(spec) = own {
+            return spec.clone();
+        }
+        match index {
+            0 => &self.background,
+            1 | 9 => &self.messages.error,
+            2 | 10 => &self.status.live_stats,
+            3 | 11 => &self.status.operation,
+            4 | 12 => &self.dialog.border,
+            5 | 13 => &self.dialog.title,
+            6 | 14 => &self.ui.cursor,
+            8 => &self.messages.system,
+            _ => &self.foreground,
+        }
+        .clone()
+    }
+
+    /// Every colour role this scheme defines.
+    fn roles(&self) -> Vec<&ColorSpec> {
+        vec![
+            &self.background,
+            &self.foreground,
+            &self.highlight_bg,
+            &self.highlight_fg,
+            &self.status.live_stats,
+            &self.status.training,
+            &self.status.download,
+            &self.status.operation,
+            &self.status.border,
+            &self.messages.user,
+            &self.messages.assistant,
+            &self.messages.system,
+            &self.messages.error,
+            &self.messages.tool,
+            &self.ui.border,
+            &self.ui.separator,
+            &self.ui.input,
+            &self.ui.cursor,
+            &self.dialog.border,
+            &self.dialog.title,
+            &self.dialog.selected_bg,
+            &self.dialog.selected_fg,
+            &self.dialog.option,
+        ]
+    }
+
     /// Returns true if this color scheme represents a dark terminal palette.
     pub fn is_dark(&self) -> bool {
         color_luminance(&self.foreground) >= 0.5
@@ -528,6 +590,29 @@ impl ColorSpec {
     }
 }
 
+/// The ANSI palette index (0–15) of a named colour, `None` for RGB.
+fn ansi_index(color: Color) -> Option<u8> {
+    Some(match color {
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        _ => return None,
+    })
+}
+
 fn color_luminance(color: &ColorSpec) -> f32 {
     let (red, green, blue) = match color.to_color() {
         Color::Black => (0, 0, 0),
@@ -617,6 +702,47 @@ mod tests {
             Color::Rgb(red, green, blue) => (red, green, blue),
             other => panic!("expected RGB color, got {other:?}"),
         }
+    }
+
+    /// A bare ANSI colour follows the theme: it keeps meaning itself in a
+    /// scheme that uses that named colour, and otherwise takes the role the
+    /// colour conventionally signals.
+    #[test]
+    fn test_ansi_color_keeps_a_schemes_own_named_colours_and_maps_the_rest_to_roles() {
+        let dark = ColorTheme::Dark.to_scheme();
+        assert_eq!(
+            dark.ansi_color(6),
+            ColorSpec::Named("cyan".to_string()),
+            "Dark uses cyan by name, so ANSI cyan stays cyan"
+        );
+        assert_eq!(
+            dark.ansi_color(8),
+            dark.messages.system,
+            "ANSI dark grey is the muted role; Dark's is the AA-contrast RGB grey"
+        );
+        assert_eq!(
+            dark.ansi_color(14),
+            dark.ui.cursor,
+            "bright cyan, the old fixed accent, is the scheme accent"
+        );
+
+        let light = ColorTheme::Light.to_scheme();
+        for (index, role, why) in [
+            (0u8, &light.background, "black is the canvas"),
+            (1, &light.messages.error, "red is an error"),
+            (2, &light.status.live_stats, "green is success"),
+            (3, &light.status.operation, "yellow is an operation"),
+            (6, &light.ui.cursor, "cyan is the accent"),
+            (8, &light.messages.system, "dark grey is muted text"),
+            (15, &light.foreground, "white is the default ink"),
+        ] {
+            assert_eq!(&light.ansi_color(index), role, "Light: ANSI {index}: {why}");
+        }
+        assert_ne!(
+            light.ansi_color(15),
+            light.background,
+            "Light: text styled 'white' must not vanish into the white canvas"
+        );
     }
 
     /// Product `theme-color` from the shipped site (`#080808`).

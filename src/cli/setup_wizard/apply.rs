@@ -68,10 +68,10 @@ pub(super) fn apply_setup_result_to_config(
     apply_daemon_api_key(&mut new_config, &result.finch_api_key);
     new_config.active_theme = result.active_theme.clone();
     // The wizard selects a theme, never individual colours: the saved scheme
-    // is that theme's preset, so the next start renders what was picked.
-    new_config.colors = crate::theme::ColorTheme::from_name(&result.active_theme)
-        .unwrap_or_default()
-        .to_scheme();
+    // is that theme's preset plus whatever overrides the user had written by
+    // hand, so the next start renders what was picked.
+    new_config.colors =
+        crate::config::resolve_colors(&result.active_theme, result.color_overrides.clone());
     new_config.active_persona = result.default_persona.clone();
     if let Some(ref hf_tok) = result.hf_token {
         if !hf_tok.is_empty() {
@@ -128,17 +128,7 @@ pub fn apply_daemon_api_key(config: &mut crate::config::Config, api_key: &str) {
 
 /// Build the final SetupResult from wizard state
 pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
-    use crate::theme::ColorTheme;
-
-    // Extract theme
-    let active_theme = if let Some(SectionState::Themes { selected_theme }) =
-        state.sections.get(&WizardSection::Themes)
-    {
-        let themes = ColorTheme::all();
-        themes[*selected_theme].name().to_lowercase()
-    } else {
-        "dark".to_string()
-    };
+    let active_theme = state.selected_theme_name();
 
     // Extract models
     let (primary_model, tool_models) = if let Some(SectionState::Models {
@@ -371,6 +361,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
 
     Ok(SetupResult {
         active_theme,
+        color_overrides: state.color_overrides.clone(),
         primary_model,
         tool_models,
         providers,
