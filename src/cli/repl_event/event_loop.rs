@@ -3368,6 +3368,34 @@ impl EventLoop {
         }
     }
 
+    /// Move every queued turn back into the composer draft, in the order
+    /// it was queued and ahead of whatever is being typed right now.
+    ///
+    /// Used when the turn the queue was waiting behind ends without a
+    /// boundary that could consume it (provider failure, Escape): the text
+    /// must neither run later out of order nor disappear (#1587, queued
+    /// messages lost when a turn ends early). The draft is read and
+    /// replaced under one renderer lock, so a keystroke cannot land between
+    /// the two and be overwritten.
+    async fn return_pending_queries_to_draft(&mut self) {
+        let pending = self.take_pending_queries();
+        if pending.is_empty() {
+            return;
+        }
+        let mut lines = pending_user_texts(&pending);
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            let current_draft = tui.get_input_draft();
+            if !current_draft.is_empty() {
+                lines.push(current_draft);
+            }
+            tui.restore_input_draft(&lines.join("\n"));
+        }
+        if let Err(error) = self.render_tui().await {
+            tracing::warn!("Failed to render TUI after returning queued input: {error}");
+        }
+    }
+
     /// Write the scrollback echo for queued turns being merged onto an
     /// in-flight tool round's continuation (`finalize_tool_execution`).
     ///

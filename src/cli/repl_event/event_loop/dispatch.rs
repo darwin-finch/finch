@@ -433,22 +433,7 @@ impl EventLoop {
                 if *self.active_query_id.read().await == Some(query_id) {
                     *self.active_query_id.write().await = None;
 
-                    let mut restored = String::new();
-                    while let Some((next, _echo, _chat_only)) = self.pending_queries.pop_front() {
-                        if !restored.is_empty() {
-                            restored.push('\n');
-                        }
-                        restored.push_str(&next);
-                    }
-                    if !restored.is_empty() {
-                        let mut tui = self.tui_renderer.lock().await;
-                        let current_draft = tui.get_input_draft();
-                        if !current_draft.is_empty() {
-                            restored.push('\n');
-                            restored.push_str(&current_draft);
-                        }
-                        tui.restore_input_draft(&restored);
-                    }
+                    self.return_pending_queries_to_draft().await;
                 }
             }
 
@@ -861,11 +846,14 @@ impl EventLoop {
                     if !named_turn {
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
-                        // Drop the queue rather than let it re-fire after a later
-                        // turn's StreamingComplete (#463, queued turn must not
-                        // execute out of order after cancel). Tool-round inject
-                        // already drained anything that belonged on the in-flight query.
-                        self.pending_queries.clear();
+                        // Take the queue off rather than let it re-fire after a
+                        // later turn's StreamingComplete (#463, queued turn must
+                        // not execute out of order after cancel). Tool-round
+                        // inject already drained anything that belonged on the
+                        // in-flight query; what is left goes back to the composer
+                        // instead of vanishing (#1587, queued messages lost when
+                        // a turn ends early).
+                        self.return_pending_queries_to_draft().await;
                     }
 
                     // Plan/executing overlays cancel with the query so the
