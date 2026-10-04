@@ -56,6 +56,17 @@ impl OutputManagerLayer {
     }
 }
 
+/// True for log events that llama.cpp or ggml emitted through the llama
+/// binding's log-to-tracing bridge (`models::llama_log`). These are native
+/// runtime diagnostics, not messages for the person using the session.
+fn is_native_model_runtime_target(target: &str) -> bool {
+    let crate_name = target.split("::").next().unwrap_or(target);
+    matches!(
+        crate_name,
+        "llama-cpp-2" | "llama_cpp_2" | "llama.cpp" | "llama" | "ggml" | "mtmd"
+    )
+}
+
 impl Default for OutputManagerLayer {
     fn default() -> Self {
         Self::new()
@@ -87,6 +98,14 @@ where
             || target.starts_with("finch::server");
         if is_internal && *level <= Level::INFO {
             return; // Suppress internal INFO/DEBUG from TUI; ERRORs still shown
+        }
+
+        // llama.cpp and ggml narrate every context they build (the memory
+        // embedding model builds one per message). That belongs in the
+        // diagnostic log, which the file layer already records and the
+        // Ctrl+` console shows, never in the conversation.
+        if is_native_model_runtime_target(target) {
+            return;
         }
 
         // Extract the message using a visitor
@@ -171,6 +190,53 @@ impl Visit for MessageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported failure: after llama.cpp's output was routed to tracing,
+    /// every message in a live session painted a dozen `[llama-cpp-2] …`
+    /// lines into the conversation, because this layer forwards external
+    /// INFO events to the session output. Native runtime targets must be
+    /// recognised so they stay in the diagnostic log only, while ordinary
+    /// dependency and Finch targets are unaffected.
+    #[test]
+    fn test_native_model_runtime_logs_are_not_session_output() {
+        for target in [
+            "llama-cpp-2",
+            "llama_cpp_2::log",
+            "llama.cpp",
+            "llama",
+            "ggml",
+            "mtmd",
+        ] {
+            assert!(
+                is_native_model_runtime_target(target),
+                "{target:?} is llama.cpp/ggml diagnostics and must not reach the conversation"
+            );
+        }
+        for target in [
+            "reqwest",
+            "hf_hub::api",
+            "finch::providers",
+            "log",
+            "llamafile",
+        ] {
+            assert!(
+                !is_native_model_runtime_target(target),
+                "{target:?} is not a native model runtime target and must keep its existing routing"
+            );
+        }
+        // The layer consults the check before it formats or emits anything.
+        let source = include_str!("output_layer.rs");
+        let guard = source
+            .find("if is_native_model_runtime_target(target) {")
+            .expect("on_event must consult the native-runtime check");
+        let emit = source
+            .find("let formatted = self.format_message(target, &message);")
+            .expect("on_event formats the message before emitting it");
+        assert!(
+            guard < emit,
+            "the native-runtime check must run before a log line is formatted for the session"
+        );
+    }
 
     #[test]
     fn test_layer_creation() {
