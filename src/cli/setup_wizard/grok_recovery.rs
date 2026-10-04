@@ -14,7 +14,16 @@ pub(super) enum GrokSetupFailureCause {
     Denied,
     StartDisabledOrUnsupported,
     ClientRejected,
-    ProviderRejected,
+    StartTransport,
+    PollTransport,
+    /// xAI answered a step with an error status. Carries which step and the
+    /// status (no secrets), so the dialog says more than "rejected".
+    ProviderRejected(String),
+    ResponseContract,
+    VerificationAuthority,
+    IdentityVerification,
+    ClientBinding,
+    AccountEntitlement,
     Persistence,
     ProtocolOrOther(String),
 }
@@ -51,11 +60,28 @@ pub(super) fn grok_setup_failure_cause(error: &anyhow::Error) -> GrokSetupFailur
             }
             GrokDeviceEndpointError::ClientRejected => GrokSetupFailureCause::ClientRejected,
             GrokDeviceEndpointError::StartRejected(_)
-            | GrokDeviceEndpointError::PollRejected(_) => GrokSetupFailureCause::ProviderRejected,
+            | GrokDeviceEndpointError::PollRejected(_) => {
+                GrokSetupFailureCause::ProviderRejected(endpoint.to_string())
+            }
         };
     }
-    if error.downcast_ref::<GrokAuthStageError>().is_some() {
-        return GrokSetupFailureCause::ProviderRejected;
+    if let Some(stage) = error.downcast_ref::<GrokAuthStageError>() {
+        return match stage {
+            GrokAuthStageError::DeviceStartTransport => GrokSetupFailureCause::StartTransport,
+            GrokAuthStageError::DevicePollTransport => GrokSetupFailureCause::PollTransport,
+            GrokAuthStageError::DeviceStartContract
+            | GrokAuthStageError::PollContract
+            | GrokAuthStageError::TokenExchangeContract => GrokSetupFailureCause::ResponseContract,
+            GrokAuthStageError::TokenExchangeRejected(_) => {
+                GrokSetupFailureCause::ProviderRejected(stage.to_string())
+            }
+            GrokAuthStageError::JwksTransport => GrokSetupFailureCause::VerificationAuthority,
+            GrokAuthStageError::IdentityVerification | GrokAuthStageError::IdentitySignature => {
+                GrokSetupFailureCause::IdentityVerification
+            }
+            GrokAuthStageError::ClientBinding => GrokSetupFailureCause::ClientBinding,
+            GrokAuthStageError::AccountEntitlement => GrokSetupFailureCause::AccountEntitlement,
+        };
     }
     if error
         .downcast_ref::<crate::oauth::OAuthCredentialPersistenceError>()
@@ -83,8 +109,31 @@ pub(super) fn grok_setup_failure_summary(cause: GrokSetupFailureCause) -> String
         GrokSetupFailureCause::ClientRejected => {
             "xAI rejected Finch as an OAuth client (invalid_client). SuperGrok device login is not available for this independent client. No credential was saved. Finch will not switch to Console API-key billing."
         }
-        GrokSetupFailureCause::ProviderRejected => {
-            "Grok subscription sign-in was rejected. No credential was saved. Finch will not fall back to an API key."
+        GrokSetupFailureCause::StartTransport => {
+            "Finch could not reach xAI to start Grok subscription sign-in. Check network access and retry. No credential was saved."
+        }
+        GrokSetupFailureCause::PollTransport => {
+            "Finch lost network access while waiting for Grok subscription authorization. Retry for a fresh one-time code. No credential was saved."
+        }
+        GrokSetupFailureCause::ProviderRejected(ref step) => {
+            return format!(
+                "Grok subscription sign-in was rejected: {step}. No credential was saved. Finch will not fall back to an API key."
+            );
+        }
+        GrokSetupFailureCause::ResponseContract => {
+            "xAI returned an unsupported Grok subscription authorization response. Update Finch before retrying. No credential was saved."
+        }
+        GrokSetupFailureCause::VerificationAuthority => {
+            "Finch could not verify xAI's pinned Grok identity-signing authority. Check network access and retry. No credential was saved."
+        }
+        GrokSetupFailureCause::IdentityVerification => {
+            "Finch could not verify the signed Grok subscription identity. No credential was saved."
+        }
+        GrokSetupFailureCause::ClientBinding => {
+            "The signed Grok identity was not issued for Finch's pinned public client. No credential was saved."
+        }
+        GrokSetupFailureCause::AccountEntitlement => {
+            "The signed Grok identity did not contain a usable subscription account binding. No credential was saved."
         }
         GrokSetupFailureCause::Persistence => {
             "Grok subscription sign-in was validated, but Finch could not save the named credential."
@@ -203,5 +252,104 @@ mod tests {
             !missing.contains("console.x.ai"),
             "missing device flow must not steer into Console API keys; summary={missing}"
         );
+    }
+
+    /// The reported dialog said only "Grok subscription sign-in was
+    /// rejected", which is one message for three different rejections (the
+    /// device-code request, the poll, the token exchange). The summary must
+    /// say which step xAI rejected and with what status.
+    #[test]
+    fn test_a_rejected_grok_sign_in_names_the_step_and_status() {
+        for (error, step) in [
+            (
+                anyhow::Error::new(GrokDeviceEndpointError::StartRejected(403)),
+                GrokDeviceEndpointError::StartRejected(403).to_string(),
+            ),
+            (
+                anyhow::Error::new(GrokDeviceEndpointError::PollRejected(400)),
+                GrokDeviceEndpointError::PollRejected(400).to_string(),
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::TokenExchangeRejected(401)),
+                GrokAuthStageError::TokenExchangeRejected(401).to_string(),
+            ),
+        ] {
+            let cause = grok_setup_failure_cause(&error);
+            assert_eq!(
+                cause,
+                GrokSetupFailureCause::ProviderRejected(step.clone()),
+                "a rejection must keep its step; error={error:#}"
+            );
+            let summary = grok_setup_failure_summary(cause);
+            assert!(
+                summary.contains(&step) && summary.contains("HTTP"),
+                "the dialog must name the rejected step and its status ({step}); summary={summary:?}"
+            );
+            assert!(
+                summary.contains("No credential was saved")
+                    && summary.contains("will not fall back to an API key"),
+                "the no-credential and no-API-key-fallback guarantees stay in the message; summary={summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_grok_failures_keep_distinct_secret_free_actions() {
+        let cases = [
+            (
+                anyhow::Error::new(GrokAuthStageError::DeviceStartTransport),
+                GrokSetupFailureCause::StartTransport,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::DevicePollTransport),
+                GrokSetupFailureCause::PollTransport,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::PollContract),
+                GrokSetupFailureCause::ResponseContract,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::JwksTransport),
+                GrokSetupFailureCause::VerificationAuthority,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::IdentitySignature),
+                GrokSetupFailureCause::IdentityVerification,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::ClientBinding),
+                GrokSetupFailureCause::ClientBinding,
+            ),
+            (
+                anyhow::Error::new(GrokAuthStageError::AccountEntitlement),
+                GrokSetupFailureCause::AccountEntitlement,
+            ),
+            (
+                anyhow::Error::new(crate::oauth::OAuthCredentialPersistenceError::Commit),
+                GrokSetupFailureCause::Persistence,
+            ),
+        ];
+        let summaries = cases
+            .into_iter()
+            .map(|(error, expected)| {
+                assert_eq!(
+                    grok_setup_failure_cause(&error),
+                    expected,
+                    "typed Grok failure lost its safe stage: {error:#}"
+                );
+                grok_setup_failure_summary(expected)
+            })
+            .collect::<Vec<_>>();
+        let distinct = summaries.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            summaries.len(),
+            "different recovery stages need different actionable summaries: {summaries:?}"
+        );
+        for summary in summaries {
+            assert!(!summary.contains("access-secret"));
+            assert!(!summary.contains("refresh-secret"));
+            assert!(!summary.contains("id-secret"));
+        }
     }
 }

@@ -926,10 +926,22 @@ mod tests {
         let target_file = workdir.path().join("target.txt");
         std::fs::write(&target_file, "original\n").expect("seed the target file");
 
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        // macOS caps `sockaddr_un.sun_path` at 104 bytes, and the supervised
+        // test `TMPDIR` is longer than that, so a socket under the default
+        // temp directory cannot be bound ("path must be shorter than
+        // SUN_LEN"). Production binds under a short path for the same reason
+        // (`ClaudeCliProvider`, `crates/finch-providers/src/claude_cli.rs`).
+        let socket_dir = tempfile::Builder::new()
+            .prefix("fb-")
+            .tempdir_in("/tmp")
+            .expect("socket directory");
         let socket_path = socket_dir.path().join("bridge.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path)
-            .expect("bind the bridge socket exactly as ClaudeCliProvider does");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap_or_else(|error| {
+            panic!(
+                "bind the bridge socket exactly as ClaudeCliProvider does, at {}: {error}",
+                socket_path.display()
+            )
+        });
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RealWriteProbe));

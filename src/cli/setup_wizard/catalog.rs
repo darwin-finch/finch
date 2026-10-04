@@ -344,6 +344,29 @@ pub(super) fn known_models_for(provider: &str) -> Vec<String> {
     static_fallback(provider)
 }
 
+/// What a model-list refresh was started for, so a result that arrives after
+/// the form moved on to another provider, name, key or credential is dropped.
+///
+/// A ChatGPT subscription has no key and no `/models` profile; its identity
+/// is the profile name and the named credential it is bound to. Every other
+/// discovery-capable provider uses the catalogue profile's cache identity.
+/// `None` means the provider has no model discovery at all.
+pub(super) fn catalog_selection_identity(
+    provider: &str,
+    profile_id: &str,
+    api_key: &str,
+    persisted: Option<&ProviderEntry>,
+) -> Option<String> {
+    if provider == "chatgpt" {
+        return Some(format!(
+            "chatgpt-subscription\u{0}{profile_id}\u{0}{}",
+            chatgpt_persisted_reference(persisted)
+        ));
+    }
+    model_catalog_profile(provider, profile_id, api_key, persisted)
+        .map(|profile| profile_cache_identity(&profile))
+}
+
 pub(super) fn model_catalog_profile(
     provider: &str,
     profile_id: &str,
