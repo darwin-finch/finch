@@ -3820,6 +3820,17 @@ async fn buffered_and_streaming_require_the_exact_requested_catalog_entry() {
         .err()
         .expect("buffered request must require its exact catalog entry");
     assert!(buffered_error.is::<SubscriptionRequestedModelUnavailable>());
+    // The reported failure read "does not advertise the configured supported
+    // model" and named neither side, so there was nothing to act on. The
+    // message must name the model that was asked for and the ones this
+    // account offers.
+    let message = buffered_error.to_string();
+    assert!(
+        message.contains(&format!("'{DEFAULT_MODEL}'"))
+            && message.contains(&format!("offers: {MODEL_ALIAS}.")),
+        "the error must name the configured model ({DEFAULT_MODEL}) and what the account \
+         offers ({MODEL_ALIAS}); message={message:?}"
+    );
     assert!(!buffered_error.to_string().contains("subscription-secret"));
     assert!(!buffered_error.to_string().contains("account-1"));
 
