@@ -137,8 +137,10 @@ pub enum ProviderEntry {
     /// through the interactive CLI product. Anthropic has enforced account
     /// suspensions against CLI-wrapper/proxy usage that disguises a
     /// subscription-gated product as a generic backend; enabling this entry
-    /// is an explicit, informed acceptance of that risk. It is never offered
-    /// by the setup wizard and is off unless configured by hand.
+    /// is an explicit, informed acceptance of that risk. By the project
+    /// owner's decision the setup wizard offers it as the Claude subscription
+    /// choice ("Claude Pro subscription (CLI Bridge)"); the browser sign-in
+    /// it replaces there is kept in `src/cli/claude_auth.rs` but not offered.
     #[serde(rename = "claude_cli_backend")]
     ClaudeCliBackend {
         /// Upstream model the CLI is asked to serve (`--model`). Unset means
