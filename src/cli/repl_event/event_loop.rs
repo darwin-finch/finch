@@ -5529,14 +5529,19 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
     match tool_name.as_str() {
         "bash" | "Bash" => {
             if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
-                format!(
-                    "Command: {}",
-                    if cmd.len() > 60 {
-                        format!("{}...", cmd.chars().take(60).collect::<String>())
-                    } else {
-                        cmd.to_string()
-                    }
-                )
+                let lines = cmd.lines().count().max(1);
+                let chars = cmd.chars().count();
+                if chars > 60 || lines > 1 {
+                    format!(
+                        "Command ({} character{}, {} line{}), shown in full below",
+                        chars,
+                        if chars == 1 { "" } else { "s" },
+                        lines,
+                        if lines == 1 { "" } else { "s" },
+                    )
+                } else {
+                    format!("Command: {}", cmd)
+                }
             } else {
                 "Execute shell command".to_string()
             }

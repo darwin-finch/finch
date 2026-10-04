@@ -6338,19 +6338,14 @@ fn test_tool_approval_summary_bash_uppercase() {
 }
 
 #[test]
-fn test_tool_approval_summary_bash_long_command_truncated() {
+fn test_tool_approval_summary_bash_long_command_is_not_cut_with_an_ellipsis() {
     let long_cmd = "a".repeat(70);
     let tool = make_tool_use("bash", serde_json::json!({"command": long_cmd}));
     let result = tool_approval_summary(&tool);
-    assert!(
-        result.starts_with("Command: "),
-        "should start with 'Command: ': {}",
-        result
-    );
-    assert!(
-        result.contains("..."),
-        "long command should be truncated with '...': {}",
-        result
+    assert_eq!(
+        result, "Command (70 characters, 1 line), shown in full below",
+        "INVARIANT: a command too long for the title row is described by its size and shown \
+         whole in the dialog body, never cut with an ellipsis"
     );
 }
 
@@ -14272,6 +14267,218 @@ async fn test_turn_with_a_tool_round_records_one_request_metric_not_one_per_prov
                  provider_calls={provider_calls} tool_runs={tool_runs} rows={rows:?} \
                  summary={summary:?}"
             );
+        })
+        .await;
+}
+
+// ── #1669: the bash approval dialog shows the whole command ─────────────────
+
+const BASH_APPROVAL_WIDTH: usize = 80;
+const BASH_APPROVAL_HEIGHT: usize = 24;
+
+/// The on-screen rows of the bash approval dialog, one entry per page of its
+/// scrollable body.
+///
+/// The approval is raised through `EventLoop::handle_tool_approval_request`,
+/// painted by the production render tick into a modelled 80x24 terminal
+/// (`LiveFrameProbe`), and paged with the real PageDown key until the body
+/// reports nothing further below.
+async fn bash_approval_pages(command: &str) -> Vec<Vec<String>> {
+    let (mut event_loop, _tempdir, _store_path) = patterns_event_loop();
+    let probe = finch_tui::LiveFrameProbe::attach(
+        &mut *event_loop.tui_renderer.lock().await,
+        BASH_APPROVAL_WIDTH,
+        BASH_APPROVAL_HEIGHT,
+    );
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    event_loop
+        .handle_tool_approval_request(Uuid::new_v4(), bash_call(command), Vec::new(), response_tx)
+        .await
+        .expect("the bash approval request must be accepted");
+
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    // Far more pages than any command in these tests needs; a body that never
+    // reaches its end fails the caller's assertions instead of hanging.
+    for _ in 0..200 {
+        event_loop
+            .render_tui()
+            .await
+            .expect("the production render tick must succeed");
+        let rows = probe.rows();
+        let more_below = rows
+            .iter()
+            .any(|row| row.trim_start().starts_with(['↑', '↓']) && row.contains(" below"));
+        let repeated = pages.last() == Some(&rows);
+        pages.push(rows);
+        if !more_below || repeated {
+            break;
+        }
+        let mut tui = event_loop.tui_renderer.lock().await;
+        let dialog = tui
+            .active_dialog
+            .as_mut()
+            .expect("the approval stays open while its body is paged");
+        let answer = dialog.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            answer.is_none(),
+            "INVARIANT: paging the command must not answer the approval; answer={answer:?}"
+        );
+        // The input task repaints after a dialog key by writing to the real
+        // terminal; mark the live area dirty so the probed tick repaints.
+        tui.set_typing_words(Vec::new());
+    }
+    pages
+}
+
+/// Dialog rows between the tool-name title and the last option, inclusive.
+fn bash_approval_dialog_rows(rows: &[String]) -> Vec<String> {
+    let start = rows
+        .iter()
+        .position(|row| row.trim_start().starts_with("Command"))
+        .unwrap_or(0);
+    let end = rows
+        .iter()
+        .rposition(|row| row.contains("4. No"))
+        .unwrap_or(rows.len().saturating_sub(1));
+    rows[start..=end.max(start)].to_vec()
+}
+
+/// Every dialog row of every page, joined into one whitespace-normalised
+/// string so text wrapped across rows can be matched.
+fn bash_approval_text(pages: &[Vec<String>]) -> String {
+    pages
+        .iter()
+        .flat_map(|rows| bash_approval_dialog_rows(rows))
+        .flat_map(|row| {
+            row.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bash_approval_report(pages: &[Vec<String>]) -> String {
+    pages
+        .iter()
+        .enumerate()
+        .map(|(index, rows)| format!("--- page {index} ---\n{}", rows.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_bash_approval_options_visible(pages: &[Vec<String>]) {
+    for (index, rows) in pages.iter().enumerate() {
+        let visible = |label: &str| rows.iter().any(|row| row.contains(label));
+        assert!(
+            visible("1. Yes") && visible("4. No"),
+            "INVARIANT: the approve and deny options stay on screen on every page of the \
+             command; missing on page {index}\n{}",
+            bash_approval_report(pages)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_bash_approval_dialog_shows_the_whole_command_at_80_columns() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let command = "sleep 25; tail -40 /tmp/test_1650.log; echo \"---\"; \
+                           ps -p 97997 > /dev/null && echo RUNNING || echo DONE";
+            let pages = bash_approval_pages(command).await;
+            let text = bash_approval_text(&pages);
+            assert!(
+                text.contains(command) && text.ends_with("4. No"),
+                "INVARIANT: the bash approval dialog shows the complete command, through its \
+                 last characters (`|| echo DONE`), above the options\n{}",
+                bash_approval_report(&pages)
+            );
+            let ellipsis_rows = pages
+                .iter()
+                .flat_map(|rows| bash_approval_dialog_rows(rows))
+                .filter(|row| row.contains("...") || row.contains('…'))
+                .collect::<Vec<_>>();
+            assert!(
+                ellipsis_rows.is_empty(),
+                "INVARIANT: no ellipsis stands in for command text in the approval dialog; \
+                 rows with one: {ellipsis_rows:?}\n{}",
+                bash_approval_report(&pages)
+            );
+            assert_eq!(
+                pages.len(),
+                1,
+                "INVARIANT: a two-row command needs no paging\n{}",
+                bash_approval_report(&pages)
+            );
+            assert_bash_approval_options_visible(&pages);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_bash_approval_dialog_pages_a_very_long_multiline_command_with_options_visible() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let steps = (0..250)
+                .map(|step| format!("step-{step:04};"))
+                .collect::<Vec<_>>();
+            let command = steps
+                .chunks(50)
+                .map(|chunk| chunk.join(" "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                command.chars().count() > 2_000,
+                "the fixture must be a very long command; chars={}",
+                command.chars().count()
+            );
+            let pages = bash_approval_pages(&command).await;
+            assert_bash_approval_options_visible(&pages);
+            assert!(
+                pages.len() > 1 && pages[0].iter().any(|row| row.contains("lines below")),
+                "INVARIANT: a command taller than the dialog says in words how many lines are \
+                 below and how to reach them; pages={}\n{}",
+                pages.len(),
+                bash_approval_report(&pages[..pages.len().min(2)])
+            );
+            let text = bash_approval_text(&pages);
+            let missing = steps
+                .iter()
+                .filter(|step| !text.contains(step.as_str()))
+                .collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "INVARIANT: every part of a very long command is reachable by paging the \
+                 approval dialog; never shown: {missing:?} pages={}\n{}",
+                pages.len(),
+                bash_approval_report(&pages)
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_bash_approval_dialog_shows_escape_sequences_as_text_and_keeps_its_rows() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // Clear screen, cursor home, conceal: a raw pass-through would wipe
+            // the title and hide the destructive tail.
+            let command = "echo harmless-looking-prefix-that-fills-the-title-row-of-the-dialog; \
+                           \x1b[2J\x1b[H\x1b[8mrm -rf ./build";
+            let pages = bash_approval_pages(command).await;
+            let text = bash_approval_text(&pages);
+            assert!(
+                text.starts_with("Command (")
+                    && text.contains("harmless-looking-prefix")
+                    && text.contains("\u{fffd}[2J\u{fffd}[H\u{fffd}[8mrm -rf ./build"),
+                "INVARIANT: an escape sequence inside the command is shown as text and cannot \
+                 repaint or hide any part of the approval dialog\n{}",
+                bash_approval_report(&pages)
+            );
+            assert_bash_approval_options_visible(&pages);
         })
         .await;
 }

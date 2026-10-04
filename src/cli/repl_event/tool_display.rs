@@ -1957,6 +1957,24 @@ fn bounded_write_preview(content: &str) -> String {
     crate::cli::diff::sanitize_multiline(&lines.join("\n"))
 }
 
+/// Sanitize a bash command for display in the approval dialog body.
+///
+/// Escape characters are replaced with the unicode replacement character so terminal
+/// control sequences are displayed literally as text and cannot escape or corrupt
+/// the dialog. Unlike diff sanitization, long command lines are preserved without
+/// truncation so the renderer can wrap and page through the entire command.
+fn sanitize_bash_command(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    for c in cmd.chars() {
+        if c == '\x1b' || (c.is_control() && c != '\n' && c != '\t') {
+            out.push('\u{fffd}');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Build a file-tool approval dialog from a tool call.
 ///
 /// This lives here, not on `Dialog`, because it is assembly from Finch's own vocabulary: a
@@ -1977,6 +1995,14 @@ pub fn tool_approval_dialog(
     } else if tool_use.name.eq_ignore_ascii_case("write") {
         if let Some(content) = tool_use.input.get("content").and_then(Value::as_str) {
             dialog.body = Some(bounded_write_preview(content));
+        }
+    } else if tool_use.name.eq_ignore_ascii_case("bash") {
+        if let Some(cmd) = tool_use.input.get("command").and_then(Value::as_str) {
+            let lines = cmd.lines().count().max(1);
+            let chars = cmd.chars().count();
+            if chars > 60 || lines > 1 {
+                dialog.body = Some(sanitize_bash_command(cmd));
+            }
         }
     }
     dialog
