@@ -58,6 +58,25 @@ retain the stricter active observation check.
 Restart deliberately
 starts empty, so the first real post-restart failure may warn again but never invents recovery.
 
+**A participant's task-list replacement commits outside the Brain execution lane (issue #1585,
+`todo_write` timed out after 30 seconds).** A `Prompt` holds the lane in
+`submit_named_brain_event_with_authority_and_receipt` (`handlers.rs`) until its turn returns, and
+that turn's own `todo_write` submits `TaskListReplaced` through the same driver attachment; queued
+behind the lane, the tool waited for the turn that issued it. The replacement now returns before
+the lane, after the same submittable-kind filter, `attachment_can_submit` role check, and
+`validate_submitted_brain_tasks` as before, and through the same `BrainStore::push` /
+`push_idempotent` append. It may therefore sit between a turn's request and its result in the
+journal; a run's rebuilt context still reads the task list at or before its own request
+(`named_brain_provider_messages_at`). No other event kind leaves the lane this way.
+`test_task_list_replacement_during_an_active_turn_does_not_wait_for_the_turn`,
+`test_two_task_list_replacements_during_one_turn_commit_once_each_in_order`,
+`test_task_list_replacement_from_a_second_attachment_during_a_turn_keeps_role_authority`,
+`test_task_list_replacement_racing_turn_completion_commits_exactly_once`, and
+`test_task_list_replaced_mid_turn_survives_restart_and_does_not_leak_into_that_turn` in
+`handlers/handler_tests.rs`;
+`test_todo_write_during_a_brain_turn_returns_success_through_the_real_tool_path` in
+`src/cli/repl_event/tool_execution.rs` drives the real tool path against the same lane.
+
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and
 `SpeculativePrompt` receives the daemon-authored `TypedRuntime::intrinsic_grants()` ceiling in its
 `RunnerTurnRequest`; the frontend may transport and apply that ceiling but may not reconstruct it
