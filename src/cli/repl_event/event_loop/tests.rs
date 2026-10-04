@@ -9552,7 +9552,7 @@ async fn test_queued_turn_defers_echo_like_fresh_query_before_streaming_complete
             assert_eq!(second.1, "queued while generating");
             assert_eq!(
                 second.3,
-                Some("queued while generating".to_string()),
+                Some(("queued while generating".to_string(), Vec::new())),
                 "the queued turn promoted to a new query must carry pending_echo so \
                  process_query_with_tools defers the scrollback echo until after its own \
                  memory-recall notice commits, exactly like a fresh query; observed={second:?}"
