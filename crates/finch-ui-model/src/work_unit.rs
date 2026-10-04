@@ -58,6 +58,8 @@ pub struct WorkUnitHead {
     pub response_text: String,
     pub transient_status: Option<String>,
     pub progress: Option<(u64, Option<u64>)>,
+    /// The turn was cancelled rather than failing on its own.
+    pub cancelled: bool,
 }
 
 impl WorkUnitHead {
@@ -183,7 +185,7 @@ impl WorkUnitView {
 /// that is only a local tool group, lifecycle activity, or typed program
 /// does not either.
 pub fn turn_indicator(view: &WorkUnitView) -> Option<TurnIndicatorView> {
-    if view.head.status != MessageStatus::InProgress {
+    if view.head.status != MessageStatus::InProgress || view.head.cancelled {
         return None;
     }
     let pending_prose = view.is_pending_prose() && view.head.response_text.is_empty();
@@ -522,6 +524,7 @@ fn assistant_prose_label(view: &WorkUnitView) -> String {
             .map(|indicator| indicator.plain_text())
             .unwrap_or_else(|| glyph.to_string()),
         MessageStatus::Complete => format!("{glyph} No assistant text"),
+        MessageStatus::Failed if head.cancelled => format!("{glyph} Turn cancelled"),
         MessageStatus::Failed => format!("{glyph} Assistant turn failed"),
     }
 }
@@ -626,6 +629,7 @@ mod tests {
                 response_text: String::new(),
                 transient_status: None,
                 progress: None,
+                cancelled: false,
             },
             verb: "Channeling".into(),
             rows: Vec::new(),

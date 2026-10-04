@@ -211,6 +211,9 @@ struct WorkUnitInner {
     /// True once this unit has been handed a provider request: it is the
     /// turn's generation unit and owns the turn indicator while in progress.
     awaiting_provider: bool,
+    /// True when the turn was cancelled rather than failing on its own. A
+    /// cancelled unit is terminal and reads "Turn cancelled".
+    cancelled: bool,
     /// Sub-rows for tool calls
     rows: Vec<WorkRow>,
     /// Overall status of this unit
@@ -296,6 +299,7 @@ impl WorkUnit {
                 response_text: String::new(),
                 token_count: 0,
                 awaiting_provider: false,
+                cancelled: false,
                 rows: Vec::new(),
                 status: MessageStatus::InProgress,
                 requested_terminal: None,
@@ -931,6 +935,35 @@ impl WorkUnit {
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
     }
+
+    /// Give a unit that is still in progress its terminal state because its
+    /// turn was cancelled. Returns whether this call settled it.
+    ///
+    /// A unit that already completed or failed is left exactly as it is, so
+    /// a cancel that loses the race with a completion changes nothing, and a
+    /// second cancel is a no-op. The unit stops owning the turn indicator at
+    /// once, even when a child agent is still running and the terminal
+    /// status itself has to wait for it.
+    pub fn set_cancelled(&self) -> bool {
+        let elapsed = self.elapsed();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress || inner.cancelled {
+            return false;
+        }
+        inner.cancelled = true;
+        inner.awaiting_provider = false;
+        if inner
+            .agent_activity
+            .iter()
+            .any(|row| matches!(row.status, WorkRowStatus::Running))
+        {
+            inner.requested_terminal = Some(MessageStatus::Failed);
+            return true;
+        }
+        inner.elapsed_at_finish = Some(elapsed);
+        inner.status = MessageStatus::Failed;
+        true
+    }
 }
 
 fn finish_requested_terminal(inner: &mut WorkUnitInner, elapsed: std::time::Duration) {
@@ -1253,6 +1286,7 @@ impl WorkUnit {
             response_text: inner.response_text.clone(),
             transient_status: inner.transient_status.clone(),
             progress: inner.progress,
+            cancelled: inner.cancelled,
         }
     }
 
@@ -1276,6 +1310,7 @@ impl WorkUnit {
                 response_text: inner.response_text.clone(),
                 transient_status: inner.transient_status.clone(),
                 progress: inner.progress,
+                cancelled: inner.cancelled,
             },
             verb: self.verb.clone(),
             elapsed: inner.elapsed_at_finish.unwrap_or_else(|| self.elapsed()),
@@ -2172,6 +2207,60 @@ mod tests {
             (Duration::from_millis(18_250), None),
             "invariant: a completed unit's elapsed time is frozen at its finish and it \
              owns no indicator; view={finished:?}"
+        );
+    }
+
+    /// A cancelled unit is terminal exactly once: it stops owning the turn
+    /// indicator, reads `Turn cancelled`, freezes its elapsed time, and
+    /// neither a second cancel nor a cancel that lost the race with a
+    /// completion changes anything.
+    #[test]
+    fn test_cancel_settles_an_in_progress_unit_exactly_once() {
+        let now = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let reading = Arc::clone(&now);
+        let unit = WorkUnit::with_clock(
+            MessageId::new(),
+            "Channeling",
+            WorkClock::from_fn(move || *reading.lock().unwrap()),
+        );
+        unit.begin_provider_request();
+        *now.lock().unwrap() = Duration::from_secs(4);
+
+        assert!(unit.set_cancelled(), "the first cancel settles the unit");
+        *now.lock().unwrap() = Duration::from_secs(30);
+        assert!(!unit.set_cancelled(), "a second cancel is a no-op");
+
+        let view = unit.domain_view(&colors());
+        let row = try_project_for_test(&unit, &colors()).unwrap();
+        assert_eq!(
+            (
+                view.head.status,
+                view.elapsed,
+                finch_ui_model::turn_indicator(&view),
+                row.label.as_str(),
+            ),
+            (
+                MessageStatus::Failed,
+                Duration::from_secs(4),
+                None,
+                "\u{2298} Turn cancelled",
+            ),
+            "invariant: a cancelled unit is terminal, frozen at its cancel time, owns no \
+             indicator, and says it was cancelled; view={view:?} row={row:?}"
+        );
+
+        let finished = WorkUnit::new("Channeling");
+        finished.set_response("done");
+        finished.set_complete();
+        assert!(
+            !finished.set_cancelled(),
+            "a cancel that arrives after completion must not change the unit"
+        );
+        let view = finished.domain_view(&colors());
+        assert_eq!(
+            (view.head.status, view.head.cancelled),
+            (MessageStatus::Complete, false),
+            "invariant: a completed unit stays completed; view={view:?}"
         );
     }
 

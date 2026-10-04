@@ -232,6 +232,42 @@ impl IndicatorTurn {
         }
     }
 
+    /// Cancel the active turn the way Escape does.
+    async fn cancel(&mut self) {
+        self.event_loop
+            .handle_event(ReplEvent::CancelQuery)
+            .await
+            .expect("the cancel event must dispatch");
+    }
+
+    /// After a cancel: no indicator on screen now, and none comes back and
+    /// nothing repaints as time passes.
+    async fn assert_cancelled_turn_is_quiet(&mut self, stage: &str) {
+        let rows = self.frame(stage).await;
+        assert_eq!(
+            indicator_rows(&rows),
+            Vec::<String>::new(),
+            "INVARIANT: a cancelled turn owns no in-progress indicator; at stage `{stage}`\n{}",
+            self.report()
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("cancelled")),
+            "INVARIANT: a cancelled turn says it was cancelled; at stage `{stage}`\n{}",
+            self.report()
+        );
+        let painted = self.painted();
+        self.advance(Duration::from_secs(7));
+        let later = format!("{stage}, 7 s later");
+        let rows = self.frame(&later).await;
+        assert_eq!(
+            (self.painted(), indicator_rows(&rows)),
+            (painted, Vec::new()),
+            "INVARIANT: after a turn is cancelled no tick repaints and no indicator \
+             returns; at stage `{later}`\n{}",
+            self.report()
+        );
+    }
+
     /// Move the turn's clock forward by exactly `by`.
     fn advance(&self, by: Duration) {
         *self.now.lock().expect("indicator-test clock lock poisoned") += by;
@@ -675,6 +711,210 @@ async fn test_a_turn_has_exactly_one_in_progress_indicator_and_leaves_none_behin
                     found.len() <= 1,
                     "INVARIANT: no frame of a turn contains two in-progress indicators; \
                      painted frame {index} had {found:?}\n{}",
+                    turn.report()
+                );
+            }
+        })
+        .await;
+}
+
+/// Cancel while the request is still waiting: the turn reaches its terminal
+/// state at once, even though the provider call never returns.
+///
+/// Failed before the fix: nothing settled the generation unit on cancel, so
+/// it stayed in progress and the screen kept `✳ Analyzing… (7s · thinking)`
+/// above the cancellation notice, repainting while idle.
+#[tokio::test]
+async fn test_cancel_during_the_wait_leaves_no_indicator_and_stops_repainting() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(1);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            let rows = turn.frame("waiting").await;
+            the_indicator(&turn, "waiting", &rows);
+
+            turn.cancel().await;
+            turn.assert_cancelled_turn_is_quiet("cancelled during the wait")
+                .await;
+            let rows = turn.probe.rows();
+            assert!(
+                rows.iter().any(|row| row.contains("Turn cancelled")),
+                "INVARIANT: a turn cancelled before any reply reads `Turn cancelled`, not \
+                 `Assistant turn failed`\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// Cancel while a tool is running, then let the tool finish late.
+///
+/// Failed before the fix: the tool row read `failed: cancelled` and a live
+/// indicator kept counting beneath it.
+#[tokio::test]
+async fn test_cancel_during_a_running_tool_leaves_no_indicator_and_stops_repainting() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(2);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.release_provider_call();
+            turn.send(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: TOOL_NAME.into(),
+                input: serde_json::json!({}),
+                provenance: provenance(),
+            })
+            .await;
+            turn.end_stream();
+            turn.settle("the tool to start", |turn| {
+                turn.tool_started.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            let rows = turn.frame("tool running").await;
+            the_indicator(&turn, "tool running", &rows);
+
+            turn.cancel().await;
+            turn.assert_cancelled_turn_is_quiet("cancelled during the tool")
+                .await;
+
+            // The tool finishes after the cancel. Its late result must not
+            // bring the turn back.
+            turn.tool_release.add_permits(1);
+            turn.settle("the cancelled tool to take its release", |turn| {
+                turn.tool_release.available_permits() == 0
+            })
+            .await;
+            // Give the finished tool's result a window to reach the event
+            // loop. The window only widens what the absence check below can
+            // catch; it is not itself an assertion about timing.
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                turn.pump().await;
+            }
+            turn.assert_cancelled_turn_is_quiet("late tool result after the cancel")
+                .await;
+            assert_eq!(
+                turn.provider_calls_started(),
+                1,
+                "INVARIANT: a cancelled turn makes no further provider request\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// Cancel while the reply is streaming, then deliver a late chunk.
+///
+/// Failed before the fix: the unit stayed in progress, so the indicator
+/// stayed and kept counting after the cancel.
+#[tokio::test]
+async fn test_a_late_chunk_after_cancel_brings_no_indicator_back_and_repaints_nothing() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(1);
+            turn.submit().await;
+            turn.settle("the provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.release_provider_call();
+            turn.send(StreamChunk::ThinkingDelta {
+                text: "weigh the two approaches first".into(),
+                provenance: provenance(),
+            })
+            .await;
+            turn.settle("the reasoning tokens to be counted", |turn| {
+                turn.tokens() == 5
+            })
+            .await;
+            let rows = turn.frame("streaming").await;
+            the_indicator(&turn, "streaming", &rows);
+
+            turn.cancel().await;
+            turn.assert_cancelled_turn_is_quiet("cancelled while streaming")
+                .await;
+
+            // The provider keeps talking. The worker reads the chunk, sees
+            // the cancel, and drops the stream; nothing reaches the screen.
+            let stream = turn
+                .senders
+                .pop_front()
+                .expect("the cancelled turn's stream is still open");
+            let _ = stream
+                .send(Ok(StreamChunk::TextDelta(format!("(say \"{ANSWER}\")"))))
+                .await;
+            turn.settle("the worker to drop the cancelled stream", |_| {
+                stream.is_closed()
+            })
+            .await;
+            turn.pump().await;
+            turn.assert_cancelled_turn_is_quiet("late chunk after the cancel")
+                .await;
+            assert!(
+                !turn.probe.rows().iter().any(|row| row.contains(ANSWER)),
+                "INVARIANT: a chunk that arrives after the cancel is not shown\n{}",
+                turn.report()
+            );
+        })
+        .await;
+}
+
+/// Cancel one turn, then start another: the screen shows the new turn's
+/// indicator and only that one.
+///
+/// Failed before the fix: the cancelled turn's unit was still in progress,
+/// so two indicators were on screen at once.
+#[tokio::test]
+async fn test_a_turn_after_a_cancelled_turn_shows_exactly_one_indicator() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut turn = IndicatorTurn::start(2);
+            turn.submit().await;
+            turn.settle("the first provider request to be sent", |turn| {
+                turn.provider_calls_started() == 1
+            })
+            .await;
+            turn.advance(Duration::from_secs(3));
+            let rows = turn.frame("first turn waiting").await;
+            the_indicator(&turn, "first turn waiting", &rows);
+
+            turn.cancel().await;
+            let painted_before_second_turn = turn.painted();
+
+            turn.submit().await;
+            turn.settle("the second provider request to be sent", |turn| {
+                turn.provider_calls_started() == 2
+            })
+            .await;
+            turn.advance(Duration::from_secs(1));
+            let rows = turn.frame("second turn waiting").await;
+            let second = the_indicator(&turn, "second turn waiting", &rows);
+            assert!(
+                second.ends_with("… (1s · thinking)"),
+                "INVARIANT: the one indicator on screen is the new turn's, counting from its \
+                 own start; got {second:?}\n{}",
+                turn.report()
+            );
+            for (index, rows) in turn
+                .probe
+                .painted_frames()
+                .iter()
+                .enumerate()
+                .skip(painted_before_second_turn)
+            {
+                let found = indicator_rows(rows);
+                assert!(
+                    found.len() <= 1,
+                    "INVARIANT: no frame contains two in-progress indicators, including after \
+                     a cancelled turn; painted frame {index} had {found:?}\n{}",
                     turn.report()
                 );
             }

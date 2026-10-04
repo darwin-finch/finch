@@ -34,6 +34,11 @@ lowers the same `TurnIndicatorView`; it must not grow its own frames, verb, or s
 `WorkClock` exists so a test advances a unit's time by exact amounts; production units use
 `WorkClock::monotonic`. `test_view_carries_the_indicator_facts_and_format_lowers_the_same_description`
 in `src/work_unit.rs`. The never-read `thinking` flag and its `set_thinking` setter are deleted.
+`WorkUnit::set_cancelled` is the terminal state of a cancelled turn: it settles only a unit that
+is still in progress, exactly once, stops the unit owning the indicator immediately, and makes the
+row read `Turn cancelled` rather than `Assistant turn failed` —
+`test_cancel_settles_an_in_progress_unit_exactly_once`. Its one production caller is
+`QueryStateManager` in `src/cli/repl_event/query_state.rs`.
 
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
