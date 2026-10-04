@@ -89,7 +89,7 @@ pub(super) fn handle_local_helpers_input(
 
 /// The named credential a confirmed ChatGPT provider binds to: the persisted
 /// reference when one exists, otherwise the wizard default for fresh adds.
-fn chatgpt_persisted_reference(persisted: Option<&ProviderEntry>) -> String {
+pub(super) fn chatgpt_persisted_reference(persisted: Option<&ProviderEntry>) -> String {
     persisted
         .and_then(|entry| match entry {
             ProviderEntry::Credentialed {
@@ -463,13 +463,293 @@ fn compatible_credential_reference_count(
         .count()
 }
 
+/// Why a model-list refresh is being started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatalogRefreshTrigger {
+    /// The user pressed Ctrl+R: a refresh that cannot start says why.
+    Manual,
+    /// The form noticed it has what a refresh needs: one that cannot start
+    /// yet stays silent, because nothing was asked for.
+    Automatic,
+}
+
+/// What a model-list refresh reads from the wizard besides the open form.
+pub(super) struct CatalogRefreshInputs<'a> {
+    pub(super) primary_model: &'a ModelConfig,
+    pub(super) tool_models: &'a [ModelConfig],
+    pub(super) credentials: &'a [crate::config::ProviderCredential],
+    pub(super) cache_dir: Option<&'a std::path::Path>,
+    pub(super) chatgpt_account_models: Option<&'a Arc<dyn crate::providers::ChatGptAccountModels>>,
+}
+
+/// What Ctrl+R reports when a ChatGPT subscription form has no signed-in
+/// credential to list models with.
+pub(super) const CHATGPT_SIGN_IN_BEFORE_LISTING: &str =
+    "Sign in to ChatGPT first: the account's model list needs the signed-in subscription";
+
+/// The persisted profile behind the row being edited, if any.
+fn editing_persisted_entry<'a>(
+    primary_model: &'a ModelConfig,
+    tool_models: &'a [ModelConfig],
+    editing_idx: Option<usize>,
+) -> Option<&'a ProviderEntry> {
+    let slot = match editing_idx? {
+        0 => primary_model,
+        index => tool_models.get(index - 1)?,
+    };
+    match slot {
+        ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+        ModelConfig::Local { .. } => None,
+    }
+}
+
+/// Start a background model-list refresh for the open provider form.
+///
+/// Returns whether a refresh was started. An API-key provider is listed
+/// through its `/models` route; a ChatGPT subscription through the signed-in
+/// account catalogue the provider consults before every query. The result is
+/// collected by `advance_catalog_refresh_if_done`.
+pub(super) fn start_catalog_refresh(
+    step: Option<&AddProviderStep>,
+    inputs: CatalogRefreshInputs<'_>,
+    trigger: CatalogRefreshTrigger,
+    catalog_generation: &mut u64,
+    catalog_refresh: &mut Option<CatalogRefresh>,
+    catalog_error: &mut Option<String>,
+) -> bool {
+    let Some(AddProviderStep::ConfigureRemote {
+        provider_idx,
+        name,
+        api_key,
+        model,
+        editing_idx,
+        ..
+    }) = step
+    else {
+        return false;
+    };
+    let manual = trigger == CatalogRefreshTrigger::Manual;
+    let mut refuse = |reason: String| {
+        if manual {
+            *catalog_error = Some(reason);
+        }
+        false
+    };
+    let persisted = editing_persisted_entry(inputs.primary_model, inputs.tool_models, *editing_idx);
+    let (provider_id, provider_label, ..) =
+        CLOUD_PROVIDERS[(*provider_idx).min(CLOUD_PROVIDERS.len() - 1)];
+    let key_text = api_key.as_deref().unwrap_or("");
+    let Some(selection_identity) =
+        catalog_selection_identity(provider_id, name, key_text, persisted)
+    else {
+        return refuse(format!(
+            "{provider_label} does not advertise model discovery; enter a model ID manually"
+        ));
+    };
+    let selected_entry =
+        provider_entry_from_remote_model(provider_id, name, key_text, model, persisted);
+    let named_profile = selected_entry.profile_name();
+    let named_config = || {
+        named_catalog_refresh_config(
+            inputs.primary_model,
+            inputs.tool_models,
+            editing_idx.unwrap_or(0),
+            &selected_entry,
+            inputs.credentials.to_vec(),
+        )
+    };
+
+    type Job = Box<dyn FnOnce(&tokio::runtime::Runtime) -> (ModelCatalog, Option<String>) + Send>;
+    let (job, fallback): (Job, ModelCatalog) = if provider_id == "chatgpt" {
+        let reference = chatgpt_persisted_reference(persisted);
+        let signed_in = inputs.credentials.iter().any(|credential| {
+            credential.name == reference
+                && credential.provider == crate::config::CredentialProvider::ChatgptSubscription
+        });
+        if !signed_in {
+            return refuse(CHATGPT_SIGN_IN_BEFORE_LISTING.to_string());
+        }
+        let Some(source) = inputs.chatgpt_account_models.cloned() else {
+            return refuse(
+                "ChatGPT account model listing is unavailable in this setup session; \
+                 enter a model ID manually"
+                    .to_string(),
+            );
+        };
+        let mut fallback =
+            fallback_catalog("chatgpt", crate::providers::CHATGPT_SUBSCRIPTION_MODELS_URL);
+        fallback.profile_id = named_profile.clone();
+        let config = named_config();
+        let on_failure = fallback.clone();
+        (
+            Box::new(move |runtime| {
+                match runtime.block_on(crate::providers::refresh_chatgpt_subscription_from_config(
+                    &config,
+                    &named_profile,
+                    source.as_ref(),
+                )) {
+                    Ok(catalog) => (catalog, None),
+                    Err(error) => (on_failure, Some(format!("{error:#}"))),
+                }
+            }),
+            fallback,
+        )
+    } else {
+        let Some(profile) = model_catalog_profile(provider_id, name, key_text, persisted) else {
+            return refuse(format!(
+                "{provider_label} does not advertise model discovery; enter a model ID manually"
+            ));
+        };
+        let named = matches!(selected_entry, ProviderEntry::Credentialed { .. });
+        if !manual && !named && key_text.trim().is_empty() {
+            return false;
+        }
+        let Some(cache_dir) = inputs.cache_dir.map(std::path::Path::to_path_buf) else {
+            return refuse("Cannot locate home directory for model catalogue cache".to_string());
+        };
+        let mut fallback = fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+        fallback.profile_id = profile.profile_id.clone();
+        let named_config = named.then(named_config);
+        let on_failure = fallback.clone();
+        (
+            Box::new(move |runtime| match named_config {
+                Some(config) => match runtime.block_on(refresh_from_config(
+                    &config,
+                    &named_profile,
+                    &crate::config::EnvironmentCredentialResolver,
+                    &cache_dir,
+                )) {
+                    Ok(catalog) => (catalog, None),
+                    Err(error) => (on_failure, Some(error.to_string())),
+                },
+                None => runtime.block_on(refresh_with_fallback(&profile, &cache_dir)),
+            }),
+            fallback,
+        )
+    };
+
+    let result: Arc<Mutex<CatalogRefreshResult>> = Arc::new(Mutex::new(None));
+    let result_for_thread = Arc::clone(&result);
+    *catalog_generation = catalog_generation.wrapping_add(1);
+    let generation = *catalog_generation;
+    std::thread::spawn(move || {
+        let outcome = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => job(&runtime),
+            Err(_) => (
+                fallback,
+                Some("Could not initialize model catalogue refresh".to_string()),
+            ),
+        };
+        *result_for_thread.lock().unwrap() = Some(outcome);
+    });
+    *catalog_refresh = Some(CatalogRefresh {
+        generation,
+        selection_identity,
+        result,
+    });
+    *catalog_error = None;
+    true
+}
+
+/// Whether the cloud provider form is the open overlay.
+fn remote_form_open(state: &WizardState) -> bool {
+    matches!(
+        state.sections.get(&WizardSection::Models),
+        Some(SectionState::Models {
+            adding_provider: Some(AddProviderStep::ConfigureRemote { .. }),
+            ..
+        })
+    )
+}
+
+/// Fetch the open provider form's model list without being asked.
+///
+/// The form lists models as soon as it has what a listing needs — a usable
+/// key, or a signed-in subscription credential — so nobody has to know that
+/// Ctrl+R exists. It runs when the form opens and whenever focus rests on the
+/// Provider or Model row; never while the Name or API Key row is being typed
+/// into, because each keystroke there changes what would be asked. A list
+/// that was already fetched, is being fetched, or failed is left alone:
+/// Ctrl+R is the retry.
+fn auto_refresh_catalog(
+    state: &mut WizardState,
+    form_was_open: bool,
+    key: crossterm::event::KeyEvent,
+) {
+    if !state.auto_catalog_refresh {
+        return;
+    }
+    let credentials = state.credentials.clone();
+    let cache_dir = state.catalog_cache_dir.clone();
+    let chatgpt_account_models = state.chatgpt_account_models.clone();
+    let Some(SectionState::Models {
+        primary_model,
+        tool_models,
+        adding_provider,
+        catalog_source,
+        catalog_refresh,
+        catalog_generation,
+        catalog_error,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    else {
+        return;
+    };
+    let Some(AddProviderStep::ConfigureRemote {
+        model,
+        focused_field,
+        ..
+    }) = adding_provider.as_ref()
+    else {
+        return;
+    };
+    if catalog_refresh.is_some() || *catalog_source == CatalogSource::Discovered {
+        return;
+    }
+    // Enter on a blank model keeps the form open and asks for a model: that
+    // is the moment a list is most wanted, so it overrides a shown message.
+    let asked_for_a_model = key.code == KeyCode::Enter && model.trim().is_empty();
+    if catalog_error.is_some() && !asked_for_a_model {
+        return;
+    }
+    let identity_at_rest = matches!(*focused_field, 0 | 2);
+    if form_was_open && !identity_at_rest {
+        return;
+    }
+    start_catalog_refresh(
+        adding_provider.as_ref(),
+        CatalogRefreshInputs {
+            primary_model,
+            tool_models,
+            credentials: &credentials,
+            cache_dir: cache_dir.as_deref(),
+            chatgpt_account_models: chatgpt_account_models.as_ref(),
+        },
+        CatalogRefreshTrigger::Automatic,
+        catalog_generation,
+        catalog_refresh,
+        catalog_error,
+    );
+}
+
 /// Handle input for Models section (unified provider entries)
 pub(super) fn handle_models_input(
     state: &mut WizardState,
     key: crossterm::event::KeyEvent,
 ) -> Result<bool> {
+    let form_was_open = remote_form_open(state);
+    let outcome = handle_models_key(state, key);
+    auto_refresh_catalog(state, form_was_open, key);
+    outcome
+}
+
+fn handle_models_key(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     let catalog_cache_dir = state.catalog_cache_dir.clone();
     let credentials = state.credentials.clone();
+    let chatgpt_account_models = state.chatgpt_account_models.clone();
     let chatgpt_authenticator = state.chatgpt_authenticator.clone();
     let grok_authenticator = state.grok_authenticator.clone();
     let gemini_authenticator = state.gemini_authenticator.clone();
@@ -903,130 +1183,20 @@ pub(super) fn handle_models_input(
                     }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let Some(AddProviderStep::ConfigureRemote {
-                        provider_idx,
-                        name,
-                        api_key,
-                        model,
-                        editing_idx,
-                        ..
-                    }) = adding_provider.as_ref()
-                    else {
-                        return Ok(false);
-                    };
-                    let persisted = editing_idx.and_then(|index| {
-                        if index == 0 {
-                            match primary_model {
-                                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
-                                ModelConfig::Local { .. } => None,
-                            }
-                        } else {
-                            tool_models.get(index - 1).and_then(|model| match model {
-                                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
-                                ModelConfig::Local { .. } => None,
-                            })
-                        }
-                    });
-                    let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                    let Some(profile) = model_catalog_profile(
-                        provider_id,
-                        name,
-                        api_key.as_deref().unwrap_or(""),
-                        persisted,
-                    ) else {
-                        *catalog_error = Some(format!(
-                            "{} does not advertise model discovery; enter a model ID manually",
-                            CLOUD_PROVIDERS[*provider_idx].1
-                        ));
-                        return Ok(false);
-                    };
-                    let selected_entry = provider_entry_from_remote_model(
-                        provider_id,
-                        name,
-                        api_key.as_deref().unwrap_or(""),
-                        model,
-                        persisted,
+                    start_catalog_refresh(
+                        adding_provider.as_ref(),
+                        CatalogRefreshInputs {
+                            primary_model,
+                            tool_models,
+                            credentials: &credentials,
+                            cache_dir: catalog_cache_dir.as_deref(),
+                            chatgpt_account_models: chatgpt_account_models.as_ref(),
+                        },
+                        CatalogRefreshTrigger::Manual,
+                        catalog_generation,
+                        catalog_refresh,
+                        catalog_error,
                     );
-                    let named_config = matches!(selected_entry, ProviderEntry::Credentialed { .. })
-                        .then(|| {
-                            named_catalog_refresh_config(
-                                primary_model,
-                                tool_models,
-                                editing_idx.unwrap_or(0),
-                                &selected_entry,
-                                credentials.clone(),
-                            )
-                        });
-                    let named_profile = selected_entry.profile_name();
-                    let cache_dir = match catalog_cache_dir.clone() {
-                        Some(path) => path,
-                        None => {
-                            *catalog_error = Some(
-                                "Cannot locate home directory for model catalogue cache"
-                                    .to_string(),
-                            );
-                            return Ok(false);
-                        }
-                    };
-                    let result: Arc<Mutex<CatalogRefreshResult>> = Arc::new(Mutex::new(None));
-                    let result_for_thread = Arc::clone(&result);
-                    *catalog_generation = catalog_generation.wrapping_add(1);
-                    let generation = *catalog_generation;
-                    let selection_identity = profile_cache_identity(&profile);
-                    std::thread::spawn(move || {
-                        let refreshed = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(anyhow::Error::from)
-                            .map(|runtime| {
-                                if let Some(config) = named_config {
-                                    runtime.block_on(async {
-                                        match refresh_from_config(
-                                            &config,
-                                            &named_profile,
-                                            &crate::config::EnvironmentCredentialResolver,
-                                            &cache_dir,
-                                        )
-                                        .await
-                                        {
-                                            Ok(catalog) => (catalog, None),
-                                            Err(error) => {
-                                                let mut fallback = fallback_catalog(
-                                                    &profile.provider,
-                                                    &profile.endpoints.models_url,
-                                                );
-                                                fallback.profile_id = profile.profile_id.clone();
-                                                (fallback, Some(error.to_string()))
-                                            }
-                                        }
-                                    })
-                                } else {
-                                    runtime.block_on(refresh_with_fallback(&profile, &cache_dir))
-                                }
-                            });
-                        *result_for_thread.lock().unwrap() = Some(match refreshed {
-                            Ok(result) => result,
-                            Err(_) => {
-                                let mut fallback = fallback_catalog(
-                                    &profile.provider,
-                                    &profile.endpoints.models_url,
-                                );
-                                fallback.profile_id = profile.profile_id.clone();
-                                (
-                                    fallback,
-                                    Some(
-                                        "Could not initialize model catalogue refresh".to_string(),
-                                    ),
-                                )
-                            }
-                        });
-                    });
-                    *catalog_refresh = Some(CatalogRefresh {
-                        generation,
-                        selection_identity,
-                        result,
-                    });
-                    *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
                     if let Some(AddProviderStep::DeviceAuth { pending, .. }) =

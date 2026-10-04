@@ -8,7 +8,10 @@ mod catalog;
 mod claude_cli_daemon;
 mod factory;
 
-pub use catalog::refresh_from_config;
+pub use catalog::{
+    refresh_chatgpt_subscription_from_config, refresh_from_config, ChatGptAccountModels,
+    ProductionChatGptAccountModels, CHATGPT_SUBSCRIPTION_MODELS_URL,
+};
 pub use claude_cli_daemon::DaemonClaudeCliProvider;
 pub use factory::preflight_provider_config;
 pub use factory::{

@@ -89,7 +89,7 @@ pub(super) fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         }
     });
     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-    let Some(current_profile) = model_catalog_profile(
+    let Some(current_identity) = catalog_selection_identity(
         provider_id,
         name,
         api_key.as_deref().unwrap_or(""),
@@ -97,18 +97,25 @@ pub(super) fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     ) else {
         return;
     };
-    if generation != *catalog_generation
-        || selection_identity != profile_cache_identity(&current_profile)
-    {
+    if generation != *catalog_generation || selection_identity != current_identity {
         return;
     }
 
+    let setup_default = CLOUD_PROVIDERS[*provider_idx].2;
     if let Some(AddProviderStep::ConfigureRemote { model, .. }) = adding_provider.as_mut() {
+        // A provider's own setup default stays selected when the listing
+        // offers it: a ChatGPT subscription defaults to its newest model, and
+        // must not be moved to whichever identifier happens to sort first.
+        // A blank or generated selection still follows the listing.
+        let offered_setup_default = !setup_default.is_empty()
+            && model == setup_default
+            && catalog.models.iter().any(|listed| listed == setup_default);
         if catalog.source == CatalogSource::Discovered
             && matches!(
                 catalog_model_provenance,
                 ModelSelectionProvenance::Blank | ModelSelectionProvenance::DefaultGenerated
             )
+            && !offered_setup_default
         {
             if let Some(discovered) = catalog.models.first() {
                 *model = discovered.clone();
@@ -313,6 +320,11 @@ pub(super) fn run_tabbed_wizard(
             None
         }
     };
+    // The provider form lists models without being asked: an API-key provider
+    // once a key is entered, a ChatGPT subscription once it is signed in.
+    state.chatgpt_account_models = Some(Arc::new(crate::providers::ProductionChatGptAccountModels)
+        as Arc<dyn crate::providers::ChatGptAccountModels>);
+    state.auto_catalog_refresh = true;
     state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production_for_surface(
         crate::providers::GrokDeviceClientSurface::Ui,
     ) {
