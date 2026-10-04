@@ -1462,12 +1462,117 @@ fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool)
     WizardLine::concat(&[label_text, value_painted])
 }
 
+/// How many model rows the provider form shows at once.
+pub(super) const MODEL_CHOICE_WINDOW: usize = 6;
+
+/// Rows the model list always occupies in the provider form: a heading, the
+/// window of choices, and one note row. The line count is fixed whatever the
+/// catalogue holds, so a list that grows from two built-in entries to a
+/// hundred discovered ones, or a note that appears and clears, never moves
+/// the rows beneath it (at a width the note fits on one row).
+pub(super) const MODEL_CHOICE_ROWS: usize = MODEL_CHOICE_WINDOW + 2;
+
+/// Longest model identifier shown in full; a longer one is cut with `…`.
+const MODEL_CHOICE_MAX_CHARS: usize = 60;
+
+fn model_choice_display(model: &str) -> String {
+    if model.chars().count() <= MODEL_CHOICE_MAX_CHARS {
+        return model.to_string();
+    }
+    let head: String = model.chars().take(MODEL_CHOICE_MAX_CHARS - 1).collect();
+    format!("{head}…")
+}
+
+/// The visible model list of the provider form.
+///
+/// Shows what ←→ on the Model row moves through, with the selected entry
+/// marked in words as well as by colour, so nobody has to know an identifier
+/// from memory or cycle blind. A typed identifier the list does not contain
+/// is called out here, before saving, rather than at the first query.
+pub(super) fn model_choice_lines(
+    models: &[String],
+    current: &str,
+    source: &CatalogSource,
+    subscription: bool,
+) -> Vec<WizardLine> {
+    let mut lines = Vec::with_capacity(MODEL_CHOICE_ROWS);
+    let selected = models.iter().position(|model| model == current);
+    if models.is_empty() {
+        lines.push(wizard_line(
+            "No model list yet · type a model ID on the Model row",
+            Color::DarkGray,
+        ));
+    } else if models.len() <= MODEL_CHOICE_WINDOW {
+        lines.push(wizard_line(
+            &format!(
+                "Model choices ({}) · ←→ on the Model row picks one",
+                models.len()
+            ),
+            Color::DarkGray,
+        ));
+    }
+    // Keep the selected entry inside the window; with nothing selected the
+    // window starts at the top of the list.
+    let start = selected
+        .map(|index| {
+            index
+                .saturating_sub(MODEL_CHOICE_WINDOW / 2)
+                .min(models.len().saturating_sub(MODEL_CHOICE_WINDOW))
+        })
+        .unwrap_or(0);
+    let end = (start + MODEL_CHOICE_WINDOW).min(models.len());
+    if models.len() > MODEL_CHOICE_WINDOW {
+        lines.push(wizard_line(
+            &format!(
+                "Model choices ({} to {} of {}) · ←→ on the Model row moves through all",
+                start + 1,
+                end,
+                models.len()
+            ),
+            Color::DarkGray,
+        ));
+    }
+    for (index, model) in models.iter().enumerate().take(end).skip(start) {
+        let shown = model_choice_display(model);
+        lines.push(if Some(index) == selected {
+            wizard_line(&format!("  → {shown}  (selected)"), Color::Green)
+        } else {
+            wizard_line(&format!("    {shown}"), Color::Cyan)
+        });
+    }
+    while lines.len() < MODEL_CHOICE_ROWS - 1 {
+        lines.push(WizardLine::blank());
+    }
+    let typed = current.trim();
+    let listed = *source != CatalogSource::StaticFallback;
+    let note = if !typed.is_empty() && selected.is_none() && !models.is_empty() {
+        let shown = model_choice_display(typed);
+        Some(if listed {
+            format!("'{shown}' is not in this list · the provider may reject it")
+        } else {
+            format!("'{shown}' is not in the built-in list · unchecked until the list is fetched")
+        })
+    } else if subscription && !listed {
+        Some(
+            "Built-in choices · this account's own list needs a signed-in subscription".to_string(),
+        )
+    } else {
+        None
+    };
+    lines.push(match note {
+        Some(note) => wizard_line(&note, Color::Yellow),
+        None => WizardLine::blank(),
+    });
+    lines
+}
+
 /// The add-provider overlay as one claimed card: type selection, the
 /// single-screen remote/local forms, the network scan, and the device
 /// ceremony all render as body lines whose controls stay pinned inside the
 /// card (#807) — no floating second painter.
 pub(super) fn add_provider_card(
     step: &AddProviderStep,
+    catalog_models: &[String],
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
     catalog_refreshed_at: Option<&DateTime<Utc>>,
@@ -1580,8 +1685,14 @@ pub(super) fn add_provider_card(
                     Color::Yellow,
                 ));
             }
+            body.extend(model_choice_lines(
+                catalog_models,
+                model,
+                catalog_source,
+                CLOUD_PROVIDERS[remote_idx].0 == "chatgpt",
+            ));
             let controls = if editing {
-                "↑↓ navigate · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
+                "↑↓ navigate · ←→ pick model · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
             } else {
                 "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
             };
@@ -1984,6 +2095,7 @@ pub(super) fn wizard_view_with_permission_target(
         match state.sections.get(&WizardSection::Models) {
             Some(SectionState::Models {
                 adding_provider: Some(step),
+                catalog_models,
                 catalog_source,
                 catalog_refresh,
                 catalog_refreshed_at,
@@ -1991,6 +2103,7 @@ pub(super) fn wizard_view_with_permission_target(
                 ..
             }) => Some(add_provider_card(
                 step,
+                catalog_models,
                 catalog_source,
                 catalog_refresh.is_some(),
                 catalog_refreshed_at.as_ref(),

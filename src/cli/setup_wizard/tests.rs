@@ -2707,7 +2707,14 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
 
     let step = AddProviderStep::SelectAddType { selected: 0 };
     let rendered = render_card_text(
-        add_provider_card(&step, &CatalogSource::StaticFallback, false, None, None),
+        add_provider_card(
+            &step,
+            &[],
+            &CatalogSource::StaticFallback,
+            false,
+            None,
+            None,
+        ),
         160,
         50,
     );
@@ -2791,7 +2798,7 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
     ));
 
     let rendered = render_card_text(
-        add_provider_card(step, &CatalogSource::StaticFallback, false, None, None),
+        add_provider_card(step, &[], &CatalogSource::StaticFallback, false, None, None),
         180,
         50,
     );
@@ -2877,6 +2884,7 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
     let rendered = render_card_text(
         add_provider_card(
             &step,
+            &[],
             &CatalogSource::StaticFallback,
             false,
             Some(&misleading_runtime_time),
@@ -9251,5 +9259,576 @@ fn test_long_sign_in_address_is_two_links_not_wrapped_plain_text() {
         Some(WizardLinkAction::CopyText(address.into())),
         "the copy link must carry the whole address; links={:?}",
         frame.links
+    );
+}
+
+// ── choosing a model from a visible list ──────────────────────────────────
+//
+// The provider form used to take a model identifier from memory: the built-in
+// choices were reachable only by cycling ←→ blind, a ChatGPT subscription
+// could not list its account's models at all, and an API-key provider listed
+// them only after Ctrl+R. These tests drive the real key handler, the real
+// background refresh and the real frame planner.
+
+/// A scripted ChatGPT account listing: what the account offers, or why the
+/// listing failed. Records how often it was asked and for which credential,
+/// so a test can prove setup did not ask without a signed-in credential.
+struct ScriptedChatGptAccountModels {
+    outcome: Mutex<Result<Vec<String>, String>>,
+    asked_for: Mutex<Vec<String>>,
+}
+
+impl ScriptedChatGptAccountModels {
+    fn offering(models: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(Ok(models.iter().map(|model| model.to_string()).collect())),
+            asked_for: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn failing(reason: &str) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(Err(reason.to_string())),
+            asked_for: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn asked_for(&self) -> Vec<String> {
+        self.asked_for.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::providers::ChatGptAccountModels for ScriptedChatGptAccountModels {
+    async fn account_models(
+        &self,
+        credential: &crate::config::ProviderCredential,
+    ) -> anyhow::Result<Vec<String>> {
+        self.asked_for.lock().unwrap().push(credential.name.clone());
+        self.outcome
+            .lock()
+            .unwrap()
+            .clone()
+            .map_err(|reason| anyhow::anyhow!(reason))
+    }
+}
+
+/// The named credential a completed ChatGPT sign-in leaves in the wizard:
+/// metadata only, no token material.
+fn signed_in_chatgpt_credential() -> crate::config::ProviderCredential {
+    use crate::config::{
+        AudienceBinding, CredentialKind, CredentialLifecycle, CredentialProvider, EndpointFamily,
+    };
+    crate::config::ProviderCredential {
+        name: "chatgpt:default".into(),
+        kind: CredentialKind::OauthDevice,
+        provider: CredentialProvider::ChatgptSubscription,
+        issuer: "openai-chatgpt".into(),
+        audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+        tenant: None,
+        project: None,
+        account: Some("account-123".into()),
+        scopes: crate::providers::chatgpt_required_scopes(),
+        secret_ref: "oauth-store:chatgpt:default".into(),
+        lifecycle: CredentialLifecycle::Active {
+            expires_at: Some("2099-01-02T03:04:05Z".parse().unwrap()),
+            refreshable: true,
+        },
+        revocation: Default::default(),
+    }
+}
+
+/// A wizard on the Models tab that behaves like the live one: it lists models
+/// on its own, and asks `source` for a ChatGPT account's list.
+fn live_like_models_state(
+    source: Arc<ScriptedChatGptAccountModels>,
+    signed_in: bool,
+) -> WizardState {
+    let hermetic_config = crate::config::Config::with_providers_and_paths(
+        vec![ProviderEntry::Claude {
+            api_key: String::new(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".to_string()),
+        }],
+        std::path::PathBuf::from("unused-test-metrics"),
+    );
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&hermetic_config), None);
+    state.current_section = WizardSection::Models;
+    state.auto_catalog_refresh = true;
+    state.chatgpt_account_models = Some(source as Arc<dyn crate::providers::ChatGptAccountModels>);
+    if signed_in {
+        state.credentials.push(signed_in_chatgpt_credential());
+    }
+    state
+}
+
+/// Open the add-provider overlay and choose its first entry, the ChatGPT
+/// subscription, exactly as a user does: `a`, then Enter.
+fn open_chatgpt_add_form(state: &mut WizardState) {
+    assert_eq!(
+        CLOUD_PROVIDERS[0].0, "chatgpt",
+        "this helper relies on the ChatGPT subscription being the first add-provider choice"
+    );
+    handle_models_input(state, key(KeyCode::Char('a'))).unwrap();
+    handle_models_input(state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(
+            get_step(state),
+            Some(AddProviderStep::ConfigureRemote {
+                provider_idx: 0,
+                ..
+            })
+        ),
+        "choosing the ChatGPT subscription must open its provider form; step={:?}",
+        get_step(state)
+    );
+}
+
+fn catalog_refresh_in_flight(state: &WizardState) -> bool {
+    matches!(
+        state.sections.get(&WizardSection::Models),
+        Some(SectionState::Models {
+            catalog_refresh: Some(_),
+            ..
+        })
+    )
+}
+
+/// Let a started background refresh finish and be applied, as the run loop's
+/// tick does. The bound is a liveness guard only: reaching it means the
+/// refresh hung, not that it was slow.
+fn settle_catalog_refresh(state: &mut WizardState) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while catalog_refresh_in_flight(state) {
+        advance_catalog_refresh_if_done(state);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the model list refresh never completed: the background refresh hung"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn form_model(state: &WizardState) -> String {
+    match get_step(state) {
+        Some(AddProviderStep::ConfigureRemote { model, .. }) => model.clone(),
+        other => panic!("expected the provider form to be open; step={other:?}"),
+    }
+}
+
+fn catalog_state_summary(state: &WizardState) -> String {
+    match state.sections.get(&WizardSection::Models) {
+        Some(SectionState::Models {
+            catalog_models,
+            catalog_source,
+            catalog_error,
+            catalog_refresh,
+            ..
+        }) => format!(
+            "models={catalog_models:?} source={catalog_source:?} error={catalog_error:?} refreshing={}",
+            catalog_refresh.is_some()
+        ),
+        _ => "no models section".to_string(),
+    }
+}
+
+#[test]
+fn test_chatgpt_form_lists_the_signed_in_accounts_models_without_a_keypress() {
+    // The account offers the `gpt-5.6` alias and `gpt-6.1-sol`, which differs
+    // from Finch's built-in pair (`gpt-5.6-sol`, `gpt-6.1-sol`).
+    let source = ScriptedChatGptAccountModels::offering(&["gpt-5.6", "gpt-6.1-sol"]);
+    let mut state = live_like_models_state(source.clone(), true);
+
+    open_chatgpt_add_form(&mut state);
+    assert!(
+        catalog_refresh_in_flight(&state),
+        "opening the form for a signed-in ChatGPT subscription must start listing the \
+         account's models on its own, with no Ctrl+R; {}",
+        catalog_state_summary(&state)
+    );
+    settle_catalog_refresh(&mut state);
+
+    assert_eq!(
+        source.asked_for(),
+        vec!["chatgpt:default".to_string()],
+        "the account must be asked exactly once, for the credential the profile is bound to"
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("provider discovery"),
+        "the list must be labelled as fetched from the provider; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("Model choices (2)"),
+        "the form must show the account's choices as a visible list; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("    gpt-5.6 ") && !rendered.contains("gpt-5.6-sol"),
+        "the list must be the account's models, not Finch's built-in pair; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("→ gpt-6.1-sol  (selected)"),
+        "the selected model must be marked in the list in words; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert_eq!(
+        form_model(&state),
+        "gpt-6.1-sol",
+        "a default model the account offers must stay selected instead of being replaced \
+         by whichever identifier sorts first; {}",
+        catalog_state_summary(&state)
+    );
+}
+
+#[test]
+fn test_chatgpt_form_without_a_sign_in_shows_the_builtin_list_and_says_why() {
+    let source = ScriptedChatGptAccountModels::offering(&["gpt-6.1-sol"]);
+    let mut state = live_like_models_state(source.clone(), false);
+
+    open_chatgpt_add_form(&mut state);
+    assert!(
+        !catalog_refresh_in_flight(&state),
+        "with no signed-in credential there is nothing to list with, so no refresh may \
+         start; {}",
+        catalog_state_summary(&state)
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("built-in list") && rendered.contains("incomplete"),
+        "the fallback must be labelled as Finch's dated, incomplete built-in list; \n{rendered}"
+    );
+    assert!(
+        rendered.contains("    gpt-5.6-sol") && rendered.contains("→ gpt-6.1-sol  (selected)"),
+        "the built-in choices must be visible with the default marked; \n{rendered}"
+    );
+    assert!(
+        rendered.contains("this account's own list needs a signed-in subscription"),
+        "the form must say why it is not showing the account's own list; \n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Refresh warning"),
+        "not being signed in yet is not a failure and must not be shown as one before the \
+         user asks for a refresh; \n{rendered}"
+    );
+
+    handle_models_input(
+        &mut state,
+        modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+    )
+    .unwrap();
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Refresh warning: Sign in to ChatGPT first"),
+        "Ctrl+R with no sign-in must say sign-in is what is missing; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        source.asked_for().is_empty(),
+        "setup must never ask for an account's models without a signed-in credential; \
+         asked_for={:?}",
+        source.asked_for()
+    );
+}
+
+#[test]
+fn test_chatgpt_listing_failure_falls_back_to_the_builtin_list_with_the_reason() {
+    let source = ScriptedChatGptAccountModels::failing(
+        "ChatGPT subscription model discovery failed (HTTP 503 Service Unavailable)",
+    );
+    let mut state = live_like_models_state(source.clone(), true);
+
+    open_chatgpt_add_form(&mut state);
+    settle_catalog_refresh(&mut state);
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Refresh warning:") && rendered.contains("HTTP 503"),
+        "a failed listing must show its reason in the form; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("built-in list")
+            && rendered.contains("incomplete")
+            && !rendered.contains("provider discovery"),
+        "after a failed listing the choices must be labelled as the built-in list, never as \
+         fetched; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("    gpt-5.6-sol") && rendered.contains("→ gpt-6.1-sol  (selected)"),
+        "the built-in choices must stay visible and selectable after a failed listing; \
+         \n{rendered}"
+    );
+
+    // Moving around the form must not hammer a failing listing.
+    handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(
+        !catalog_refresh_in_flight(&state) && source.asked_for().len() == 1,
+        "a failed listing must not be retried by navigation; asked_for={:?} {}",
+        source.asked_for(),
+        catalog_state_summary(&state)
+    );
+
+    // Ctrl+R is the retry.
+    handle_models_input(
+        &mut state,
+        modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+    )
+    .unwrap();
+    settle_catalog_refresh(&mut state);
+    assert_eq!(
+        source.asked_for().len(),
+        2,
+        "Ctrl+R must retry the listing; {}",
+        catalog_state_summary(&state)
+    );
+}
+
+#[test]
+fn test_typed_model_missing_from_the_fetched_list_is_flagged_before_saving() {
+    let source = ScriptedChatGptAccountModels::offering(&["gpt-5.6", "gpt-6.1-sol"]);
+    let mut state = live_like_models_state(source, true);
+    open_chatgpt_add_form(&mut state);
+    settle_catalog_refresh(&mut state);
+
+    // Name is focused when the form opens; Down reaches Model.
+    handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+    for _ in 0.."gpt-6.1-sol".len() {
+        handle_models_input(&mut state, key(KeyCode::Backspace)).unwrap();
+    }
+    for c in "gpt-9".chars() {
+        handle_models_input(&mut state, key(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(
+        form_model(&state),
+        "gpt-9",
+        "typing a model identifier must stay possible when a list is shown"
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("'gpt-9' is not in this list"),
+        "an identifier the fetched list does not contain must be flagged in the form, \
+         not left to fail at the first query; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        !rendered.contains("(selected)"),
+        "no listed model may be marked selected while a different identifier is typed; \
+         \n{rendered}"
+    );
+
+    // ←→ picks from the list, which clears the warning.
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    let picked = form_model(&state);
+    let rendered = render_wizard_text(&state);
+    assert!(
+        ["gpt-5.6", "gpt-6.1-sol"].contains(&picked.as_str()),
+        "→ on the Model row must pick a listed model; picked={picked:?}"
+    );
+    assert!(
+        rendered.contains(&format!("→ {picked}  (selected)")) && !rendered.contains("is not in"),
+        "picking a listed model must mark it and clear the warning; picked={picked:?}\n{rendered}"
+    );
+}
+
+#[test]
+fn test_api_key_form_lists_models_once_the_key_is_entered_and_never_per_keystroke() {
+    let mut server = mockito::Server::new();
+    let listing = server
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-typed-0123456789")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"gpt-b"},{"id":"gpt-a"}]}"#)
+        .expect(1)
+        .create();
+    // Any request sent while the key was still being typed would land here.
+    let partial_key = server
+        .mock("GET", "/v1/models")
+        .match_header(
+            "authorization",
+            mockito::Matcher::Regex("^Bearer .{0,18}$".into()),
+        )
+        .with_status(401)
+        .expect(0)
+        .create();
+    let cache = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::with_providers_and_paths(
+        vec![ProviderEntry::Openai {
+            api_key: String::new(),
+            model: None,
+            base_url: Some(server.url()),
+            chat_path: Some("/v1/chat/completions".into()),
+            models_path: Some("/v1/models".into()),
+            name: Some("openai-work".to_string()),
+            reasoning_effort: None,
+        }],
+        std::path::PathBuf::from("unused-test-metrics"),
+    );
+    let mut state =
+        WizardState::new_with_catalog_cache_dir(Some(&config), Some(cache.path().to_path_buf()));
+    state.current_section = WizardSection::Models;
+    state.auto_catalog_refresh = true;
+
+    // Open the editor for the keyless OpenAI row: focus lands on API Key.
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                focused_field: 3,
+                ..
+            })
+        ),
+        "a keyless API provider must open on its API Key row; step={:?}",
+        get_step(&state)
+    );
+    assert!(
+        !catalog_refresh_in_flight(&state),
+        "with no key there is nothing to list with; {}",
+        catalog_state_summary(&state)
+    );
+    for c in "sk-typed-0123456789".chars() {
+        handle_models_input(&mut state, key(KeyCode::Char(c))).unwrap();
+        assert!(
+            !catalog_refresh_in_flight(&state),
+            "typing the key must not send a request per keystroke (after {c:?}); {}",
+            catalog_state_summary(&state)
+        );
+    }
+
+    // Leaving the key for the Model row is when the form has what it needs.
+    handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+    assert!(
+        catalog_refresh_in_flight(&state),
+        "reaching the Model row with a key entered must list models without Ctrl+R; {}",
+        catalog_state_summary(&state)
+    );
+    settle_catalog_refresh(&mut state);
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("provider discovery") && rendered.contains("Model choices (2)"),
+        "the key's models must be shown as a fetched, visible list; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        rendered.contains("→ gpt-a  (selected)") && rendered.contains("    gpt-b"),
+        "a blank model must be filled with a listed one and both choices shown; {}\n{rendered}",
+        catalog_state_summary(&state)
+    );
+    assert!(
+        !rendered.contains("sk-typed-0123456789"),
+        "the form must never display the whole key; \n{rendered}"
+    );
+    listing.assert();
+    partial_key.assert();
+}
+
+#[test]
+fn test_model_choice_block_keeps_a_fixed_height_and_windows_a_long_list() {
+    let many: Vec<String> = (0..100).map(|index| format!("model-{index:03}")).collect();
+    let cases: Vec<(&str, Vec<String>, &str, CatalogSource)> = vec![
+        ("empty", Vec::new(), "", CatalogSource::StaticFallback),
+        (
+            "two built-in",
+            vec!["a".into(), "b".into()],
+            "b",
+            CatalogSource::StaticFallback,
+        ),
+        (
+            "exactly a window",
+            many[..MODEL_CHOICE_WINDOW].to_vec(),
+            "model-003",
+            CatalogSource::Discovered,
+        ),
+        (
+            "one more than a window",
+            many[..MODEL_CHOICE_WINDOW + 1].to_vec(),
+            "model-006",
+            CatalogSource::Discovered,
+        ),
+        (
+            "long, selected deep",
+            many.clone(),
+            "model-057",
+            CatalogSource::Discovered,
+        ),
+        (
+            "long, selected last",
+            many.clone(),
+            "model-099",
+            CatalogSource::Cache,
+        ),
+        (
+            "long, typed id",
+            many.clone(),
+            "not-listed",
+            CatalogSource::Discovered,
+        ),
+    ];
+    for (name, models, current, source) in cases {
+        let lines = model_choice_lines(&models, current, &source, false);
+        let text: Vec<String> = lines.iter().map(|line| line.plain_text()).collect();
+        assert_eq!(
+            lines.len(),
+            MODEL_CHOICE_ROWS,
+            "the model list must occupy the same number of rows whatever the catalogue \
+             holds, so nothing beneath it moves (case {name:?}); lines={text:#?}"
+        );
+        if models.iter().any(|model| model == current) {
+            assert!(
+                text.iter()
+                    .any(|line| line == &format!("  → {current}  (selected)")),
+                "the selected model must always be inside the visible window \
+                 (case {name:?}); lines={text:#?}"
+            );
+        }
+        if models.len() > MODEL_CHOICE_WINDOW {
+            assert!(
+                text[0].contains(&format!("of {}", models.len())),
+                "a windowed list must say how many models there are in all \
+                 (case {name:?}); lines={text:#?}"
+            );
+        }
+    }
+
+    // In the frame: a two-entry list and a hundred-entry list leave the
+    // controls row on the same screen row.
+    let openai_idx = CLOUD_PROVIDERS
+        .iter()
+        .position(|(id, ..)| *id == "openai")
+        .unwrap();
+    let controls_row = |models: &[String], model: &str| {
+        let step = AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: model.to_string(),
+            api_key: Some("openai-key".to_string()),
+            focused_field: 2,
+            editing_idx: None,
+        };
+        let rendered = render_card_text(
+            add_provider_card(&step, models, &CatalogSource::Discovered, false, None, None),
+            120,
+            40,
+        );
+        rendered
+            .lines()
+            .position(|row| row.contains("Enter adds"))
+            .unwrap_or_else(|| panic!("the controls row must be on screen:\n{rendered}"))
+    };
+    let short = controls_row(&["a".to_string(), "b".to_string()], "a");
+    let long = controls_row(&many, "model-057");
+    assert_eq!(
+        short, long,
+        "the form's controls row must not move when the model list grows from 2 to 100 \
+         entries (row with 2 entries, row with 100 entries)"
     );
 }
