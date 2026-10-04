@@ -219,10 +219,10 @@ pub use dom_manifest::{
 // module private so the crate facade remains the only external path.
 pub use wizard_host::{
     lower_wizard_line, lower_wizard_span, plan_wizard_frame, theme_wizard_frame, wizard_bold,
-    wizard_boxed, wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint,
-    wizard_plain, wizard_selected, wizard_url, wizard_visible_length, wizard_wrap, WizardCard,
-    WizardColor, WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent,
-    WizardSpan, WizardView,
+    wizard_boxed, wizard_centered, wizard_line, wizard_line_is_selected, wizard_markdown,
+    wizard_paint, wizard_plain, wizard_selected, wizard_url, wizard_visible_length, wizard_wrap,
+    WizardCard, WizardColor, WizardFrame, WizardHost, WizardLine, WizardLinkRegion, WizardRects,
+    WizardSectionContent, WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
