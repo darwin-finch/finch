@@ -3,7 +3,7 @@
 //! The live transcript region — the [`super::widgets`] root column's `Flex`
 //! `TRANSCRIPT` claim, the leftover frame under the bottom chrome — is a
 //! scroll view over the conversation (#806). The state is presentation-only,
-//! like the accordion's open set and the tool viewports' offsets: one offset
+//! like the accordion's open set and the expanded tool surface's offset: one offset
 //! counted in physical terminal rows from the bottom of the scroll content,
 //! where `0` is follow mode (the newest content stays in view).
 //!
@@ -18,8 +18,8 @@
 //! therefore never desynchronize the view from the content.
 //!
 //! Step sizes are the ScrollView's own (#897): a wheel tick moves a few rows
-//! and a PageUp/PageDown moves a page of the visible pane — never the bounded
-//! tool-result viewport's one-row tick or four-row page.
+//! and a PageUp/PageDown moves a page of the visible pane — never the expanded
+//! tool-result surface's one-row tick or four-row page.
 
 use super::accordion::RenderedTranscriptLine;
 use super::shadow_buffer;
@@ -28,8 +28,8 @@ use crossterm::event::MouseEventKind;
 
 /// Rows one wheel tick moves the conversation transcript (#897).
 ///
-/// A full transcript pane scrolls a few rows per tick; the bounded
-/// tool-result viewport keeps its own one-row tick
+/// A full transcript pane scrolls a few rows per tick; the expanded
+/// tool-result surface keeps its own one-row tick
 /// (`tool_viewport::WHEEL_STEP_LINES`) and the two never mix.
 pub(crate) const TRANSCRIPT_WHEEL_STEP_LINES: usize = 3;
 
@@ -178,7 +178,7 @@ impl TranscriptScrollView {
 
     /// Rows one PageUp/PageDown moves (#897): a page of the conversation
     /// pane — the transcript claim of the last painted frame — at least one
-    /// row. The bounded tool-result viewport keeps its own four-row page.
+    /// row. The expanded tool-result surface keeps its own four-row page.
     pub(crate) fn page_step(&self) -> usize {
         self.claim.height.max(1)
     }

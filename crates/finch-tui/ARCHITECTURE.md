@@ -146,21 +146,25 @@ path; the dialog-option `markdown` preview keeps its own rendering.
 
 **Bounded tool-result controls** (`crates/finch-tui/src/tool_viewport.rs`):
 - Every `ToolOutput` transcript row is a reusable semantic control with a bounded
-  child viewport (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is
-  truncated to the terminal width, so the bound is a hard row bound; one
-  plain-text status row names the visible range, the total, and the
-  scroll/expand affordances (`… lines 1–3 of 40 — ↑/↓ scroll · Enter expand`).
-- Per-row scroll offsets live in `ToolViewportState`, keyed by the append-stable
-  `view_model::RowId` — interleaved tool updates never reset them. Hit regions are
-  rebuilt from physical-row geometry after every frame and resize, mirroring the
-  accordion; a wheel whose X/Y lands inside a control scrolls that result only.
-  A wheel anywhere else in the transcript claim scrolls the conversation
-  ScrollView (#806); a wheel over the bottom chrome is claimed by nobody.
+  compact window (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4) on the first lines of
+  the output: each body line is truncated to the terminal width, so the bound is
+  a hard row bound; when lines are left out, one plain-text status row names the
+  visible range, the total, and how to open the rest
+  (`… lines 1–3 of 40 — click, or F6 then Enter, to expand`).
+- The compact window has no scroll position and claims no wheel or scroll key
+  (#1590, a block under the pointer swallowed the wheel halfway through
+  scrolling the conversation): a wheel anywhere in the transcript claim, a
+  compact window included, scrolls the conversation ScrollView (#806), page keys
+  do the same whatever row has focus, and a wheel over the bottom chrome is
+  claimed by nobody. `ToolViewportState` holds only the hit regions, rebuilt
+  from physical-row geometry after every frame and resize, mirroring the
+  accordion; they serve click-to-expand and hover.
 - Click on the control's cells, or Enter/Space with the row focused via F6,
   opens a focused expanded surface (title bar, scrolled body, plain-text
-  footer). Up/Down/PageUp/PageDown/Home/End scroll it, Esc/q/Enter close it, and
-  closing restores the captured child scroll offset, disclosure grouping, and
-  focus. Ctrl+C and other unclaimed keys fall through to the input loop.
+  footer) at the first line. Up/Down/PageUp/PageDown/Home/End and the wheel
+  scroll it, Esc/q/Enter close it, and closing leaves disclosure grouping and
+  focus as they were. Ctrl+C and other unclaimed keys fall through to the input
+  loop.
 - Canonical native scrollback is never bounded: `commit_complete_messages`
   still writes the fully expanded projection exactly once, so the copyable
   record stays complete. The bound applies only to viewport projections.
