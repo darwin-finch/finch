@@ -100,6 +100,7 @@ pub fn lower_rendered_line(
     line: &RenderedTranscriptLine,
     force_bg: Option<SpanColor>,
     canvas_bg: Option<SpanColor>,
+    canvas_fg: Option<SpanColor>,
 ) -> String {
     if let Some(b64) = &line.image_attachment {
         if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
@@ -109,14 +110,17 @@ pub fn lower_rendered_line(
 
     let mut rendered = if line.spans.is_empty() {
         let bg = force_bg.clone().or_else(|| canvas_bg.clone());
-        if let Some(bg) = bg {
-            let span = Span::styled(&line.text, SpanStyle::default().with_bg(bg));
+        if bg.is_some() || canvas_fg.is_some() {
+            let mut style = SpanStyle::default();
+            if let Some(bg) = bg { style.bg = Some(bg); }
+            if let Some(fg) = canvas_fg.clone() { style.fg = Some(fg); }
+            let span = Span::styled(&line.text, style);
             lower_span(&span)
         } else {
             line.text.clone()
         }
     } else {
-        if force_bg.is_some() || canvas_bg.is_some() {
+        if force_bg.is_some() || canvas_bg.is_some() || canvas_fg.is_some() {
             let spans = line
                 .spans
                 .iter()
@@ -127,6 +131,11 @@ pub fn lower_rendered_line(
                     } else if style.bg.is_none() {
                         if let Some(cbg) = &canvas_bg {
                             style.bg = Some(cbg.clone());
+                        }
+                    }
+                    if style.fg.is_none() {
+                        if let Some(cfg) = &canvas_fg {
+                            style.fg = Some(cfg.clone());
                         }
                     }
                     Span::styled(&s.text, style)
@@ -302,7 +311,7 @@ mod tests {
             ..RenderedTranscriptLine::default()
         };
         assert_eq!(
-            lower_rendered_line(&plain, None, None),
+            lower_rendered_line(&plain, None, None, None),
             "legacy \x1b[2mdim\x1b[0m",
             "span-free lines pass their bytes through untouched"
         );
@@ -311,7 +320,7 @@ mod tests {
             Span::plain(" Generating"),
         ]);
         assert_eq!(
-            lower_rendered_line(&styled, None, None),
+            lower_rendered_line(&styled, None, None, None),
             "\x1b[96m⏺\x1b[0m Generating"
         );
     }
@@ -325,14 +334,14 @@ mod tests {
             " ❯ hello",
             SpanStyle::fg(SpanColor::CYAN).with_bg(SpanColor::Rgb(38, 38, 42)),
         )]);
-        let lowered = lower_rendered_line(&user_line, None, None);
+        let lowered = lower_rendered_line(&user_line, None, None, None);
         assert!(
             lowered.ends_with("\x1b[K\x1b[0m"),
             "line with background must extend with \\x1b[K before reset; got {lowered:?}"
         );
 
         let hover_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
-        let hovered = lower_rendered_line(&hover_line, Some(SpanColor::Rgb(52, 54, 60)), None);
+        let hovered = lower_rendered_line(&hover_line, Some(SpanColor::Rgb(52, 54, 60)), None, None);
         assert!(
             !hovered.ends_with("\x1b[K\x1b[0m"),
             "hovered line must NOT extend background with \\x1b[K before reset; got {hovered:?}"
@@ -340,7 +349,7 @@ mod tests {
 
         let canvas_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
         let canvas_lowered =
-            lower_rendered_line(&canvas_line, None, Some(SpanColor::Rgb(52, 54, 60)));
+            lower_rendered_line(&canvas_line, None, Some(SpanColor::Rgb(52, 54, 60)), None);
         assert!(
             canvas_lowered.ends_with("\x1b[K\x1b[0m"),
             "canvas background must extend with \\x1b[K before reset; got {canvas_lowered:?}"

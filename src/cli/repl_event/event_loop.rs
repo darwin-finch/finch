@@ -2814,14 +2814,14 @@ impl EventLoop {
                         ReplEvent::NamedBrainProgramFinished { .. } => "NamedBrainProgramFinished",
                         ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
                     };
-                    tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
-                    tracing::debug!("Received event: {:?}", event);
+                    tracing::trace!("[EVENT_LOOP] Received event: {}", event_name);
+                    tracing::trace!("Received event: {:?}", event);
                     if matches!(event, ReplEvent::Shutdown) {
                         should_exit = true;
                     } else {
-                        tracing::debug!("[EVENT_LOOP] Handling {}...", event_name);
+                        tracing::trace!("[EVENT_LOOP] Handling {}...", event_name);
                         self.handle_event(event).await?;
-                        tracing::debug!("[EVENT_LOOP] {} handled", event_name);
+                        tracing::trace!("[EVENT_LOOP] {} handled", event_name);
                     }
                 }
 
