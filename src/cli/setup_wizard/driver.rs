@@ -383,34 +383,7 @@ pub(super) fn run_tabbed_wizard(
                 }
                 WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
             },
-            Event::Mouse(mouse) => {
-                handle_wizard_mouse(&mut state, mouse);
-            }
             _ => {}
-        }
-    }
-}
-
-pub(super) fn handle_wizard_mouse(state: &mut WizardState, mouse: crossterm::event::MouseEvent) {
-    if matches!(
-        mouse.kind,
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-    ) {
-        if let Some(SectionState::Models {
-            adding_provider, ..
-        }) = state.sections.get_mut(&WizardSection::Models)
-        {
-            if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_ref() {
-                if let Some(presentation) = pending.lock().unwrap().as_ref() {
-                    let code = presentation.user_code.replace("-", "");
-                    if !code.is_empty() {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            let _ = clipboard.set_text(code);
-                        }
-                    }
-                    open_browser_silently(&presentation.verification_uri);
-                }
-            }
         }
     }
 }

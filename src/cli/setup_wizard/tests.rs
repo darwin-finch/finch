@@ -8907,7 +8907,7 @@ fn test_device_dialog_advertises_browser_open_controls() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("O / Enter / Click: Open & Copy Code | Esc: Cancel"),
+        rendered.contains("O / Enter: Open & Copy Code | Esc: Cancel"),
         "the dialog must advertise browser open and cancellation keys; rendered={rendered}"
     );
 }

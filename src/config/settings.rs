@@ -1001,7 +1001,7 @@ impl Config {
             providers,
             default_provider: self.default_provider.clone(),
             credentials: self.credentials.clone(),
-            colors: Some(self.colors.clone()),
+            colors: super::colors::color_overrides(&self.active_theme, &self.colors),
             features: Some(self.features.clone()),
             license: self.license.clone(),
             diagnostics: Some(self.diagnostics.clone()),
@@ -1037,7 +1037,7 @@ struct TomlConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     credentials: Vec<ProviderCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    colors: Option<ColorScheme>,
+    colors: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     features: Option<FeaturesConfig>,
     #[serde(default)]

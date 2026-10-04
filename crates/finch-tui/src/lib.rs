@@ -1008,6 +1008,9 @@ fn aggregate_agent_usage<'a>(
 pub(crate) struct LiveFrame {
     /// Logical lines, painted separated by `\r\n`. Any of them may wrap.
     pub lines: Vec<String>,
+    /// The scheme canvas each line is painted on. Applied at the write, never
+    /// stored in `lines`, so measurement and hit regions read unpainted text.
+    pub canvas: Option<span_render::Canvas>,
     /// Physical rows between the top of the live area and the cursor's row.
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -1115,6 +1118,18 @@ fn write_live_frame(
         // defer every intermediate command to the one trailing `execute!`
         // flush.
         let line_rows = shadow_buffer::physical_rows(line, terminal_width).max(1);
+        let painted;
+        let line = match &frame.canvas {
+            Some(canvas) => {
+                // Select the canvas before the row clears below, so every
+                // physical row this line occupies is erased in the canvas
+                // background rather than the terminal default.
+                queue!(out, Print(canvas.open()))?;
+                painted = canvas.paint_row(line);
+                &painted
+            }
+            None => line,
+        };
         if line_rows <= 1 {
             execute!(out, Clear(ClearType::CurrentLine), Print(line))?;
         } else {
@@ -1335,10 +1350,12 @@ pub(crate) fn plan_live_frame(
         frame.push(line.clone());
     }
 
+    let accent = vm.chrome.accent.as_str();
+    let muted = vm.chrome.muted.as_str();
     // ── 3c. Separator: "──  ~/repos/finch ──────── jade-river ──" ────────────
     let separator = session_separator_line(width, vm.cwd_label, vm.session_label);
     if claimed_rects.separator.height > 0 && frame.physical_rows(width) < height {
-        frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
+        frame.push(format!("{muted}{separator}{RESET}"));
     }
 
     // ── 4. Open dialog card or input ─────────────────────────────────────────
@@ -1363,10 +1380,10 @@ pub(crate) fn plan_live_frame(
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
     // ── 5. Input area, with the dim ghost suffix on its last row ─────────────
-    let prompt = format!("{CYAN}❯{RESET} ");
+    let prompt = format!("{accent}❯{RESET} ");
     let ghost = vm
         .ghost_text
-        .map(|ghost| format!("{DIM_GRAY}{ghost}{RESET}"))
+        .map(|ghost| format!("{muted}{ghost}{RESET}"))
         .unwrap_or_default();
     if claimed_rects.composer.height == 0 {
         // Tiny terminals can allocate every row before the composer. The
@@ -1387,7 +1404,7 @@ pub(crate) fn plan_live_frame(
     // remains on the upper separator so the two identities are not stacked.
     let rule = status_rule_line(width, vm.model_identity, vm.scroll_hint);
     if claimed_rects.status_rule.height > 0 {
-        frame.push(format!("{DIM_GRAY}{rule}{RESET}"));
+        frame.push(format!("{muted}{rule}{RESET}"));
     }
     for line in vm
         .effective_status
@@ -1395,7 +1412,7 @@ pub(crate) fn plan_live_frame(
         .take(claimed_rects.status.height)
     {
         let line = shadow_buffer::truncate_to_columns(line, width);
-        frame.push(format!("{DIM_GRAY}{line}{RESET}"));
+        frame.push(format!("{muted}{line}{RESET}"));
     }
 
     // ── 7. Cursor position inside the input area ─────────────────────────────
@@ -1449,10 +1466,14 @@ fn transcript_disclosure_hitboxes(
 }
 
 /// One session task list row, or `None` for a finished row the draw skips.
-fn session_task_line(row: &activity::ActivityRow, width: usize) -> Option<String> {
+fn session_task_line(
+    row: &activity::ActivityRow,
+    width: usize,
+    chrome: &span_render::ChromeStyle,
+) -> Option<String> {
     let (symbol, color) = match row.state {
-        activity::ActivityState::Active => ("●", CYAN),
-        activity::ActivityState::Pending => ("○", DIM_GRAY),
+        activity::ActivityState::Active => ("●", chrome.accent.as_str()),
+        activity::ActivityState::Pending => ("○", chrome.muted.as_str()),
         activity::ActivityState::Done => return None,
     };
     let urgent_tag = if row.urgent { " [!]" } else { "" };
@@ -1463,7 +1484,12 @@ fn session_task_line(row: &activity::ActivityRow, width: usize) -> Option<String
 }
 
 /// One child-agent task tree row.
-fn tracked_agent_line(row: &activity::ActivityRow, width: usize) -> String {
+fn tracked_agent_line(
+    row: &activity::ActivityRow,
+    width: usize,
+    chrome: &span_render::ChromeStyle,
+) -> String {
+    let muted = chrome.muted.as_str();
     let indent = "  ".repeat(row.depth);
     let symbol = match row.state {
         activity::ActivityState::Pending => "○",
@@ -1471,15 +1497,15 @@ fn tracked_agent_line(row: &activity::ActivityRow, width: usize) -> String {
         activity::ActivityState::Done => "✓",
     };
     let color = if row.state == activity::ActivityState::Active {
-        CYAN
+        chrome.accent.as_str()
     } else {
-        DIM_GRAY
+        muted
     };
     let detail = row.detail.clone().unwrap_or_default();
     let prefix_width = indent.chars().count() + 2;
     let available = width.saturating_sub(prefix_width + shadow_buffer::visible_length(&detail) + 3);
     let task_text = shadow_buffer::truncate_to_columns(&row.text, available);
-    format!("{color}{indent}{symbol}{RESET} {task_text}{DIM_GRAY}{detail}{RESET}")
+    format!("{color}{indent}{symbol}{RESET} {task_text}{muted}{detail}{RESET}")
 }
 
 // ─── Poset panel view mode ─────────────────────────────────────────────────────
@@ -2291,7 +2317,10 @@ impl TuiRenderer {
             vm.hovered_row = self.hovered_row.as_ref();
             let hover_bg = span_render::component_style_palette(&self.colors).hover_background;
             vm.hover_bg = Some(hover_bg);
-            plan_live_frame(&vm, &mut self.autocomplete_state)
+            vm.chrome = span_render::ChromeStyle::from_scheme(&self.colors);
+            let mut frame = plan_live_frame(&vm, &mut self.autocomplete_state);
+            frame.canvas = Some(span_render::Canvas::from_scheme(&self.colors));
+            frame
         };
 
         // The erase ends at the previous frame's top. If the replacement is
@@ -2387,7 +2416,7 @@ impl TuiRenderer {
                 )?;
             }
         }
-        let style = span_render::selection_highlight_style();
+        let style = span_render::selection_highlight_style(&self.colors);
         for (row, text, (start, end)) in rows {
             let chars: Vec<char> = text.chars().collect();
             let prefix: String = chars[..start].iter().collect();
@@ -2947,6 +2976,7 @@ fn live_view_model<'a>(
         expanded_lines,
         hovered_row: None,
         hover_bg: None,
+        chrome: Default::default(),
         render_error: sources.render_error,
         task_rows: &sources.task_rows,
         tracked_rows: &sources.tracked_rows,
@@ -4490,10 +4520,11 @@ impl TuiRenderer {
             .sum();
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
         let hover_bg = span_render::component_style_palette(&self.colors).hover_background;
+        let canvas = span_render::Canvas::from_scheme(&self.colors);
         let painted_transcript = transcript
             .iter()
             .map(|l| {
-                span_render::lower_rendered_line(
+                let lowered = span_render::lower_rendered_line(
                     l,
                     if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
                     {
@@ -4501,8 +4532,9 @@ impl TuiRenderer {
                     } else {
                         None
                     },
-                    Some(span_render::span_color_from_spec(&self.colors.background)),
-                )
+                    None,
+                );
+                canvas.paint_row(&lowered)
             })
             .collect::<Vec<_>>();
 
@@ -6663,6 +6695,7 @@ mod tests {
         let draft = vec![String::new()];
         let vm = view_model::LiveViewModel {
             hover_bg: None,
+            chrome: Default::default(),
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
@@ -11928,6 +11961,7 @@ mod tests {
     ) -> view_model::LiveViewModel<'a> {
         view_model::LiveViewModel {
             hover_bg: None,
+            chrome: Default::default(),
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
@@ -12009,6 +12043,7 @@ mod tests {
                 .collect();
             let vm = view_model::LiveViewModel {
                 hover_bg: None,
+                chrome: Default::default(),
                 hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
@@ -12186,6 +12221,7 @@ mod tests {
             let status = "ready";
             let vm = view_model::LiveViewModel {
                 hover_bg: None,
+                chrome: Default::default(),
                 hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
@@ -12279,6 +12315,7 @@ mod tests {
         let status = "ready";
         let vm = view_model::LiveViewModel {
             hover_bg: None,
+            chrome: Default::default(),
             hovered_row: None,
             terminal_width: width,
             terminal_height: 24,

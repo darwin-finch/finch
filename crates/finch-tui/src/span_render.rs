@@ -156,30 +156,11 @@ pub fn lower_rendered_line(
 }
 
 /// Map a `ColorSpec` (the ColorScheme's serializable colour) to the span
-/// vocabulary's colour, with the same named-colour table the retired
-/// `format()` paths used.
+/// vocabulary's colour. The name table lives in `finch-theme`
+/// (`ColorSpec::to_color`) and nowhere else, so configuration, ratatui
+/// widgets, and span lowering cannot disagree about what a name means.
 pub(crate) fn span_color_from_spec(spec: &finch_theme::ColorSpec) -> SpanColor {
-    match spec {
-        finch_theme::ColorSpec::Rgb(r, g, b) => SpanColor::Rgb(*r, *g, *b),
-        finch_theme::ColorSpec::Named(name) => match name.to_lowercase().as_str() {
-            "black" => SpanColor::BLACK,
-            "red" => SpanColor::DARK_RED,
-            "green" => SpanColor::DARK_GREEN,
-            "yellow" => SpanColor::DARK_YELLOW,
-            "blue" => SpanColor::DARK_BLUE,
-            "magenta" => SpanColor::DARK_MAGENTA,
-            "cyan" => SpanColor::DARK_CYAN,
-            "white" => SpanColor::GREY,
-            "gray" | "grey" | "darkgray" | "darkgrey" => SpanColor::DARK_GREY,
-            "lightred" => SpanColor::RED,
-            "lightgreen" => SpanColor::GREEN,
-            "lightyellow" => SpanColor::YELLOW,
-            "lightblue" => SpanColor::BLUE,
-            "lightmagenta" => SpanColor::MAGENTA,
-            "lightcyan" => SpanColor::CYAN,
-            _ => SpanColor::GREY,
-        },
-    }
+    span_color_from_ratatui_color(spec.to_color())
 }
 
 /// Map a ratatui `Color` to a `SpanColor`.
@@ -207,9 +188,9 @@ fn span_color_from_ratatui_color(color: ratatui::style::Color) -> SpanColor {
     }
 }
 
-/// Build the component palette from the user's scheme: the roles the scheme
-/// owns (progress, static-row, and user-turn colours) come from it; the glyph vocabulary
-/// (⏺ ⎿ dim summaries) keeps the pre-migration fixed colours. This is the one
+/// Build the component palette from the user's scheme: every role comes from
+/// it, including the glyph vocabulary (⏺ takes the accent `ui.cursor`; ⎿,
+/// summaries and ellipses take the muted `messages.system`). This is the one
 /// place the conversation pipeline meets `ColorScheme` — component renderers
 /// stay scheme-free.
 pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
@@ -221,6 +202,13 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette.static_error = SpanStyle::fg(span_color_from_spec(&colors.messages.error));
     palette.static_success = palette.static_info.clone();
     palette.static_warning = SpanStyle::fg(span_color_from_spec(&colors.status.operation));
+    let accent = span_color_from_spec(&colors.ui.cursor);
+    let muted = span_color_from_spec(&colors.messages.system);
+    palette.operation_glyph = SpanStyle::fg(accent);
+    palette.operation_row_glyph = SpanStyle::fg(muted);
+    palette.operation_summary = SpanStyle::fg(muted).with_dim(true);
+    palette.operation_error = SpanStyle::fg(span_color_from_spec(&colors.messages.error));
+    palette.live_tool_ellipsis = SpanStyle::fg(muted).with_dim(true);
     palette.user_foreground = span_color_from_spec(&colors.messages.user);
     if let Some(bg) = colors.message_band_style(MessageBand::LocalUser).bg {
         palette.user_background = span_color_from_ratatui_color(bg);
@@ -234,17 +222,86 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette
 }
 
-/// The transcript drag-selection highlight (#221): bold bright white on
-/// blue, the common terminal/editor selection convention, mirroring the
-/// wizard's own selection-contrast precedent (#1140, `wizard_selected` in
-/// `wizard_host.rs`) rather than inventing a new look. A fixed colour pair,
-/// not derived from the user's `ColorScheme` — selection has no natural
-/// semantic role in that scheme, so this stays a named constant instead of
-/// a fabricated mapping. Callers lower it through the same [`lower_span`]
-/// every other transcript style uses; nothing here writes raw SGR.
-pub fn selection_highlight_style() -> SpanStyle {
-    SpanStyle::fg(SpanColor::WHITE)
-        .with_bg(SpanColor::DARK_BLUE)
+/// The scheme's canvas: the background every row is painted on and the
+/// default text colour on it. The transcript and the live area below it
+/// (composer, rules, status) share one canvas, so a theme whose background
+/// differs from the terminal profile's does not split the screen in two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Canvas {
+    pub bg: SpanColor,
+    pub fg: SpanColor,
+}
+
+impl Canvas {
+    pub fn from_scheme(colors: &ColorScheme) -> Self {
+        Self {
+            bg: span_color_from_spec(&colors.background),
+            fg: span_color_from_spec(&colors.foreground),
+        }
+    }
+
+    /// The SGR run that selects the canvas colours.
+    pub(crate) fn open(&self) -> String {
+        format!("\x1b[{};{}m", fg_code(self.fg), bg_code(self.bg))
+    }
+
+    /// Paint one already-lowered row on the canvas. The canvas colours open
+    /// the row and are re-asserted after every reset inside it, so styled
+    /// fragments keep their own colours while unstyled text and gaps take the
+    /// canvas.
+    ///
+    /// The row is erased to the right margin in the canvas background
+    /// *before* its text is written. Erasing after the text would delete the
+    /// last glyph of a row that exactly fills the terminal width: the cursor
+    /// then rests on that final column, and erase-to-end-of-line starts there.
+    pub fn paint_row(&self, row: &str) -> String {
+        const ERASE_TO_END: &str = "\x1b[K";
+        let open = self.open();
+        let body = row.replace(SGR_RESET, &format!("{SGR_RESET}{open}"));
+        format!("{open}{ERASE_TO_END}{body}{SGR_RESET}")
+    }
+}
+
+/// Colours for the live-area chrome the renderer draws itself: the prompt
+/// and active markers (`accent`), and rules, status text, ghost text and
+/// idle markers (`muted`). Each is an opening SGR run; the planner closes
+/// with a reset. The `Default` value is the pre-theme fixed pair, kept for
+/// planners with no scheme at hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChromeStyle {
+    pub accent: String,
+    pub muted: String,
+}
+
+impl Default for ChromeStyle {
+    fn default() -> Self {
+        Self {
+            accent: crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan).to_string(),
+            muted: crossterm::style::SetForegroundColor(crossterm::style::Color::DarkGrey)
+                .to_string(),
+        }
+    }
+}
+
+impl ChromeStyle {
+    pub fn from_scheme(colors: &ColorScheme) -> Self {
+        let open = |spec: &finch_theme::ColorSpec| {
+            format!("\x1b[{}m", fg_code(span_color_from_spec(spec)))
+        };
+        Self {
+            accent: open(&colors.ui.cursor),
+            muted: open(&colors.ui.separator),
+        }
+    }
+}
+
+/// The transcript drag-selection highlight (#221): bold `highlight_fg` on
+/// `highlight_bg` from the user's scheme. Callers lower it through the same
+/// [`lower_span`] every other transcript style uses; nothing here writes raw
+/// SGR.
+pub fn selection_highlight_style(colors: &ColorScheme) -> SpanStyle {
+    SpanStyle::fg(span_color_from_spec(&colors.highlight_fg))
+        .with_bg(span_color_from_spec(&colors.highlight_bg))
         .with_bold(true)
 }
 
@@ -345,7 +402,7 @@ mod tests {
     /// escape sequence.
     #[test]
     fn test_selection_highlight_style_lowers_through_the_span_path() {
-        let span = Span::styled("hi", selection_highlight_style());
+        let span = Span::styled("hi", selection_highlight_style(&ColorScheme::default()));
         assert_eq!(
             lower_span(&span),
             "\x1b[1;97;44mhi\x1b[0m",
@@ -378,18 +435,23 @@ mod tests {
         );
         assert_eq!(
             palette.operation_glyph,
-            SpanStyle::fg(SpanColor::CYAN),
-            "the ⏺ glyph keeps the retained cyan"
+            SpanStyle::fg(SpanColor::DARK_CYAN),
+            "the ⏺ glyph takes the scheme accent (ui.cursor)"
         );
         assert_eq!(
             palette.operation_row_glyph,
-            SpanStyle::fg(SpanColor::DARK_GREY),
-            "the ⎿ glyph keeps the retained dark grey"
+            SpanStyle::fg(SpanColor::Rgb(180, 180, 180)),
+            "the ⎿ glyph takes the scheme's muted messages.system"
         );
         assert_eq!(
             palette.operation_summary,
-            SpanStyle::fg(SpanColor::DARK_GREY).with_dim(true),
-            "summaries keep the dimmed dark grey"
+            SpanStyle::fg(SpanColor::Rgb(180, 180, 180)).with_dim(true),
+            "summaries are the dimmed muted colour"
+        );
+        assert_eq!(
+            palette.operation_error,
+            SpanStyle::fg(SpanColor::DARK_RED),
+            "row errors take messages.error"
         );
         assert_eq!(
             palette.user_foreground,
@@ -406,6 +468,78 @@ mod tests {
             SpanColor::Rgb(36, 38, 42),
             "hover background maps to the softened dark-scheme hover color"
         );
+    }
+
+    /// The reported light-theme failure: the transcript was filled with the
+    /// scheme background while the composer and status rows below it were
+    /// not, and the glyph colours ignored the scheme. Every preset must put
+    /// its own canvas and its own accent/muted colours on a chrome row.
+    #[test]
+    fn test_canvas_and_chrome_follow_every_preset_scheme() {
+        use finch_theme::ColorTheme;
+        for theme in ColorTheme::all() {
+            let scheme = theme.to_scheme();
+            let canvas = Canvas::from_scheme(&scheme);
+            let chrome = ChromeStyle::from_scheme(&scheme);
+            let palette = component_style_palette(&scheme);
+            let name = theme.name();
+
+            assert_eq!(
+                (canvas.bg, canvas.fg),
+                (
+                    span_color_from_spec(&scheme.background),
+                    span_color_from_spec(&scheme.foreground)
+                ),
+                "{name}: the canvas is the scheme's background and foreground"
+            );
+            assert_ne!(
+                canvas.bg, canvas.fg,
+                "{name}: text must not be painted in its own background colour"
+            );
+            assert_eq!(
+                chrome.accent,
+                format!("\x1b[{}m", fg_code(span_color_from_spec(&scheme.ui.cursor))),
+                "{name}: the prompt accent is ui.cursor"
+            );
+            assert_eq!(
+                chrome.muted,
+                format!(
+                    "\x1b[{}m",
+                    fg_code(span_color_from_spec(&scheme.ui.separator))
+                ),
+                "{name}: rules and status text are ui.separator"
+            );
+            assert_eq!(
+                palette.operation_glyph,
+                SpanStyle::fg(span_color_from_spec(&scheme.ui.cursor)),
+                "{name}: the ⏺ glyph is the scheme accent, not a fixed cyan"
+            );
+
+            let row = format!("{}❯{SGR_RESET} typed", chrome.accent);
+            let painted = canvas.paint_row(&row);
+            let open = canvas.open();
+            assert!(
+                painted.starts_with(&format!("{open}\x1b[K")),
+                "{name}: a row opens on the canvas and erases to the margin before its text; painted={painted:?}"
+            );
+            assert!(
+                painted.contains(&format!("{SGR_RESET}{open} typed")),
+                "{name}: text after a styled fragment returns to the canvas, not the terminal default; painted={painted:?}"
+            );
+            assert!(
+                !painted.trim_end_matches(SGR_RESET).ends_with("\x1b[K"),
+                "{name}: erasing after the text deletes the last column of a full-width row; painted={painted:?}"
+            );
+        }
+    }
+
+    /// The light preset on a light scheme must not resolve to the dark
+    /// defaults: its canvas is white with dark ink.
+    #[test]
+    fn test_light_scheme_canvas_is_dark_ink_on_white() {
+        let canvas = Canvas::from_scheme(&finch_theme::ColorTheme::Light.to_scheme());
+        assert_eq!(canvas.bg, SpanColor::Rgb(255, 255, 255));
+        assert_eq!(canvas.fg, SpanColor::Rgb(31, 35, 40));
     }
 
     /// User turn foreground and background bridge correctly across all themes.

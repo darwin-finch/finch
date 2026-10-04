@@ -128,6 +128,8 @@ pub(crate) struct LiveViewModel<'a> {
     pub scroll_hint: Option<&'a str>,
     pub hovered_row: Option<&'a finch_ui_model::RowId>,
     pub hover_bg: Option<finch_ui_model::SpanColor>,
+    /// Scheme colours for the chrome the planner draws itself.
+    pub chrome: super::span_render::ChromeStyle,
 
     pub dialog: Option<&'a super::Dialog>,
     /// Lines of the focused expanded tool-result surface (#656), pre-rendered
@@ -160,7 +162,7 @@ pub(crate) struct LiveFrameContent {
 pub(crate) fn furniture_task_lines(vm: &LiveViewModel<'_>, width: usize) -> Vec<String> {
     vm.task_rows
         .iter()
-        .filter_map(|row| super::session_task_line(row, width))
+        .filter_map(|row| super::session_task_line(row, width, &vm.chrome))
         .collect()
 }
 
@@ -169,7 +171,7 @@ pub(crate) fn furniture_task_lines(vm: &LiveViewModel<'_>, width: usize) -> Vec<
 pub(crate) fn furniture_tracked_lines(vm: &LiveViewModel<'_>, width: usize) -> Vec<String> {
     vm.tracked_rows
         .iter()
-        .map(|row| super::tracked_agent_line(row, width))
+        .map(|row| super::tracked_agent_line(row, width, &vm.chrome))
         .collect()
 }
 

@@ -15,31 +15,9 @@ use std::sync::{Arc, RwLock};
 
 /// Render a configured color using crossterm's terminal command formatter.
 fn color_to_ansi(color: &ColorSpec) -> String {
-    let color = match color {
-        ColorSpec::Named(name) => match name.to_lowercase().as_str() {
-            "black" => Color::Black,
-            "red" => Color::DarkRed,
-            "green" => Color::DarkGreen,
-            "yellow" => Color::DarkYellow,
-            "blue" => Color::DarkBlue,
-            "magenta" => Color::DarkMagenta,
-            "cyan" => Color::DarkCyan,
-            "white" => Color::Grey,
-            "gray" | "grey" | "darkgray" | "darkgrey" => Color::DarkGrey,
-            "lightred" => Color::Red,
-            "lightgreen" => Color::Green,
-            "lightyellow" => Color::Yellow,
-            "lightblue" => Color::Blue,
-            "lightmagenta" => Color::Magenta,
-            "lightcyan" => Color::Cyan,
-            _ => Color::Grey,
-        },
-        ColorSpec::Rgb(r, g, b) => Color::Rgb {
-            r: *r,
-            g: *g,
-            b: *b,
-        },
-    };
+    // The name table lives in `finch-theme` (`ColorSpec::to_color`); this
+    // only converts the resolved colour to the terminal backend's type.
+    let color: Color = color.to_color().into();
     SetForegroundColor(color).to_string()
 }
 

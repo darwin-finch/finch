@@ -67,6 +67,11 @@ pub(super) fn apply_setup_result_to_config(
 
     apply_daemon_api_key(&mut new_config, &result.finch_api_key);
     new_config.active_theme = result.active_theme.clone();
+    // The wizard selects a theme, never individual colours: the saved scheme
+    // is that theme's preset, so the next start renders what was picked.
+    new_config.colors = crate::theme::ColorTheme::from_name(&result.active_theme)
+        .unwrap_or_default()
+        .to_scheme();
     new_config.active_persona = result.default_persona.clone();
     if let Some(ref hf_tok) = result.hf_token {
         if !hf_tok.is_empty() {

@@ -3,6 +3,7 @@
 
 mod atomic_write;
 mod backend;
+mod colors;
 mod constants;
 mod diagnostics;
 mod loader;

@@ -1396,10 +1396,7 @@ fn device_auth_card(
                         "Complete sign-in in your browser; this dialog finishes automatically.",
                     ));
                 }
-                controls = wizard_line(
-                    "O / Enter / Click: Open & Copy Code | Esc: Cancel",
-                    Color::Yellow,
-                );
+                controls = wizard_line("O / Enter: Open & Copy Code | Esc: Cancel", Color::Yellow);
             }
             None => {
                 body.push(wizard_plain("Starting the device sign-in…"));

@@ -36,6 +36,9 @@ impl ColorTheme {
     fn dark_scheme() -> ColorScheme {
         ColorScheme {
             background: default_black(),
+            foreground: default_white(),
+            highlight_bg: default_blue(),
+            highlight_fg: default_white(),
             status: StatusColors {
                 live_stats: default_green(),
                 training: default_dark_gray(),
@@ -66,35 +69,50 @@ impl ColorTheme {
         }
     }
 
+    /// Light preset. Every role is an explicit RGB value from the GitHub
+    /// Primer light palette rather than an ANSI name: named colours resolve
+    /// through the terminal's own 16-colour table, so "white" and "gray" land
+    /// on whatever the profile maps them to and cannot guarantee contrast
+    /// against the canvas this scheme paints.
     fn light_scheme() -> ColorScheme {
+        let canvas = ColorSpec::Rgb(255, 255, 255); // #ffffff
+        let ink = ColorSpec::Rgb(31, 35, 40); // fg.default #1f2328
+        let muted = ColorSpec::Rgb(89, 99, 110); // fg.muted #59636e
+        let accent = ColorSpec::Rgb(9, 105, 218); // accent.fg #0969da
+        let success = ColorSpec::Rgb(26, 127, 55); // success.fg #1a7f37
+        let attention = ColorSpec::Rgb(154, 103, 0); // attention.fg #9a6700
+        let danger = ColorSpec::Rgb(207, 34, 46); // danger.fg #cf222e
         ColorScheme {
-            background: ColorSpec::Named("white".to_string()),
+            background: canvas.clone(),
+            foreground: ink.clone(),
+            highlight_bg: accent.clone(),
+            highlight_fg: canvas.clone(),
             status: StatusColors {
-                live_stats: ColorSpec::Rgb(0, 128, 0), // Dark green
-                training: ColorSpec::Named("gray".to_string()),
-                download: ColorSpec::Rgb(0, 0, 139), // Dark blue
-                operation: ColorSpec::Rgb(184, 134, 11), // Dark goldenrod
-                border: ColorSpec::Named("darkgray".to_string()),
+                live_stats: success,
+                training: muted.clone(),
+                download: accent.clone(),
+                operation: attention.clone(),
+                border: muted.clone(),
             },
             messages: MessageColors {
-                user: ColorSpec::Rgb(0, 0, 255), // Blue
-                assistant: ColorSpec::Named("black".to_string()),
-                system: ColorSpec::Named("gray".to_string()),
-                error: ColorSpec::Named("red".to_string()),
-                tool: ColorSpec::Rgb(139, 69, 19), // Brown
+                user: accent.clone(),
+                assistant: ink.clone(),
+                system: muted.clone(),
+                error: danger,
+                tool: attention,
             },
             ui: UiColors {
-                border: ColorSpec::Named("darkgray".to_string()),
-                separator: ColorSpec::Named("gray".to_string()),
-                input: ColorSpec::Named("black".to_string()),
-                cursor: ColorSpec::Rgb(0, 0, 255), // Blue
+                border: muted.clone(),
+                separator: muted,
+                input: ink,
+                cursor: accent.clone(),
             },
             dialog: DialogColors {
-                border: ColorSpec::Rgb(0, 0, 139), // Dark blue
-                title: ColorSpec::Rgb(0, 0, 139),
-                selected_bg: ColorSpec::Rgb(0, 0, 139),
-                selected_fg: ColorSpec::Named("white".to_string()),
-                option: ColorSpec::Rgb(0, 0, 139),
+                border: accent.clone(),
+                title: accent.clone(),
+                selected_bg: accent.clone(),
+                selected_fg: canvas,
+                option: accent,
             },
         }
     }
@@ -102,6 +120,9 @@ impl ColorTheme {
     fn high_contrast_scheme() -> ColorScheme {
         ColorScheme {
             background: default_black(),
+            foreground: default_white(),
+            highlight_bg: ColorSpec::Named("yellow".to_string()),
+            highlight_fg: default_black(),
             status: StatusColors {
                 live_stats: ColorSpec::Named("yellow".to_string()),
                 training: ColorSpec::Named("white".to_string()),
@@ -135,13 +156,16 @@ impl ColorTheme {
     fn solarized_scheme() -> ColorScheme {
         // Solarized Dark color palette
         ColorScheme {
-            background: ColorSpec::Rgb(0, 43, 54), // Solarized base03
+            background: ColorSpec::Rgb(0, 43, 54),      // Solarized base03
+            foreground: ColorSpec::Rgb(147, 161, 161),  // Solarized base1
+            highlight_bg: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+            highlight_fg: ColorSpec::Rgb(0, 43, 54),    // Solarized base03
             status: StatusColors {
                 live_stats: ColorSpec::Rgb(133, 153, 0), // Solarized green
                 training: ColorSpec::Rgb(88, 110, 117),  // Solarized base01
                 download: ColorSpec::Rgb(38, 139, 210),  // Solarized blue
                 operation: ColorSpec::Rgb(181, 137, 0),  // Solarized yellow
-                border: ColorSpec::Rgb(101, 123, 131),   // Solarized base0
+                border: ColorSpec::Rgb(131, 148, 150),   // Solarized base0
             },
             messages: MessageColors {
                 user: ColorSpec::Rgb(38, 139, 210),       // Solarized blue
@@ -151,7 +175,7 @@ impl ColorTheme {
                 tool: ColorSpec::Rgb(181, 137, 0),        // Solarized yellow
             },
             ui: UiColors {
-                border: ColorSpec::Rgb(101, 123, 131),   // Solarized base0
+                border: ColorSpec::Rgb(131, 148, 150),   // Solarized base0
                 separator: ColorSpec::Rgb(88, 110, 117), // Solarized base01
                 input: ColorSpec::Rgb(147, 161, 161),    // Solarized base1
                 cursor: ColorSpec::Rgb(38, 139, 210),    // Solarized blue
@@ -163,6 +187,24 @@ impl ColorTheme {
                 selected_fg: ColorSpec::Rgb(0, 43, 54), // Solarized base03
                 option: ColorSpec::Rgb(38, 139, 210),
             },
+        }
+    }
+
+    /// Resolve a saved theme name (`active_theme` in the config, or a
+    /// display name) to its preset. Case, spaces, hyphens and underscores are
+    /// ignored so `high-contrast`, `high contrast` and `HighContrast` agree.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let key: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        match key.as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "highcontrast" => Some(Self::HighContrast),
+            "solarized" | "solarizeddark" => Some(Self::Solarized),
+            _ => None,
         }
     }
 
@@ -185,7 +227,7 @@ impl ColorTheme {
     pub fn description(&self) -> &str {
         match self {
             Self::Dark => "White text on black background (default)",
-            Self::Light => "Black text on white background",
+            Self::Light => "Dark text on a white background",
             Self::HighContrast => "Yellow/white on black (accessibility)",
             Self::Solarized => "Solarized Dark color palette",
         }
@@ -193,11 +235,23 @@ impl ColorTheme {
 }
 
 /// Color scheme for TUI elements
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColorScheme {
     /// Terminal canvas background.
     #[serde(default = "default_black")]
     pub background: ColorSpec,
+
+    /// Default text colour on the canvas.
+    #[serde(default = "default_white")]
+    pub foreground: ColorSpec,
+
+    /// Background of highlighted (drag-selected) transcript text.
+    #[serde(default = "default_blue")]
+    pub highlight_bg: ColorSpec,
+
+    /// Text colour of highlighted (drag-selected) transcript text.
+    #[serde(default = "default_white")]
+    pub highlight_fg: ColorSpec,
 
     /// Status bar colors
     #[serde(default = "default_status_colors")]
@@ -231,6 +285,9 @@ impl Default for ColorScheme {
     fn default() -> Self {
         Self {
             background: default_black(),
+            foreground: default_white(),
+            highlight_bg: default_blue(),
+            highlight_fg: default_white(),
             status: default_status_colors(),
             messages: default_message_colors(),
             ui: default_ui_colors(),
@@ -240,9 +297,17 @@ impl Default for ColorScheme {
 }
 
 impl ColorScheme {
+    /// True when this scheme is exactly one of the built-in presets, i.e. it
+    /// carries no user customisation worth saving or honouring over a theme.
+    pub fn is_builtin_preset(&self) -> bool {
+        ColorTheme::all()
+            .iter()
+            .any(|theme| theme.to_scheme() == *self)
+    }
+
     /// Returns true if this color scheme represents a dark terminal palette.
     pub fn is_dark(&self) -> bool {
-        color_luminance(&self.messages.assistant) >= 0.5
+        color_luminance(&self.foreground) >= 0.5
     }
 
     /// Return the subtle background used to identify interactive rows on hover.
@@ -313,7 +378,7 @@ impl ColorScheme {
 }
 
 /// Status bar color configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusColors {
     /// Live stats (tokens, latency, etc.)
     #[serde(default = "default_green")]
@@ -347,7 +412,7 @@ fn default_status_colors() -> StatusColors {
 }
 
 /// Message display colors
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageColors {
     /// User messages
     #[serde(default = "default_cyan")]
@@ -381,7 +446,7 @@ fn default_message_colors() -> MessageColors {
 }
 
 /// UI element colors
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiColors {
     /// Borders
     #[serde(default = "default_gray")]
@@ -410,7 +475,7 @@ fn default_ui_colors() -> UiColors {
 }
 
 /// Dialog color configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialogColors {
     /// Dialog border
     #[serde(default = "default_cyan")]
@@ -444,7 +509,7 @@ fn default_dialog_colors() -> DialogColors {
 }
 
 /// Color specification - supports named colors and RGB
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ColorSpec {
     /// Named color (e.g., "red", "green", "cyan")
@@ -533,6 +598,10 @@ fn default_white() -> ColorSpec {
 
 fn default_red() -> ColorSpec {
     ColorSpec::Named("red".to_string())
+}
+
+fn default_blue() -> ColorSpec {
+    ColorSpec::Named("blue".to_string())
 }
 
 fn default_black() -> ColorSpec {

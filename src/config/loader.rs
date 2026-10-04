@@ -38,7 +38,7 @@ struct TomlConfig {
     #[serde(default)]
     teachers: Vec<LegacyTeacherEntry>,
     #[serde(default)]
-    colors: Option<crate::theme::ColorScheme>,
+    colors: Option<toml::Value>,
     #[serde(default)]
     features: Option<super::settings::FeaturesConfig>,
     #[serde(default)]
@@ -598,12 +598,12 @@ where
     if let Some(server) = toml_config.server {
         config.server = server;
     }
-    if let Some(colors) = toml_config.colors {
-        config.colors = colors;
-    }
     if let Some(theme) = toml_config.active_theme {
         config.active_theme = theme;
     }
+    // The theme selects the scheme; `[colors]` only overrides individual
+    // roles on top of it.
+    config.colors = super::colors::resolve_colors(&config.active_theme, toml_config.colors);
     if let Some(persona) = toml_config.active_persona {
         config.active_persona = persona;
     }
@@ -933,6 +933,98 @@ streaming_enabled = false
         assert_eq!(loaded.default_provider, None);
         assert_eq!(loaded.active_theme, "solarized");
         assert!(!loaded.features.streaming_enabled);
+    }
+
+    /// The reported failure, at the file boundary: a config whose
+    /// `active_theme` is "light" but whose `[colors]` table still holds the
+    /// dark defaults an earlier save wrote. The renderer took the table and
+    /// painted a dark canvas. The theme must win, a save must not write the
+    /// preset back, and a hand-written override must survive both.
+    #[test]
+    fn test_active_theme_selects_the_scheme_and_colors_table_only_overrides() {
+        use crate::theme::{ColorSpec, ColorTheme};
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"active_theme = "light"
+
+[colors]
+background = "black"
+
+[colors.status]
+live_stats = "green"
+training = [180, 180, 180]
+download = "cyan"
+operation = "yellow"
+border = "gray"
+
+[colors.messages]
+user = "cyan"
+assistant = "white"
+system = [180, 180, 180]
+error = "red"
+tool = "yellow"
+
+[colors.ui]
+border = "gray"
+separator = [180, 180, 180]
+input = "white"
+cursor = "cyan"
+
+[colors.dialog]
+border = "cyan"
+title = "cyan"
+selected_bg = "cyan"
+selected_fg = "black"
+option = "cyan"
+"#,
+        )
+        .unwrap();
+
+        let loaded = try_load_from_path_with_mode(&config_path, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.colors,
+            ColorTheme::Light.to_scheme(),
+            "active_theme = \"light\" must render the light preset even when a stale \
+             [colors] table repeats the dark defaults"
+        );
+
+        loaded.save_to(&config_path).unwrap();
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !saved.contains("[colors"),
+            "saving an unmodified preset must not write a [colors] table; saved file:\n{saved}"
+        );
+
+        std::fs::write(
+            &config_path,
+            "active_theme = \"light\"\n\n[colors.messages]\nuser = [200, 0, 100]\n",
+        )
+        .unwrap();
+        let overridden = try_load_from_path_with_mode(&config_path, true)
+            .unwrap()
+            .unwrap();
+        let mut expected = ColorTheme::Light.to_scheme();
+        expected.messages.user = ColorSpec::Rgb(200, 0, 100);
+        assert_eq!(
+            overridden.colors, expected,
+            "one overridden colour must apply over the light preset and leave the rest alone"
+        );
+
+        overridden.save_to(&config_path).unwrap();
+        let reloaded = try_load_from_path_with_mode(&config_path, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.colors,
+            expected,
+            "an override must survive a save and reload; saved file:\n{}",
+            std::fs::read_to_string(&config_path).unwrap()
+        );
     }
 
     #[test]

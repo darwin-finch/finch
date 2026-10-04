@@ -159,10 +159,10 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "get key at console.anthropic.com",
     ),
     (
-        "claude-sub",
-        "Claude Pro subscription",
+        "claude-cli",
+        "Claude Pro subscription (CLI Bridge)",
         "claude-sonnet-5",
-        "device sign-in uses Claude Pro entitlement; not an Anthropic API key and not Console billing",
+        "proxies through the local Anthropic Claude CLI; requires `npm install -g @anthropic-ai/claude-code`",
     ),
     ("openai", "OpenAI API", "", "get key at platform.openai.com"),
     (
@@ -225,10 +225,7 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
             provider: crate::config::CredentialProvider::GrokSubscription,
             ..
         } => Some("grok-sub"),
-        ProviderEntry::Credentialed {
-            provider: crate::config::CredentialProvider::ClaudeSubscription,
-            ..
-        } => Some("claude-sub"),
+        ProviderEntry::ClaudeCliBackend { .. } => Some("claude-cli"),
         ProviderEntry::Credentialed {
             provider: crate::config::CredentialProvider::Xai,
             ..
@@ -274,7 +271,7 @@ pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
         provider.to_ascii_lowercase().as_str(),
         "chatgpt"
             | "grok-sub"
-            | "claude-sub"
+            | "claude-cli"
             | "gemini-sub"
             | "openai-compatible"
             | "ollama"
