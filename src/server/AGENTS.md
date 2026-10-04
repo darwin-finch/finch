@@ -81,6 +81,21 @@ A retried replacement replays its mutation receipt instead of appending again.
 `test_todo_write_during_a_brain_turn_returns_success_through_the_real_tool_path` in
 `src/cli/repl_event/tool_execution.rs` drives the real tool path against the same lane.
 
+**On the WebSocket transport the same replacement also leaves the socket's serial command worker
+(issue #1646, a task list write over the socket still waited for the turn).** `watch_named_brain`
+(`handlers/runs.rs`) runs one command at a time per socket, so a socket whose `Prompt` is suspended
+on its turn answers nothing else until that turn ends. `Submit(TaskListReplaced)` is routed to the
+second worker that already carries `Submit(ApprovalDecided)`; the two kinds stay ordered with each
+other and are the only commands that skip the queue. This depends on the paragraph above: a
+replacement that still took the execution lane would park that second worker and block approval
+decisions behind it. Role checks, validation, the revision precondition, and receipt replay are
+unchanged, because the command still runs through `execute_remote_brain_command`.
+`test_task_list_replacement_on_the_socket_during_a_turn_does_not_wait_for_the_turn`,
+`test_socket_task_list_replacements_during_a_turn_commit_once_each_in_order_and_a_retry_replays`,
+`test_participant_message_on_the_socket_during_a_turn_still_waits_for_the_turn`, and
+`test_observer_socket_task_list_replacement_during_a_turn_is_refused` in
+`handlers/task_list_socket_tests.rs` drive the real socket handler.
+
 **Named-Brain provider execution is intrinsically bounded.** Every delegated `Prompt` and
 `SpeculativePrompt` receives the daemon-authored `TypedRuntime::intrinsic_grants()` ceiling in its
 `RunnerTurnRequest`; the frontend may transport and apply that ceiling but may not reconstruct it

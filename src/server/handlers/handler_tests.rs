@@ -5,7 +5,7 @@ use crate::brain::{
 };
 use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 
-async fn connect_test_brain_socket(
+pub(super) async fn connect_test_brain_socket(
     server: &Arc<crate::server::AgentServer>,
     address: std::net::SocketAddr,
     brain: &str,
