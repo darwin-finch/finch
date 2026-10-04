@@ -621,7 +621,8 @@ pub(super) async fn watch_named_brain(
             // A runner may suspend an executable command while it awaits an
             // approval from this same socket. Keep approval decisions ordered
             // with each other, but do not queue them behind that suspended
-            // command (or behind the Brain turn lane it holds).
+            // command (or behind the Brain turn lane it holds). Task-list
+            // replacements share this worker for the same reason (#1646).
             let approval_worker = tokio::spawn(async move {
                 while let Some(command) = approval_rx.recv().await {
                     let reply = execute_remote_brain_command(
@@ -677,13 +678,21 @@ pub(super) async fn watch_named_brain(
                                     ) {
                                         detach_request_id = Some(command.request_id);
                                     }
-                                    let is_approval = matches!(
+                                    // The two submissions that commit
+                                    // outside the Brain execution lane. A
+                                    // running turn's own `todo_write` arrives
+                                    // on this socket while the socket's
+                                    // prompt command is still suspended on
+                                    // that turn (#1646); queued behind it, the
+                                    // write could only wait the turn out.
+                                    let bypasses_suspended_command = matches!(
                                         &command.kind,
                                         crate::brain::BrainRemoteCommandKind::Submit(
                                             crate::brain::BrainEventKind::ApprovalDecided { .. }
+                                                | crate::brain::BrainEventKind::TaskListReplaced { .. }
                                         )
                                     );
-                                    let sent = if is_approval {
+                                    let sent = if bypasses_suspended_command {
                                         approval_tx.send(command)
                                     } else {
                                         command_tx.send(command)
