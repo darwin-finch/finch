@@ -1,0 +1,19 @@
+_version: 1
+app:
+  name: "Finch"
+  bin: "finch"
+
+setup:
+  starting: "Iniciando el asistente de configuración de %{app}...\n"
+  cancelled: "Configuración cancelada; la configuración no fue modificada."
+  saved: "\n✓ Configuración guardada en ~/.finch/config.toml\n  Ahora puedes ejecutar: %{bin}\n  O iniciar el daemon: %{bin} daemon\n"
+  banner_title: " Configuración de Finch "
+  read_only_hint: "Esta vista completa es solo de lectura/desplazamiento; copiar al portapapeles no está disponible en el asistente de configuración."
+
+daemon:
+  starting: "Iniciando %{app} en modo daemon"
+  pid_written: "Archivo PID del daemon guardado"
+
+general:
+  success: "Éxito"
+  error: "Error"
