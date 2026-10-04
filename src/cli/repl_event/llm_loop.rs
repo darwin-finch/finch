@@ -255,6 +255,30 @@ impl LlmLoop {
             .pinned_generators
             .for_turn(query_id, !query.is_empty(), active_generator)
             .await;
+        // Name the provider entry this turn runs on for its request metric.
+        // Local versus cloud is the configured entry's kind; a generator no
+        // configured entry matches is recorded without one rather than
+        // guessed.
+        self.query_states
+            .bind_request_route(
+                query_id,
+                crate::cli::repl_event::query_state::RequestRoute {
+                    provider: claude_gen.name().to_string(),
+                    model: claude_gen.model_name().to_string(),
+                    kind: self
+                        .available_providers
+                        .iter()
+                        .find(|entry| entry.profile_name() == claude_gen.name())
+                        .map(|entry| {
+                            if entry.is_local() {
+                                crate::metrics::ProviderKind::Local
+                            } else {
+                                crate::metrics::ProviderKind::Cloud
+                            }
+                        }),
+                },
+            )
+            .await;
         let qwen_gen = Arc::clone(&self.qwen_gen);
         let router = Arc::clone(&self.router);
         let generator_state = Arc::clone(&self.generator_state);

@@ -906,56 +906,94 @@ pub fn format_help() -> String {
          {gray}Tip: Press Esc to cancel long-running queries{reset}")
 }
 
+/// A duration for the `/metrics` report: milliseconds below one second,
+/// otherwise seconds to one decimal place.
+fn format_metric_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+fn provider_kind_label(kind: Option<crate::metrics::ProviderKind>) -> &'static str {
+    match kind {
+        Some(crate::metrics::ProviderKind::Local) => "local",
+        Some(crate::metrics::ProviderKind::Cloud) => "cloud",
+        None => "kind not recorded",
+    }
+}
+
+/// The "Requests" block of `/metrics`: only what was recorded, and a plain
+/// statement when nothing was (issue #1629, the report printing a block of
+/// zeros for a session that had made real requests).
+fn format_request_summary(summary: &crate::metrics::RequestSummary) -> String {
+    let mut output = String::from("Requests (last 24 hours):\n");
+    if summary.total == 0 {
+        output.push_str("  No requests recorded in the last 24 hours.\n");
+    } else {
+        let plural = |count: usize| if count == 1 { "request" } else { "requests" };
+        output.push_str(&format!(
+            "  {} {}: {} completed, {} failed, {} cancelled\n",
+            summary.total,
+            plural(summary.total),
+            summary.completed,
+            summary.failed,
+            summary.cancelled
+        ));
+        let mut by_kind = format!(
+            "  By provider kind: {} cloud, {} local",
+            summary.cloud, summary.local
+        );
+        if summary.unclassified > 0 {
+            by_kind.push_str(&format!(", {} not recorded", summary.unclassified));
+        }
+        output.push_str(&by_kind);
+        output.push('\n');
+        match summary.avg_completed_ms {
+            Some(ms) => output.push_str(&format!(
+                "  Average time to complete: {}\n",
+                format_metric_duration(ms)
+            )),
+            None => output.push_str("  Average time to complete: no completed requests\n"),
+        }
+        for group in &summary.groups {
+            let average = group
+                .avg_completed_ms
+                .map(|ms| format!(", avg {}", format_metric_duration(ms)))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  {}/{} ({}): {} total, {} completed, {} failed, {} cancelled{average}\n",
+                group.provider,
+                group.model,
+                provider_kind_label(group.kind),
+                group.total,
+                group.completed,
+                group.failed,
+                group.cancelled
+            ));
+        }
+    }
+    if summary.unreadable_rows > 0 {
+        output.push_str(&format!(
+            "  ({} unreadable {} skipped)\n",
+            summary.unreadable_rows,
+            if summary.unreadable_rows == 1 {
+                "row"
+            } else {
+                "rows"
+            }
+        ));
+    }
+    output
+}
+
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
-    let summary = metrics_logger.get_today_summary()?;
+    let summary = metrics_logger.request_summary_last_24_hours()?;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let wire_metrics = metrics_logger.read_wire_metrics(&today)?;
 
-    let local_pct = if summary.total > 0 {
-        (summary.local_count as f64 / summary.total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let forward_pct = if summary.total > 0 {
-        (summary.forward_count as f64 / summary.total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let crisis_pct = if summary.total > 0 {
-        (summary.crisis_count as f64 / summary.total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let no_match_pct = if summary.total > 0 {
-        (summary.no_match_count as f64 / summary.total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let mut output = format!(
-        "Metrics (last 24 hours):\n\
-        Total requests: {}\n\
-        Local: {} ({:.1}%)\n\
-        Forwarded: {} ({:.1}%)\n\
-          - Crisis: {} ({:.1}%)\n\
-          - No match: {} ({:.1}%)\n\
-        Avg response time (local): {}ms\n\
-        Avg response time (forwarded): {}ms\n",
-        summary.total,
-        summary.local_count,
-        local_pct,
-        summary.forward_count,
-        forward_pct,
-        summary.crisis_count,
-        crisis_pct,
-        summary.no_match_count,
-        no_match_pct,
-        summary.avg_local_time,
-        summary.avg_forward_time
-    );
+    let mut output = format_request_summary(&summary);
 
     #[derive(Default)]
     struct WireCounts {
@@ -1841,5 +1879,94 @@ mod tests {
         assert!(text.contains("xai/grok-code-fast-1: 2 total, 1 first-pass (50.0%)"));
         assert!(text.contains("1 repaired, 0 terminal"));
         assert!(text.contains("RawProse=1"));
+    }
+
+    #[test]
+    fn test_metrics_report_says_plainly_when_no_requests_were_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = crate::metrics::MetricsLogger::new(dir.path().to_path_buf()).unwrap();
+
+        let text = format_metrics(&logger).unwrap();
+        assert!(
+            text.contains("No requests recorded in the last 24 hours."),
+            "an empty metrics directory must be reported in words; text={text:?}"
+        );
+        for stale in [
+            "Total requests: 0",
+            "Forwarded",
+            "Crisis",
+            "No match",
+            "0ms",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "the report must not print the old zero-filled routing block ({stale:?}); \
+                 text={text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metrics_report_counts_requests_by_provider_kind_and_outcome() {
+        use crate::metrics::{ProviderKind, RequestMetric, RequestOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let logger = crate::metrics::MetricsLogger::new(dir.path().to_path_buf()).unwrap();
+        for (provider, model, kind, outcome, ms) in [
+            (
+                "Work Claude",
+                "claude-x",
+                ProviderKind::Cloud,
+                RequestOutcome::Completed,
+                2000,
+            ),
+            (
+                "Work Claude",
+                "claude-x",
+                ProviderKind::Cloud,
+                RequestOutcome::Completed,
+                4000,
+            ),
+            (
+                "Work Claude",
+                "claude-x",
+                ProviderKind::Cloud,
+                RequestOutcome::Failed,
+                10,
+            ),
+            (
+                "Laptop Qwen",
+                "qwen-3b",
+                ProviderKind::Local,
+                RequestOutcome::Cancelled,
+                20,
+            ),
+        ] {
+            logger
+                .log(&RequestMetric::turn(
+                    provider,
+                    model,
+                    Some(kind),
+                    outcome,
+                    "interactive",
+                    ms,
+                ))
+                .unwrap();
+        }
+
+        let text = format_metrics(&logger).unwrap();
+        for expected in [
+            "Requests (last 24 hours):",
+            "  4 requests: 2 completed, 1 failed, 1 cancelled",
+            "  By provider kind: 3 cloud, 1 local",
+            "  Average time to complete: 3.0s",
+            "  Laptop Qwen/qwen-3b (local): 1 total, 0 completed, 0 failed, 1 cancelled\n",
+            "  Work Claude/claude-x (cloud): 3 total, 2 completed, 1 failed, 0 cancelled, avg 3.0s",
+        ] {
+            assert!(
+                text.contains(expected),
+                "the request block must report recorded turns by provider entry, kind and \
+                 outcome; missing={expected:?} text={text:?}"
+            );
+        }
     }
 }

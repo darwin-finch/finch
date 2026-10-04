@@ -56,7 +56,7 @@ impl EventLoop {
     /// only needs to be mirrored here once.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn new_test_runner(
+    pub(super) fn new_test_runner(
         label: &str,
         generator: Arc<dyn Generator>,
         tool_definitions: Vec<ToolDefinition>,

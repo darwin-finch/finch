@@ -2322,7 +2322,14 @@ impl EventLoop {
             conversation,
             summary_cache,
             active_persona,
-            query_states: Arc::new(QueryStateManager::new()),
+            query_states: {
+                // One request metric per query, appended when the query first
+                // reaches a terminal state, into the same injected logger
+                // `/metrics` reads.
+                let query_states = QueryStateManager::new();
+                query_states.record_request_metrics_to(metrics_logger.clone());
+                Arc::new(query_states)
+            },
             model_selection: ModelSelection::from_handle(
                 active_provider_index,
                 provider_resolver.generator_handle(),
@@ -2498,6 +2505,8 @@ impl EventLoop {
         &mut self,
         logger: Arc<crate::metrics::MetricsLogger>,
     ) {
+        self.query_states
+            .record_request_metrics_to(Some(Arc::clone(&logger)));
         self.metrics_logger = Some(logger);
     }
 

@@ -1803,6 +1803,21 @@ pub(crate) async fn process_query_with_tools(
             Arc::clone(&claude_gen)
         }
     };
+    // The worker bound the session generator before this ran. When routing
+    // chose the separate on-device generator instead, the request metric
+    // must name that one.
+    if !Arc::ptr_eq(&generator, &claude_gen) {
+        query_states
+            .bind_request_route(
+                query_id,
+                crate::cli::repl_event::query_state::RequestRoute {
+                    provider: generator.name().to_string(),
+                    model: generator.model_name().to_string(),
+                    kind: Some(crate::metrics::ProviderKind::Local),
+                },
+            )
+            .await;
+    }
 
     // Get conversation context, optionally injecting relevant memories
     let mut memory_recall = finch_memory::Recall::none();
