@@ -218,10 +218,11 @@ pub use dom_manifest::{
 // The root setup wizard uses this named widget-host surface; keep the child
 // module private so the crate facade remains the only external path.
 pub use wizard_host::{
-    lower_wizard_line, lower_wizard_span, plan_wizard_frame, wizard_bold, wizard_boxed,
-    wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint, wizard_plain,
-    wizard_selected, wizard_url, wizard_visible_length, wizard_wrap, WizardCard, WizardColor,
-    WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent, WizardSpan, WizardView,
+    lower_wizard_line, lower_wizard_span, plan_wizard_frame, theme_wizard_frame, wizard_bold,
+    wizard_boxed, wizard_centered, wizard_line, wizard_line_is_selected, wizard_paint,
+    wizard_plain, wizard_selected, wizard_url, wizard_visible_length, wizard_wrap, WizardCard,
+    WizardColor, WizardFrame, WizardHost, WizardLine, WizardRects, WizardSectionContent,
+    WizardSpan, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
@@ -2277,6 +2278,13 @@ impl TuiRenderer {
                     );
                 }
             }
+            // The tiny frame is planned as plain text; it goes on the same
+            // scheme canvas as the full frame.
+            let canvas = span_render::Canvas::from_scheme(&self.colors);
+            let mut frame = frame;
+            for line in &mut frame.lines {
+                *line = canvas.paint_row(line);
+            }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
             let rows = write_tiny_live_frame(out, &frame)?;
             execute!(out, EndSynchronizedUpdate)?;
@@ -2406,13 +2414,17 @@ impl TuiRenderer {
         // Restore rows that fell out of the selection since the last call
         // before painting the current highlight, so no row ever shows a
         // highlighted background the logical selection no longer covers.
+        // Overlay rows are painted on the scheme canvas like every other row,
+        // so a selected (or just-deselected) row does not drop back to the
+        // terminal profile's own colours.
+        let canvas = span_render::Canvas::from_scheme(&self.colors);
         for row in stale_rows {
             if let Some(entry) = self.selection_index.row(row) {
                 execute!(
                     out,
                     cursor::MoveTo(0, row),
                     Clear(ClearType::CurrentLine),
-                    Print(&entry.text)
+                    Print(canvas.paint_row(&entry.text))
                 )?;
             }
         }
@@ -2422,15 +2434,17 @@ impl TuiRenderer {
             let prefix: String = chars[..start].iter().collect();
             let highlighted: String = chars[start..end].iter().collect();
             let suffix: String = chars[end..].iter().collect();
-            execute!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-            if !prefix.is_empty() {
-                execute!(out, Print(&prefix))?;
-            }
             let span = finch_ui_model::Span::styled(highlighted, style.clone());
-            execute!(out, Print(span_render::lower_span(&span)))?;
-            if !suffix.is_empty() {
-                execute!(out, Print(&suffix))?;
-            }
+            let painted = canvas.paint_row(&format!(
+                "{prefix}{}{suffix}",
+                span_render::lower_span(&span)
+            ));
+            execute!(
+                out,
+                cursor::MoveTo(0, row),
+                Clear(ClearType::CurrentLine),
+                Print(painted)
+            )?;
         }
         execute!(out, cursor::RestorePosition)?;
         self.previous_highlighted_rows = current_rows;
@@ -15088,7 +15102,10 @@ mod selection_tests {
             .draw_live_area_to(&mut retracted)
             .expect("live draw of the retracted drag must succeed");
         let retracted_bytes = String::from_utf8_lossy(&retracted).into_owned();
-        let restore = format!("{bottom_move_to}\x1b[2Ksecond line");
+        // The restored row is plain text on the scheme canvas: no highlight
+        // run, just the canvas the rest of the screen is painted on.
+        let canvas = span_render::Canvas::from_scheme(&renderer.colors);
+        let restore = format!("{bottom_move_to}\x1b[2K{}", canvas.paint_row("second line"));
         assert!(
             retracted_bytes.contains(&restore),
             "the row that fell out of the selection must be repainted as \

@@ -352,7 +352,12 @@ pub(super) fn run_tabbed_wizard(
         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
         let (width, height) = (term_w as usize, term_h as usize);
         let view = wizard_view(&state, width, height);
-        let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+        // The whole setup screen is painted in the theme under the cursor,
+        // so moving through the theme list previews each one live.
+        let frame = crate::cli::tui::theme_wizard_frame(
+            crate::cli::tui::plan_wizard_frame(&view, width, height),
+            &state.selected_scheme(),
+        );
         host.paint(&mut io::stdout(), &frame, width, height)?;
 
         // When scanning for network agents, poll with a short timeout so we can check

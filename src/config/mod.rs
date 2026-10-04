@@ -46,9 +46,10 @@ mod persona;
 mod provider;
 mod settings;
 
-#[allow(deprecated)]
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
 pub use backend::{BackendConfig, ExecutionTarget};
+#[allow(deprecated)]
+pub(crate) use colors::{color_overrides, resolve_colors};
 // Colours are a presentation vocabulary, not a configuration one: `finch-theme` defines what a
 // scheme is and this module turns a config file into one. The root `theme` compatibility path
 // keeps existing application callers working.

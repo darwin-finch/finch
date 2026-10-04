@@ -15,7 +15,7 @@ use finch_theme::{ColorScheme, MessageBand};
 use finch_ui_model::{ComponentStylePalette, RenderedTranscriptLine, Span, SpanColor, SpanStyle};
 
 /// SGR parameter for one colour: foreground position.
-fn fg_code(color: SpanColor) -> String {
+pub(crate) fn fg_code(color: SpanColor) -> String {
     match color {
         SpanColor::Indexed(index) if index < 8 => format!("{}", 30 + index),
         SpanColor::Indexed(index) => format!("{}", 90 + (index - 8)),
@@ -24,7 +24,7 @@ fn fg_code(color: SpanColor) -> String {
 }
 
 /// SGR parameter for one colour: background position.
-fn bg_code(color: SpanColor) -> String {
+pub(crate) fn bg_code(color: SpanColor) -> String {
     match color {
         SpanColor::Indexed(index) if index < 8 => format!("{}", 40 + index),
         SpanColor::Indexed(index) => format!("{}", 100 + (index - 8)),
@@ -222,21 +222,29 @@ pub fn component_style_palette(colors: &ColorScheme) -> ComponentStylePalette {
     palette
 }
 
-/// The scheme's canvas: the background every row is painted on and the
-/// default text colour on it. The transcript and the live area below it
-/// (composer, rules, status) share one canvas, so a theme whose background
-/// differs from the terminal profile's does not split the screen in two.
+/// The scheme's canvas: the background every row is painted on, the default
+/// text colour on it, and the scheme's rendering of the 16 ANSI colours. The
+/// transcript and the live area below it (composer, rules, status) share one
+/// canvas, so a theme whose background differs from the terminal profile's
+/// does not split the screen in two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Canvas {
     pub bg: SpanColor,
     pub fg: SpanColor,
+    /// `ColorScheme::ansi_color` for palette indices 0–15.
+    ansi: [SpanColor; 16],
 }
 
 impl Canvas {
     pub fn from_scheme(colors: &ColorScheme) -> Self {
+        let mut ansi = [SpanColor::BLACK; 16];
+        for (index, slot) in ansi.iter_mut().enumerate() {
+            *slot = span_color_from_spec(&colors.ansi_color(index as u8));
+        }
         Self {
             bg: span_color_from_spec(&colors.background),
             fg: span_color_from_spec(&colors.foreground),
+            ansi,
         }
     }
 
@@ -245,10 +253,17 @@ impl Canvas {
         format!("\x1b[{};{}m", fg_code(self.fg), bg_code(self.bg))
     }
 
-    /// Paint one already-lowered row on the canvas. The canvas colours open
-    /// the row and are re-asserted after every reset inside it, so styled
-    /// fragments keep their own colours while unstyled text and gaps take the
-    /// canvas.
+    /// Paint one already-lowered row on the canvas.
+    ///
+    /// This is the single place colour reaches the terminal for a row, so it
+    /// is where every colour is made to follow the scheme:
+    ///
+    /// - bare ANSI colours (text some producer styled with a fixed colour
+    ///   instead of a scheme role) are mapped through the scheme;
+    /// - "default colour" resets return to the canvas, not to the terminal
+    ///   profile's own colours;
+    /// - the canvas colours open the row and are re-asserted after every
+    ///   full reset, so unstyled text and gaps take the canvas.
     ///
     /// The row is erased to the right margin in the canvas background
     /// *before* its text is written. Erasing after the text would delete the
@@ -257,8 +272,78 @@ impl Canvas {
     pub fn paint_row(&self, row: &str) -> String {
         const ERASE_TO_END: &str = "\x1b[K";
         let open = self.open();
-        let body = row.replace(SGR_RESET, &format!("{SGR_RESET}{open}"));
+        let body = self
+            .retheme(row)
+            .replace(SGR_RESET, &format!("{SGR_RESET}{open}"));
         format!("{open}{ERASE_TO_END}{body}{SGR_RESET}")
+    }
+
+    /// Rewrite every SGR run in `row` onto the scheme.
+    fn retheme(&self, row: &str) -> String {
+        let mut out = String::with_capacity(row.len());
+        let mut rest = row;
+        while let Some(start) = rest.find("\x1b[") {
+            let after = &rest[start + 2..];
+            let end = after
+                .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+                .filter(|&end| after[end..].starts_with('m'));
+            let Some(end) = end else {
+                // Not an SGR run (cursor movement, erase, OSC…): copy through.
+                out.push_str(&rest[..start + 2]);
+                rest = after;
+                continue;
+            };
+            out.push_str(&rest[..start]);
+            out.push_str(&format!("\x1b[{}m", self.retheme_params(&after[..end])));
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn retheme_params(&self, params: &str) -> String {
+        let parts: Vec<&str> = params.split(';').collect();
+        let number = |index: usize| parts.get(index).and_then(|part| part.parse::<u16>().ok());
+        let mut out: Vec<String> = Vec::new();
+        let mut index = 0;
+        while index < parts.len() {
+            let code = number(index);
+            match code {
+                // Extended colour: `38;2;r;g;b` is already a colour by value;
+                // `38;5;n` names an ANSI colour only for n < 16.
+                Some(extended @ (38 | 48)) => {
+                    let palette = match (number(index + 1), number(index + 2)) {
+                        (Some(5), Some(n)) if n < 16 => Some(self.ansi[n as usize]),
+                        _ => None,
+                    };
+                    let width = match number(index + 1) {
+                        Some(2) => 5,
+                        Some(5) => 3,
+                        _ => 1,
+                    };
+                    match palette {
+                        Some(color) if extended == 38 => out.push(fg_code(color)),
+                        Some(color) => out.push(bg_code(color)),
+                        None => out.extend(
+                            parts[index..(index + width).min(parts.len())]
+                                .iter()
+                                .map(|part| part.to_string()),
+                        ),
+                    }
+                    index += width;
+                    continue;
+                }
+                Some(n @ 30..=37) => out.push(fg_code(self.ansi[(n - 30) as usize])),
+                Some(n @ 90..=97) => out.push(fg_code(self.ansi[(n - 90 + 8) as usize])),
+                Some(n @ 40..=47) => out.push(bg_code(self.ansi[(n - 40) as usize])),
+                Some(n @ 100..=107) => out.push(bg_code(self.ansi[(n - 100 + 8) as usize])),
+                Some(39) => out.push(fg_code(self.fg)),
+                Some(49) => out.push(bg_code(self.bg)),
+                _ => out.push(parts[index].to_string()),
+            }
+            index += 1;
+        }
+        out.join(";")
     }
 }
 
@@ -531,6 +616,76 @@ mod tests {
                 "{name}: erasing after the text deletes the last column of a full-width row; painted={painted:?}"
             );
         }
+    }
+
+    /// Colour that a producer wrote as a bare ANSI code, in any of the forms
+    /// the codebase emits (crossterm's `38;5;n`, the short `3x`/`9x` codes,
+    /// and `39` "default foreground"), must reach the terminal as the
+    /// scheme's colour. This is what keeps tool labels, dialog rows, diff
+    /// messages and markdown code readable on the light theme without each
+    /// producer knowing the scheme.
+    #[test]
+    fn test_paint_row_maps_bare_ansi_colours_onto_the_scheme() {
+        let light = finch_theme::ColorTheme::Light.to_scheme();
+        let canvas = Canvas::from_scheme(&light);
+        let accent = fg_code(span_color_from_spec(&light.ui.cursor));
+        let muted = fg_code(span_color_from_spec(&light.messages.system));
+        let error = fg_code(span_color_from_spec(&light.messages.error));
+        let ink = fg_code(canvas.fg);
+
+        for (legacy, expected, what) in [
+            (
+                "\x1b[38;5;14m",
+                accent.as_str(),
+                "crossterm bright cyan (the old fixed accent)",
+            ),
+            (
+                "\x1b[36m",
+                accent.as_str(),
+                "short-form cyan (markdown inline code)",
+            ),
+            (
+                "\x1b[38;5;8m",
+                muted.as_str(),
+                "crossterm dark grey (the old fixed muted)",
+            ),
+            ("\x1b[38;5;9m", error.as_str(), "crossterm red"),
+            (
+                "\x1b[38;5;15m",
+                ink.as_str(),
+                "white text, which would vanish on a white canvas",
+            ),
+            ("\x1b[39m", ink.as_str(), "default-foreground reset"),
+        ] {
+            let painted = canvas.paint_row(&format!("{legacy}x"));
+            assert!(
+                painted.contains(&format!("\x1b[{expected}mx")),
+                "Light: {what} must paint as the scheme colour {expected:?}; painted={painted:?}"
+            );
+        }
+
+        let bold = canvas.paint_row("\x1b[1m\x1b[38;5;14mGrep\x1b[0m(args)");
+        assert!(
+            bold.contains("\x1b[1m") && bold.contains(&format!("\x1b[{accent}mGrep")),
+            "modifiers survive and the colour follows the scheme; painted={bold:?}"
+        );
+        let truecolor = canvas.paint_row("\x1b[38;2;1;2;3;48;2;4;5;6mx");
+        assert!(
+            truecolor.contains("\x1b[38;2;1;2;3;48;2;4;5;6mx"),
+            "a colour given by value is already a scheme colour and passes through; painted={truecolor:?}"
+        );
+        let extended = canvas.paint_row("\x1b[38;5;200mx");
+        assert!(
+            extended.contains("\x1b[38;5;200mx"),
+            "a 256-colour index past the ANSI 16 is not a named colour; painted={extended:?}"
+        );
+
+        // Dark uses cyan by name, so its own cyan is unchanged.
+        let dark = Canvas::from_scheme(&finch_theme::ColorTheme::Dark.to_scheme());
+        assert!(
+            dark.paint_row("\x1b[36mx").contains("\x1b[36mx"),
+            "a named colour the scheme itself uses keeps meaning itself"
+        );
     }
 
     /// The light preset on a light scheme must not resolve to the dark

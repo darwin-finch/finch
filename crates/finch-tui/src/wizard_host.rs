@@ -1047,6 +1047,9 @@ pub struct WizardRects {
 /// and each line's physical-row span for the row-diff blit.
 pub struct WizardFrame {
     pub lines: Vec<String>,
+    /// The scheme canvas the frame is painted on, set by
+    /// [`theme_wizard_frame`]. `None` paints on the terminal's own colours.
+    pub canvas: Option<super::span_render::Canvas>,
     /// The regions the claiming pass gave each part of the screen. Read by
     /// the claiming tests; the blit itself paints from `lines`/`row_spans`.
     #[allow(dead_code)]
@@ -1246,10 +1249,109 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
     }
 
     WizardFrame {
+        canvas: None,
         lines,
         rects,
         row_spans,
     }
+}
+
+// ─── Theming: the wizard on the selected scheme ──────────────────────────────
+
+/// Re-colour a planned frame onto `colors`, so the setup screen itself shows
+/// the theme the user is choosing.
+///
+/// View builders name a small fixed vocabulary of colours ([`WizardColor`]);
+/// this maps each to the scheme role it stands for and paints every row on
+/// the scheme canvas. A segment that carries a named background is a
+/// selection (the selected row, the active tab) and takes the scheme's
+/// highlight pair. Truecolour segments — the theme list's own swatches —
+/// pass through untouched, since they already are scheme colours by value.
+pub fn theme_wizard_frame(
+    mut frame: WizardFrame,
+    colors: &finch_theme::ColorScheme,
+) -> WizardFrame {
+    let canvas = super::span_render::Canvas::from_scheme(colors);
+    let open = canvas.open();
+    for line in &mut frame.lines {
+        let themed = retheme_sgr_runs(line, colors);
+        // The canvas opens the row and returns after every reset, and stays
+        // selected at the end so the host's erase-to-margin uses it.
+        *line = format!(
+            "{open}{}",
+            themed.replace(WIZ_RESET, &format!("{WIZ_RESET}{open}"))
+        );
+    }
+    frame.canvas = Some(canvas);
+    frame
+}
+
+/// Rewrite every SGR run in one lowered wizard line onto the scheme.
+fn retheme_sgr_runs(line: &str, colors: &finch_theme::ColorScheme) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("\x1b[") {
+        let after = &rest[start + 2..];
+        let end = after.find(|c: char| !(c.is_ascii_digit() || c == ';'));
+        let Some(end) = end.filter(|&end| after[end..].starts_with('m') && end > 0) else {
+            // Not an SGR run (or a bare reset-less form): copy it through.
+            out.push_str(&rest[..start + 2]);
+            rest = after;
+            continue;
+        };
+        out.push_str(&rest[..start]);
+        let params = &after[..end];
+        if params == "0" {
+            out.push_str(WIZ_RESET);
+        } else {
+            out.push_str(&format!("\x1b[{}m", retheme_sgr_params(params, colors)));
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn retheme_sgr_params(params: &str, colors: &finch_theme::ColorScheme) -> String {
+    use super::span_render::{bg_code, fg_code, span_color_from_spec};
+    let parts: Vec<&str> = params.split(';').collect();
+    let named_bg = |code: &str| matches!(code.parse::<u16>(), Ok(40..=47 | 100..=107));
+    // Truecolour runs carry their own `38;2;r;g;b` / `48;2;r;g;b` triples;
+    // their numeric components must not be read as named-colour codes.
+    let truecolor = parts.contains(&"38") || parts.contains(&"48");
+    let selection = !truecolor && parts.iter().any(|code| named_bg(code));
+    if truecolor {
+        return params.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for code in parts {
+        let role = match code.parse::<u16>() {
+            Ok(1 | 2) => {
+                out.push(code.to_string());
+                continue;
+            }
+            Ok(40..=47 | 100..=107) => {
+                out.push(bg_code(span_color_from_spec(&colors.highlight_bg)));
+                continue;
+            }
+            Ok(_) if selection => &colors.highlight_fg,
+            Ok(30) => &colors.background,
+            Ok(31 | 91) => &colors.messages.error,
+            Ok(32 | 92) => &colors.status.live_stats,
+            Ok(33 | 93) => &colors.status.operation,
+            Ok(34 | 94) => &colors.dialog.border,
+            Ok(35 | 95) => &colors.dialog.title,
+            Ok(36 | 96) => &colors.ui.cursor,
+            Ok(37 | 90) => &colors.messages.system,
+            Ok(97) => &colors.foreground,
+            _ => {
+                out.push(code.to_string());
+                continue;
+            }
+        };
+        out.push(fg_code(span_color_from_spec(role)));
+    }
+    out.join(";")
 }
 
 // ─── The host: shadow-buffer blit ────────────────────────────────────────────
@@ -1268,6 +1370,10 @@ pub struct WizardHost {
     /// between tabs of the same name-set, #1140 follow-up) compared equal and
     /// the tab row was silently never repainted after the first frame.
     previous_lines: Option<Vec<String>>,
+    /// The canvas the previous frame was painted on. A different canvas
+    /// (the user moved to another theme) forces a full repaint, since rows
+    /// the frame does not cover still hold the old background.
+    previous_canvas: Option<super::span_render::Canvas>,
 }
 
 impl WizardHost {
@@ -1299,10 +1405,19 @@ impl WizardHost {
         execute!(out, Hide)?;
         execute!(out, BeginSynchronizedUpdate)?;
 
-        let repaint_all = match &previous {
-            Some(previous) => previous.width != width || previous.height != height,
-            None => true,
-        };
+        let canvas_changed = self.previous_canvas != frame.canvas;
+        self.previous_canvas = frame.canvas;
+        let repaint_all = canvas_changed
+            || match &previous {
+                Some(previous) => previous.width != width || previous.height != height,
+                None => true,
+            };
+        // Select the canvas before any erase so cleared cells take the
+        // scheme background rather than the terminal default.
+        let canvas_open = frame.canvas.map(|canvas| canvas.open());
+        if let Some(open) = &canvas_open {
+            execute!(out, Print(open))?;
+        }
         if repaint_all {
             execute!(out, Clear(ClearType::All))?;
             execute!(out, crossterm::cursor::MoveTo(0, 0))?;
@@ -1345,6 +1460,9 @@ impl WizardHost {
                     execute!(out, Clear(ClearType::UntilNewLine))?;
                 }
             }
+        }
+        if canvas_open.is_some() {
+            execute!(out, Print(WIZ_RESET))?;
         }
 
         execute!(out, EndSynchronizedUpdate)?;

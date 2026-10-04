@@ -187,13 +187,13 @@ pub struct ComponentStylePalette {
     pub progress_complete: SpanStyle,
     /// Progress line when failed — pre-migration: `colors.messages.error`.
     pub progress_failed: SpanStyle,
-    /// The operation chrome glyph `⏺` — retained fixed cyan.
+    /// The operation chrome glyph `⏺` — the scheme accent (`ui.cursor`).
     pub operation_glyph: SpanStyle,
-    /// The operation row glyph `⎿` — retained fixed dark grey.
+    /// The operation row glyph `⎿` — the scheme's muted `messages.system`.
     pub operation_row_glyph: SpanStyle,
     /// Operation summaries and running ellipses — dark grey + dim.
     pub operation_summary: SpanStyle,
-    /// Operation row `error:` prefix — retained fixed red.
+    /// Operation row `error:` prefix — `messages.error`.
     pub operation_error: SpanStyle,
     /// The live-tool running ellipsis — dark grey + dim.
     pub live_tool_ellipsis: SpanStyle,

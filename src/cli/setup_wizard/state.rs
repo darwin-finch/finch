@@ -187,9 +187,31 @@ pub(super) struct WizardState {
     pub(super) gemini_authenticator:
         Option<std::sync::Arc<dyn crate::cli::gemini_auth::GeminiCredentialAuthenticator>>,
     pub(super) save_error: Option<String>,
+    /// The hand-written `[colors]` overrides of the configuration being
+    /// edited. The wizard only selects a theme; these are carried through
+    /// unchanged so saving setup does not erase them.
+    pub(super) color_overrides: Option<toml::Value>,
 }
 
 impl WizardState {
+    /// The scheme of the theme currently selected in the Themes section,
+    /// with the user's own colour overrides applied: what the setup screen
+    /// is painted in, and what a save would make the UI use.
+    pub(super) fn selected_scheme(&self) -> crate::theme::ColorScheme {
+        crate::config::resolve_colors(&self.selected_theme_name(), self.color_overrides.clone())
+    }
+
+    /// The saved name (`active_theme`) of the currently selected theme.
+    pub(super) fn selected_theme_name(&self) -> String {
+        match self.sections.get(&WizardSection::Themes) {
+            Some(SectionState::Themes { selected_theme }) => crate::theme::ColorTheme::all()
+                .get(*selected_theme)
+                .map(|theme| theme.name().to_lowercase())
+                .unwrap_or_else(|| "dark".to_string()),
+            _ => "dark".to_string(),
+        }
+    }
+
     pub(super) fn new(existing_config: Option<&crate::config::Config>) -> Self {
         Self::new_with_catalog_cache_dir(existing_config, default_cache_dir().ok())
     }
@@ -420,6 +442,9 @@ impl WizardState {
         sections.insert(WizardSection::Review, SectionState::Review);
 
         Self {
+            color_overrides: existing_config.and_then(|config| {
+                crate::config::color_overrides(&config.active_theme, &config.colors)
+            }),
             current_section: WizardSection::Themes,
             sections,
             completed: HashSet::new(),
@@ -481,6 +506,9 @@ pub(super) fn scoped_permission_history(
 pub struct SetupResult {
     // Theme
     pub active_theme: String,
+    /// Hand-written `[colors]` overrides carried through from the edited
+    /// configuration; applied on top of `active_theme`.
+    pub color_overrides: Option<toml::Value>,
 
     // Models (primary + tools)
     pub primary_model: ModelConfig,

@@ -8657,46 +8657,149 @@ fn test_wizard_view_builders_construct_no_sgr_bytes() {
     );
 }
 
-/// REGRESSION (#1300, finding 1): the Themes section's on-screen instruction
-/// claimed the selected theme "shows with white background", but the real
-/// selection style (#1140, `wizard_selected`) is bold bright-white TEXT on a
-/// BLACK background -- confirmed live via `tmux capture-pane -e -p`
-/// (`\x1b[1m\x1b[97m\x1b[40m`). The help text must describe the style the
-/// wizard actually renders, not a background colour it has never painted.
+/// The frame the live wizard loop paints: planned, then re-coloured onto the
+/// scheme of the theme currently selected (`driver.rs`).
+fn themed_wizard_frame_bytes(state: &WizardState, width: usize, height: usize) -> String {
+    let view = wizard_view_with_permission_target(state, "", width, height);
+    let frame = crate::cli::tui::theme_wizard_frame(
+        crate::cli::tui::plan_wizard_frame(&view, width, height),
+        &state.selected_scheme(),
+    );
+    frame.lines.join("\n")
+}
+
+/// The Themes section's instruction must describe what the wizard really
+/// does (#1300 established this rule for an earlier, wrong "white
+/// background" claim). The setup screen is now painted in the theme under
+/// the cursor, so the text says exactly that, and the frame proves it: the
+/// selected row carries that theme's own highlight pair.
 #[test]
 fn test_theme_selector_help_text_matches_actual_selection_style() {
     let mut state = WizardState::new(None);
     state.current_section = WizardSection::Themes;
-    let bytes = wizard_frame_bytes(&state, 100, 30);
+    let bytes = themed_wizard_frame_bytes(&state, 100, 30);
 
-    // Scope the check to the help-text line itself: the frame legitimately
-    // contains the substring "white background" elsewhere, as part of the
-    // *Light theme's own description* ("Light - Black text on white
-    // background"), which is unrelated content this check must not flag.
     let help_line = bytes
         .lines()
         .find(|line| line.contains("Press Enter to confirm."))
         .unwrap_or_else(|| panic!("the theme selector's confirm instruction must be in the rendered frame; frame:\n{bytes}"));
     assert!(
-        !help_line.contains("white background"),
-        "the theme selector help text must not claim a white background -- \
-         the real selection style is bold bright-white text on black; \
-         help line: {help_line:?}"
-    );
-    assert!(
-        help_line.contains("bold bright-white text on black"),
-        "the theme selector help text must describe the real selection \
-         style; help line: {help_line:?}"
+        help_line.contains("This whole screen previews the selected theme."),
+        "the theme selector help text must describe the live preview; help line: {help_line:?}"
     );
 
-    // Cross-check against the actual rendered style of the selected theme
-    // row in the same frame: bold (1), bright-white foreground (97), black
-    // background (40) -- the #1140 style this help text is describing.
+    // WizardState::new(None) selects Light: its highlight is white (#ffffff)
+    // on the accent blue (#0969da), bold.
     assert!(
-        bytes.contains("\x1b[1;97;40m"),
-        "the selected theme row must actually paint bold bright-white text \
-         on black so the corrected help text is true, not merely less \
-         wrong; frame:\n{bytes}"
+        bytes.contains("\x1b[1;38;2;255;255;255;48;2;9;105;218m"),
+        "the selected theme row must paint the selected theme's own highlight pair so the \
+         help text is true; frame:\n{bytes}"
+    );
+}
+
+/// The reported request: changing the theme selection must re-colour the
+/// whole setup screen, not only a swatch. Every row of the frame opens on the
+/// selected theme's canvas, the wizard's fixed named colours are gone, and
+/// moving the selection changes the canvas.
+#[test]
+fn test_setup_screen_is_painted_in_the_selected_theme_and_follows_the_selection() {
+    use crate::theme::ColorTheme;
+
+    let themes = ColorTheme::all();
+    let mut canvases = Vec::new();
+    for (index, theme) in themes.iter().enumerate() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Themes;
+        state.sections.insert(
+            WizardSection::Themes,
+            SectionState::Themes {
+                selected_theme: index,
+            },
+        );
+        let scheme = state.selected_scheme();
+        assert_eq!(
+            scheme,
+            theme.to_scheme(),
+            "selecting {} must resolve to that preset",
+            theme.name()
+        );
+
+        let view = wizard_view_with_permission_target(&state, "", 100, 30);
+        let frame = crate::cli::tui::theme_wizard_frame(
+            crate::cli::tui::plan_wizard_frame(&view, 100, 30),
+            &scheme,
+        );
+        let canvas = frame
+            .canvas
+            .unwrap_or_else(|| panic!("{}: a themed frame must carry its canvas", theme.name()));
+        let open = format!("{canvas:?}");
+        for line in &frame.lines {
+            assert!(
+                line.starts_with("\x1b["),
+                "{}: every row must open on the theme canvas; row={line:?}",
+                theme.name()
+            );
+            // Light and Solarized define every role as RGB, so no ANSI-named
+            // colour may survive in their frames. (Dark and High Contrast
+            // legitimately use named colours for their own roles.)
+            if matches!(theme, ColorTheme::Light | ColorTheme::Solarized) {
+                for fixed in [
+                    "\x1b[34m",
+                    "\x1b[1;34m",
+                    "\x1b[36m",
+                    "\x1b[33m",
+                    "\x1b[1;97;40m",
+                    "\x1b[1;35;40m",
+                ] {
+                    assert!(
+                        !line.contains(fixed),
+                        "{}: the wizard's fixed colour {fixed:?} must be mapped onto the theme; row={line:?}",
+                        theme.name()
+                    );
+                }
+            }
+        }
+        canvases.push(open);
+    }
+    canvases.dedup();
+    assert!(
+        canvases.len() >= 3,
+        "moving the theme selection must change the setup screen's canvas; canvases={canvases:?}"
+    );
+}
+
+/// Saving setup must not erase colours the user overrode by hand in
+/// `[colors]`: the wizard picks the theme, the overrides ride on top of it.
+#[test]
+fn test_setup_save_keeps_hand_written_color_overrides_over_the_chosen_theme() {
+    use crate::theme::{ColorSpec, ColorTheme};
+
+    let mut existing = crate::config::Config::with_providers(vec![chatgpt_subscription_provider()]);
+    existing.active_theme = "dark".to_string();
+    existing.colors = ColorTheme::Dark.to_scheme();
+    existing.colors.messages.user = ColorSpec::Rgb(200, 0, 100);
+
+    let mut state = WizardState::new(Some(&existing));
+    let light = ColorTheme::all()
+        .iter()
+        .position(|theme| *theme == ColorTheme::Light)
+        .unwrap();
+    state.sections.insert(
+        WizardSection::Themes,
+        SectionState::Themes {
+            selected_theme: light,
+        },
+    );
+    let result = build_setup_result(&state).expect("a configured wizard must build a result");
+    let saved = config_from_setup_result(&result);
+
+    let mut expected = ColorTheme::Light.to_scheme();
+    expected.messages.user = ColorSpec::Rgb(200, 0, 100);
+    assert_eq!(saved.active_theme, "light");
+    assert_eq!(
+        saved.colors, expected,
+        "switching Dark to Light in setup must give the light preset with the user's one \
+         overridden colour kept"
     );
 }
 

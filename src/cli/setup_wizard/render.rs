@@ -225,7 +225,7 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
         Color::Blue,
     ));
     lines.push(wizard_bold(
-        "Selected theme shows as bold bright-white text on black. Press Enter to confirm.",
+        "This whole screen previews the selected theme. Press Enter to confirm.",
         Color::Blue,
     ));
     lines
