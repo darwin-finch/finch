@@ -3264,10 +3264,8 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
         render_grok_auth_status_line, save_grok_named_credential, GrokAuthService,
         GrokDeviceLoginPresentation,
     };
-    use std::io::IsTerminal as _;
 
-    let device_surface = grok_auth_device_surface(std::io::stdout().is_terminal());
-    let service = GrokAuthService::production_for_surface(device_surface)?;
+    let service = GrokAuthService::production()?;
     match command {
         AuthCommand::Status { credential, .. } => {
             let status = service.status(&credential)?;
@@ -3311,14 +3309,6 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn grok_auth_device_surface(stdout_is_terminal: bool) -> finch::cli::GrokDeviceClientSurface {
-    if stdout_is_terminal {
-        finch::cli::GrokDeviceClientSurface::Cli
-    } else {
-        finch::cli::GrokDeviceClientSurface::Headless
-    }
 }
 
 async fn run_gemini_auth(command: AuthCommand) -> Result<()> {
@@ -4004,29 +3994,15 @@ fn remove_named_brain(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_brain_command, finish_first_run_setup, grok_auth_device_surface,
-        query_tool_state_paths, register_query_vm_tools, reject_retired_session_flags,
-        resolve_brain_name, supervise_generator_loader_task, suppress_ort_logs_unless_overridden,
-        Args, AuthCommand, BrainCommand, Command,
+        execute_brain_command, finish_first_run_setup, query_tool_state_paths,
+        register_query_vm_tools, reject_retired_session_flags, resolve_brain_name,
+        supervise_generator_loader_task, suppress_ort_logs_unless_overridden, Args, AuthCommand,
+        BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
     use finch::models::GeneratorState;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-
-    #[test]
-    fn grok_auth_cli_surface_tracks_interactive_vs_headless_output() {
-        assert_eq!(
-            grok_auth_device_surface(true),
-            finch::cli::GrokDeviceClientSurface::Cli,
-            "interactive `finch auth login grok-sub` must identify the official CLI surface"
-        );
-        assert_eq!(
-            grok_auth_device_surface(false),
-            finch::cli::GrokDeviceClientSurface::Headless,
-            "redirected `finch auth login grok-sub` output must identify the headless surface"
-        );
-    }
 
     #[test]
     fn query_code_search_fails_closed_without_an_application_state_root() {
@@ -5077,11 +5053,10 @@ mod build_query_tool_executor_tests2 {
     async fn test_co_forth_executable_words() {
         let runtime = finch::runtime::ProgramRuntime::new();
         let _ = finch::cli::register_co_forth_tool_words(&runtime).await;
-        let outcome = execute_one_shot_wire_source(
-            &runtime,
-            "code_outline \"src/main.rs\"",
-        ).await.unwrap();
-        
+        let outcome = execute_one_shot_wire_source(&runtime, "code_outline \"src/main.rs\"")
+            .await
+            .unwrap();
+
         let diags = format!("{:?}", outcome.diagnostics);
         assert!(!diags.contains("E-LINK-002"));
     }

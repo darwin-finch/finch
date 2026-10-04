@@ -19,30 +19,6 @@ struct MemoryStore(Mutex<BTreeMap<String, OAuthTokenRecord>>);
 
 struct NeverReachedOpenAiVerifier;
 
-#[test]
-fn public_oauth_metadata_is_allowlisted_validated_and_redacted() {
-    let metadata = OAuthPublicMetadata::grok_client("1.0.32", "ui").unwrap();
-    assert_eq!(
-        metadata.grok_headers().collect::<Vec<_>>(),
-        vec![
-            ("x-grok-client-version", "1.0.32"),
-            ("x-grok-client-surface", "ui"),
-        ],
-        "the transport carrier must expose only the two pinned nonsecret Grok headers"
-    );
-    assert_eq!(
-        format!("{metadata:?}"),
-        "OAuthPublicMetadata([REDACTED])",
-        "request metadata Debug must not become a general header dump"
-    );
-    assert!(OAuthPublicMetadata::grok_client("1.0.32\r\nauthorization", "ui").is_err());
-    assert!(OAuthPublicMetadata::grok_client("1.0.32", "desktop").is_err());
-    assert!(OAuthPublicMetadata::default()
-        .grok_headers()
-        .next()
-        .is_none());
-}
-
 #[async_trait::async_trait]
 impl OpenAiTokenVerifier for NeverReachedOpenAiVerifier {
     fn preflight(&self) -> Result<()> {
@@ -278,7 +254,6 @@ impl SyntheticDialect {
             } else {
                 OAuthRequestBody::Form(vec![("payload".into(), body.to_string())])
             },
-            metadata: Default::default(),
         }
     }
 }
@@ -653,7 +628,6 @@ async fn generic_oauth_http_cancellation_is_not_mislabeled_as_device_authorizati
     let request = OAuthHttpRequest {
         endpoint: format!("{}/alpha/token", server.origin),
         body: OAuthRequestBody::Json(json!({"grant_type": "refresh_token"})),
-        metadata: Default::default(),
     };
     let pending = client.post_form_bytes_cancellable(request, &cancel);
     tokio::pin!(pending);
@@ -1903,53 +1877,4 @@ async fn foreign_dialect_cannot_resolve_revoke_or_recover_a_stored_token() {
         .is_err());
     let unchanged = &store.0.lock().unwrap()["chatgpt:work"];
     assert!(unchanged.mutation_pending && !unchanged.revoked);
-}
-
-#[tokio::test]
-async fn exact_predecessor_recovery_clears_secrets_and_rebinds_only_via_cas() {
-    let server = FakeServer::start().await;
-    let dialect = SyntheticDialect::new(&server.origin, "alpha");
-    let mut record = dialect
-        .validate_tokens(
-            StatusCode::OK,
-            token_body("alpha", "account-one", "refresh-one"),
-            None,
-            &TokenValidationContext::Device,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let current_revision = dialect.descriptor.protocol_revision.clone();
-    let predecessor = "synthetic-alpha-v0";
-    record.protocol_revision = predecessor.into();
-    let old_generation = record.generation.clone();
-    let store = Arc::new(MemoryStore::default());
-    store
-        .0
-        .lock()
-        .unwrap()
-        .insert("chatgpt:work".into(), record);
-    let client = OAuthClient::new(Arc::new(dialect), store.clone()).unwrap();
-
-    let credential = client
-        .recover_predecessor_revision_as_revoked("chatgpt:work", predecessor)
-        .expect("the exact adjacent protocol revision must become a secret-cleared tombstone");
-    let recovered = store.0.lock().unwrap()["chatgpt:work"].clone();
-    assert_eq!(recovered.protocol_revision, current_revision);
-    assert!(recovered.revoked && !recovered.mutation_pending);
-    assert!(recovered.access_token.is_empty());
-    assert!(recovered.refresh_token.is_none() && recovered.id_token.is_none());
-    assert_ne!(recovered.generation, old_generation);
-    assert!(matches!(
-        credential.lifecycle,
-        crate::CredentialLifecycle::Revoked
-    ));
-
-    let error = client
-        .recover_predecessor_revision_as_revoked("chatgpt:work", predecessor)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("recoverable predecessor"),
-        "a current or concurrently replaced record must not be overwritten: {error:#}"
-    );
 }

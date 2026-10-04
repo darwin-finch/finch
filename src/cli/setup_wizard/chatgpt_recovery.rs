@@ -48,7 +48,6 @@ pub(super) trait ChatGptSetupRecoveryEditor {
 
 pub(super) struct TerminalChatGptSetupRecoveryEditor;
 
-
 pub(super) fn claude_setup_references(result: &SetupResult) -> std::collections::BTreeSet<String> {
     result
         .providers
@@ -63,7 +62,6 @@ pub(super) fn claude_setup_references(result: &SetupResult) -> std::collections:
         })
         .collect()
 }
-
 
 pub(super) const MAX_CHATGPT_EDITOR_INPUT_ATTEMPTS: usize = 4;
 
@@ -161,26 +159,34 @@ pub async fn validate_and_apply_for(
         if !claude_setup_references(result).is_empty() {
             if let Ok(service) = crate::cli::claude_auth::ClaudeAuthService::production() {
                 for reference in claude_setup_references(result) {
-                    let _ = service.login(
-                        &reference,
-                        crate::cli::BrowserLoginPresentation { open_browser: false },
-                        tokio_util::sync::CancellationToken::new(),
-                    ).await;
+                    let _ = service
+                        .login(
+                            &reference,
+                            crate::cli::BrowserLoginPresentation {
+                                open_browser: false,
+                            },
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await;
                 }
             }
         }
         apply_and_save(result)?;
         return Ok(SetupApplyOutcome::Saved);
     }
-    
+
     if !claude_setup_references(result).is_empty() {
         if let Ok(service) = crate::cli::claude_auth::ClaudeAuthService::production() {
             for reference in claude_setup_references(result) {
-                let _ = service.login(
-                    &reference,
-                    crate::cli::BrowserLoginPresentation { open_browser: false },
-                    tokio_util::sync::CancellationToken::new(),
-                ).await;
+                let _ = service
+                    .login(
+                        &reference,
+                        crate::cli::BrowserLoginPresentation {
+                            open_browser: false,
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
             }
         }
     }

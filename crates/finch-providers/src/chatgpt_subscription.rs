@@ -890,7 +890,10 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
 }
 
 fn subscription_capabilities(model: &str) -> ModelCapabilities {
-    if !matches!(model, DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1") {
+    if !matches!(
+        model,
+        DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1"
+    ) {
         return ModelCapabilities::unknown("chatgpt_subscription", model);
     }
     let source = CHATGPT_INFERENCE_PROTOCOL_REVISION;
@@ -941,7 +944,10 @@ fn catalog_model_matches_request(model: &CatalogModel, requested_model: &str) ->
 }
 
 fn validate_model(model: &str) -> Result<()> {
-    if !matches!(model, DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1") {
+    if !matches!(
+        model,
+        DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1"
+    ) {
         bail!("ChatGPT subscription only supports GPT-5.6 Sol and GPT-6.1 Sol");
     }
     Ok(())
@@ -1313,7 +1319,10 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             .as_object()
             .context("ChatGPT catalog model was invalid")?;
         let slug = required_identifier(object, "slug", 256)?;
-        if !matches!(slug.as_str(), DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1") {
+        if !matches!(
+            slug.as_str(),
+            DEFAULT_MODEL | MODEL_ALIAS | "gpt-6.1-sol" | "gpt-6.1"
+        ) {
             continue;
         }
         let supported = object

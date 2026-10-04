@@ -96,8 +96,14 @@ pub fn lower_spans(spans: &[Span]) -> String {
 /// itself carry SGR from an unmigrated projection — that path is unchanged).
 /// Measurement never runs on this string: SGR is zero-width and the plain
 /// `text` is what every row count reads.
-pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>, canvas_bg: Option<SpanColor>) -> String {
-    let has_bg = force_bg.is_some() || canvas_bg.is_some() || line.spans.iter().any(|s| s.style.bg.is_some());
+pub fn lower_rendered_line(
+    line: &RenderedTranscriptLine,
+    force_bg: Option<SpanColor>,
+    canvas_bg: Option<SpanColor>,
+) -> String {
+    let has_bg = force_bg.is_some()
+        || canvas_bg.is_some()
+        || line.spans.iter().any(|s| s.style.bg.is_some());
     let mut rendered = if line.spans.is_empty() {
         let bg = force_bg.clone().or_else(|| canvas_bg.clone());
         if let Some(bg) = bg {

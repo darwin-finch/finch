@@ -118,56 +118,6 @@ impl OAuthDialectDescriptor {
 pub struct OAuthHttpRequest {
     pub endpoint: String,
     pub body: OAuthRequestBody,
-    pub metadata: OAuthPublicMetadata,
-}
-
-/// Narrow, non-secret request metadata understood by the OAuth transport.
-///
-/// Construction is crate-private so external dialects cannot use this seam to
-/// inject authorization, cookie, content framing, forwarding, or hop-by-hop
-/// headers. Empty metadata remains the default for every other dialect.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct OAuthPublicMetadata {
-    grok_client_version: Option<String>,
-    grok_client_surface: Option<String>,
-}
-
-impl OAuthPublicMetadata {
-    pub(crate) fn grok_client(version: &str, surface: &str) -> Result<Self> {
-        if version.is_empty()
-            || version.len() > 32
-            || !version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-        {
-            bail!("Grok OAuth client version metadata is invalid");
-        }
-        if !matches!(surface, "ui" | "cli" | "headless") {
-            bail!("Grok OAuth client surface metadata is invalid");
-        }
-        Ok(Self {
-            grok_client_version: Some(version.to_string()),
-            grok_client_surface: Some(surface.to_string()),
-        })
-    }
-
-    pub(crate) fn grok_headers(&self) -> impl Iterator<Item = (&'static str, &str)> {
-        self.grok_client_version
-            .as_deref()
-            .map(|value| ("x-grok-client-version", value))
-            .into_iter()
-            .chain(
-                self.grok_client_surface
-                    .as_deref()
-                    .map(|value| ("x-grok-client-surface", value)),
-            )
-    }
-}
-
-impl fmt::Debug for OAuthPublicMetadata {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("OAuthPublicMetadata([REDACTED])")
-    }
 }
 
 /// Audited request encoding chosen by a dialect.
@@ -189,7 +139,6 @@ impl fmt::Debug for OAuthHttpRequest {
             .debug_struct("OAuthHttpRequest")
             .field("endpoint", &self.endpoint)
             .field("body", &"[REDACTED]")
-            .field("metadata", &"[REDACTED]")
             .finish()
     }
 }
@@ -1009,48 +958,6 @@ where
             bail!("OAuth credential has no interrupted mutation to recover");
         }
         let mut tombstone = current.clone();
-        tombstone.access_token.clear();
-        tombstone.refresh_token = None;
-        tombstone.id_token = None;
-        tombstone.generation = random_secret(24);
-        tombstone.revoked = true;
-        tombstone.mutation_pending = false;
-        self.store
-            .compare_and_swap(reference, Some(&current.generation), &tombstone)?;
-        Ok(tombstone.provider_credential(reference))
-    }
-
-    /// Explicitly replace one exactly recognized predecessor protocol binding
-    /// with a current-revision, secret-cleared tombstone.
-    ///
-    /// This is not a credential migration: no bearer material survives, and
-    /// the generation CAS leaves a concurrent replacement untouched. The
-    /// caller must name the one adjacent revision it is prepared to recover.
-    pub fn recover_predecessor_revision_as_revoked(
-        &self,
-        reference: &str,
-        predecessor_revision: &str,
-    ) -> Result<ProviderCredential> {
-        validate_reference(reference)?;
-        if predecessor_revision.is_empty()
-            || predecessor_revision == self.dialect.descriptor().protocol_revision
-        {
-            bail!("OAuth predecessor protocol revision is invalid");
-        }
-        let current = self
-            .store
-            .load(reference)?
-            .context("named OAuth credential is missing")?;
-        if current.protocol_revision != predecessor_revision {
-            bail!("OAuth credential does not match the recoverable predecessor revision");
-        }
-        let mut rebound = current.clone();
-        rebound.protocol_revision = self.dialect.descriptor().protocol_revision.clone();
-        self.validate_record_binding(&rebound)?;
-        if current.generation.trim().is_empty() {
-            bail!("OAuth predecessor credential generation is invalid");
-        }
-        let mut tombstone = rebound;
         tombstone.access_token.clear();
         tombstone.refresh_token = None;
         tombstone.id_token = None;

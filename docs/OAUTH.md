@@ -21,21 +21,6 @@ Console API-key provider (`api.x.ai`):
   independent-client registration.
 - Device authorization is RFC 8628 against `https://auth.x.ai/oauth2/device/code`
   with user verification at `https://accounts.x.ai`.
-- Device initiation sends `referrer=grok-build`. Initiation and polling both send the narrowly
-  allowlisted `x-grok-client-version: 1.0.32` and a stable `x-grok-client-surface`: setup uses
-  `ui`, an interactive `finch auth login grok-sub` uses `cli`, and redirected/headless CLI output
-  uses `headless`. Polling does not repeat the referrer.
-- The pinned token response permits an optional `refresh_token`. Without one, Finch stores an
-  expiring, non-refreshable credential rather than inventing refresh authority. A present
-  `expires_in` must be a positive bounded integer and shortens (never extends) the verified token
-  deadline. The official refresh response may omit a new ID token: for an opaque replacement
-  bearer, Finch retains only the exact already-verified account/client lineage and requires the
-  response's bounded lifetime; a signed replacement bearer is independently verified and bound.
-- An opaque access bearer is accepted only when a separate ES256 ID token has been verified
-  against the exact xAI issuer/JWKS authority and pinned client audience. When no ID token is
-  present, the access token itself must be a verified compact JWS. If both are signed, their
-  subjects must agree. The upstream fixture's unsigned (`alg=none`) ID token is shape evidence
-  only and is never accepted by Finch.
 - Subscription inference is bound only to `https://cli-chat-proxy.grok.com/v1`
   and the `xai-grok-cli` session header.
 - `api.x.ai`, Console API keys, compatible endpoints, and silent account
@@ -43,38 +28,6 @@ Console API-key provider (`api.x.ai`):
 - If xAI returns `invalid_client` or HTTP 404 for device authorization, Finch
   fails closed and saves no credential. Console API keys are a separate
   provider with different billing; they are never an automatic fallback.
-
-The current Grok OAuth binding is
-`xai-grok-build-public-client@482711333c7195dc16a272777f86086d615e2afb+finch-binding-v2`.
-The immediately preceding `finch-binding-v1` record is not reused after this wire correction:
-explicit `finch auth recover grok-sub --credential <name>` replaces only that exact revision with
-a generation-checked, secret-cleared tombstone, and the user must sign in again. Rolling Finch
-back after creating a v2 credential likewise requires explicit recovery/reauthorization; bearer
-material is never silently rebound across protocol revisions.
-
-## Opt-in Grok subscription conformance check
-
-This is a manual, credential-gated check for a maintainer who already has a supported Grok
-subscription. It is never run in CI, and ordinary tests use local fake authorities. Do not enable
-HTTP body logging, shell tracing, packet capture, or `RUST_LOG` directives that expose request
-fields while running it.
-
-1. Build through the repository's documented supervised path and record `finch --version`, the
-   source revision, the date, and the pinned upstream Grok Build revision shown above.
-2. Use a fresh disposable Finch credential name and run
-   `finch auth login grok-sub --credential grok-sub:conformance`. Complete the displayed xAI URL
-   and one-time code yourself. Do not copy the code, token response, credential-store file, or
-   request/response bodies into the report.
-3. Record only the last secret-free stage reached: device initiation, pending polling, token
-   response contract, JWKS authority, identity signature, client binding, account entitlement,
-   or credential persistence. On success, record the account only as a one-way local alias such
-   as `account-A`, never its provider identifier.
-4. Confirm `finch auth status grok-sub --credential grok-sub:conformance` reports active (or
-   active/non-refreshable), and that setup can select that exact named reference. Confirm no xAI
-   API-key provider or `api.x.ai` endpoint was created.
-5. Run `finch auth logout grok-sub --credential grok-sub:conformance`. If the run was interrupted,
-   use explicit `finch auth recover grok-sub --credential grok-sub:conformance` instead. Retain
-   only version/revision/date, the safe stage, result, and redacted assertions above.
 
 The ChatGPT adapter is
 strictly separate from the OpenAI Platform API-key provider:

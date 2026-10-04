@@ -340,14 +340,6 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   contributor-tier models, or a custom compatible origin (#317, direct Meta Model API for Muse Spark; reviewed
   against official Meta documentation on 2026-10-01).
 - Subscription and API billing are never automatically interchangeable.
-- **Grok subscription device login follows the pinned Grok Build public-client wire contract.**
-  Initiation sends `referrer=grok-build`; initiation and polling both carry the allowlisted
-  `x-grok-client-version: 1.0.32` and a stable `x-grok-client-surface` (`ui`, `cli`, or
-  `headless`). A token response may omit `refresh_token`. An opaque access bearer is accepted only
-  alongside an independently verified ES256 identity token issued by the pinned xAI authority;
-  without that identity, the access token itself must be a verified compact JWS. Signed identity
-  and signed access subjects must agree. None of these compatibility rules permits API-key
-  fallback or relaxed issuer/JWKS/client binding.
 - Claude requests opt into Anthropic's top-level automatic moving-prefix cache. OpenAI API and
   ChatGPT transports continue to send stable, complete prefixes and rely on those services'
   implicit prompt caching; provider context caching never permits Finch to omit conversation

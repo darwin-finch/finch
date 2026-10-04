@@ -14,14 +14,7 @@ pub(super) enum GrokSetupFailureCause {
     Denied,
     StartDisabledOrUnsupported,
     ClientRejected,
-    StartTransport,
-    PollTransport,
     ProviderRejected,
-    ResponseContract,
-    VerificationAuthority,
-    IdentityVerification,
-    ClientBinding,
-    AccountEntitlement,
     Persistence,
     ProtocolOrOther,
 }
@@ -61,21 +54,8 @@ pub(super) fn grok_setup_failure_cause(error: &anyhow::Error) -> GrokSetupFailur
             | GrokDeviceEndpointError::PollRejected(_) => GrokSetupFailureCause::ProviderRejected,
         };
     }
-    if let Some(stage) = error.downcast_ref::<GrokAuthStageError>() {
-        return match stage {
-            GrokAuthStageError::DeviceStartTransport => GrokSetupFailureCause::StartTransport,
-            GrokAuthStageError::DevicePollTransport => GrokSetupFailureCause::PollTransport,
-            GrokAuthStageError::DeviceStartContract
-            | GrokAuthStageError::PollContract
-            | GrokAuthStageError::TokenExchangeContract => GrokSetupFailureCause::ResponseContract,
-            GrokAuthStageError::TokenExchangeRejected(_) => GrokSetupFailureCause::ProviderRejected,
-            GrokAuthStageError::JwksTransport => GrokSetupFailureCause::VerificationAuthority,
-            GrokAuthStageError::IdentityVerification | GrokAuthStageError::IdentitySignature => {
-                GrokSetupFailureCause::IdentityVerification
-            }
-            GrokAuthStageError::ClientBinding => GrokSetupFailureCause::ClientBinding,
-            GrokAuthStageError::AccountEntitlement => GrokSetupFailureCause::AccountEntitlement,
-        };
+    if error.downcast_ref::<GrokAuthStageError>().is_some() {
+        return GrokSetupFailureCause::ProviderRejected;
     }
     if error
         .downcast_ref::<crate::oauth::OAuthCredentialPersistenceError>()
@@ -103,29 +83,8 @@ pub(super) fn grok_setup_failure_summary(cause: GrokSetupFailureCause) -> String
         GrokSetupFailureCause::ClientRejected => {
             "xAI rejected Finch as an OAuth client (invalid_client). SuperGrok device login is not available for this independent client. No credential was saved. Finch will not switch to Console API-key billing."
         }
-        GrokSetupFailureCause::StartTransport => {
-            "Finch could not reach xAI to start Grok subscription sign-in. Check network access and retry. No credential was saved."
-        }
-        GrokSetupFailureCause::PollTransport => {
-            "Finch lost network access while waiting for Grok subscription authorization. Retry for a fresh one-time code. No credential was saved."
-        }
         GrokSetupFailureCause::ProviderRejected => {
             "Grok subscription sign-in was rejected. No credential was saved. Finch will not fall back to an API key."
-        }
-        GrokSetupFailureCause::ResponseContract => {
-            "xAI returned an unsupported Grok subscription authorization response. Update Finch before retrying. No credential was saved."
-        }
-        GrokSetupFailureCause::VerificationAuthority => {
-            "Finch could not verify xAI's pinned Grok identity-signing authority. Check network access and retry. No credential was saved."
-        }
-        GrokSetupFailureCause::IdentityVerification => {
-            "Finch could not verify the signed Grok subscription identity. No credential was saved."
-        }
-        GrokSetupFailureCause::ClientBinding => {
-            "The signed Grok identity was not issued for Finch's pinned public client. No credential was saved."
-        }
-        GrokSetupFailureCause::AccountEntitlement => {
-            "The signed Grok identity did not contain a usable subscription account binding. No credential was saved."
         }
         GrokSetupFailureCause::Persistence => {
             "Grok subscription sign-in was validated, but Finch could not save the named credential."
@@ -244,65 +203,5 @@ mod tests {
             !missing.contains("console.x.ai"),
             "missing device flow must not steer into Console API keys; summary={missing}"
         );
-    }
-
-    #[test]
-    fn typed_grok_failures_keep_distinct_secret_free_actions() {
-        let cases = [
-            (
-                anyhow::Error::new(GrokAuthStageError::DeviceStartTransport),
-                GrokSetupFailureCause::StartTransport,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::DevicePollTransport),
-                GrokSetupFailureCause::PollTransport,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::PollContract),
-                GrokSetupFailureCause::ResponseContract,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::JwksTransport),
-                GrokSetupFailureCause::VerificationAuthority,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::IdentitySignature),
-                GrokSetupFailureCause::IdentityVerification,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::ClientBinding),
-                GrokSetupFailureCause::ClientBinding,
-            ),
-            (
-                anyhow::Error::new(GrokAuthStageError::AccountEntitlement),
-                GrokSetupFailureCause::AccountEntitlement,
-            ),
-            (
-                anyhow::Error::new(crate::oauth::OAuthCredentialPersistenceError::Commit),
-                GrokSetupFailureCause::Persistence,
-            ),
-        ];
-        let summaries = cases
-            .into_iter()
-            .map(|(error, expected)| {
-                assert_eq!(
-                    grok_setup_failure_cause(&error),
-                    expected,
-                    "typed Grok failure lost its safe stage: {error:#}"
-                );
-                grok_setup_failure_summary(expected)
-            })
-            .collect::<Vec<_>>();
-        let distinct = summaries.iter().collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            distinct.len(),
-            summaries.len(),
-            "different recovery stages need different actionable summaries: {summaries:?}"
-        );
-        for summary in summaries {
-            assert!(!summary.contains("access-secret"));
-            assert!(!summary.contains("refresh-secret"));
-            assert!(!summary.contains("id-secret"));
-        }
     }
 }

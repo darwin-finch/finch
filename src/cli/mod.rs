@@ -29,7 +29,6 @@ pub(crate) mod test_projection;
 use finch_tui as tui;
 mod usage; // Phase 2: Terminal UI
 
-pub use crate::providers::GrokDeviceClientSurface;
 pub use chatgpt_auth::{
     render_status_line as render_chatgpt_auth_status_line,
     save_named_credential as save_chatgpt_named_credential, ChatGptAuthService,
@@ -79,6 +78,7 @@ pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, Use
 pub(crate) use output_layer::MessageVisitor;
 pub use output_layer::OutputManagerLayer;
 pub use output_manager::{OutputManager, VmOutputProjection};
+pub use repl::register_co_forth_tool_words;
 pub use repl::{Repl, ReplMode, ReplModeState};
 pub use repl_event::{format_token_count, format_tool_label, EventLoop, ReplEvent};
 pub(crate) use repl_event::{
@@ -95,4 +95,3 @@ pub use tui::{
     DialogResult, QuestionOptionView, QuestionView, TabbedDialog, TabbedDialogResult,
     TuiOutputPort, TuiRenderer, TuiStatusPort,
 };
-pub use repl::register_co_forth_tool_words;

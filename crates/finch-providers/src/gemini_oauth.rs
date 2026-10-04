@@ -246,7 +246,7 @@ impl GoogleGeminiOAuthDialect<GeminiTokenVerifierProduction> {
         let mut client_secret = std::env::var("FINCH_GEMINI_CLIENT_SECRET")
             .or_else(|_| std::env::var("GOOGLE_CLIENT_SECRET"))
             .ok();
-        
+
         if client_id == GOOGLE_PUBLIC_CLIENT_ID {
             client_secret = None;
         }
@@ -361,7 +361,6 @@ where
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.device_authorization_endpoint.clone(),
             body: OAuthRequestBody::Form(form),
-            metadata: Default::default(),
         })
     }
 
@@ -466,7 +465,6 @@ where
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.device_token_endpoint.clone(),
             body: OAuthRequestBody::Form(form),
-            metadata: Default::default(),
         })
     }
 
@@ -515,7 +513,6 @@ where
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.token_endpoint.clone(),
             body: OAuthRequestBody::Form(form),
-            metadata: Default::default(),
         })
     }
 
@@ -532,7 +529,6 @@ where
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.token_endpoint.clone(),
             body: OAuthRequestBody::Form(form),
-            metadata: Default::default(),
         })
     }
 
@@ -541,7 +537,6 @@ where
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.revocation_endpoint.clone(),
             body: OAuthRequestBody::Form(vec![("token".into(), token.to_string())]),
-            metadata: Default::default(),
         })
     }
 

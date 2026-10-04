@@ -223,35 +223,56 @@ async fn extract_claude_cli_token(
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
         use crate::oauth::OAuthDialect;
-        
+        use std::process::Command;
+
         let output = tokio::process::Command::new("security")
-            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
             .output()
             .await
             .context("Failed to run security find-generic-password")?;
-            
+
         if !output.status.success() {
             bail!("Failed to extract Claude credentials from macOS Keychain. Are you signed in to the `claude` CLI?");
         }
-        
-        let json_str = String::from_utf8(output.stdout).context("Invalid UTF-8 in keychain data")?;
-        
-        let data: serde_json::Value = serde_json::from_str(&json_str).context("Failed to parse keychain JSON")?;
-        let oauth = data.get("claudeAiOauth").context("Missing claudeAiOauth in keychain data")?;
-        
-        let access_token = oauth.get("accessToken").and_then(|v| v.as_str()).context("Missing accessToken")?.to_string();
-        let refresh_token = oauth.get("refreshToken").and_then(|v| v.as_str()).map(|s| s.to_string());
-        
+
+        let json_str =
+            String::from_utf8(output.stdout).context("Invalid UTF-8 in keychain data")?;
+
+        let data: serde_json::Value =
+            serde_json::from_str(&json_str).context("Failed to parse keychain JSON")?;
+        let oauth = data
+            .get("claudeAiOauth")
+            .context("Missing claudeAiOauth in keychain data")?;
+
+        let access_token = oauth
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .context("Missing accessToken")?
+            .to_string();
+        let refresh_token = oauth
+            .get("refreshToken")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // try to get email from `claude auth status --json`
         let status_output = Command::new("claude")
             .args(["auth", "status", "--json"])
             .output();
         let account = if let Ok(out) = status_output {
             if out.status.success() {
-                let status_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
-                status_json.get("email").and_then(|v| v.as_str()).unwrap_or("claude-cli").to_string()
+                let status_json: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
+                status_json
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude-cli")
+                    .to_string()
             } else {
                 "claude-cli".to_string()
             }
@@ -281,12 +302,12 @@ async fn extract_claude_cli_token(
             revoked: false,
             mutation_pending: false,
         };
-        
+
         let current = store.load(reference)?;
         let expected_generation = current.as_ref().map(|c| c.generation.as_str());
-        
+
         store.compare_and_swap(reference, expected_generation, &record)?;
-        
+
         Ok(record.provider_credential(reference))
     }
     #[cfg(not(target_os = "macos"))]
@@ -512,5 +533,4 @@ mod tests {
             generation
         );
     }
-
-    }
+}

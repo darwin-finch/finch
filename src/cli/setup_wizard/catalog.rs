@@ -272,7 +272,13 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
 pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
     !matches!(
         provider.to_ascii_lowercase().as_str(),
-        "chatgpt" | "grok-sub" | "claude-sub" | "gemini-sub" | "openai-compatible" | "ollama" | "finch"
+        "chatgpt"
+            | "grok-sub"
+            | "claude-sub"
+            | "gemini-sub"
+            | "openai-compatible"
+            | "ollama"
+            | "finch"
     )
 }
 

@@ -96,11 +96,10 @@ pub use gemini_subscription::{GeminiSubscriptionProvider, DEFAULT_GEMINI_SUB_MOD
 #[cfg(feature = "grok_subscription")]
 pub use grok_jwks::GrokJwksVerifier;
 pub use grok_oauth::{
-    grok_required_scopes, GrokAuthStageError, GrokDeviceClientSurface, GrokDeviceEndpointError,
-    GrokSubscriptionService, GrokTokenVerifier, VerifiedGrokClaims, XaiGrokOAuthDialect,
-    GROK_OAUTH_PROTOCOL_REVISION, GROK_PREVIOUS_OAUTH_PROTOCOL_REVISION,
-    GROK_PUBLIC_CLIENT_VERSION, GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER,
-    GROK_SUBSCRIPTION_BASE_URL, XAI_PUBLIC_CLIENT_ID,
+    grok_required_scopes, GrokAuthStageError, GrokDeviceEndpointError, GrokSubscriptionService,
+    GrokTokenVerifier, VerifiedGrokClaims, XaiGrokOAuthDialect, GROK_OAUTH_PROTOCOL_REVISION,
+    GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER, GROK_SUBSCRIPTION_BASE_URL,
+    XAI_PUBLIC_CLIENT_ID,
 };
 #[cfg(feature = "grok_subscription")]
 pub use grok_subscription::GrokSubscriptionProvider;
@@ -113,8 +112,8 @@ pub use oauth::{
     validate_reference, AuthorizationCodeGrant, DeviceAuthorization, DevicePoll,
     FileOAuthCredentialStore, OAuthClient, OAuthCredentialCommit, OAuthCredentialPersistenceError,
     OAuthCredentialStore, OAuthDeviceAuthorizationError, OAuthDialect, OAuthDialectDescriptor,
-    OAuthHttpRequest, OAuthPublicMetadata, OAuthRequestBody, OAuthTokenRecord,
-    PendingBrowserAuthorization, StoredOAuthCredentialResolver, TokenValidationContext,
+    OAuthHttpRequest, OAuthRequestBody, OAuthTokenRecord, PendingBrowserAuthorization,
+    StoredOAuthCredentialResolver, TokenValidationContext,
 };
 #[cfg(feature = "openai")]
 pub use openai::OpenAIProvider;
