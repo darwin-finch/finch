@@ -137,7 +137,10 @@ pub(super) fn spawn_add_time_gemini_device_flow(
                                 user_code: device.user_code.clone(),
                                 expires_in: device.expires_in,
                             });
-                            let _ = crate::cli::gemini_auth::open_browser(&device.verification_uri);
+                            // Through the wizard's own launcher, which is inert
+                            // under test: a fixture authorization must never
+                            // open a real browser tab.
+                            open_browser_silently(&device.verification_uri);
                             authenticator
                                 .finish_named_credential(&reference, &device, cancel)
                                 .await
