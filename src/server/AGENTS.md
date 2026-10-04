@@ -67,11 +67,15 @@ the lane, after the same submittable-kind filter, `attachment_can_submit` role c
 `validate_submitted_brain_tasks` as before, and through the same `BrainStore::push` /
 `push_idempotent` append. It may therefore sit between a turn's request and its result in the
 journal; a run's rebuilt context still reads the task list at or before its own request
-(`named_brain_provider_messages_at`). No other event kind leaves the lane this way.
+(`named_brain_provider_messages_at`). `ApprovalDecided` is the only other kind that returns before
+the lane; every other submission, `ParticipantMessage` included, still waits for the running turn.
+A retried replacement replays its mutation receipt instead of appending again.
 `test_task_list_replacement_during_an_active_turn_does_not_wait_for_the_turn`,
 `test_two_task_list_replacements_during_one_turn_commit_once_each_in_order`,
 `test_task_list_replacement_from_a_second_attachment_during_a_turn_keeps_role_authority`,
-`test_task_list_replacement_racing_turn_completion_commits_exactly_once`, and
+`test_retried_task_list_replacement_during_a_turn_replays_its_receipt_once`,
+`test_participant_message_during_an_active_turn_still_waits_for_the_turn`,
+`test_task_list_replacement_after_the_turns_terminal_state_commits_exactly_once`, and
 `test_task_list_replaced_mid_turn_survives_restart_and_does_not_leak_into_that_turn` in
 `handlers/handler_tests.rs`;
 `test_todo_write_during_a_brain_turn_returns_success_through_the_real_tool_path` in

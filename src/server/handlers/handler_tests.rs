@@ -6858,10 +6858,11 @@ async fn test_task_list_replacement_from_a_second_attachment_during_a_turn_keeps
     assert_eq!(vec![lane_task("from-bob")], snapshot.tasks);
 }
 
-/// A replacement racing the end of its turn is neither lost nor duplicated,
-/// whichever of the two the daemon finishes first.
+/// A replacement submitted once its turn has reached a terminal state commits
+/// exactly once and leaves that terminal state alone. This does not interleave
+/// with the turn's terminal batch; it pins the write that arrives just after.
 #[tokio::test]
-async fn test_task_list_replacement_racing_turn_completion_commits_exactly_once() {
+async fn test_task_list_replacement_after_the_turns_terminal_state_commits_exactly_once() {
     let temp = tempfile::tempdir().unwrap();
     let mut brain = ActiveTurnBrain::new(temp.path());
     let mut runner_rx = std::mem::replace(
@@ -6873,45 +6874,204 @@ async fn test_task_list_replacement_racing_turn_completion_commits_exactly_once(
     let run_id = turn.run_id;
 
     turn.response_tx
-        .send(failed_turn("turn ended while a task write was in flight"))
+        .send(failed_turn("turn ended before the task write arrived"))
         .expect("the daemon must still be waiting for the turn");
-    let replace = brain.submit(
-        &brain.driver,
-        BrainEventKind::TaskListReplaced {
-            tasks: vec![lane_task("racing")],
-        },
-    );
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::join!(&mut prompt, replace)
-    })
-    .await;
-    let snapshot = brain.snapshot();
-    let (_turn_outcome, replaced) = joined.unwrap_or_else(|_| {
-        panic!(
-            "a task list replacement racing turn completion hung instead of committing; \
-             durable tasks: {:?}, runs: {:?}",
-            snapshot.tasks, snapshot.runs
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), &mut prompt)
+        .await
+        .expect("the turn hung instead of finishing after its runner answered");
+    brain
+        .submit(
+            &brain.driver,
+            BrainEventKind::TaskListReplaced {
+                tasks: vec![lane_task("after")],
+            },
         )
-    });
-    replaced.unwrap_or_else(|error| panic!("the racing replacement must be accepted: {error:?}"));
+        .await
+        .unwrap_or_else(|error| panic!("the replacement must be accepted: {error:?}"));
 
+    let snapshot = brain.snapshot();
     let journaled = journaled_task_lists(&snapshot);
     assert_eq!(
-        vec![Some("racing".to_string())],
+        vec![Some("after".to_string())],
         journaled
             .iter()
             .map(|(_, _, id)| id.clone())
             .collect::<Vec<_>>(),
-        "the racing replacement must be journaled exactly once: {journaled:?}"
+        "the replacement must be journaled exactly once: {journaled:?}"
     );
-    assert_eq!(vec![lane_task("racing")], snapshot.tasks);
+    assert_eq!(vec![lane_task("after")], snapshot.tasks);
     assert!(
         snapshot
             .runs
             .iter()
             .any(|run| run.run_id == run_id && run.status.is_terminal()),
-        "the turn must still reach its own terminal state: {:?}",
+        "the turn must keep its own terminal state: {:?}",
         snapshot.runs
+    );
+}
+
+/// A retried submission carries the same mutation receipt. During a turn the
+/// retry must replay the original event rather than append a second list, and
+/// a receipt written against an older revision must still be refused.
+#[tokio::test]
+async fn test_retried_task_list_replacement_during_a_turn_replays_its_receipt_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut brain = ActiveTurnBrain::new(temp.path());
+    let mut runner_rx = std::mem::replace(
+        &mut brain.runner_rx,
+        tokio::sync::mpsc::unbounded_channel().1,
+    );
+    let mut prompt = brain.prompt();
+    let _turn = park_dispatched_turn(&mut runner_rx, &mut prompt).await;
+
+    let before = brain.snapshot();
+    let receipt = crate::brain::BrainMutationReceipt {
+        mutation_id: uuid::Uuid::new_v4(),
+        attachment_id: brain.driver.attachment_id,
+        expected_revision: before.revision,
+        environment_generation: before.environment.generation,
+        command_sha256: "task-list-replacement".into(),
+    };
+    let submit = |receipt: crate::brain::BrainMutationReceipt, id: &'static str| {
+        submit_named_brain_event_with_authority_and_receipt(
+            brain.server.brain_store(),
+            brain.server.brain_runners(),
+            &brain.approvals,
+            "shared",
+            &brain.driver,
+            BrainEventKind::TaskListReplaced {
+                tasks: vec![lane_task(id)],
+            },
+            false,
+            Some(receipt),
+        )
+    };
+    let within_bound = |label: &'static str| {
+        move |outcome: Result<_, tokio::time::error::Elapsed>| {
+            outcome.unwrap_or_else(|_| {
+                panic!("the {label} submission hung behind the Brain execution lane")
+            })
+        }
+    };
+    let bound = std::time::Duration::from_secs(5);
+
+    let first = within_bound("first")(
+        tokio::time::timeout(bound, submit(receipt.clone(), "receipted")).await,
+    )
+    .unwrap_or_else(|error| panic!("the receipted replacement must be accepted: {error:?}"));
+    let retried = within_bound("retried")(
+        tokio::time::timeout(bound, submit(receipt.clone(), "receipted")).await,
+    )
+    .unwrap_or_else(|error| panic!("the retry must replay, not fail: {error:?}"));
+
+    let snapshot = brain.snapshot();
+    let journaled = journaled_task_lists(&snapshot);
+    assert_eq!(
+        1,
+        journaled.len(),
+        "a retry with the same receipt must not append a second task list: {journaled:?}"
+    );
+    assert_eq!(
+        (first.accepted.seq, &first.accepted.mutation),
+        (retried.accepted.seq, &Some(receipt.clone())),
+        "the retry must return the original event, which records its receipt; first: {:?}, \
+         retried: {:?}",
+        first.accepted,
+        retried.accepted
+    );
+
+    let mut stale = receipt;
+    stale.mutation_id = uuid::Uuid::new_v4();
+    let refused = within_bound("stale")(tokio::time::timeout(bound, submit(stale, "stale")).await);
+    assert!(
+        refused.is_err(),
+        "a new mutation written against the revision before the first replacement must be \
+         refused: {:?}",
+        refused.map(|outcome| outcome.accepted.seq)
+    );
+    assert_eq!(
+        vec![lane_task("receipted")],
+        brain.snapshot().tasks,
+        "a refused stale replacement must leave the durable list alone"
+    );
+}
+
+/// Only the task list (and, already, an approval decision) leaves the lane. A
+/// participant message is conversation input and must still wait for the
+/// running turn, landing after that turn's terminal state.
+#[tokio::test]
+async fn test_participant_message_during_an_active_turn_still_waits_for_the_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut brain = ActiveTurnBrain::new(temp.path());
+    let mut runner_rx = std::mem::replace(
+        &mut brain.runner_rx,
+        tokio::sync::mpsc::unbounded_channel().1,
+    );
+    let mut prompt = brain.prompt();
+    let turn = park_dispatched_turn(&mut runner_rx, &mut prompt).await;
+    let run_id = turn.run_id;
+    let message_seqs = |snapshot: &BrainSnapshot| {
+        snapshot
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, BrainEventKind::ParticipantMessage { .. }))
+            .map(|event| event.seq)
+            .collect::<Vec<_>>()
+    };
+
+    let mut message = Box::pin(brain.submit(
+        &brain.driver,
+        BrainEventKind::ParticipantMessage {
+            text: "while you work".into(),
+        },
+    ));
+    // No clock: give the submission every chance to run, then observe that it
+    // is parked on the lane with nothing journaled.
+    for _ in 0..16 {
+        assert!(
+            futures::poll!(&mut message).is_pending(),
+            "a participant message submitted during an active turn must wait for the Brain \
+             execution lane, but it returned while run {run_id:?} was still running"
+        );
+        tokio::task::yield_now().await;
+    }
+    let during = brain.snapshot();
+    assert!(
+        message_seqs(&during).is_empty(),
+        "nothing may be journaled for a message that is still waiting: {:?}",
+        message_seqs(&during)
+    );
+
+    turn.response_tx
+        .send(failed_turn("turn ended"))
+        .expect("the daemon must still be waiting for the turn");
+    let (_turn_outcome, delivered) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(&mut prompt, &mut message)
+        })
+        .await
+        .expect("the turn or the waiting message hung after the runner answered");
+    delivered.unwrap_or_else(|error| panic!("the message must be accepted: {error:?}"));
+
+    let snapshot = brain.snapshot();
+    let terminal_seq = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::RunStatusChanged { run_id: changed, status, .. }
+                    if changed == run_id && status.is_terminal()
+            )
+        })
+        .map(|event| event.seq)
+        .max()
+        .expect("the turn must record its terminal state");
+    let seqs = message_seqs(&snapshot);
+    assert!(
+        seqs.len() == 1 && seqs[0] > terminal_seq,
+        "the message must be journaled once, after the turn's terminal state (seq \
+         {terminal_seq}): {seqs:?}"
     );
 }
 
