@@ -12345,3 +12345,769 @@ async fn provider_switch_activates_configured_subscription_provider() {
         })
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// `/patterns` commands (issue #1634: the commands for reviewing and revoking
+// standing tool approvals printed "recognized but not yet implemented" in the
+// live session although the approvals themselves were stored and matched).
+//
+// Every test below drives `EventLoop::handle_user_input` (the real command
+// dispatch) and `EventLoop::resolve_dialog_result` (the real dialog-answer
+// routing), and decides "does this still auto-approve?" by spawning a real
+// tool call through the event loop's own `ToolExecutionCoordinator`, the
+// production approval path. The pattern store lives in a temporary directory.
+// ---------------------------------------------------------------------------
+
+/// What the production approval path did with one tool call.
+#[derive(Debug, PartialEq)]
+enum ApprovalProbe {
+    /// The call ran without asking: a standing approval matched it.
+    AutoApproved,
+    /// The call raised `ToolApprovalNeeded`: the owner is asked.
+    AskedOwner,
+}
+
+fn patterns_event_loop() -> (super::EventLoop, tempfile::TempDir, std::path::PathBuf) {
+    let (event_loop, tempdir) = auto_accept_event_loop();
+    event_loop.output_manager.disable_stdout();
+    let store_path = tempdir.path().join("patterns.json");
+    (event_loop, tempdir, store_path)
+}
+
+fn bash_call(command: &str) -> crate::tools::ToolUse {
+    crate::tools::ToolUse::new(
+        "bash".to_string(),
+        serde_json::json!({ "command": command }),
+    )
+}
+
+/// A wildcard pattern whose text is exactly the signature of `command`, so
+/// it matches that call and nothing else.
+fn pattern_for_bash(command: &str) -> crate::tools::ToolPattern {
+    let signature =
+        crate::tools::generate_tool_signature(&bash_call(command), std::path::Path::new("."));
+    crate::tools::ToolPattern::new(
+        signature.context_key,
+        "bash".to_string(),
+        format!("allow {command}"),
+    )
+}
+
+/// Send one bash call through the event loop's real tool coordinator and
+/// report whether the approval path let it run or asked the owner.
+async fn probe_bash_approval(event_loop: &mut super::EventLoop, command: &str) -> ApprovalProbe {
+    let query_id = Uuid::new_v4();
+    let tool_use = bash_call(command);
+    let tool_id = tool_use.id.clone();
+    let round_token = crate::cli::conversation::ConversationHistory::new()
+        .stage_assistant(
+            query_id,
+            crate::providers::Message {
+                role: "assistant".into(),
+                content: vec![crate::providers::ContentBlock::ToolUse {
+                    id: tool_id.clone(),
+                    name: tool_use.name.clone(),
+                    input: tool_use.input.clone(),
+                }],
+            },
+        )
+        .expect("mint a tool round token for the probe");
+    let work_unit = event_loop.output_manager.start_work_unit("Tools");
+    let row_idx = work_unit.add_row(format!("bash({command})"));
+    event_loop.tool_coordinator.spawn_tool_execution(
+        query_id,
+        round_token,
+        tool_use,
+        work_unit,
+        row_idx,
+        None,
+        None,
+    );
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the approval probe hung: the tool coordinator emitted neither an approval request nor a result")
+        .expect("the event channel must stay open during the probe");
+        match event {
+            ReplEvent::ToolApprovalNeeded { tool_use, .. } if tool_use.id == tool_id => {
+                return ApprovalProbe::AskedOwner;
+            }
+            ReplEvent::ToolResult { tool_id: id, .. } if id == tool_id => {
+                return ApprovalProbe::AutoApproved;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scrollback(event_loop: &super::EventLoop) -> Vec<String> {
+    event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect()
+}
+
+/// Answer the dialog on screen the way the input task does: the dialog
+/// leaves the screen, then its result is routed.
+async fn answer_dialog(
+    event_loop: &mut super::EventLoop,
+    result: crate::cli::tui::DialogResult,
+    step: &str,
+) {
+    let dialog = event_loop.tui_renderer.lock().await.active_dialog.take();
+    assert!(
+        dialog.is_some(),
+        "a dialog must be on screen before it can be answered; step={step} scrollback={:?}",
+        scrollback(event_loop)
+    );
+    event_loop
+        .resolve_dialog_result(result)
+        .await
+        .expect("routing a dialog answer must succeed");
+}
+
+async fn stored_ids(event_loop: &super::EventLoop) -> (Vec<String>, Vec<String>) {
+    let executor = event_loop.tool_coordinator.tool_executor().lock().await;
+    let store = executor.persistent_store();
+    (
+        store.patterns.iter().map(|p| p.id.clone()).collect(),
+        store.exact_approvals.iter().map(|a| a.id.clone()).collect(),
+    )
+}
+
+fn ids_on_disk(path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let store = crate::tools::PersistentPatternStore::load(path)
+        .expect("the pattern store file must be readable");
+    (
+        store.patterns.iter().map(|p| p.id.clone()).collect(),
+        store.exact_approvals.iter().map(|a| a.id.clone()).collect(),
+    )
+}
+
+#[tokio::test]
+async fn test_patterns_list_shows_id_match_scope_and_count_from_the_live_approval_store() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, _store_path) = patterns_event_loop();
+            let persistent = pattern_for_bash("cargo build --offline");
+            let session = pattern_for_bash("cargo fmt --check");
+            let exact = crate::tools::generate_tool_signature(
+                &bash_call("git status --short"),
+                std::path::Path::new("."),
+            );
+            {
+                let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                executor.approve_pattern_persistent(persistent.clone());
+                executor.approve_pattern_session(session.clone());
+                executor.approve_exact_persistent(exact.clone());
+                executor.save_patterns().expect("seed the temporary store");
+            }
+            // One real auto-approved call, so the count shown is the count
+            // the approval path itself recorded.
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, "cargo build --offline").await,
+                ApprovalProbe::AutoApproved,
+                "fixture: the seeded persistent pattern must auto-approve its command"
+            );
+
+            for command in ["/patterns list", "/patterns"] {
+                let before = scrollback(&event_loop).len();
+                event_loop
+                    .handle_user_input(command.to_string())
+                    .await
+                    .expect("the list command must dispatch");
+                let rows = scrollback(&event_loop)[before..].to_vec();
+                let listing = rows.join("\n");
+                assert!(
+                    !listing.contains("not yet implemented"),
+                    "{command} must list the approvals, not report itself unimplemented; rows={rows:?}"
+                );
+                for (what, expected) in [
+                    ("the persistent pattern's short ID and scope", format!("{}  persistent  wildcard", &persistent.id[..8])),
+                    ("what the persistent pattern matches", format!("Matches: {}", persistent.pattern)),
+                    ("the persistent pattern's recorded match count", "Match count: 1 |".to_string()),
+                    ("the session pattern's short ID and scope", format!("{}  session  wildcard", &session.id[..8])),
+                    ("what the session pattern matches", format!("Matches: {}", session.pattern)),
+                    ("the session pattern's match count", "Match count: 0 |".to_string()),
+                    ("what the exact approval matches", format!("Matches: {}", exact.context_key)),
+                    ("the totals", "Total: 2 patterns (1 persistent, 1 session), 1 exact approvals (1 persistent, 0 session)".to_string()),
+                ] {
+                    assert!(
+                        listing.contains(&expected),
+                        "{command} must show {what}; expected={expected:?} rows={rows:?}"
+                    );
+                }
+                assert!(
+                    !listing.contains('\u{1b}'),
+                    "the listing must be plain text with no terminal styling; rows={rows:?}"
+                );
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_patterns_remove_revokes_a_persistent_pattern_so_the_next_call_asks() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+            let command = "cargo build --offline";
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AskedOwner,
+                "fixture: with no standing approval the call must ask the owner"
+            );
+            let pattern = pattern_for_bash(command);
+            let kept = pattern_for_bash("cargo fmt --check");
+            {
+                let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                executor.approve_pattern_persistent(pattern.clone());
+                executor.approve_pattern_persistent(kept.clone());
+                executor.save_patterns().expect("seed the temporary store");
+            }
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AutoApproved,
+                "fixture: the persistent pattern must auto-approve its command before removal"
+            );
+
+            // An ID that names nothing changes nothing.
+            event_loop
+                .handle_user_input("/patterns remove 00000000-not-a-real-id".to_string())
+                .await
+                .expect("removing an unknown ID must dispatch");
+            assert_eq!(
+                stored_ids(&event_loop).await.0,
+                vec![pattern.id.clone(), kept.id.clone()],
+                "an unknown ID must leave the store unchanged; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert!(
+                scrollback(&event_loop)
+                    .iter()
+                    .any(|row| row.contains("No pattern or approval found with ID: 00000000-not-a-real-id")),
+                "an unknown ID must be named in the reply; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+
+            // The short ID shown by `/patterns list` is enough.
+            event_loop
+                .handle_user_input(format!("/patterns remove {}", &pattern.id[..8]))
+                .await
+                .expect("the remove command must dispatch");
+
+            let rows = scrollback(&event_loop);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains(&format!("Removed pattern: {}", &pattern.id[..8]))),
+                "remove must confirm what it removed, not report itself unimplemented; scrollback={rows:?}"
+            );
+            assert_eq!(
+                stored_ids(&event_loop).await.0,
+                vec![kept.id.clone()],
+                "remove must delete exactly the named pattern from the live store; scrollback={rows:?}"
+            );
+            assert_eq!(
+                ids_on_disk(&store_path).0,
+                vec![kept.id.clone()],
+                "remove must persist, or the pattern would return on restart; scrollback={rows:?}"
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AskedOwner,
+                "a removed pattern must stop auto-approving in the same session; scrollback={rows:?}"
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, "cargo fmt --check").await,
+                ApprovalProbe::AutoApproved,
+                "removing one pattern must not revoke another; scrollback={rows:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_patterns_remove_revokes_a_session_pattern_so_the_next_call_asks() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, _store_path) = patterns_event_loop();
+            let command = "cargo fmt --check";
+            let pattern = pattern_for_bash(command);
+            event_loop
+                .tool_coordinator
+                .tool_executor()
+                .lock()
+                .await
+                .approve_pattern_session(pattern.clone());
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AutoApproved,
+                "fixture: the session pattern must auto-approve its command before removal"
+            );
+
+            event_loop
+                .handle_user_input(format!("/patterns rm {}", pattern.id))
+                .await
+                .expect("the remove alias must dispatch");
+
+            let rows = scrollback(&event_loop);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains(&format!("Removed pattern: {}", &pattern.id[..8]))),
+                "remove must confirm removal of a session pattern; scrollback={rows:?}"
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AskedOwner,
+                "a removed session pattern must stop auto-approving in the same session; scrollback={rows:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_patterns_remove_of_a_heavily_used_pattern_waits_for_confirmation() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+            let command = "cargo build --offline";
+            let mut pattern = pattern_for_bash(command);
+            pattern.match_count = 11;
+            {
+                let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                executor.approve_pattern_persistent(pattern.clone());
+                executor.save_patterns().expect("seed the temporary store");
+            }
+            let remove = format!("/patterns remove {}", pattern.id);
+
+            event_loop
+                .handle_user_input(remove.clone())
+                .await
+                .expect("the remove command must dispatch");
+            assert_eq!(
+                stored_ids(&event_loop).await.0,
+                vec![pattern.id.clone()],
+                "a pattern used more than ten times must not be removed before the owner confirms; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            answer_dialog(
+                &mut event_loop,
+                crate::cli::tui::DialogResult::Confirmed(false),
+                "decline removal",
+            )
+            .await;
+            assert_eq!(
+                (stored_ids(&event_loop).await.0, ids_on_disk(&store_path).0),
+                (vec![pattern.id.clone()], vec![pattern.id.clone()]),
+                "a declined removal must leave the live store and the file unchanged; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AutoApproved,
+                "a declined removal must leave the pattern in force"
+            );
+
+            event_loop
+                .handle_user_input(remove)
+                .await
+                .expect("the remove command must dispatch a second time");
+            answer_dialog(
+                &mut event_loop,
+                crate::cli::tui::DialogResult::Confirmed(true),
+                "confirm removal",
+            )
+            .await;
+            assert_eq!(
+                (stored_ids(&event_loop).await.0, ids_on_disk(&store_path).0),
+                (Vec::<String>::new(), Vec::<String>::new()),
+                "a confirmed removal must delete the pattern from the live store and the file; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AskedOwner,
+                "after a confirmed removal the call must ask the owner again"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_patterns_clear_confirms_then_revokes_every_persistent_and_session_approval() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+            let commands = [
+                "cargo build --offline", // persistent pattern
+                "cargo fmt --check",     // session pattern
+                "git status --short",    // persistent exact approval
+                "git diff --stat",       // session exact approval
+            ];
+            let signature = |command: &str| {
+                crate::tools::generate_tool_signature(&bash_call(command), std::path::Path::new("."))
+            };
+            {
+                let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                executor.approve_pattern_persistent(pattern_for_bash(commands[0]));
+                executor.approve_pattern_session(pattern_for_bash(commands[1]));
+                executor.approve_exact_persistent(signature(commands[2]));
+                executor.approve_exact_session(signature(commands[3]));
+                executor.save_patterns().expect("seed the temporary store");
+            }
+            for command in commands {
+                assert_eq!(
+                    probe_bash_approval(&mut event_loop, command).await,
+                    ApprovalProbe::AutoApproved,
+                    "fixture: every seeded approval must auto-approve before clear; command={command}"
+                );
+            }
+            let seeded = stored_ids(&event_loop).await;
+
+            event_loop
+                .handle_user_input("/patterns clear".to_string())
+                .await
+                .expect("the clear command must dispatch");
+            assert!(
+                scrollback(&event_loop)
+                    .iter()
+                    .any(|row| row.contains("This will remove 2 pattern(s) and 2 exact approval(s)")),
+                "clear must say what it is about to remove, not report itself unimplemented; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert_eq!(
+                stored_ids(&event_loop).await,
+                seeded,
+                "clear must not change the store before the owner confirms"
+            );
+            answer_dialog(
+                &mut event_loop,
+                crate::cli::tui::DialogResult::Cancelled,
+                "escape the clear confirmation",
+            )
+            .await;
+            assert_eq!(
+                (stored_ids(&event_loop).await, ids_on_disk(&store_path)),
+                (seeded.clone(), seeded.clone()),
+                "an escaped clear must leave the live store and the file unchanged; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+
+            event_loop
+                .handle_user_input("/patterns clear".to_string())
+                .await
+                .expect("the clear command must dispatch a second time");
+            answer_dialog(
+                &mut event_loop,
+                crate::cli::tui::DialogResult::Confirmed(true),
+                "confirm clear",
+            )
+            .await;
+
+            let rows = scrollback(&event_loop);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("Cleared 4 pattern(s) and approval(s).")),
+                "a confirmed clear must report how much it removed; scrollback={rows:?}"
+            );
+            let empty = (Vec::<String>::new(), Vec::<String>::new());
+            assert_eq!(
+                (stored_ids(&event_loop).await, ids_on_disk(&store_path)),
+                (empty.clone(), empty),
+                "a confirmed clear must empty the live store and the file; scrollback={rows:?}"
+            );
+            for command in commands {
+                assert_eq!(
+                    probe_bash_approval(&mut event_loop, command).await,
+                    ApprovalProbe::AskedOwner,
+                    "after clear no standing approval, persistent or session, may auto-approve; command={command} scrollback={rows:?}"
+                );
+            }
+
+            event_loop
+                .handle_user_input("/patterns clear".to_string())
+                .await
+                .expect("clear on an empty store must dispatch");
+            assert!(
+                scrollback(&event_loop)
+                    .last()
+                    .is_some_and(|row| row.contains("No patterns to clear.")),
+                "clear on an empty store must say so; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert!(
+                event_loop.tui_renderer.lock().await.active_dialog.is_none(),
+                "clear on an empty store must not open a confirmation dialog"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_patterns_add_wizard_saves_a_persistent_pattern_that_auto_approves() {
+    use crate::cli::tui::DialogResult;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+            let command = "cargo build --offline";
+            let pattern_text = pattern_for_bash(command).pattern;
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AskedOwner,
+                "fixture: with no standing approval the call must ask the owner"
+            );
+
+            // Escaping the wizard part-way stores nothing.
+            event_loop
+                .handle_user_input("/patterns add".to_string())
+                .await
+                .expect("the add command must dispatch");
+            answer_dialog(&mut event_loop, DialogResult::Selected(0), "pattern type").await;
+            answer_dialog(&mut event_loop, DialogResult::Cancelled, "escape at tool name").await;
+            assert_eq!(
+                (stored_ids(&event_loop).await.0.len(), store_path.exists()),
+                (0, false),
+                "an escaped add wizard must store nothing; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert!(
+                event_loop.tui_renderer.lock().await.active_dialog.is_none(),
+                "an escaped add wizard must not leave a dialog open"
+            );
+
+            // An invalid regex is refused before anything is stored.
+            event_loop
+                .handle_user_input("/patterns add".to_string())
+                .await
+                .expect("the add command must dispatch");
+            answer_dialog(&mut event_loop, DialogResult::Selected(1), "regex type").await;
+            for (answer, step) in [("bash", "tool name"), ("(unclosed", "pattern"), ("bad", "description")] {
+                answer_dialog(&mut event_loop, DialogResult::TextEntered(answer.to_string()), step)
+                    .await;
+            }
+            assert!(
+                scrollback(&event_loop)
+                    .iter()
+                    .any(|row| row.contains("Invalid pattern")),
+                "an invalid regex must be reported; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert_eq!(
+                stored_ids(&event_loop).await.0.len(),
+                0,
+                "an invalid regex must not be stored; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+
+            // The full wizard: type, tool, pattern, description, test, save.
+            event_loop
+                .handle_user_input("/patterns add".to_string())
+                .await
+                .expect("the add command must dispatch");
+            answer_dialog(&mut event_loop, DialogResult::Selected(0), "wildcard type").await;
+            for (answer, step) in [
+                ("bash", "tool name"),
+                (pattern_text.as_str(), "pattern"),
+                ("offline builds", "description"),
+            ] {
+                answer_dialog(&mut event_loop, DialogResult::TextEntered(answer.to_string()), step)
+                    .await;
+            }
+            answer_dialog(&mut event_loop, DialogResult::Confirmed(true), "ask to test").await;
+            answer_dialog(
+                &mut event_loop,
+                DialogResult::TextEntered(pattern_text.clone()),
+                "test string",
+            )
+            .await;
+            assert!(
+                scrollback(&event_loop)
+                    .iter()
+                    .any(|row| row.contains("Pattern matches the test string.")),
+                "the wizard's test step must report the match; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+            assert_eq!(
+                stored_ids(&event_loop).await.0.len(),
+                0,
+                "the wizard must not store the pattern before the owner confirms saving"
+            );
+            answer_dialog(&mut event_loop, DialogResult::Confirmed(true), "save").await;
+
+            let rows = scrollback(&event_loop);
+            let (live, _) = stored_ids(&event_loop).await;
+            assert_eq!(
+                live.len(),
+                1,
+                "the completed wizard must add exactly one pattern to the live store; scrollback={rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains(&format!("Pattern saved: {}", &live[0][..8]))),
+                "the completed wizard must report the saved pattern's ID, not report itself unimplemented; scrollback={rows:?}"
+            );
+            assert_eq!(
+                ids_on_disk(&store_path).0,
+                live,
+                "the added pattern must be persisted; scrollback={rows:?}"
+            );
+            assert_eq!(
+                probe_bash_approval(&mut event_loop, command).await,
+                ApprovalProbe::AutoApproved,
+                "a pattern added by the wizard must be the one the approval path consults; scrollback={rows:?}"
+            );
+        })
+        .await;
+}
+
+/// A tool approval that arrives while a `/patterns` confirmation is open
+/// replaces it on screen. The owner's answer is then an answer to the tool
+/// approval: it must reach the tool, and it must not be taken as consent to
+/// clear the standing approvals.
+#[tokio::test]
+async fn test_patterns_dialog_displaced_by_a_tool_approval_changes_nothing_and_answers_the_tool() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+            {
+                let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                executor.approve_pattern_persistent(pattern_for_bash("cargo build --offline"));
+                executor.save_patterns().expect("seed the temporary store");
+            }
+            let seeded = stored_ids(&event_loop).await;
+
+            event_loop
+                .handle_user_input("/patterns clear".to_string())
+                .await
+                .expect("the clear command must dispatch");
+            assert!(
+                event_loop.tui_renderer.lock().await.active_dialog.is_some(),
+                "clear must open its confirmation dialog; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_tool_approval_request(
+                    Uuid::new_v4(),
+                    bash_call("rm notes.txt"),
+                    Vec::new(),
+                    response_tx,
+                )
+                .await
+                .expect("the tool approval request must be accepted");
+
+            // The owner answers the dialog now on screen: "Yes" to the tool.
+            answer_dialog(
+                &mut event_loop,
+                crate::cli::tui::DialogResult::Selected(0),
+                "approve the tool once",
+            )
+            .await;
+
+            let confirmation =
+                tokio::time::timeout(std::time::Duration::from_secs(30), response_rx)
+                    .await
+                    .expect(
+                        "the tool approval hung: its answer was consumed by the displaced \
+                         /patterns dialog instead of reaching the tool",
+                    )
+                    .expect("the tool approval must receive the owner's answer");
+            assert!(
+                matches!(
+                    confirmation,
+                    crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+                ),
+                "the answer must reach the tool approval it was given to; confirmation={confirmation:?}"
+            );
+            assert_eq!(
+                (stored_ids(&event_loop).await, ids_on_disk(&store_path)),
+                (seeded.clone(), seeded),
+                "an answer given to a tool approval must never clear the standing approvals; scrollback={:?}",
+                scrollback(&event_loop)
+            );
+        })
+        .await;
+}
+
+/// Owner-only guard. A peer's prompt reaches this frontend as a named-Brain
+/// turn; its text is never parsed as a slash command, so naming a `/patterns`
+/// command there cannot list or change the owner's standing approvals.
+#[tokio::test]
+async fn test_peer_turn_prompt_naming_a_patterns_command_cannot_list_or_change_owner_approvals() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let seeded_pattern = pattern_for_bash("cargo build --offline");
+            let prompts = [
+                "/patterns".to_string(),
+                "/patterns list".to_string(),
+                "/patterns clear".to_string(),
+                "/patterns add".to_string(),
+                format!("/patterns remove {}", seeded_pattern.id),
+            ];
+            for prompt in prompts {
+                let (mut event_loop, _tempdir, store_path) = patterns_event_loop();
+                {
+                    let mut executor = event_loop.tool_coordinator.tool_executor().lock().await;
+                    executor.approve_pattern_persistent(seeded_pattern.clone());
+                    executor.save_patterns().expect("seed the temporary store");
+                }
+                event_loop.runner_brain = Some("home".into());
+                event_loop.home_runner_lease_active = true;
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                event_loop
+                    .handle_event(super::ReplEvent::NamedBrainTurnRequested(
+                        crate::server::RunnerTurnRequest {
+                            brain: "home".into(),
+                            run_id: crate::brain::RunId(Uuid::new_v4()),
+                            request_seq: 1,
+                            prompt: prompt.clone(),
+                            context: vec![crate::providers::Message::user(prompt.clone())],
+                            approval_audience: crate::brain::BrainApprovalAudience {
+                                brain_id: crate::brain::BrainId(Uuid::new_v4()),
+                                brain: "home".into(),
+                                attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
+                                subject: "peer".into(),
+                                role: crate::brain::AttachmentRole::Runner,
+                                environment_generation: 1,
+                            },
+                            approval_connection_id: None,
+                            grant_ceiling: crate::vm::TypedRuntime::intrinsic_grants(),
+                            approval_tx: None,
+                            effect_audit: None,
+                            response_tx,
+                        },
+                    ))
+                    .await
+                    .expect("a named-Brain turn must dispatch");
+
+                let rows = scrollback(&event_loop);
+                assert_eq!(
+                    (stored_ids(&event_loop).await.0, ids_on_disk(&store_path).0),
+                    (vec![seeded_pattern.id.clone()], vec![seeded_pattern.id.clone()]),
+                    "a peer's prompt must not change the owner's standing approvals; prompt={prompt:?} scrollback={rows:?}"
+                );
+                assert!(
+                    !rows.iter().any(|row| {
+                        row.contains("Tool approval patterns")
+                            || row.contains("This will remove")
+                            || row.contains("Found pattern to remove")
+                            || row.contains("Add Confirmation Pattern")
+                            || row.contains(&seeded_pattern.pattern)
+                    }),
+                    "a peer's prompt must not run a /patterns command or reveal the owner's approvals; prompt={prompt:?} scrollback={rows:?}"
+                );
+                assert!(
+                    event_loop.tui_renderer.lock().await.active_dialog.is_none(),
+                    "a peer's prompt must not open a /patterns dialog; prompt={prompt:?}"
+                );
+            }
+        })
+        .await;
+}

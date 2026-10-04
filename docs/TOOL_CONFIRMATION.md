@@ -58,30 +58,38 @@ You can manage confirmation patterns using the `/patterns` command family:
 /patterns list
 ```
 
-Shows all saved patterns and exact approvals with:
-- Pattern ID (for removal)
-- Tool name
-- Pattern string
-- Match count
-- Last used timestamp
-- Creation date
+Shows every standing approval the session holds, as plain text:
+- the first 8 characters of its ID (for removal)
+- whether it is `persistent` (saved to disk) or `session` (this session only)
+- the tool name and what the pattern matches
+- its match count and when it was last used
 
 **Example output:**
 ```
-Persistent Patterns (saved to disk):
-─────────────────────────────────────
-[abc123-def456] bash: cargo * in /project
-  Matches: 15
-  Last used: 2026-01-30 14:23:45 UTC
-  Created: 2026-01-29 10:15:30 UTC
+Tool approval patterns
 
-[xyz789-abc123] read: reading /project/src/**
-  Matches: 42
-  Last used: 2026-01-30 15:10:12 UTC
-  Created: 2026-01-29 11:20:00 UTC
+Patterns:
+  1a2b3c4d  persistent  wildcard
+    Tool: bash
+    Matches: cargo * in /project
+    Description: Allow cargo commands
+    Match count: 15 | Last used: 5m ago
 
-Total: 2 patterns, 5 exact approvals
+  9f8e7d6c  session  wildcard
+    Tool: read
+    Matches: reading /project/src/**
+    Match count: 2 | Last used: 1m ago
+
+Exact approvals:
+  5e6f7a8b  persistent
+    Tool: bash
+    Matches: git status in /project
+    Match count: 4
+
+Total: 2 patterns (1 persistent, 1 session), 1 exact approvals (1 persistent, 0 session)
 ```
+
+A session exact approval has no ID. It is removed by `/patterns clear` or by ending the session.
 
 ### Add Pattern
 
@@ -89,20 +97,15 @@ Total: 2 patterns, 5 exact approvals
 /patterns add
 ```
 
-Interactively create a new pattern:
-1. Enter tool name (bash, read, grep, etc.)
-2. Enter pattern string (with wildcards or regex)
-3. Choose pattern type (wildcard or regex)
-4. Enter description
+Create a persistent pattern through a short series of prompts:
+1. Choose the pattern type (wildcard or regex)
+2. Enter the tool name (bash, read, grep, etc.)
+3. Enter the pattern string
+4. Enter a description
+5. Optionally test the pattern against a string
+6. Confirm saving
 
-**Example interaction:**
-```
-Tool name (bash, read, grep, etc.): bash
-Pattern (use * for wildcards): cargo * in *
-Pattern type (wildcard/regex) [wildcard]: wildcard
-Description: Allow all cargo commands in any directory
-✓ Pattern saved persistently
-```
+Escape at any prompt cancels and stores nothing. An invalid regex is refused.
 
 ### Remove Pattern
 
@@ -111,12 +114,15 @@ Description: Allow all cargo commands in any directory
 /patterns rm <id>        # Short alias
 ```
 
-Remove a specific pattern or approval by its ID (shown in `/patterns list`).
+Remove one pattern or approval by its ID: the full ID, or at least its first 8 characters as shown
+by `/patterns list`. The removal is saved, and the pattern stops auto-approving immediately. A
+pattern that has matched more than 10 times asks for confirmation first. An ID that matches more
+than one approval removes nothing.
 
 **Example:**
 ```bash
-/patterns rm abc123-def456
-✓ Removed pattern: cargo * in /project
+/patterns rm 1a2b3c4d
+Removed pattern: 1a2b3c4d
 ```
 
 ### Clear All Patterns
@@ -125,13 +131,17 @@ Remove a specific pattern or approval by its ID (shown in `/patterns list`).
 /patterns clear
 ```
 
-Remove all persistent patterns and exact approvals. Requires confirmation prompt.
+Remove every pattern and exact approval, persistent and session, after a confirmation prompt.
 
 **Example:**
 ```
-Are you sure you want to clear ALL patterns? (yes/no): yes
-✓ Cleared 5 patterns and 10 exact approvals
+This will remove 2 pattern(s) and 1 exact approval(s), persistent and session.
+Are you sure? yes
+Cleared 3 pattern(s) and approval(s).
 ```
+
+These commands act only on input typed by the session's owner. A peer's prompt is never parsed as
+a slash command.
 
 ## Pattern Types
 
@@ -856,28 +866,19 @@ Claude: I understand you don't want to delete those files.
 ### Example 6: Managing Patterns
 
 ```bash
-# List all saved patterns
-$ /patterns
-Persistent Patterns:
-  [abc123] bash: cargo * in /project (15 matches)
-  [def456] read: reading /project/src/** (42 matches)
+# List every standing approval
+/patterns
 
-# Add a new pattern manually
-$ /patterns add
-Tool name: bash
-Pattern: npm * in /project
-Pattern type [wildcard]: wildcard
-Description: Allow npm commands in project
-✓ Pattern saved
+# Add a persistent pattern through the prompts
+/patterns add
 
-# Remove a pattern
-$ /patterns rm abc123
-✓ Removed pattern: cargo * in /project
+# Remove one by the ID shown in the list
+/patterns rm 1a2b3c4d
+Removed pattern: 1a2b3c4d
 
-# Clear everything (with confirmation)
-$ /patterns clear
-Are you sure? (yes/no): yes
-✓ Cleared all patterns
+# Clear everything, persistent and session (asks first)
+/patterns clear
+Cleared 3 pattern(s) and approval(s).
 ```
 
 ## Testing

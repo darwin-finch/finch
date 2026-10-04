@@ -627,6 +627,10 @@ pub struct EventLoop {
     /// Data for a pending Co-Forth poset run that is waiting on a confirmation dialog.
     pending_poset_run: Option<PendingPosetRun>,
 
+    /// A `/patterns` command (clear, remove, or the add wizard) waiting on
+    /// the answer to the dialog it opened.
+    pending_patterns_dialog: Option<patterns::PendingPatternsDialog>,
+
     /// Per-query completed tool-result hashes, keyed by `name:input`.
     /// Used to detect uninformative loops of loop-eligible tools.
     tool_call_history: ToolCallHistory,
@@ -2045,6 +2049,8 @@ mod dispatch;
 
 mod input;
 
+mod patterns;
+
 async fn forward_agent_events(
     scheduler: Arc<crate::scheduler::AgentScheduler>,
     mut events: tokio::sync::broadcast::Receiver<crate::scheduler::AgentEvent>,
@@ -2406,6 +2412,7 @@ impl EventLoop {
             auto_compact_enabled,
             pending_dialog_tx: None,
             pending_poset_run: None,
+            pending_patterns_dialog: None,
             tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
             current_graph: Arc::new(tokio::sync::Mutex::new(crate::graph::ExecutionGraph::new())),
             stack,
@@ -2996,6 +3003,11 @@ impl EventLoop {
         &mut self,
         dialog_result: crate::cli::tui::DialogResult,
     ) -> Result<()> {
+        // A `/patterns` dialog (owner-only standing-approval management)
+        // claims its own answer; any other answer is handed back.
+        let Some(dialog_result) = self.resolve_patterns_dialog(dialog_result).await? else {
+            return Ok(());
+        };
         {
             // Priority 0: ShowDialog (used by PresentPlan, AskUserQuestion, etc.)
             if let Some(tx) = self.pending_dialog_tx.take() {
