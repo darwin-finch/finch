@@ -206,6 +206,7 @@ impl OAuthDialect for ClaudeOAuthDialect {
                 "client_id": self.descriptor.client_id,
                 "code_verifier": grant.verifier,
             })),
+            metadata: Default::default(),
         })
     }
 
@@ -219,6 +220,7 @@ impl OAuthDialect for ClaudeOAuthDialect {
                 "client_id": self.descriptor.client_id,
                 "scope": scope_string(&self.descriptor.scopes),
             })),
+            metadata: Default::default(),
         })
     }
 

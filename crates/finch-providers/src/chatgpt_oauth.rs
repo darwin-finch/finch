@@ -218,6 +218,7 @@ where
             body: OAuthRequestBody::Json(json!({
                 "client_id": self.descriptor.client_id,
             })),
+            metadata: Default::default(),
         })
     }
 
@@ -278,6 +279,7 @@ where
                 "device_auth_id": pending.device_code,
                 "user_code": pending.user_code,
             })),
+            metadata: Default::default(),
         })
     }
 
@@ -326,6 +328,7 @@ where
                 ("client_id".into(), self.descriptor.client_id.clone()),
                 ("code_verifier".into(), grant.verifier.clone()),
             ]),
+            metadata: Default::default(),
         })
     }
 
@@ -338,6 +341,7 @@ where
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
             })),
+            metadata: Default::default(),
         })
     }
 
@@ -350,6 +354,7 @@ where
                 "token": token,
                 "token_type_hint": "refresh_token",
             })),
+            metadata: Default::default(),
         })
     }
 
