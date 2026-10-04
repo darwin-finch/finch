@@ -96,7 +96,11 @@ pub fn lower_spans(spans: &[Span]) -> String {
 /// itself carry SGR from an unmigrated projection — that path is unchanged).
 /// Measurement never runs on this string: SGR is zero-width and the plain
 /// `text` is what every row count reads.
-pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>, canvas_bg: Option<SpanColor>) -> String {
+pub fn lower_rendered_line(
+    line: &RenderedTranscriptLine,
+    force_bg: Option<SpanColor>,
+    canvas_bg: Option<SpanColor>,
+) -> String {
     if let Some(b64) = &line.image_attachment {
         if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
             return format!("\x1b]1337;File=inline=1;width=auto;height=auto:{}\x07", b64);
@@ -312,7 +316,6 @@ mod tests {
         );
     }
 
-
     /// When a line carries a background style (e.g. user turns or canvas background),
     /// the background is extended to the right margin with \x1b[K before resetting.
     /// However, forced backgrounds (like hover) do NOT extend.
@@ -336,7 +339,8 @@ mod tests {
         );
 
         let canvas_line = RenderedTranscriptLine::from_spans(vec![Span::plain("item")]);
-        let canvas_lowered = lower_rendered_line(&canvas_line, None, Some(SpanColor::Rgb(52, 54, 60)));
+        let canvas_lowered =
+            lower_rendered_line(&canvas_line, None, Some(SpanColor::Rgb(52, 54, 60)));
         assert!(
             canvas_lowered.ends_with("\x1b[K\x1b[0m"),
             "canvas background must extend with \\x1b[K before reset; got {canvas_lowered:?}"

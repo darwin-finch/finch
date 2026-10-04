@@ -9291,11 +9291,10 @@ async fn test_pending_user_messages_restored_in_order_when_continuation_fails() 
                 "QueryFailed must drain the queue and restore to composer; queued={:?}",
                 event_loop.pending_queries
             );
-            
+
             let restored = event_loop.tui_renderer.lock().await.get_input_draft();
             assert_eq!(
-                restored,
-                "steer now\nand also this",
+                restored, "steer now\nand also this",
                 "the queued turns must be restored into the TUI input composer"
             );
 
@@ -9398,7 +9397,12 @@ async fn test_pending_user_message_without_tools_drains_on_streaming_complete() 
         .await;
 }
 
-type ObservedLlmQueryWithEcho = (Uuid, String, Vec<crate::providers::Message>, Option<(String, Vec<String>)>);
+type ObservedLlmQueryWithEcho = (
+    Uuid,
+    String,
+    Vec<crate::providers::Message>,
+    Option<(String, Vec<String>)>,
+);
 
 /// Like `observe_llm_queries`, but also captures `pending_echo` -- the value
 /// `process_query_with_tools` uses to defer a query's scrollback echo until

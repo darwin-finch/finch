@@ -246,7 +246,7 @@ impl GoogleGeminiOAuthDialect<GeminiTokenVerifierProduction> {
         let mut client_secret = std::env::var("FINCH_GEMINI_CLIENT_SECRET")
             .or_else(|_| std::env::var("GOOGLE_CLIENT_SECRET"))
             .ok();
-        
+
         if client_id == GOOGLE_PUBLIC_CLIENT_ID {
             client_secret = None;
         }

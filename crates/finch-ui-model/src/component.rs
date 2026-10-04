@@ -1729,9 +1729,15 @@ mod tests {
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 3); // 1 content line + 2 image lines
         assert_eq!(lines[0].text, " ❯ what is this?");
-        assert_eq!(lines[1].text, "[Image attachment: natively rendered in iTerm2]");
+        assert_eq!(
+            lines[1].text,
+            "[Image attachment: natively rendered in iTerm2]"
+        );
         assert_eq!(lines[1].image_attachment.as_deref(), Some("base64image1=="));
-        assert_eq!(lines[2].text, "[Image attachment: natively rendered in iTerm2]");
+        assert_eq!(
+            lines[2].text,
+            "[Image attachment: natively rendered in iTerm2]"
+        );
         assert_eq!(lines[2].image_attachment.as_deref(), Some("base64image2=="));
     }
 }

@@ -5077,11 +5077,10 @@ mod build_query_tool_executor_tests2 {
     async fn test_co_forth_executable_words() {
         let runtime = finch::runtime::ProgramRuntime::new();
         let _ = finch::cli::register_co_forth_tool_words(&runtime).await;
-        let outcome = execute_one_shot_wire_source(
-            &runtime,
-            "code_outline \"src/main.rs\"",
-        ).await.unwrap();
-        
+        let outcome = execute_one_shot_wire_source(&runtime, "code_outline \"src/main.rs\"")
+            .await
+            .unwrap();
+
         let diags = format!("{:?}", outcome.diagnostics);
         assert!(!diags.contains("E-LINK-002"));
     }
