@@ -6522,3 +6522,105 @@ async fn test_local_message_generation_does_not_starve_concurrent_tasks() {
          the blocking pool"
     );
 }
+
+/// Reproduction for the `todo_write` 30-second timeout (issue #1585). A
+/// prompt holds the Brain's execution lane until its turn returns; the turn's
+/// own `todo_write` journals a `TaskListReplaced` through the same driver
+/// attachment, which waits for that lane, so the tool can only time out.
+/// Ignored because no fix has been chosen: the ordering of a mid-turn task
+/// list write on the durable journal is the owner's decision.
+#[tokio::test]
+#[ignore = "reproduces issue #1585 (todo_write waits for its own turn); fails until the lane decision is made"]
+async fn test_task_list_replacement_during_an_active_turn_does_not_wait_for_the_turn() {
+    use crate::brain::BrainStore;
+    use crate::server::BrainLifecycleService;
+
+    let temp = tempfile::tempdir().unwrap();
+    let server = Arc::new(
+        crate::server::AgentServer::for_brain_protocol_test(
+            BrainStore::with_root("box.local", Some(temp.path().into())),
+            crate::brain::BrainCredentialAuthority::ephemeral([63; 32]),
+            "test-password".into(),
+            temp.path(),
+        )
+        .unwrap(),
+    );
+    let lifecycle = BrainLifecycleService::from_server(&server);
+    let driver = lifecycle
+        .attach("shared", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    let driver = server
+        .brain_store()
+        .activate_connection(
+            "shared",
+            driver.attachment_id,
+            driver.connection_id.unwrap(),
+        )
+        .unwrap();
+    let snapshot = lifecycle.snapshot("shared").unwrap();
+    let lease = lifecycle
+        .acquire_runner("shared", "runner", &snapshot.environment, None, 60_000)
+        .unwrap();
+    let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+    lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
+    let approvals = server.brain_approvals().clone();
+    let mut prompt = Box::pin(submit_named_brain_event(
+        server.brain_store(),
+        server.brain_runners(),
+        &approvals,
+        "shared",
+        &driver,
+        BrainEventKind::Prompt {
+            text: "plan the work".into(),
+            attached_mentions: Vec::new(),
+        },
+    ));
+    let turn = tokio::select! {
+        request = runner_rx.recv() => request.expect("runner request"),
+        outcome = &mut prompt => panic!("prompt ended before dispatch: {:?}", outcome.map(|o| o.accepted.seq).map_err(|e| format!("{e:?}"))),
+    };
+    let crate::server::RunnerRequest::Turn(turn) = turn else {
+        panic!("expected a turn")
+    };
+    let tasks = vec![BrainTask {
+        id: "1".into(),
+        content: "first".into(),
+        status: BrainTaskStatus::InProgress,
+        priority: BrainTaskPriority::High,
+    }];
+    let replace = submit_named_brain_event(
+        server.brain_store(),
+        server.brain_runners(),
+        &approvals,
+        "shared",
+        &driver,
+        BrainEventKind::TaskListReplaced {
+            tasks: tasks.clone(),
+        },
+    );
+    // Coarse liveness bound only: the structural fact is that the replacement
+    // commits while the run that issued it is still active.
+    let outcome = tokio::select! {
+        outcome = tokio::time::timeout(std::time::Duration::from_secs(5), replace) => outcome,
+        _ = &mut prompt => panic!("the parked turn ended before the task list replacement was observed"),
+    };
+    let snapshot = server.brain_store().snapshot("shared").unwrap();
+    let outcome = outcome.unwrap_or_else(|_| {
+        panic!(
+            "a task list replacement submitted during active run {:?} must commit without waiting \
+             for that run to finish, but the submission hung behind the Brain execution lane \
+             (todo_write would time out); durable tasks: {:?}, runs: {:?}",
+            turn.run_id, snapshot.tasks, snapshot.runs
+        )
+    });
+    assert!(
+        outcome.is_ok(),
+        "the mid-turn task list replacement must be accepted: {:?}",
+        outcome.as_ref().err().map(|error| format!("{error:?}"))
+    );
+    assert_eq!(
+        tasks, snapshot.tasks,
+        "the replacement must be durable while run {:?} is still active; runs: {:?}",
+        turn.run_id, snapshot.runs
+    );
+}
