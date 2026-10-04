@@ -1163,7 +1163,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             let output_row = call
                 .children
                 .iter()
-                .find(|child| child.role == crate::cli::test_projection::NodeRole::ToolOutput)
+                .find(|child| child.role == crate::cli::test_projection::NodeRole::ToolCall)
                 .unwrap_or_else(|| {
                     panic!("long loop diagnostic must be expandable output; call={call:?}")
                 });
@@ -2475,18 +2475,8 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert_eq!(tool.role, crate::cli::test_projection::NodeRole::ToolCall);
     assert_eq!(tool.id.message_id, unit.id());
     assert_eq!(tool.id.path, vec![1, 1]);
-    assert_eq!(tool.children.len(), 2);
-    assert_eq!(
-        tool.children[0].role,
-        crate::cli::test_projection::NodeRole::Input
-    );
-    assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
-    assert_eq!(
-        tool.children[1].role,
-        crate::cli::test_projection::NodeRole::ToolOutput
-    );
-    assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
-    assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
+    assert_eq!(tool.children.len(), 0);
+    assert!(tool.body.iter().any(|line| line == "value=7"));
 
     let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
     assert!(canonical.contains("read_cache"));

@@ -3642,7 +3642,7 @@ impl TuiRenderer {
         let Some(focused) = self.accordion.focused.clone() else {
             return false;
         };
-        if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolOutput) {
+        if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolCall) {
             return false;
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
@@ -4272,7 +4272,7 @@ impl TuiRenderer {
                 view_model::ProjectedMessage::Plain(_) => return None,
             };
             return find_transcript_row(&root, row_id)
-                .filter(|row| row.role == view_model::NodeRole::ToolOutput)
+                .filter(|row| row.role == view_model::NodeRole::ToolCall)
                 .map(|row| row.body.clone());
         }
         None

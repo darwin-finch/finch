@@ -9,7 +9,7 @@
 //! console, and never releases mouse tracking to native scrollback.
 //!
 //! The control is reusable: it applies to every row of
-//! [`NodeRole::ToolOutput`], not to one tool name. Activation (click
+//! [`NodeRole::ToolCall`], not to one tool name. Activation (click
 //! on the window, or Enter with the row focused) opens a focused expanded
 //! surface; closing it restores the child scroll offset, disclosure grouping,
 //! and focus exactly as they were.
@@ -186,7 +186,7 @@ impl ToolViewportState {
             let owner = lines[index]
                 .body_of
                 .clone()
-                .filter(|_| lines[index].role == Some(NodeRole::ToolOutput));
+                .filter(|_| lines[index].role == Some(NodeRole::ToolCall));
             let Some(owner) = owner else {
                 projected.push(lines[index].clone());
                 index += 1;
@@ -195,7 +195,7 @@ impl ToolViewportState {
             let start = index;
             while index < lines.len()
                 && lines[index].body_of.as_ref() == Some(&owner)
-                && lines[index].role == Some(NodeRole::ToolOutput)
+                && lines[index].role == Some(NodeRole::ToolCall)
             {
                 index += 1;
             }
@@ -251,7 +251,7 @@ impl ToolViewportState {
                     width,
                 ),
                 body_of: Some(row_id),
-                role: Some(NodeRole::ToolOutput),
+                role: Some(NodeRole::ToolCall),
                 ..RenderedTranscriptLine::default()
             });
         }
@@ -291,7 +291,7 @@ impl ToolViewportState {
             let owner = line
                 .body_of
                 .clone()
-                .filter(|_| line.role == Some(NodeRole::ToolOutput));
+                .filter(|_| line.role == Some(NodeRole::ToolCall));
             let continues = match (&owner, &open) {
                 (Some(owner), Some((open_id, _))) => open_id == owner,
                 _ => false,
