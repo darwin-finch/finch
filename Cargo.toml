@@ -201,6 +201,7 @@ unicode-width = "0.2"
 # GGUF). Keep the safe wrapper and vendored sys crate on the same release;
 # chat uses Metal while the tiny embedding helper remains CPU-only until the
 # upstream Metal residency-set teardown bug is resolved.
+llama-cpp-sys-2 = { version = "=0.1.157" }
 llama-cpp-2 = { version = "=0.1.157", default-features = false, features = ["common"] }
 # Shared dependencies
 sysinfo = "0.32"  # System RAM detection for model selection
@@ -280,5 +281,3 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1

@@ -114,6 +114,9 @@ pub(crate) struct FrameRects {
 pub(crate) struct LiveViewModel<'a> {
     pub terminal_width: usize,
     pub terminal_height: usize,
+    /// Display-only image attachment rows shown separately from the editable
+    /// provider-visible text draft.
+    pub attachment_lines: &'a [String],
     pub input_lines: &'a [String],
     pub input_cursor: (usize, usize),
     pub ghost_text: Option<&'a str>,
@@ -276,13 +279,15 @@ pub(crate) fn project_root(
         ));
     }
     if vm.dialog.is_none() {
+        let mut composer_lines = vm.attachment_lines.to_vec();
+        composer_lines.extend_from_slice(vm.input_lines);
         children.extend([
             (
                 Track::Natural,
                 Widget::Marked(
                     frame_key::COMPOSER,
                     Box::new(Widget::Composer {
-                        input_lines: vm.input_lines.to_vec(),
+                        input_lines: composer_lines,
                         ghost: vm.ghost_text.map(str::to_owned),
                     }),
                 ),
@@ -665,7 +670,7 @@ mod tests {
         let output = &node.children[0].children[1];
         assert_eq!(
             output.role,
-            NodeRole::ToolOutput,
+            NodeRole::ToolCall,
             "the control must exercise a real tool output row; got {:?}",
             node.children[0]
         );

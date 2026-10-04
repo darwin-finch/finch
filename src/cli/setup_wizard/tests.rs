@@ -1729,8 +1729,9 @@ fn test_device_code_overlay_claims_a_card_with_chrome_inside_it() {
     let card_text = rows[card.y..card.y + card.height].join("\n");
     assert!(
         card_text.contains("One-time code: CODE5678")
-            && card_text.contains("Open: https://auth.openai.com/activate"),
-        "the device code and verification URL must blit through the shadow buffer; card:\n{card_text}"
+            && card_text.contains("Open in Browser")
+            && !card_text.contains("https://auth.openai.com/activate"),
+        "the device code and compact browser link must blit without exposing the raw URL; card:\n{card_text}"
     );
     assert!(
         card_text.contains("Esc: Cancel"),
@@ -5539,6 +5540,10 @@ fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
 fn test_provider_editor_identity_table_matches_catalog() {
     let cases = [
         (crate::config::CredentialProvider::Anthropic, "claude"),
+        (
+            crate::config::CredentialProvider::ClaudeSubscription,
+            "claude-sub",
+        ),
         (crate::config::CredentialProvider::OpenaiPlatform, "openai"),
         (
             crate::config::CredentialProvider::ChatgptSubscription,
@@ -7707,7 +7712,7 @@ fn device_auth_dialog_keeps_the_run_loop_polling_instead_of_blocking() {
 }
 
 #[test]
-fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
+fn add_time_device_dialog_hides_raw_url_behind_browser_link() {
     let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
     let mut state = state_with_step(device_auth_step(outcome));
     state.current_section = WizardSection::Models;
@@ -7727,13 +7732,67 @@ fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
     let rendered = render_wizard_text(&state);
     assert!(
         rendered.contains("One-time code: CODE1234")
-            && rendered.contains("Open: https://auth.openai.com/activate"),
-        "the dialog must present the code and verification URL as speakable text; rendered={rendered}"
+            && rendered.contains("Open in Browser")
+            && !rendered.contains("https://auth.openai.com/activate"),
+        "the dialog must show a compact, speakable browser link instead of the raw URL; rendered={rendered}"
     );
     assert!(
         rendered.contains("Esc: Cancel"),
         "the dialog must advertise its cancellation key; rendered={rendered}"
     );
+}
+
+#[test]
+fn device_oauth_cards_use_one_compact_browser_link_for_every_provider() {
+    let provider_cases = [
+        ("chatgpt", "https://auth.openai.com/activate"),
+        ("grok-sub", "https://accounts.x.ai/device"),
+        (
+            "gemini-sub",
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=finch&response_type=device_code&scope=openid%20email",
+        ),
+    ];
+
+    for (provider_id, verification_uri) in provider_cases {
+        let provider_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|provider| provider.0 == provider_id)
+            .expect("device OAuth provider must remain in the setup catalog");
+        let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+            verification_uri: verification_uri.to_string(),
+            user_code: "CODE-1234".into(),
+            expires_in: Duration::from_secs(600),
+        })));
+        let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
+        let card =
+            super::render::device_auth_card(provider_idx, provider_id, &pending, &outcome, false);
+        let visible_text = card
+            .body
+            .iter()
+            .flat_map(|line| line.0.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        let link = card
+            .body
+            .iter()
+            .flat_map(|line| line.0.iter())
+            .find(|span| span.osc8_url.is_some())
+            .expect("device OAuth card must contain an OSC 8 browser link");
+
+        assert_eq!(
+            link.text, "Open in Browser",
+            "{provider_id} must use the standardized compact OAuth link label"
+        );
+        assert_eq!(
+            link.osc8_url.as_deref(),
+            Some(verification_uri),
+            "{provider_id} must preserve the verification URI as the browser-link target"
+        );
+        assert!(
+            !visible_text.contains(verification_uri),
+            "{provider_id} must not expose the raw OAuth URL in visible wizard text"
+        );
+    }
 }
 
 struct ScriptedGrokAddTimeAuthenticator {

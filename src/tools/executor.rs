@@ -2090,7 +2090,7 @@ mod tests {
             "check.sh",
             "echo 'error[E0308]: mismatched types --> lib.txt:3:5'\nexit 1\n",
         );
-        let declared = diagnostics_config(&script, 5, 2000);
+        let declared = diagnostics_config(&script, 20, 2000);
         let executor = executor_with_edit_tool(
             PermissionManager::new()
                 .with_default_rule(PermissionRule::Allow)
@@ -2175,7 +2175,7 @@ mod tests {
     async fn test_failed_edit_produces_no_diagnostics_annotation() {
         let (workspace, root) = isolated_workspace();
         let script = write_check_script(&root, "check.sh", "echo checked\n");
-        let declared = diagnostics_config(&script, 5, 2000);
+        let declared = diagnostics_config(&script, 20, 2000);
         let executor = executor_with_edit_tool(
             PermissionManager::new()
                 .with_default_rule(PermissionRule::Allow)
@@ -2202,7 +2202,7 @@ mod tests {
     async fn test_write_result_also_carries_declared_diagnostics() {
         let (workspace, root) = isolated_workspace();
         let script = write_check_script(&root, "check.sh", "echo 'warning: unused' \nexit 0\n");
-        let declared = diagnostics_config(&script, 5, 2000);
+        let declared = diagnostics_config(&script, 20, 2000);
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(crate::tools::WriteTool));
         let tempdir = tempfile::tempdir().expect("isolated pattern store");
@@ -2247,7 +2247,7 @@ mod tests {
     async fn test_patch_result_also_carries_declared_diagnostics() {
         let (workspace, root) = isolated_workspace();
         let script = write_check_script(&root, "check.sh", "echo 'error: bad token'\nexit 2\n");
-        let declared = diagnostics_config(&script, 5, 2000);
+        let declared = diagnostics_config(&script, 20, 2000);
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(crate::tools::PatchTool));
         let tempdir = tempfile::tempdir().expect("isolated pattern store");
@@ -2294,7 +2294,7 @@ mod tests {
         let (workspace, root) = isolated_workspace();
         let script = write_check_script(&root, "check.sh", "touch marker; echo ran\n");
         let marker = root.join("marker");
-        let declared = diagnostics_config(&script, 5, 2000);
+        let declared = diagnostics_config(&script, 20, 2000);
         let executor = executor_with_edit_tool(
             crate::tools::PermissionManager::for_peer().with_workspace_root(root.clone()),
             &declared,
