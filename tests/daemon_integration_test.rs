@@ -35,11 +35,7 @@ impl TestDaemon {
         let proof = finch::brain::isolated_test_proof()
             .context("daemon integration tests require supervisor authority")?;
         let brain_address = proof.brain_address().to_owned();
-        let test_port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let daemon_address = format!("127.0.0.1:{}", test_port);
+        let daemon_address = proof.daemon_address().to_owned();
         let socket_root = std::env::var("FINCH_TEST_SOCKET_ROOT").unwrap_or_default();
         let ipc_socket = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(PathBuf::from)
