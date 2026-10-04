@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::cli::commands::{format_help, Command};
+use crate::cli::commands::{format_help, format_unknown_command, Command};
 use crate::cli::conversation::{ConversationHistory, ToolRoundProgress, ToolRoundToken};
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
