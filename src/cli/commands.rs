@@ -15,9 +15,9 @@ pub enum CommandOutput {
 #[derive(Debug)]
 pub enum Command {
     Help,
-    /// An unrecognised `/command` — carries the typed command token (for
-    /// example `/bogus`) so the response can name it instead of dumping the
-    /// full help screen.
+    /// An unrecognised `/command`; carries the whole typed input (for example
+    /// `/bogus`, or `/patterns invalid` when only the subcommand is wrong) so
+    /// the response can name it instead of dumping the full help screen.
     Unknown(String),
     Quit,
     Metrics,
@@ -594,8 +594,7 @@ impl Command {
 
         // Any unrecognized /command → name it instead of falling through to Forth/NL.
         if trimmed.starts_with('/') {
-            let typed = trimmed.split_whitespace().next().unwrap_or(trimmed);
-            return Some(Command::Unknown(typed.to_string()));
+            return Some(Command::Unknown(trimmed.to_string()));
         }
 
         None

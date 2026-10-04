@@ -13156,11 +13156,11 @@ async fn test_removed_local_command_gets_the_unknown_command_response() {
                 "the typed command must be echoed first; scrollback={local:?}"
             );
             assert_eq!(
-                local[1], "Unknown command: /local. Type /help for the list.",
+                local[1], "Unknown command: /local hi. Type /help for the list.",
                 "the removed /local command must get the unknown-command message naming itself; scrollback={local:?}"
             );
             assert_eq!(
-                never_existed[1], "Unknown command: /no-such-command. Type /help for the list.",
+                never_existed[1], "Unknown command: /no-such-command hi. Type /help for the list.",
                 "a never-existing slash command must get the unknown-command message naming itself; scrollback={never_existed:?}"
             );
             assert!(
@@ -13211,6 +13211,12 @@ async fn test_unknown_command_prints_short_message() {
             assert_eq!(
                 bogus[1], "Unknown command: /bogus. Type /help for the list.",
                 "an unrecognised slash command must name itself and point at /help in one short line instead of printing the full help screen; scrollback={bogus:?}"
+            );
+            let bad_subcommand = scrollback_after("/patterns invalid").await;
+            assert_eq!(
+                bad_subcommand.get(1).map(String::as_str),
+                Some("Unknown command: /patterns invalid. Type /help for the list."),
+                "a known command with an unrecognised subcommand must be named in full, so the message does not claim the command itself is unknown; scrollback={bad_subcommand:?}"
             );
             assert_eq!(
                 bogus[1].lines().count(),
