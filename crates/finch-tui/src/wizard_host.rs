@@ -732,6 +732,11 @@ pub struct WizardCard {
     pub body: Vec<WizardLine>,
     pub controls: Option<WizardLine>,
     pub accent: WizardColor,
+    /// Body line range that must stay visible (a list card's selected entry).
+    /// When the body overflows the claim, the card scrolls the minimum needed
+    /// to keep it on screen and says in words how much is hidden either side,
+    /// the same guarantee [`WizardSectionContent::pin_visible`] gives a section.
+    pub pin_visible: Option<(usize, usize)>,
 }
 
 impl WizardCard {
@@ -746,7 +751,14 @@ impl WizardCard {
             body,
             controls,
             accent: WizardColor::Cyan,
+            pin_visible: None,
         }
+    }
+
+    /// Keep body lines `start..end` visible when the card is squeezed.
+    pub fn with_pin_visible(mut self, start: usize, end: usize) -> Self {
+        self.pin_visible = Some((start, end));
+        self
     }
 
     /// The card's controls row as the host paints it: yellow, the way the old
@@ -840,7 +852,11 @@ impl WizardCard {
             body.push(controls);
         }
         let mut fragments: Vec<WizardLine> = Vec::new();
+        // Fragment index where each body line starts, to map the pinned line
+        // range onto wrapped rows.
+        let mut line_starts: Vec<usize> = Vec::new();
         for line in body.iter().take(body.len().saturating_sub(1)) {
+            line_starts.push(fragments.len());
             fragments.extend(wizard_wrap(line, inner.saturating_sub(2)));
         }
         let controls_fragment = body
@@ -851,6 +867,45 @@ impl WizardCard {
         let window = claimed_rows.saturating_sub(2);
         let mut lines = vec![top_row];
         if window == 0 {
+            lines.push(bottom_row);
+            return lines;
+        }
+        if let Some((pin_start, pin_end)) = self.pin_visible {
+            let fragment_at =
+                |line: usize| line_starts.get(line).copied().unwrap_or(fragments.len());
+            let budget = window.saturating_sub(controls_fragment.len());
+            let (start, end) = pinned_window(
+                fragments.len(),
+                budget,
+                fragment_at(pin_start),
+                fragment_at(pin_end),
+            );
+            if start > 0 {
+                lines.push(
+                    self.boxed_fragment(
+                        width,
+                        &wizard_plain(&format!("… {start} more lines above")),
+                    ),
+                );
+            }
+            for fragment in &fragments[start..end] {
+                lines.push(self.boxed_fragment(width, fragment));
+            }
+            if end < fragments.len() {
+                let below = fragments.len() - end;
+                lines.push(
+                    self.boxed_fragment(
+                        width,
+                        &wizard_plain(&format!("… {below} more lines below")),
+                    ),
+                );
+            }
+            for fragment in &controls_fragment {
+                lines.push(self.boxed_fragment(width, fragment));
+            }
+            while lines.len() < claimed_rows.saturating_sub(1) {
+                lines.push(WizardLine::blank());
+            }
             lines.push(bottom_row);
             return lines;
         }
@@ -878,6 +933,31 @@ impl WizardCard {
         lines.push(bottom_row);
         lines
     }
+}
+
+/// The rows `start..end` of a `total`-row list to show in `budget` rows so
+/// the pinned rows `pin_start..pin_end` are on screen, scrolled the minimum
+/// from the top. A row of the budget is spent on each "more lines" notice the
+/// window needs (one when rows are hidden above, one when hidden below); a
+/// budget too small for the notices keeps the pinned row and drops them.
+fn pinned_window(total: usize, budget: usize, pin_start: usize, pin_end: usize) -> (usize, usize) {
+    let pin_start = pin_start.min(total.saturating_sub(1));
+    let window_from = |start: usize| -> usize {
+        let mut rows = budget.saturating_sub(usize::from(start > 0));
+        if start + rows < total {
+            rows = rows.saturating_sub(1);
+        }
+        (start + rows).min(total)
+    };
+    let mut start = 0usize;
+    while start < pin_start && window_from(start) < pin_end.min(total) {
+        start += 1;
+    }
+    let end = window_from(start);
+    if end > start {
+        return (start, end);
+    }
+    (start, (start + budget).min(total))
 }
 
 // ─── The view: everything one wizard frame needs ─────────────────────────────
@@ -1841,6 +1921,54 @@ mod tests {
             rendered.contains("more lines"),
             "an overflowing body says what it clipped; card frame:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn test_pinned_card_scrolls_to_the_pinned_lines_and_says_what_is_hidden() {
+        // INVARIANT (#1651, setup lists do not scroll): a squeezed card with a
+        // pinned body range shows that range, says in words how many lines
+        // are hidden either side, keeps its controls, and fills exactly its
+        // claim; it never asks for a resize.
+        let body: Vec<WizardLine> = (0..30)
+            .map(|i| WizardLine::plain(format!("body line {i}")))
+            .collect();
+        for (pinned, above, below) in [(0usize, false, true), (17, true, true), (29, true, false)] {
+            let card = WizardCard::new(
+                "Add AI Provider",
+                body.clone(),
+                Some(WizardLine::plain("Esc: Cancel")),
+            )
+            .with_pin_visible(pinned, pinned + 1);
+            let view = WizardView {
+                card: Some(card),
+                ..plain_view(Vec::new())
+            };
+            let frame = plan_wizard_frame(&view, 60, 12);
+            let rows = frame.to_shadow_buffer(60, 12).rows_as_text();
+            let rendered = rows.join("\n");
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains(&format!("body line {pinned} "))),
+                "the pinned line {pinned} must be inside the squeezed card:\n{rendered}"
+            );
+            assert_eq!(
+                (
+                    rendered.contains("more lines above"),
+                    rendered.contains("more lines below"),
+                    rendered.contains("Esc: Cancel"),
+                    rendered.contains("resize window"),
+                ),
+                (above, below, true, false),
+                "pinned line {pinned}: (says hidden above, says hidden below, \
+                 controls kept, asks for a resize):\n{rendered}"
+            );
+            let card_rect = frame.rects.card;
+            assert!(
+                rows[card_rect.y + card_rect.height - 1].starts_with('└'),
+                "the bottom border must close inside the claimed rect \
+                 {card_rect:?}:\n{rendered}"
+            );
+        }
     }
 
     #[test]

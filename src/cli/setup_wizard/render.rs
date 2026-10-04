@@ -165,8 +165,9 @@ fn help_line(state: &WizardState, width: usize) -> WizardLine {
 
 // ─── Section content ─────────────────────────────────────────────────────────
 
-/// Themes section: list, preview, instructions.
-fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> {
+/// Themes section: list, preview, instructions. The selected theme's row is
+/// pinned, so a window too short for the whole section scrolls to it (#1651).
+fn themes_section_content(selected_theme: usize, width: usize) -> WizardSectionContent {
     use crate::theme::ColorTheme;
 
     let mut lines = vec![wizard_centered(
@@ -193,6 +194,11 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
             }
         })
         .collect();
+    // The box wraps each item to its inner width, one line per wrapped row;
+    // the title and the box's top border precede the first item.
+    let item_rows = |item: &WizardLine| wizard_wrap(item, width.max(4) - 4).len();
+    let pin_start = 2 + items[..selected_theme].iter().map(item_rows).sum::<usize>();
+    let pin_end = pin_start + item_rows(&items[selected_theme]);
     lines.extend(wizard_boxed("Available Themes", &items, Color::Blue, width));
 
     // Preview of the selected theme, in the theme's own colours.
@@ -228,7 +234,11 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
         "This whole screen previews the selected theme. Press Enter to confirm.",
         Color::Blue,
     ));
-    lines
+    WizardSectionContent {
+        lines,
+        scroll_rows: 0,
+        pin_visible: Some((pin_start, pin_end)),
+    }
 }
 
 /// Wrap `text` at `width` into one [`WizardLine`] per physical row, then pad
@@ -1281,6 +1291,7 @@ pub(super) fn cancel_confirm_card() -> WizardCard {
             Color::Yellow,
         )),
         accent: Color::Yellow,
+        pin_visible: None,
     }
 }
 
@@ -1291,6 +1302,7 @@ pub(super) fn validation_error_card(error: &str) -> WizardCard {
         body: vec![wizard_plain(&clean_error), WizardLine::blank()],
         controls: Some(wizard_line("Enter / Esc: Back to setup", Color::Yellow)),
         accent: Color::Red,
+        pin_visible: None,
     }
 }
 
@@ -1617,6 +1629,9 @@ pub(super) fn add_provider_card(
                 "        Discover other Finch instances running on your LAN",
                 Color::DarkGray,
             ));
+            // Every entry is a name line and a hint line; the card scrolls
+            // to keep the selected pair on screen (#1651).
+            let pinned = (*selected).min(n_cloud + 1) * 2;
             WizardCard::new(
                 "Add AI Provider",
                 body,
@@ -1625,6 +1640,7 @@ pub(super) fn add_provider_card(
                     Color::Yellow,
                 )),
             )
+            .with_pin_visible(pinned, pinned + 2)
         }
         // ── single-screen cloud provider form ────────────────────────────────
         AddProviderStep::ConfigureRemote {
@@ -1969,7 +1985,7 @@ pub(super) fn wizard_view_with_permission_target(
     let help_rows = crate::cli::tui::wizard_wrap(&help_line(state, width), width).len();
     let section = match state.sections.get(&state.current_section) {
         Some(SectionState::Themes { selected_theme }) => {
-            WizardSectionContent::plain(themes_section_lines(*selected_theme, width))
+            themes_section_content(*selected_theme, width)
         }
         Some(SectionState::LocalHelpers {
             use_neural_embeddings,
