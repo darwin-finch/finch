@@ -634,6 +634,18 @@ Rules:\n\
                     Command::Reject(reason) => {
                         self.handle_reject(reason).await?;
                     }
+                    Command::PatternsList => {
+                        self.handle_patterns_list().await?;
+                    }
+                    Command::PatternsRemove(id) => {
+                        self.handle_patterns_remove(id).await?;
+                    }
+                    Command::PatternsClear => {
+                        self.handle_patterns_clear().await?;
+                    }
+                    Command::PatternsAdd => {
+                        self.handle_patterns_add().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(

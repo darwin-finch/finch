@@ -39,6 +39,7 @@ them:
 | `event_loop/brain.rs` | remote and named Brain traffic, invitations, reconnection |
 | `event_loop/plan.rs` | plan mode, plan tasks, poset confirmation |
 | `event_loop/commands.rs` | slash-style commands: provider switch, feedback, demos |
+| `event_loop/patterns.rs` | `/patterns`: list, remove, clear, and add standing tool approvals |
 | `runner_recovery.rs` | leftover-daemon / lease / environment mismatch labels |
 
 **Adding an event.** Add the variant to `ReplEvent` in `events.rs`, then handle it in
@@ -205,6 +206,30 @@ provider across both commands and proves both a rich success and a failure are f
 post-reset projection or execution;
 `test_unrelated_help_command_preserves_provider_context_and_staged_round` keeps raw, staged, and
 summary context non-destructive for unrelated slash commands.
+
+**`/patterns` manages the approval path's own store, and only for the owner (#1634, "/patterns
+commands say 'recognized but not yet implemented'").** `event_loop/patterns.rs` reads and changes
+the `ToolExecutor` behind `ToolExecutionCoordinator::tool_executor` — the same confirmation cache
+`spawn_tool_execution` consults — never a second copy loaded from disk, so a removed or cleared
+approval stops auto-approving on the next tool call. `/patterns list` shows each pattern's ID,
+what it matches, `persistent` or `session`, and its match count as plain text. `/patterns remove`
+and `/patterns clear` cover session approvals as well as persistent ones and save the store;
+`clear` always confirms, `remove` confirms above ten matches, and `add` is a dialog wizard that
+stores nothing until its final confirmation. A `/patterns` dialog is a state machine on
+`EventLoop::pending_patterns_dialog`, resolved first in `resolve_dialog_result`; when another
+prompt (tool, VM, remote-Brain approval, `ShowDialog`, poset confirmation) has taken the dialog
+area, the answer belongs to that prompt and the `/patterns` flow is dropped without changing
+anything. The commands are reachable only through `handle_user_input`, which receives the local
+composer's line; a peer's prompt arrives as a named-Brain turn and is never parsed as a slash
+command. Pinned in `event_loop/tests.rs` by
+`test_patterns_list_shows_id_match_scope_and_count_from_the_live_approval_store`,
+`test_patterns_remove_revokes_a_persistent_pattern_so_the_next_call_asks`,
+`test_patterns_remove_revokes_a_session_pattern_so_the_next_call_asks`,
+`test_patterns_remove_of_a_heavily_used_pattern_waits_for_confirmation`,
+`test_patterns_clear_confirms_then_revokes_every_persistent_and_session_approval`,
+`test_patterns_add_wizard_saves_a_persistent_pattern_that_auto_approves`,
+`test_patterns_dialog_displaced_by_a_tool_approval_changes_nothing_and_answers_the_tool`, and
+`test_peer_turn_prompt_naming_a_patterns_command_cannot_list_or_change_owner_approvals`.
 
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was

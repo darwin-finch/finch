@@ -299,13 +299,38 @@ impl ToolConfirmationCache {
         &mut self.persistent
     }
 
-    /// Remove a pattern or approval by ID
+    /// Session-only patterns, in the order they were approved.
+    pub fn session_patterns(&self) -> &[ToolPattern] {
+        &self.session_patterns
+    }
+
+    /// Session-only exact approvals, sorted by tool name then context so a
+    /// listing is stable (the backing set has no order of its own).
+    pub fn session_exact_approvals(&self) -> Vec<&ToolSignature> {
+        let mut approvals: Vec<&ToolSignature> = self.session_exact.iter().collect();
+        approvals.sort_by(|left, right| {
+            (&left.tool_name, &left.context_key).cmp(&(&right.tool_name, &right.context_key))
+        });
+        approvals
+    }
+
+    /// Remove a pattern or approval by ID: a persistent pattern, a persistent
+    /// exact approval, or a session pattern. Returns whether anything was
+    /// removed; only a persistent removal marks the store for saving.
     pub fn remove_by_id(&mut self, id: &str) -> bool {
-        let removed = self.persistent.remove(id);
-        if removed {
+        if self.persistent.remove(id) {
             self.dirty = true;
+            return true;
         }
-        removed
+        let Some(position) = self
+            .session_patterns
+            .iter()
+            .position(|pattern| pattern.id == id)
+        else {
+            return false;
+        };
+        self.session_patterns.remove(position);
+        true
     }
 
     /// Clear all persistent patterns and approvals
@@ -494,7 +519,17 @@ impl ToolExecutor {
         self.confirmation_cache.persistent_store()
     }
 
-    /// Remove a pattern or approval by ID
+    /// Session-only patterns, in the order they were approved.
+    pub fn session_patterns(&self) -> &[ToolPattern] {
+        self.confirmation_cache.session_patterns()
+    }
+
+    /// Session-only exact approvals, in a stable order.
+    pub fn session_exact_approvals(&self) -> Vec<&ToolSignature> {
+        self.confirmation_cache.session_exact_approvals()
+    }
+
+    /// Remove a pattern or approval by ID (persistent or session)
     pub fn remove_pattern(&mut self, id: &str) -> bool {
         self.confirmation_cache.remove_by_id(id)
     }
