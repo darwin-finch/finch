@@ -30,11 +30,26 @@ use tokio::sync::RwLock;
 /// model at all.
 const LOCAL_HISTORY_WINDOW_EXCHANGES: usize = 3;
 
-/// Token budget reserved for the model's generated response. Mirrors the
-/// `max_new_tokens` this module actually requests from the backend
-/// (`try_neural_generate`, `try_neural_generate_streaming`) so the prompt
-/// budget below never counts on room the response itself will consume.
-const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 100;
+/// Room kept free for the model's reply when the prompt is budgeted: history
+/// is trimmed so at least this many tokens of context remain for generation.
+///
+/// It is a floor on the room, not a cap on the reply. Generation itself runs
+/// until the model emits its stop token, bounded only by what is left of the
+/// context window (`reply_token_limit`).
+///
+/// Both used to be a flat 100 tokens. That cut every reply off mid-sentence
+/// and, worse, cut a tool call off before its closing `</tool_use>`: the
+/// parser needs the closing tag, so the call was never recognised and the raw
+/// XML was shown to the user as the answer.
+const LOCAL_RESPONSE_TOKEN_RESERVE: usize = 1024;
+
+/// How many tokens a local model may generate for a prompt of `prompt_tokens`
+/// in a context window of `context_length`: everything the window has left.
+/// The model stops by itself at its stop token long before that in the normal
+/// case; this is only the hard ceiling the window imposes.
+fn reply_token_limit(context_length: usize, prompt_tokens: usize) -> usize {
+    context_length.saturating_sub(prompt_tokens).max(1)
+}
 
 /// Token budget reserved for chat-template markers, the system prompt, and
 /// a small safety margin -- rendering overhead that `prompt_parts` itself
@@ -555,11 +570,12 @@ impl TemplateGenerator {
         // The GGUF backend implements this narrow generation contract.
         let backend = gen.backend_mut();
         let input_ids = backend.tokenize(&formatted_prompt)?;
+        let reply_limit = reply_token_limit(backend.context_length() as usize, input_ids.len());
 
         // Generate with streaming callback (filter special tokens)
         let output_ids = backend.generate_stream(
             &input_ids,
-            100, // max 100 new tokens
+            reply_limit,
             Box::new(move |token_id, token_text| {
                 // Filter out special tokens (template markers, control characters)
                 // Only stream actual content tokens
@@ -620,10 +636,14 @@ impl TemplateGenerator {
             .try_write()
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
 
-        tracing::info!("[neural_gen] Lock acquired, starting generation (max 100 tokens)...");
+        let prompt_tokens = gen.tokenize(&formatted_prompt)?.len();
+        let reply_limit = reply_token_limit(gen.context_length() as usize, prompt_tokens);
+        tracing::info!(
+            "[neural_gen] Lock acquired, starting generation (until the stop token, at most {reply_limit} tokens)..."
+        );
 
         // Use generate_text() which handles tokenization internally
-        let raw_response = gen.generate_text(&formatted_prompt, 100)?; // max 100 new tokens
+        let raw_response = gen.generate_text(&formatted_prompt, reply_limit)?;
 
         tracing::info!(
             "[neural_gen] Raw response length: {} chars",
@@ -930,6 +950,83 @@ mod tests {
         assert!(
             !streamed.lock().expect("lock stream").is_empty(),
             "local GGUF path must call the streaming callback"
+        );
+    }
+
+    /// The reported failure: asked for a long essay, a local Qwen model
+    /// answered with a `<tool_use>` call to `ask_user_question`. Generation
+    /// stopped at 100 tokens, in the middle of the call's JSON, so the block
+    /// had no closing tag, the parser did not recognise it, and the raw XML
+    /// was shown as the reply.
+    ///
+    /// A reply limit must leave room for a whole tool call, and both
+    /// generation paths must request the same limit the prompt budget
+    /// reserves.
+    #[test]
+    fn test_local_reply_limit_leaves_room_for_a_whole_tool_call() {
+        // The call from the report, completed: what the model was writing
+        // when it was cut off.
+        let tool_call = r#"<tool_use>
+  <name>ask_user_question</name>
+  <parameters>{"questions": [{"question": "What specific type of birds would you like to know about?", "header": "Bird Type", "options": [{"label": "Passerines", "description": "Songbirds, perching birds"}, {"label": "Waterfowl", "description": "Ducks, geese, swans"}, {"label": "Raptors", "description": "Birds of prey"}, {"label": "All birds", "description": "A general overview"}], "multiSelect": false}]}</parameters>
+</tool_use>"#;
+        // Roughly four characters per token is the usual estimate for
+        // English and JSON; this call is therefore well over 100 tokens.
+        let estimated_tokens = tool_call.len() / 4;
+        assert!(
+            estimated_tokens > 100,
+            "the reported tool call must exceed the old 100-token limit for this test to mean \
+             anything; estimated_tokens={estimated_tokens}"
+        );
+        assert!(
+            LOCAL_RESPONSE_TOKEN_RESERVE >= estimated_tokens * 4,
+            "a local reply must have room for a tool call several times the size of the one \
+             that was cut off; limit={LOCAL_RESPONSE_TOKEN_RESERVE} estimated_tokens={estimated_tokens}"
+        );
+        let parsed = crate::models::ToolCallParser::parse(tool_call);
+        assert_eq!(
+            (parsed.tool_uses.len(), parsed.errors.len()),
+            (1, 0),
+            "the completed call must parse as exactly one tool call; errors={:?}",
+            parsed.errors
+        );
+        let cut_off = &tool_call[..400];
+        assert!(
+            crate::models::ToolCallParser::parse(cut_off)
+                .tool_uses
+                .is_empty(),
+            "a call cut off before its closing tag is not recognised, which is why the limit \
+             matters; cut_off={cut_off:?}"
+        );
+
+        // Generation is bounded by the context window, not by a fixed
+        // number: a reply may use everything the prompt left free.
+        assert_eq!(
+            reply_token_limit(8192, 700),
+            7492,
+            "an 8192-token window with a 700-token prompt leaves 7492 tokens for the reply"
+        );
+        assert_eq!(
+            reply_token_limit(512, 600),
+            1,
+            "an over-long prompt still asks the backend for a positive number of tokens"
+        );
+        // Both generation paths must ask for that limit, and neither may
+        // carry a literal cap of its own.
+        let source = include_str!("generator.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half of the file");
+        assert_eq!(
+            production.matches("reply_token_limit(").count(),
+            3,
+            "the definition plus one call in each of the streaming and buffered paths"
+        );
+        assert!(
+            !production.contains("generate_text(&formatted_prompt, 100)")
+                && !production.contains("100, // max 100 new tokens"),
+            "the fixed 100-token cap must not come back"
         );
     }
 
