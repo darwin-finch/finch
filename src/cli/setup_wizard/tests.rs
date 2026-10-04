@@ -10152,3 +10152,181 @@ fn test_model_choice_block_keeps_a_fixed_height_and_windows_a_long_list() {
          entries (row with 2 entries, row with 100 entries)"
     );
 }
+
+/// Which setup list a #1651 walk drives.
+#[derive(Clone, Copy, Debug)]
+enum ScrolledSetupList {
+    Themes,
+    AddProvider,
+}
+
+/// One painted step of a list walk: what was selected, the screen the real
+/// incremental blit left, and an independent from-scratch repaint of the
+/// same frame.
+struct ListWalkStep {
+    label: String,
+    selected: String,
+    incremental: Vec<String>,
+    fresh: Vec<String>,
+}
+
+/// Open `list` through the real key handling, walk the selection down to the
+/// last entry and back up to the first, and paint every step through one
+/// `WizardHost` into a `MiniVt` (the real frame builder and row-diff blit).
+fn walk_setup_list(list: ScrolledSetupList, width: usize, height: usize) -> Vec<ListWalkStep> {
+    let entries: Vec<String> = match list {
+        ScrolledSetupList::Themes => crate::theme::ColorTheme::all()
+            .iter()
+            .map(|theme| format!(">>> {} - ", theme.name()))
+            .collect(),
+        ScrolledSetupList::AddProvider => CLOUD_PROVIDERS
+            .iter()
+            .map(|(_, display_name, _, _)| format!(">>> {display_name} <<<"))
+            .chain([
+                ">>> Local model <<<".to_string(),
+                ">>> Scan local network <<<".to_string(),
+            ])
+            .collect(),
+    };
+
+    let mut state = WizardState::new(None);
+    assert_eq!(state.current_section, WizardSection::Themes);
+    if matches!(list, ScrolledSetupList::AddProvider) {
+        handle_wizard_key(&mut state, key(KeyCode::Tab)).unwrap();
+        assert_eq!(state.current_section, WizardSection::Models);
+        handle_wizard_key(&mut state, key(KeyCode::Char('a'))).unwrap();
+    }
+    // The theme list opens on the theme the environment suggests; start the
+    // walk from the first entry whatever that was.
+    for _ in &entries {
+        handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    }
+
+    let mut host = crate::cli::tui::WizardHost::new();
+    let mut terminal = MiniVt::new(width, height);
+    let mut steps = Vec::new();
+    let mut paint = |state: &WizardState, label: String, selected: &str| {
+        let view = wizard_view_with_permission_target(state, "", width, height);
+        let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+        let mut sink: Vec<u8> = Vec::new();
+        host.paint(&mut sink, &frame, width, height).unwrap();
+        terminal.feed(&sink);
+
+        let mut fresh_sink: Vec<u8> = Vec::new();
+        crate::cli::tui::WizardHost::new()
+            .paint(&mut fresh_sink, &frame, width, height)
+            .unwrap();
+        let mut fresh_terminal = MiniVt::new(width, height);
+        fresh_terminal.feed(&fresh_sink);
+        steps.push(ListWalkStep {
+            label,
+            selected: selected.to_string(),
+            incremental: terminal.rows(),
+            fresh: fresh_terminal.rows(),
+        });
+    };
+
+    paint(&state, format!("{list:?} opened"), &entries[0]);
+    for (index, entry) in entries.iter().enumerate().skip(1) {
+        handle_wizard_key(&mut state, key(KeyCode::Down)).unwrap();
+        paint(&state, format!("{list:?} after Down x{index}"), entry);
+    }
+    for (index, entry) in entries.iter().enumerate().rev().skip(1) {
+        handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+        paint(&state, format!("{list:?} back Up to entry {index}"), entry);
+    }
+    steps
+}
+
+/// REGRESSION (#1651, setup lists do not scroll): at 80x24 and 60x15 the Add
+/// AI Provider list and the theme list were cut at the window bottom, so the
+/// selection moved onto rows that were never drawn and the only hint was
+/// "more lines — resize window". Every entry, the last included, must be on
+/// screen with its `>>>` marker while it is selected, walking down and back
+/// up through the real key handling.
+#[test]
+fn test_setup_lists_scroll_to_keep_the_selected_row_on_screen() {
+    for (width, height) in [(80usize, 24usize), (60, 15)] {
+        for list in [ScrolledSetupList::Themes, ScrolledSetupList::AddProvider] {
+            let steps = walk_setup_list(list, width, height);
+            for step in &steps {
+                let screen = step.incremental.join("\n");
+                assert!(
+                    step.incremental
+                        .iter()
+                        .any(|row| row.contains(&step.selected)),
+                    "the selected setup-list entry and its marker must be drawn \
+                     ({label}, {width}x{height}): expected a row containing \
+                     {selected:?}; screen:\n{screen}",
+                    label = step.label,
+                    selected = step.selected,
+                );
+            }
+            for step in &steps {
+                let screen = step.incremental.join("\n");
+                assert!(
+                    !screen.contains("resize window"),
+                    "a list that scrolls must not tell the user to resize the \
+                     window ({label}, {width}x{height}); screen:\n{screen}",
+                    label = step.label,
+                );
+            }
+            if matches!(list, ScrolledSetupList::AddProvider) {
+                let last = &steps[steps.len() / 2];
+                let screen = last.incremental.join("\n");
+                assert!(
+                    last.selected.contains("Scan local network")
+                        && screen.contains("more lines above")
+                        && screen.contains("Esc: Cancel"),
+                    "with the last provider entry selected the card must say in \
+                     words that entries are hidden above and keep its controls \
+                     row ({label}, {width}x{height}); screen:\n{screen}",
+                    label = last.label,
+                );
+                let first = &steps[0];
+                assert!(
+                    first.incremental.join("\n").contains("more lines below"),
+                    "with the first provider entry selected the card must say in \
+                     words that entries are hidden below ({width}x{height}); \
+                     screen:\n{}",
+                    first.incremental.join("\n")
+                );
+            }
+        }
+    }
+}
+
+/// INVARIANT (#1651, setup lists do not scroll; the wizard's row-diff blit):
+/// when the visible window of a scrolling setup list changes between two
+/// frames, the incrementally painted screen must equal a from-scratch repaint
+/// of the same frame at every step, so no row of the previous window is left
+/// behind.
+#[test]
+fn test_setup_list_scrolling_leaves_no_stale_row_between_frames() {
+    for (width, height) in [(80usize, 24usize), (60, 15)] {
+        for list in [ScrolledSetupList::Themes, ScrolledSetupList::AddProvider] {
+            let steps = walk_setup_list(list, width, height);
+            let distinct: std::collections::HashSet<&Vec<String>> =
+                steps.iter().map(|step| &step.fresh).collect();
+            assert!(
+                distinct.len() > 1,
+                "sanity check: the walk must change the screen or this test \
+                 proves nothing ({list:?}, {width}x{height}); screen:\n{}",
+                steps[0].fresh.join("\n")
+            );
+            for step in &steps {
+                assert_eq!(
+                    step.incremental,
+                    step.fresh,
+                    "scrolling a setup list must leave the same screen an \
+                     independent full repaint would ({label}, {width}x{height}); \
+                     incremental (as actually blitted):\n{incremental}\n\
+                     expected (independent full repaint):\n{fresh}",
+                    label = step.label,
+                    incremental = step.incremental.join("\n"),
+                    fresh = step.fresh.join("\n"),
+                );
+            }
+        }
+    }
+}

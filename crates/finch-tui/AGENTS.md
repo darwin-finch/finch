@@ -488,6 +488,20 @@ pre-migration contrast), the active tab paints bold magenta on black from the
 spinner shows its value with its ◀/▶ keys advertised on every platform
 (`test_context_lines_spinner_value_is_visible_keys_adjust_and_keys_are_advertised`).
 
+**A setup list keeps its selected row on screen (#1651, setup lists did not scroll).** A
+section or a card that holds a list names the selected entry's line range as `pin_visible`
+(`WizardSectionContent::pin_visible`, `WizardCard::pin_visible`); when the claim is shorter
+than the content the host scrolls the minimum from the top that shows it (`section_window`,
+`pinned_window`). A squeezed pinned card says `… N more lines above` / `… N more lines below`
+in words and never asks for a resize; an unpinned card (a form) keeps the head-and-count
+clip. Every windowed row is one full-width physical row and the block always fills its claim,
+so a moving window cannot strand a row under the row-diff blit —
+`test_pinned_card_scrolls_to_the_pinned_lines_and_says_what_is_hidden` here;
+`test_setup_lists_scroll_to_keep_the_selected_row_on_screen` and
+`test_setup_list_scrolling_leaves_no_stale_row_between_frames` in
+`src/cli/setup_wizard/tests.rs` drive the Add AI Provider and theme lists through the real
+keys and `WizardHost::paint` at 80x24 and 60x15.
+
 ## The DOM manifest lowering (#1141 part 2)
 
 `dom_manifest.rs` lowers the same widget tree and component snapshots to the versioned
