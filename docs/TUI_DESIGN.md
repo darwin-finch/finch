@@ -24,6 +24,14 @@ suppresses nothing) while the canonical record keeps the raw program exactly onc
 remaining stage-2 scope (other WorkUnit presentations, thinking section #749, agent activity)
 stays open below.
 
+**Turn indicator (#1664, 2026-10-04): landed.** A turn's in-progress indicator is one
+description, `TurnIndicatorView`, rendered as one span row (`turn_indicator_line`) after the
+owning WorkUnit's content. It replaces the frozen `○ Verb…` node label and the animated header
+that lived only in `WorkUnit::format`, which the live transcript never called for a WorkUnit.
+Elapsed time and token count now ride `WorkUnitView`; the pulse frame is a function of that
+carried elapsed time. The WorkUnit node rows themselves (tool groups, streaming program source)
+are still the unmigrated stage-2 scope below.
+
 **Stage-3 outcome (#1120, 2026-09-22): landed.** Every typed message renders through a
 component via the generalized `Message::component_view` accessor — the maintainer's original
 decision, now the renderer's single projection entry: it asks the trait for the

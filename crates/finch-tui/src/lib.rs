@@ -66,7 +66,8 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 #[cfg(test)]
 mod test_support;
 mod tool_viewport;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 mod vt_oracle;
 mod wizard_host;
 // Projection stays inside the renderer; application tests compose the lower
@@ -1775,6 +1776,10 @@ pub struct TuiRenderer {
     /// to paint and restores any row that fell out to its own plain text
     /// first, then records the new set here.
     previous_highlighted_rows: Vec<u16>,
+    /// A modelled terminal the render tick paints into instead of stdout
+    /// (see [`LiveFrameProbe`]). Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    frame_probe: Option<LiveFrameProbe>,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -1844,6 +1849,8 @@ impl TuiRenderer {
             selection_press_candidate: None,
             selection_index: selection::SelectionIndex::default(),
             previous_highlighted_rows: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            frame_probe: None,
         }
     }
 
@@ -1944,6 +1951,8 @@ impl TuiRenderer {
             selection_press_candidate: None,
             selection_index: selection::SelectionIndex::default(),
             previous_highlighted_rows: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            frame_probe: None,
         })
     }
 
@@ -2542,6 +2551,84 @@ impl TuiRenderer {
     }
 }
 
+// ─── Painted-frame probe (test support) ───────────────────────────────────────
+
+/// A modelled terminal that the production render tick paints into, so a
+/// test outside this crate can read what a real terminal would show:
+/// canonical scrollback rows and the live area together.
+///
+/// Once attached, every `TuiRenderer::flush_output_safe` call — the tick the
+/// application's event loop issues — runs its own body
+/// (`flush_output_safe_to`) against a byte buffer at the probe's terminal
+/// size and feeds those bytes to a VT100 parser. Nothing is forced: a tick
+/// whose dirty gate decides not to repaint writes no bytes and records no
+/// frame, exactly as in a live session.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+pub struct LiveFrameProbe {
+    state: Arc<std::sync::Mutex<LiveFrameProbeState>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct LiveFrameProbeState {
+    terminal: vt_oracle::VtOracle,
+    width: usize,
+    height: usize,
+    painted: Vec<Vec<String>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl LiveFrameProbe {
+    /// Attach a blank `width` x `height` terminal to `renderer`.
+    pub fn attach(renderer: &mut TuiRenderer, width: usize, height: usize) -> Self {
+        let probe = Self {
+            state: Arc::new(std::sync::Mutex::new(LiveFrameProbeState {
+                terminal: vt_oracle::VtOracle::new(width, height),
+                width,
+                height,
+                painted: Vec::new(),
+            })),
+        };
+        renderer.frame_probe = Some(probe.clone());
+        probe
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveFrameProbeState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn size(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.width, state.height)
+    }
+
+    fn record(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        state.terminal.feed(bytes);
+        let rows = (0..state.height)
+            .map(|row| state.terminal.row(row))
+            .collect::<Vec<_>>();
+        state.painted.push(rows);
+    }
+
+    /// The visible rows as last painted, top to bottom, trailing blanks
+    /// trimmed.
+    pub fn rows(&self) -> Vec<String> {
+        let state = self.lock();
+        (0..state.height)
+            .map(|row| state.terminal.row(row))
+            .collect()
+    }
+
+    /// The screen after each tick that wrote to the terminal, in order.
+    pub fn painted_frames(&self) -> Vec<Vec<String>> {
+        self.lock().painted.clone()
+    }
+}
+
 // ─── Redraw predicate ─────────────────────────────────────────────────────────
 
 /// Returns true when the live area needs an erase+draw cycle.
@@ -3002,6 +3089,24 @@ impl TuiRenderer {
     /// Called from the event loop on every tick.
     /// Commits newly-completed messages to permanent scrollback, then redraws.
     pub fn flush_output_safe(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(probe) = self.frame_probe.clone() {
+            let mut bytes = Vec::new();
+            let result = self.flush_output_safe_to(&mut bytes, Some(probe.size()));
+            probe.record(&bytes);
+            return result;
+        }
+        self.flush_output_safe_to(&mut io::stdout(), None)
+    }
+
+    /// The production tick against an injected terminal sink and, for
+    /// boundary tests, an explicit terminal size. `flush_output_safe` is the
+    /// stdout wrapper; [`LiveFrameProbe`] feeds the same bytes to a VT model.
+    fn flush_output_safe_to(
+        &mut self,
+        out: &mut impl Write,
+        explicit_size: Option<(usize, usize)>,
+    ) -> Result<()> {
         let messages = self.output_manager.get_messages();
         let plan = plan_canonical_commit(&messages, &self.printed_ids);
         self.poll_status_changes();
@@ -3017,7 +3122,7 @@ impl TuiRenderer {
         // completion that raced resize. The completed message remains in the
         // uncommitted suffix until its canonical bytes are actually written.
         if self.viewport_invalidated {
-            self.redraw_full_viewport()?;
+            self.redraw_full_viewport_inner_to(out, false, explicit_size)?;
             if plan.emit.is_empty() {
                 self.live_area_dirty = false;
                 return Ok(());
@@ -3025,16 +3130,15 @@ impl TuiRenderer {
         }
 
         if !plan.emit.is_empty() {
-            let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(
-                &mut stdout,
-                self.colors.background.to_color().into(),
-            )?;
+            prepare_canonical_commit_guarded(out, self.colors.background.to_color().into())?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
-            let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
+            let (term_width, term_height) = match explicit_size {
+                Some((width, height)) => (width as u16, height as u16),
+                None => crossterm::terminal::size().unwrap_or((80, 24)),
+            };
             match commit_complete_messages(
-                &mut stdout,
+                out,
                 &plan.emit,
                 &mut self.accordion,
                 &self.colors,
@@ -3044,7 +3148,7 @@ impl TuiRenderer {
             ) {
                 Ok(_committed_rows) => {}
                 Err(error) => {
-                    let _ = execute!(stdout, EndSynchronizedUpdate);
+                    let _ = execute!(out, EndSynchronizedUpdate);
                     return Err(error);
                 }
             };
@@ -3056,16 +3160,21 @@ impl TuiRenderer {
             // (offset 0) keeps tracking the newest content.
             self.pending_viewport_size = Some((term_width, term_height));
             self.viewport_invalidated = true;
-            self.redraw_full_viewport_inner(true)?;
+            self.redraw_full_viewport_inner_to(out, true, None)?;
             self.live_area_dirty = false;
         } else {
-            // Redraw only for an actual semantic mutation. An in-progress
-            // marker by itself is not a clock: repainting it every 33 ms
-            // destroys terminal-native text selection, even while Option is
-            // held to bypass mouse capture.
+            // Redraw only when what is painted changes. Repainting on every
+            // 33 ms tick destroys terminal-native text selection, even while
+            // Option is held to bypass mouse capture, so a running turn's
+            // indicator (#1664) repaints only when its own text changes —
+            // one pulse frame per 200 ms — via `WorkUnitView::paint_key`,
+            // never merely because time passed.
             if self.live_area_should_redraw() {
-                self.erase_live_area()?;
-                self.draw_live_area()?;
+                self.erase_live_area_to(out)?;
+                match explicit_size {
+                    Some((width, height)) => self.draw_live_area_to_at(out, width, height, None)?,
+                    None => self.draw_live_area_to(out)?,
+                }
                 self.live_area_dirty = false;
             }
         }
@@ -3110,9 +3219,14 @@ impl TuiRenderer {
                         .map(|line| format!("{line:?}"))
                         .collect::<Vec<_>>()
                         .join("\n"),
+                    // A WorkUnit's elapsed time and token count change on
+                    // every poll while it runs but reach the screen only
+                    // through the turn indicator, so its key carries the
+                    // indicator's text: the row repaints when its pulse
+                    // frame or readout changes, not on every tick.
                     None => message
                         .work_unit_view(&self.colors)
-                        .map(|view| format!("{view:?}"))
+                        .map(|view| view.paint_key())
                         .unwrap_or_else(|| message.content()),
                 };
                 (message.id(), message.status(), semantic)
@@ -3449,12 +3563,21 @@ impl TuiRenderer {
         // scope — keep this legacy path, which is also the canonical-commit
         // projection: the component is the live reader; the settled record
         // keeps today's exact bytes (the say-turn precedent, #882).
-        let lines = match view_model::project_message(message, &self.colors) {
-            view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
-            view_model::ProjectedMessage::Plain(formatted) => {
+        let live = view_model::project_live_message(message, &self.colors);
+        let mut lines = match live.content {
+            Some(view_model::ProjectedMessage::Node(node)) => self.accordion.render_node(&node),
+            Some(view_model::ProjectedMessage::Plain(formatted)) => {
                 self.accordion.render_plain(&formatted.join("\n"))
             }
+            None => Vec::new(),
         };
+        // The turn's in-progress indicator (#1664) is one styled row after
+        // the unit's own content, lowered from spans like every component
+        // row. It is drawn here and nowhere else in the live transcript.
+        if let Some(indicator) = &live.indicator {
+            let palette = span_render::component_style_palette(&self.colors);
+            lines.push(finch_ui_model::turn_indicator_line(indicator, &palette));
+        }
         // Tool results are bounded child viewports (#656): the visible
         // projection shows a configured number of rows with a scroll offset
         // the control owns. Canonical scrollback is projected separately
@@ -12410,8 +12533,11 @@ mod tests {
         let rendered = AccordionState::default().render_node(&node);
         let header = &rendered[0].text;
         assert!(
-            header.contains('\u{25cb}'),
-            "a pending thinking row carries its status glyph from the ViewModel props; header={header:?}"
+            ['\u{2726}', '\u{2733}', '\u{273c}']
+                .iter()
+                .any(|marker| header.trim_start().starts_with(*marker)),
+            "a pending thinking row carries its one marker — the turn indicator's pulse \
+             frame — from the ViewModel props; header={header:?}"
         );
         assert!(
             !header.contains('•'),

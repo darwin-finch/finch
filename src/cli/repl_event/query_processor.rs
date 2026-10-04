@@ -2048,6 +2048,13 @@ pub(crate) async fn process_query_with_tools(
         let verb = crate::cli::messages::random_spinner_verb();
         output_manager.start_work_unit(verb)
     });
+    // This unit is the turn's generation unit from here on: it owns the turn
+    // indicator while the request waits, while the reply streams, and through
+    // any tool rounds that reuse it.
+    work_unit.begin_provider_request();
+    query_states
+        .set_generation_work_unit(query_id, Arc::clone(&work_unit))
+        .await;
 
     // Streaming is both a provider capability and a user preference. The
     // setup wizard persists the latter in features.streaming_enabled.

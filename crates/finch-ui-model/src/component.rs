@@ -171,6 +171,106 @@ pub struct UserTurnView {
     pub participant_index: Option<usize>,
 }
 
+/// The one description of a turn's in-progress indicator: the verb, how long
+/// the turn has run, and how many tokens have arrived.
+///
+/// Every surface that says "this turn is still working" reads this value —
+/// the live transcript ([`turn_indicator_line`]), the plain node label of a
+/// pending row, and the non-terminal `format()` text — so the wording, the
+/// animation frame, and the `thinking` → `↓ N tokens` switch are decided in
+/// one place. The animation frame is a pure function of `elapsed`, which the
+/// message captures when it builds its snapshot; nothing here reads a clock.
+///
+/// The indicator is meaningful as plain text: the verb, the trailing
+/// ellipsis, the elapsed time, and `thinking` or the token count all say the
+/// turn is in progress without the pulsing marker.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TurnIndicatorView {
+    pub verb: String,
+    pub elapsed: std::time::Duration,
+    pub token_count: usize,
+}
+
+/// Pulse frames, small → large → small.
+const TURN_INDICATOR_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
+
+/// How long each pulse frame is held.
+const TURN_INDICATOR_FRAME_MS: u128 = 200;
+
+impl TurnIndicatorView {
+    /// The pulse frame this snapshot's elapsed time selects.
+    pub fn marker(&self) -> &'static str {
+        let frame = (self.elapsed.as_millis() / TURN_INDICATOR_FRAME_MS) as usize;
+        TURN_INDICATOR_FRAMES[frame % TURN_INDICATOR_FRAMES.len()]
+    }
+
+    /// The verb with its ellipsis: `Channeling…`. A blank verb reads
+    /// `Working…` so the row never collapses to a bare marker.
+    pub fn activity(&self) -> String {
+        let verb = self.verb.trim();
+        if verb.is_empty() {
+            "Working…".to_string()
+        } else {
+            format!("{verb}…")
+        }
+    }
+
+    /// Elapsed time, then `thinking` until the first token and the token
+    /// count after: `18s · thinking`, `18s · ↓ 662 tokens`.
+    pub fn stats(&self) -> String {
+        let elapsed = turn_indicator_elapsed(self.elapsed.as_secs());
+        if self.token_count == 0 {
+            format!("{elapsed} · thinking")
+        } else {
+            format!(
+                "{elapsed} · ↓ {} tokens",
+                turn_indicator_tokens(self.token_count)
+            )
+        }
+    }
+
+    /// The whole indicator as unstyled text:
+    /// `✳ Channeling… (18s · ↓ 662 tokens)`.
+    pub fn plain_text(&self) -> String {
+        format!("{} {} ({})", self.marker(), self.activity(), self.stats())
+    }
+}
+
+fn turn_indicator_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+fn turn_indicator_tokens(count: usize) -> String {
+    if count >= 1000 {
+        format!("{:.1}k", count as f64 / 1000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+/// The live transcript row of a turn's in-progress indicator. Its text is
+/// exactly [`TurnIndicatorView::plain_text`] behind the transcript's
+/// two-column row indent; the marker wears the scheme accent and the stats
+/// the muted summary style.
+pub fn turn_indicator_line(
+    view: &TurnIndicatorView,
+    palette: &ComponentStylePalette,
+) -> RenderedTranscriptLine {
+    RenderedTranscriptLine::from_spans(vec![
+        Span::plain("  "),
+        Span::styled(view.marker(), palette.operation_glyph.clone()),
+        Span::plain(format!(" {} ", view.activity())),
+        Span::styled(
+            format!("({})", view.stats()),
+            palette.operation_summary.clone(),
+        ),
+    ])
+}
+
 /// The style roles the component renderers read (stage 4, #1141).
 ///
 /// Plain data, terminal-independent: the engine builds it from the user's
@@ -1700,5 +1800,99 @@ mod tests {
         let expected_style =
             SpanStyle::fg(PALETTE.user_foreground).with_bg(PALETTE.participant_backgrounds[3]);
         assert_eq!(lines[0].spans[0].style, expected_style);
+    }
+
+    fn indicator(millis: u64, token_count: usize) -> TurnIndicatorView {
+        TurnIndicatorView {
+            verb: "Channeling".into(),
+            elapsed: std::time::Duration::from_millis(millis),
+            token_count,
+        }
+    }
+
+    /// INVARIANT (#1664): the indicator's pulse frame is a function of the
+    /// elapsed time its snapshot carries — one frame per 200 ms, cycling
+    /// small → large → small — and nothing else.
+    #[test]
+    fn test_turn_indicator_pulse_frame_is_a_function_of_carried_elapsed_time() {
+        let frames =
+            [0, 199, 200, 400, 600, 800].map(|millis| (millis, indicator(millis, 0).marker()));
+        assert_eq!(
+            frames,
+            [
+                (0, "✦"),
+                (199, "✦"),
+                (200, "✳"),
+                (400, "✼"),
+                (600, "✳"),
+                (800, "✦"),
+            ],
+            "the pulse holds each frame for 200 ms and repeats after four"
+        );
+    }
+
+    /// INVARIANT (#1664): the indicator reads `thinking` until the first
+    /// token and the token count after, with elapsed time in both, and a
+    /// blank verb still reads as words.
+    #[test]
+    fn test_turn_indicator_text_switches_from_thinking_to_the_token_count() {
+        let waiting = indicator(18_000, 0);
+        let streaming = indicator(18_000, 662);
+        let long = indicator(125_000, 1_600);
+        let blank = TurnIndicatorView {
+            verb: "  ".into(),
+            ..indicator(0, 0)
+        };
+        assert_eq!(
+            [
+                waiting.plain_text(),
+                streaming.plain_text(),
+                long.plain_text(),
+                blank.plain_text(),
+            ],
+            [
+                "✼ Channeling… (18s · thinking)".to_string(),
+                "✼ Channeling… (18s · ↓ 662 tokens)".to_string(),
+                "✳ Channeling… (2m 5s · ↓ 1.6k tokens)".to_string(),
+                "✦ Working… (0s · thinking)".to_string(),
+            ],
+            "the indicator is one line of plain words in every state"
+        );
+    }
+
+    /// INVARIANT (#1141, #1664): the live indicator row is styled spans from
+    /// the injected palette — marker in the accent, stats in the muted
+    /// summary style — and its text is exactly the shared plain description
+    /// behind the transcript's row indent.
+    #[test]
+    fn test_turn_indicator_line_is_palette_styled_spans_over_the_shared_text() {
+        let view = indicator(400, 12);
+        let line = turn_indicator_line(&view, &PALETTE);
+        assert_eq!(
+            (line.text.as_str(), crate::spans_text(&line.spans)),
+            (
+                "  ✼ Channeling… (0s · ↓ 12 tokens)",
+                format!("  {}", view.plain_text())
+            ),
+            "the row's text is the shared description and equals its spans; line={line:?}"
+        );
+        let styled = line
+            .spans
+            .iter()
+            .filter(|span| !span.style.is_plain())
+            .map(|span| (span.as_str().to_string(), span.style.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            styled,
+            vec![
+                ("✼".to_string(), PALETTE.operation_glyph.clone()),
+                (
+                    "(0s · ↓ 12 tokens)".to_string(),
+                    PALETTE.operation_summary.clone()
+                ),
+            ],
+            "the marker wears the palette accent and the stats the muted summary style; \
+             line={line:?}"
+        );
     }
 }

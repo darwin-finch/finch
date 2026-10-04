@@ -22,6 +22,7 @@ use super::accordion::RenderedTranscriptLine;
 use super::autocomplete_widget::{completion_pane_lines, AutocompleteState};
 use super::widgets::{self, Axis, Rect, Track, Widget};
 
+use finch_ui_model::{project_live_work_unit, TurnIndicatorView};
 pub(crate) use finch_ui_model::{project_work_unit, NodeRole, RowId, TranscriptNode};
 
 /// A message projected for the transcript: a WorkUnit run becomes a
@@ -42,6 +43,36 @@ pub(crate) fn project_message(message: &MessageRef, colors: &ColorScheme) -> Pro
                 .map(str::to_owned)
                 .collect(),
         ),
+    }
+}
+
+/// A message projected for the live transcript: what [`project_message`]
+/// yields, when the message has anything of its own to draw, and the turn's
+/// in-progress indicator, when the message owns it. The indicator is one
+/// row drawn after the content; a pending unit with nothing to show yet is
+/// the indicator alone.
+pub(crate) struct LiveProjectedMessage {
+    pub content: Option<ProjectedMessage>,
+    pub indicator: Option<TurnIndicatorView>,
+}
+
+/// The live-transcript adapter over the pure finch-ui-model projection.
+pub(crate) fn project_live_message(
+    message: &MessageRef,
+    colors: &ColorScheme,
+) -> LiveProjectedMessage {
+    match message.work_unit_view(colors) {
+        Some(view) => {
+            let live = project_live_work_unit(&view);
+            LiveProjectedMessage {
+                content: live.node.map(ProjectedMessage::Node),
+                indicator: live.indicator,
+            }
+        }
+        None => LiveProjectedMessage {
+            content: Some(project_message(message, colors)),
+            indicator: None,
+        },
     }
 }
 
