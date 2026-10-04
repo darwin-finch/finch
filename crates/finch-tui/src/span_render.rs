@@ -176,7 +176,7 @@ pub(crate) fn span_color_from_spec(spec: &finch_theme::ColorSpec) -> SpanColor {
             "blue" => SpanColor::DARK_BLUE,
             "magenta" => SpanColor::DARK_MAGENTA,
             "cyan" => SpanColor::DARK_CYAN,
-            "white" => SpanColor::GREY,
+            "white" => SpanColor::WHITE,
             "gray" | "grey" | "darkgray" | "darkgrey" => SpanColor::DARK_GREY,
             "lightred" => SpanColor::RED,
             "lightgreen" => SpanColor::GREEN,
