@@ -8,6 +8,6 @@ pub use finch_messages::{
     ComponentAction, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage, Message, MessageId,
     MessageRef, MessageStatus, OperationMessage, OutputVm, ProgramSourceVm, ProgressMessage,
     SayTurnStatus, SayTurnView, StaticMessage, StreamingResponseMessage, UserQueryMessage,
-    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitPresentation,
-    WorkUnitView, WorkUnitViewModel,
+    WorkClock, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead,
+    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };

@@ -5776,12 +5776,6 @@ fn explicit_finch_address_strips_only_the_addressee() {
     assert_eq!(finch_addressed_prompt("ordinary prompt"), None);
 }
 use crate::cli::repl_event::query_processor::apply_sliding_window;
-// format_elapsed and format_token_count moved to tool_display; import for status-bar tests.
-use crate::cli::repl_event::tool_display::{format_elapsed, format_token_count};
-
-// Pulsing animation frames used in status-bar tests.
-const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
-
 fn claude_profile(name: &str, model: &str) -> crate::config::ProviderEntry {
     crate::config::ProviderEntry::Claude {
         api_key: "test-key".to_string(),
@@ -5858,98 +5852,6 @@ fn test_provider_profile_prefix_shared_by_two_entries_is_ambiguous() {
         Ok(0),
         "a longer, disambiguating prefix (or the exact name) still resolves"
     );
-}
-
-// --- streaming status bar format ---
-
-#[test]
-fn test_streaming_status_format() {
-    // Verify the status bar message format used during streaming
-    let verb = "Thinking"; // representative word; actual value comes from random_spinner_verb()
-    let secs = 75u64;
-    let tokens = 1600usize;
-    let elapsed_str = format_elapsed(secs);
-    let tokens_str = format_token_count(tokens);
-    let icon = THROB_FRAMES[1]; // "✳"
-    let status = format!(
-        "{} {}… ({} · ↓ {} tokens)",
-        icon, verb, elapsed_str, tokens_str
-    );
-    assert_eq!(status, "✳ Thinking… (1m 15s · ↓ 1.6k tokens)");
-}
-
-#[test]
-fn test_streaming_status_format_short() {
-    let verb = "Thinking";
-    let secs = 9u64;
-    let tokens = 42usize;
-    let icon = THROB_FRAMES[0]; // "✦"
-    let status = format!(
-        "{} {}… ({} · ↓ {} tokens)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(tokens)
-    );
-    assert_eq!(status, "✦ Thinking… (9s · ↓ 42 tokens)");
-}
-
-#[test]
-fn test_streaming_status_thinking() {
-    // While thinking (no text yet), status shows "· thinking" suffix
-    let verb = "Thinking";
-    let secs = 15u64;
-    let icon = THROB_FRAMES[2]; // "✼"
-    let status = format!("{} {}… ({} · thinking)", icon, verb, format_elapsed(secs));
-    assert_eq!(status, "✼ Thinking… (15s · thinking)");
-}
-
-#[test]
-fn test_streaming_status_with_input_tokens() {
-    // With input token count available, show ↑ input · ↓ output
-    let verb = "Thinking";
-    let input_tokens: u32 = 1250;
-    let output_tokens = 300usize;
-    let secs = 10u64;
-    let icon = THROB_FRAMES[1]; // "✳"
-    let status = format!(
-        "{} {}… ({} · ↑ {} · ↓ {} tokens)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(input_tokens as usize),
-        format_token_count(output_tokens),
-    );
-    assert_eq!(status, "✳ Thinking… (10s · ↑ 1.2k · ↓ 300 tokens)");
-}
-
-#[test]
-fn test_streaming_status_thinking_with_input_tokens() {
-    // Usage arrives before text — show ↑ input · thinking
-    let verb = "Thinking";
-    let input_tokens: u32 = 800;
-    let secs = 3u64;
-    let icon = THROB_FRAMES[0]; // "✦"
-    let status = format!(
-        "{} {}… ({} · ↑ {} · thinking)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(input_tokens as usize),
-    );
-    assert_eq!(status, "✦ Thinking… (3s · ↑ 800 · thinking)");
-}
-
-#[test]
-fn test_throb_frames_cycle() {
-    // Frames cycle without panicking
-    let mut idx = 0usize;
-    for _ in 0..100 {
-        idx = (idx + 1) % THROB_FRAMES.len();
-        assert!(!THROB_FRAMES[idx].is_empty());
-    }
-    // After 4 steps we're back to frame 0
-    assert_eq!(THROB_FRAMES.len(), 4);
 }
 
 // compact_tool_summary, tool_result_to_display, strip_ansi, bash_smart_summary
@@ -13114,11 +13016,12 @@ async fn test_peer_turn_prompt_naming_a_patterns_command_cannot_list_or_change_o
 
 /// `/local` was removed (issue #1633: it sent a one-off query to whichever
 /// local model the daemon happened to load, with no history, tools, or model
-/// identity). Typed in the live session it must now get the same response as
-/// any other unrecognised slash command -- `Command::parse` maps those to
-/// `Command::Help`, so the help text is shown -- and that help must not
-/// advertise it. Compared against a slash command that never existed, so the
-/// test pins "same as unknown" rather than a particular help wording.
+/// identity). Typed in the live session it must now get the same shape of
+/// response as any other unrecognised slash command -- `Command::parse` maps
+/// those to `Command::Unknown`, so a short one-line message naming the typed
+/// command is shown (issue #1650), never the full help screen. Compared
+/// against a slash command that never existed, so the test pins "same shape
+/// as unknown" rather than a particular wording.
 #[tokio::test]
 async fn test_removed_local_command_gets_the_unknown_command_response() {
     async fn scrollback_after(input: &str) -> Vec<String> {
@@ -13148,28 +13051,83 @@ async fn test_removed_local_command_gets_the_unknown_command_response() {
             assert_eq!(
                 local.len(),
                 2,
-                "the removed /local command must produce its echo and one response row; scrollback={local:?}"
+                "the removed /local command must produce its echo and one short response row; scrollback={local:?}"
             );
             assert_eq!(
                 local[0], "/local hi",
                 "the typed command must be echoed first; scrollback={local:?}"
             );
             assert_eq!(
-                local[1..],
-                never_existed[1..],
-                "the removed /local command must get exactly the response a never-existing slash command gets; local={local:?} never_existed={never_existed:?}"
+                local[1], "Unknown command: /local hi. Type /help for the list.",
+                "the removed /local command must get the unknown-command message naming itself; scrollback={local:?}"
+            );
+            assert_eq!(
+                never_existed[1], "Unknown command: /no-such-command hi. Type /help for the list.",
+                "a never-existing slash command must get the unknown-command message naming itself; scrollback={never_existed:?}"
             );
             assert!(
                 !local[1..].iter().any(|message| {
-                    message.contains("/local")
-                        || message.contains("Local Model Query")
-                        || message.contains("not yet implemented")
+                    message.contains("Local Model Query") || message.contains("not yet implemented")
                 }),
-                "the response must not come from a local-query handler or the not-implemented catch-all, and help must not advertise /local; scrollback={local:?}"
+                "the response must not come from a local-query handler or the not-implemented catch-all; scrollback={local:?}"
             );
-            assert!(
-                local[1].contains("/provider <name>"),
-                "the unknown-command response is the help text, which names /provider as the way to select a provider entry; scrollback={local:?}"
+        })
+        .await;
+}
+
+/// Issue #1650: an unrecognised slash command prints the entire help screen
+/// with no indication that the command wasn't recognised. Typed in the live
+/// session, `/bogus` must print one short line naming the unrecognised
+/// command and pointing at `/help` -- not the full help screen that `/help`
+/// itself prints.
+#[tokio::test]
+async fn test_unknown_command_prints_short_message() {
+    async fn scrollback_after(input: &str) -> Vec<String> {
+        let mut event_loop = super::EventLoop::new_provider_switch_test_runner(Vec::new(), 0, None);
+        event_loop
+            .handle_user_input(input.to_string())
+            .await
+            .expect("an unrecognised slash command must dispatch without error");
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.content())
+            .collect()
+    }
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let bogus = scrollback_after("/bogus").await;
+            let help = scrollback_after("/help").await;
+
+            assert_eq!(
+                bogus.len(),
+                2,
+                "an unrecognised slash command must produce its echo and exactly one short response row, not a multi-section help screen; scrollback={bogus:?}"
+            );
+            assert_eq!(
+                bogus[0], "/bogus",
+                "the typed command must be echoed first; scrollback={bogus:?}"
+            );
+            assert_eq!(
+                bogus[1], "Unknown command: /bogus. Type /help for the list.",
+                "an unrecognised slash command must name itself and point at /help in one short line instead of printing the full help screen; scrollback={bogus:?}"
+            );
+            let bad_subcommand = scrollback_after("/patterns invalid").await;
+            assert_eq!(
+                bad_subcommand.get(1).map(String::as_str),
+                Some("Unknown command: /patterns invalid. Type /help for the list."),
+                "a known command with an unrecognised subcommand must be named in full, so the message does not claim the command itself is unknown; scrollback={bad_subcommand:?}"
+            );
+            assert_eq!(
+                bogus[1].lines().count(),
+                1,
+                "the unknown-command response must be a single line, not the multi-line help screen; scrollback={bogus:?}"
+            );
+            assert_ne!(
+                bogus[1], help[1],
+                "the unknown-command response must differ from the full help screen that genuine /help prints; bogus_scrollback={bogus:?} help_scrollback={help:?}"
             );
         })
         .await;

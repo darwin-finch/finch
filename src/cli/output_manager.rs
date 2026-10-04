@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::cli::messages::{
     BrainParticipantMessage, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage, MessageId,
     MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage,
-    WorkUnit,
+    WorkClock, WorkUnit,
 };
 use crate::models::ModelProgress;
 use crate::runtime::VmEffectEnvelope;
@@ -267,6 +267,8 @@ pub struct OutputManager {
     messages: Arc<RwLock<Vec<MessageRef>>>,
     /// Color scheme for message formatting
     colors: crate::theme::ColorScheme,
+    /// The clock new work units read elapsed time from.
+    work_clock: Arc<RwLock<WorkClock>>,
 }
 
 impl OutputManager {
@@ -278,7 +280,19 @@ impl OutputManager {
             pending_flush: Arc::new(RwLock::new(Vec::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
             colors,
+            work_clock: Arc::new(RwLock::new(WorkClock::monotonic())),
         }
+    }
+
+    /// Replace the clock new work units read elapsed time from, so a test
+    /// can advance a turn's indicator by exact amounts.
+    #[cfg(test)]
+    pub(crate) fn set_work_clock(&self, clock: WorkClock) {
+        *self.work_clock.write().unwrap() = clock;
+    }
+
+    fn work_clock(&self) -> WorkClock {
+        self.work_clock.read().unwrap().clone()
     }
 
     /// Enable writing to stdout (for TUI mode with scrollback)
@@ -439,7 +453,11 @@ impl OutputManager {
     /// Create and register a WorkUnit for one AI generation turn.
     /// Returns the Arc so callers can update tokens, add tool rows, and mark complete.
     pub fn start_work_unit(&self, verb: impl Into<String>) -> Arc<WorkUnit> {
-        let wu = Arc::new(WorkUnit::new(verb));
+        let wu = Arc::new(WorkUnit::with_clock(
+            MessageId::new(),
+            verb,
+            self.work_clock(),
+        ));
         self.add_trait_message(Arc::clone(&wu) as MessageRef);
         wu
     }
@@ -447,7 +465,7 @@ impl OutputManager {
     /// Register a replayable WorkUnit using identity derived from its
     /// canonical event envelope rather than frontend construction time.
     pub fn start_work_unit_with_id(&self, id: MessageId, verb: impl Into<String>) -> Arc<WorkUnit> {
-        let wu = Arc::new(WorkUnit::with_id(id, verb));
+        let wu = Arc::new(WorkUnit::with_clock(id, verb, self.work_clock()));
         self.add_trait_message(Arc::clone(&wu) as MessageRef);
         wu
     }
@@ -566,6 +584,7 @@ impl Clone for OutputManager {
             pending_flush: Arc::clone(&self.pending_flush),
             messages: Arc::clone(&self.messages),
             colors: self.colors.clone(),
+            work_clock: Arc::clone(&self.work_clock),
         }
     }
 }

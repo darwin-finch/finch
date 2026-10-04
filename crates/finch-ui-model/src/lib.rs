@@ -20,9 +20,9 @@ mod span;
 mod work_unit;
 
 pub use component::{
-    component_lines, ComponentStylePalette, ComponentView, LiveToolView, MemoryRecallRowView,
-    MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
-    StaticTextView, UserTurnView,
+    component_lines, turn_indicator_line, ComponentStylePalette, ComponentView, LiveToolView,
+    MemoryRecallRowView, MemoryRecalledView, OperationRowView, OperationView, ProgressView,
+    StaticTextKind, StaticTextView, TurnIndicatorView, UserTurnView,
 };
 pub use markdown::{inline_link_segments, InlineLinkSegment};
 pub use say_turn::{
@@ -30,9 +30,9 @@ pub use say_turn::{
 };
 pub use span::{spans_text, Span, SpanColor, SpanStyle};
 pub use work_unit::{
-    project_work_unit, AgentActivityView, AgentToolView, MessageStatus, TranscriptNode,
-    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
-    WorkUnitView,
+    project_live_work_unit, project_work_unit, turn_indicator, AgentActivityView, AgentToolView,
+    LiveWorkUnit, MessageStatus, TranscriptNode, WorkRowPresentation, WorkRowStatus, WorkRowView,
+    WorkUnitHead, WorkUnitPresentation, WorkUnitView,
 };
 
 /// Stable identity for one retained application message.

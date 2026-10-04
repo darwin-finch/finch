@@ -9,7 +9,7 @@ description = "Terminal renderer, input task, dialogs, and widget layout over in
 repository = "https://github.com/darwin-finch/finch"
 
 [features]
-test-support = []
+test-support = ["dep:vte"]
 
 [dependencies]
 anyhow = "1.0"
@@ -33,6 +33,7 @@ tracing = "0.1"
 tui-textarea = "0.7"
 unicode-width = "0.2"
 uuid = { version = "1.0", features = ["v4"] }
+vte = { version = "0.15", optional = true }
 
 [dev-dependencies]
 vte = "0.15"

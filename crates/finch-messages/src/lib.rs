@@ -15,7 +15,7 @@ pub use finch_ui_model::{
     AgentActivityView, AgentToolView, ComponentView, LiveToolView, MemoryRecallRowView,
     MemoryRecalledView, MessageId, MessageStatus, OperationRowView, OperationView, OutputVm,
     ProgramSourceVm, ProgressView, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
-    UserTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
+    TurnIndicatorView, UserTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
     WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
@@ -26,7 +26,7 @@ pub use concrete::{
     BrainParticipantMessage, LiveToolMessage, MemoryRecallRow, MemoryRecalledMessage,
     OperationMessage, ProgressMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage,
 };
-pub use work_unit::{random_spinner_verb, ComponentAction, WorkUnit};
+pub use work_unit::{random_spinner_verb, ComponentAction, WorkClock, WorkUnit};
 
 /// Trait that all messages must implement
 ///
