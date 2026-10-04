@@ -335,3 +335,28 @@ of terminology (is "Brain" used consistently, do error messages explain what to 
   `kill -9`-and-reattach test on the same session, so plausibly leftover session state from that
   rather than a background-task-specific bug; below the bar for filing (not independently
   reproducible), noted here in case a future pass hits the same message after a reattach.
+- **2026-10-04**: self-hosting run (personas using Finch to work on Finch) against finch 0.7.31 /
+  commit `c0811778`, daemon restarted on that build. **No persona was dispatched.** The
+  coordinator's one-message smoke test, run before handing sessions to personas, found that
+  neither configured provider could carry a working session:
+  - The ChatGPT subscription entry (`chatgpt`, `gpt-6.1-sol`, and `gpt-5.6-sol` on one further
+    probe) answered every request with HTTP 429 "The usage limit has been reached". Finch
+    reported it as "wait a moment before retrying" with no reset time (filed as #1660, exhausted
+    allowance reported as a momentary rate limit).
+  - The agreed fallback, `local-qwen-2.5-3b`, answered a text-only prompt once and failed the
+    same prompt in a second Brain ("Finch's response needed to be corrected, and the correction
+    attempt did not succeed either"); any turn that used a tool failed on the round after the
+    tool call with the documented "Local models don't yet support continuing a conversation after
+    a tool call" 500. Evidence added to #1276 (real local-model tool-call support) and #1635 (a
+    local-model turn shows only "Program source (lisp)"). No fix was attempted: whether the local
+    path is completed or marked unsupported is an open owner question on #1635.
+  Also filed from the smoke test: #1659 (raw `[llama-cpp-2]` log lines painted into the
+  conversation on every message, on any provider, despite the load-output fix in #1626) and #1661
+  (`finch brain ls` shows ATTACHED 1 for 37 Brains with three clients running, across a daemon
+  restart).
+  **Lesson for future passes:** send one real message on each provider the wave depends on
+  before creating persona worktrees and sessions; a provider that is configured and signed in can
+  still have no allowance left, and `finch status`, `/providers` and the start screen all look
+  normal when it does. And because `ATTACHED` cannot be trusted (#1661), use the process list and
+  `tmux ls`, not `finch brain ls`, to decide whether someone else has a live session before a
+  daemon restart.
