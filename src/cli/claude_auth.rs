@@ -227,6 +227,175 @@ where
     client.preflight_reauthentication(reference)
 }
 
+/// The Claude subscription browser sign-in (authorization code with PKCE on
+/// a loopback callback).
+///
+/// Not the default path: `login` currently takes the token the Claude CLI
+/// already holds (see `extract_claude_cli_token`), and setup offers the CLI
+/// bridge instead of this flow, for licensing reasons. The ceremony is kept
+/// here, with its tests, so it can be switched back on without being
+/// rewritten.
+#[allow(dead_code)]
+mod pkce_browser_login {
+    use super::*;
+
+    /// Shared browser ceremony used by scriptable login. Tests inject the same
+    /// OAuth production boundary with a deterministic dialect/server fixture.
+    pub(super) async fn login_browser_with<D, S>(
+        client: &OAuthClient<D, S>,
+        reference: &str,
+        presentation: BrowserLoginPresentation,
+        cancel: CancellationToken,
+    ) -> Result<ProviderCredential>
+    where
+        D: crate::oauth::OAuthDialect + 'static,
+        S: OAuthCredentialStore + 'static,
+    {
+        crate::oauth::validate_reference(reference)?;
+        client.preflight_reauthentication(reference)?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("Claude sign-in could not open a local callback listener")?;
+        let port = listener
+            .local_addr()
+            .context("Claude sign-in callback listener has no local address")?
+            .port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+        let pending = client
+            .begin_browser_authorization(&redirect_uri, BROWSER_AUTHORIZATION_LIFETIME)
+            .context("Claude sign-in could not start")?;
+
+        present_authorization_url(&pending.authorization_url, presentation)?;
+
+        let callback_url = wait_for_callback(
+            listener,
+            redirect_uri,
+            BROWSER_AUTHORIZATION_LIFETIME,
+            cancel.clone(),
+        )
+        .await
+        .context("Claude sign-in did not receive a browser callback")?;
+
+        client
+            .finish_browser_authorization(reference, pending, &callback_url, cancel)
+            .await
+            .context("Claude sign-in did not complete")
+    }
+
+    #[derive(Clone)]
+    struct CallbackState {
+        /// The exact scheme+host+port+path Finch told Anthropic to redirect to
+        /// (no query). The handler appends the browser's raw query string to
+        /// reconstruct the full callback URL `finish_browser_authorization`
+        /// validates against `pending`.
+        redirect_uri: String,
+        result: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    }
+
+    /// Accept exactly one browser redirect on `listener` and return the full
+    /// callback URL (scheme/host/port/path/query), or fail on cancellation or
+    /// the authorization's own lifetime elapsing. The loopback HTTP server is
+    /// torn down as soon as one callback is observed or the deadline passes.
+    pub(super) async fn wait_for_callback(
+        listener: tokio::net::TcpListener,
+        redirect_uri: String,
+        lifetime: Duration,
+        cancel: CancellationToken,
+    ) -> Result<String> {
+        let (sender, receiver) = oneshot::channel::<String>();
+        let state = CallbackState {
+            redirect_uri,
+            result: Arc::new(Mutex::new(Some(sender))),
+        };
+        let app = axum::Router::new()
+            .route("/callback", get(callback_handler))
+            .with_state(state);
+        let server_cancel = cancel.child_token();
+        let serve_cancel = server_cancel.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { serve_cancel.cancelled().await })
+                .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + lifetime;
+        let outcome = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("Claude sign-in was cancelled")),
+            _ = tokio::time::sleep_until(deadline) => Err(anyhow::anyhow!("Claude sign-in timed out waiting for the browser callback")),
+            received = receiver => received.context("Claude sign-in callback listener closed unexpectedly"),
+        };
+        server_cancel.cancel();
+        let _ = server.await;
+        outcome
+    }
+
+    async fn callback_handler(
+        State(state): State<CallbackState>,
+        RawQuery(query): RawQuery,
+    ) -> impl IntoResponse {
+        // The browser's raw query string is forwarded verbatim (not decoded and
+        // re-encoded), so `finish_browser_authorization`'s exact
+        // parameter-count/name check sees exactly what Anthropic sent.
+        let callback_url = match query {
+            Some(query) => format!("{}?{query}", state.redirect_uri),
+            None => state.redirect_uri.clone(),
+        };
+        if let Some(sender) = state
+            .result
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            let _ = sender.send(callback_url);
+        }
+        Html(
+            "<html><body><p>Claude sign-in complete. You can close this tab and return to the terminal.</p></body></html>",
+        )
+    }
+
+    fn present_authorization_url(url: &str, presentation: BrowserLoginPresentation) -> Result<()> {
+        println!("Claude sign-in URL: {url}");
+        println!("Waiting for the browser sign-in to complete… Press Ctrl+C to cancel.");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        if presentation.open_browser {
+            open_browser(url)?;
+            println!("Opened the Claude sign-in page in the default browser.");
+        }
+        Ok(())
+    }
+
+    fn open_browser(url: &str) -> Result<()> {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(target_os = "macos")]
+        let status = Command::new("open").arg("--").arg(url).status();
+        #[cfg(target_os = "linux")]
+        let status = Command::new("xdg-open").arg(url).status();
+        #[cfg(target_os = "windows")]
+        let status = Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .status();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let status: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported browser launcher",
+        ));
+        let status =
+            status.context("Could not open a browser; use the displayed Claude sign-in URL")?;
+        if !status.success() {
+            bail!("Browser opener failed; use the displayed Claude sign-in URL");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+use pkce_browser_login::{login_browser_with, wait_for_callback};
+
 async fn extract_claude_cli_token(
     store: Arc<FileOAuthCredentialStore>,
     reference: &str,
@@ -540,5 +709,116 @@ mod tests {
             store.0.lock().unwrap().as_ref().unwrap().generation,
             generation
         );
+    }
+
+    #[tokio::test]
+    async fn pkce_login_conflicts_fail_before_any_socket_or_store_mutation() {
+        let dialect = Arc::new(
+            ClaudeOAuthDialect::for_test("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap(),
+        );
+        let descriptor = dialect.descriptor();
+        let mut hostile = record();
+        hostile.dialect_id = descriptor.dialect_id.clone();
+        hostile.protocol_revision = descriptor.protocol_revision.clone();
+        hostile.provider = descriptor.provider;
+        hostile.kind = descriptor.credential_kind;
+        hostile.issuer = descriptor.issuer.clone();
+        hostile.audience = descriptor.audience.clone();
+        hostile.client_id = descriptor.client_id.clone();
+        hostile.scopes = descriptor.scopes.clone();
+        // An active (non-revoked) record already exists locally; login must
+        // refuse to start (no listener, no store mutation) rather than race
+        // a second authorization against it.
+        let generation = hostile.generation.clone();
+        let store = Arc::new(MemoryStore(StdMutex::new(Some(hostile))));
+        let client = finch_providers::OAuthClient::new(dialect, store.clone()).unwrap();
+        assert!(login_browser_with(
+            &client,
+            "claude:work",
+            BrowserLoginPresentation::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            store.0.lock().unwrap().as_ref().unwrap().generation,
+            generation
+        );
+    }
+
+    #[tokio::test]
+    async fn login_completes_a_real_loopback_callback_round_trip() {
+        let mut server = mockito::Server::new_async().await;
+        let token_mock = server
+            .mock("POST", "/v1/oauth/token")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "access_token": "browser-access-secret",
+                    "refresh_token": "browser-refresh-secret",
+                    "expires_in": 28800,
+                    "account": {"uuid": "acct-browser"}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let dialect = Arc::new(ClaudeOAuthDialect::for_test(&server.url(), &server.url()).unwrap());
+        let store = Arc::new(MemoryStore(StdMutex::new(None)));
+        let client = finch_providers::OAuthClient::new(dialect, store).unwrap();
+
+        // Bind a real listener, spawn the callback server, and fire a real
+        // HTTP GET at it exactly as a browser redirect would, then confirm
+        // the reconstructed callback URL round-trips through
+        // `finish_browser_authorization` and the token exchange.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let pending = client
+            .begin_browser_authorization(&redirect_uri, Duration::from_secs(30))
+            .unwrap();
+        let state = reqwest::Url::parse(&pending.authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.to_string())
+            .unwrap();
+
+        let wait = tokio::spawn(wait_for_callback(
+            listener,
+            redirect_uri.clone(),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        ));
+        // Give the axum server a moment to start listening before the
+        // "browser" fires its GET.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let http = reqwest::Client::new();
+        let response = http
+            .get(format!(
+                "{redirect_uri}?state={state}&code=browser-authorization-code"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let callback_url = wait.await.unwrap().unwrap();
+        assert_eq!(
+            callback_url,
+            format!("{redirect_uri}?state={state}&code=browser-authorization-code")
+        );
+
+        let credential = client
+            .finish_browser_authorization(
+                "claude:work",
+                pending,
+                &callback_url,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(credential.account.as_deref(), Some("acct-browser"));
+        assert_eq!(credential.provider, CredentialProvider::ClaudeSubscription);
+        token_mock.assert_async().await;
     }
 }
