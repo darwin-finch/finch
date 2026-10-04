@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             asset_name: finch-macos-arm64
             cache_family: debug-default_supervisor-release_apple-release-default

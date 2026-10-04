@@ -185,11 +185,11 @@ class WorkflowContractTests(unittest.TestCase):
             "ci.yml",
             "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
             "    if: true\n",
-            after="    name: Test (macos-14, default)\n",
+            after="    name: Test (macos-15, default)\n",
         )
         self.assert_fails(
             "ci.yml: expanded check allocation changed",
-            "Test (macos-14, default)",
+            "Test (macos-15, default)",
         )
 
     def test_release_build_job_is_not_a_pull_request_gate(self) -> None:
@@ -219,12 +219,12 @@ class WorkflowContractTests(unittest.TestCase):
     def test_isolation_macos_job_stays_off_pull_requests(self) -> None:
         self.repository.replace(
             "issue-56-brain-isolation.yml",
-            "    if: github.event_name != 'pull_request'\n    runs-on: macos-14\n",
-            "    runs-on: macos-14\n",
+            "    if: github.event_name != 'pull_request'\n    runs-on: macos-15\n",
+            "    runs-on: macos-15\n",
             after="  isolation-boundaries-macos:\n",
         )
         self.assert_fails(
-            "owner job 'isolation-boundaries-macos' must run on macos-14 with "
+            "owner job 'isolation-boundaries-macos' must run on macos-15 with "
             "if: \"github.event_name != 'pull_request'\"",
         )
 
