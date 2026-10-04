@@ -169,6 +169,8 @@ pub struct UserTurnView {
     pub subject: Option<String>,
     pub content_lines: Vec<String>,
     pub participant_index: Option<usize>,
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// The style roles the component renderers read (stage 4, #1141).
@@ -587,6 +589,17 @@ fn user_turn_lines(
                 line.clone(),
                 style.clone(),
             )]));
+        }
+    }
+
+    if !view.images.is_empty() {
+        for b64 in &view.images {
+            let mut line = RenderedTranscriptLine::from_spans(vec![Span::styled(
+                "[Image attachment: natively rendered in iTerm2]",
+                style.clone().with_dim(true),
+            )]);
+            line.image_attachment = Some(b64.clone());
+            lines.push(line);
         }
     }
 
@@ -1665,6 +1678,7 @@ mod tests {
                 "third line".into(),
             ],
             participant_index: None,
+            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 3);
@@ -1693,6 +1707,7 @@ mod tests {
             subject: Some("alice@box".into()),
             content_lines: vec!["hello world".into()],
             participant_index: Some(3),
+            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 1);
@@ -1700,5 +1715,23 @@ mod tests {
         let expected_style =
             SpanStyle::fg(PALETTE.user_foreground).with_bg(PALETTE.participant_backgrounds[3]);
         assert_eq!(lines[0].spans[0].style, expected_style);
+    }
+
+    #[test]
+    fn test_user_turn_lines_with_images() {
+        let view = UserTurnView {
+            marker: '❯',
+            subject: None,
+            content_lines: vec!["what is this?".into()],
+            participant_index: None,
+            images: vec!["base64image1==".into(), "base64image2==".into()],
+        };
+        let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
+        assert_eq!(lines.len(), 3); // 1 content line + 2 image lines
+        assert_eq!(lines[0].text, " ❯ what is this?");
+        assert_eq!(lines[1].text, "[Image attachment: natively rendered in iTerm2]");
+        assert_eq!(lines[1].image_attachment.as_deref(), Some("base64image1=="));
+        assert_eq!(lines[2].text, "[Image attachment: natively rendered in iTerm2]");
+        assert_eq!(lines[2].image_attachment.as_deref(), Some("base64image2=="));
     }
 }

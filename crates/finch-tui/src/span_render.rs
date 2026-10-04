@@ -97,6 +97,12 @@ pub fn lower_spans(spans: &[Span]) -> String {
 /// Measurement never runs on this string: SGR is zero-width and the plain
 /// `text` is what every row count reads.
 pub fn lower_rendered_line(line: &RenderedTranscriptLine, force_bg: Option<SpanColor>, canvas_bg: Option<SpanColor>) -> String {
+    if let Some(b64) = &line.image_attachment {
+        if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
+            return format!("\x1b]1337;File=inline=1;width=auto;height=auto:{}\x07", b64);
+        }
+    }
+
     let mut rendered = if line.spans.is_empty() {
         let bg = force_bg.clone().or_else(|| canvas_bg.clone());
         if let Some(bg) = bg {
