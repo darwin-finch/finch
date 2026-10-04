@@ -1359,6 +1359,11 @@ pub(crate) fn plan_live_frame(
     }
     frame.cursor_visible = claimed_rects.composer.height > 0;
     let (cursor_row, cursor_col) = vm.input_cursor;
+    if claimed_rects.composer.height > 0 {
+        for line in vm.attachment_lines {
+            frame.push(format!("{DIM_GRAY}{line}{RESET}"));
+        }
+    }
     let rows_before_input = frame.physical_rows(width);
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
@@ -2241,7 +2246,11 @@ impl TuiRenderer {
                 }
                 if retained_window.is_none() {
                     self.viewport_invalidated = true;
-                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
+                    return self.redraw_full_viewport_inner_to(
+                        out,
+                        true,
+                        Some((term_width, term_h)),
+                    );
                 }
             }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
@@ -2405,6 +2414,11 @@ impl TuiRenderer {
     /// borrow it for the planning call.
     fn live_frame_sources(&mut self, term_width: usize) -> LiveFrameSources {
         let input_lines = self.input_textarea.lines().to_vec();
+        let attachment_lines = self
+            .pending_images
+            .iter()
+            .map(|(index, _, media_type)| format!("  ▣ Image {index} · {media_type}"))
+            .collect();
         let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
         let mut effective_status = compute_effective_status(
@@ -2461,6 +2475,7 @@ impl TuiRenderer {
         LiveFrameSources {
             input_cursor: self.input_textarea.cursor(),
             ghost_text: self.ghost_text.clone(),
+            attachment_lines,
             input_lines,
             effective_status,
             cwd_label,
@@ -2900,6 +2915,7 @@ fn find_parent_transcript_row<'a>(
 /// Owned state for one live-frame blit, gathered once so the ViewModel can
 /// borrow it for the planning call.
 struct LiveFrameSources {
+    attachment_lines: Vec<String>,
     input_lines: Vec<String>,
     input_cursor: (usize, usize),
     ghost_text: Option<String>,
@@ -2928,6 +2944,7 @@ fn live_view_model<'a>(
     view_model::LiveViewModel {
         terminal_width,
         terminal_height,
+        attachment_lines: &sources.attachment_lines,
         input_lines: &sources.input_lines,
         input_cursor: sources.input_cursor,
         ghost_text: sources.ghost_text.as_deref(),
@@ -6645,6 +6662,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
+            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -11902,6 +11920,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
+            attachment_lines: &[],
             input_lines,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -11983,6 +12002,7 @@ mod tests {
                 hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
+                attachment_lines: &[],
                 input_lines: &input_lines,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12160,6 +12180,7 @@ mod tests {
                 hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
+                attachment_lines: &[],
                 input_lines: &draft,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12253,6 +12274,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
+            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,
