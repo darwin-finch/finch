@@ -172,7 +172,7 @@ impl ClaudeAuthService {
         presentation: BrowserLoginPresentation,
         cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
-        let client = self.client()?;
+        preflight_login(&self.client()?, reference)?;
         extract_claude_cli_token(self.store.clone(), reference).await
     }
 
@@ -213,6 +213,18 @@ impl ClaudeAuthService {
     pub fn recover(&self, reference: &str) -> Result<ProviderCredential> {
         self.client()?.recover_interrupted_as_revoked(reference)
     }
+}
+
+/// Reject a conflicting local record before login reads the keychain or
+/// touches the credential store. Only a missing record or an exact, durable
+/// revoked tombstone may be replaced, matching the other providers' logins.
+fn preflight_login<D, S>(client: &OAuthClient<D, S>, reference: &str) -> Result<()>
+where
+    D: crate::oauth::OAuthDialect + 'static,
+    S: OAuthCredentialStore + 'static,
+{
+    crate::oauth::validate_reference(reference)?;
+    client.preflight_reauthentication(reference)
 }
 
 async fn extract_claude_cli_token(
@@ -499,8 +511,8 @@ mod tests {
         assert!(error.contains("finch auth status claude"));
     }
 
-    #[tokio::test]
-    async fn explicit_login_conflicts_fail_before_any_socket_or_store_mutation() {
+    #[test]
+    fn explicit_login_conflicts_fail_before_any_keychain_read_or_store_mutation() {
         let dialect = Arc::new(
             ClaudeOAuthDialect::for_test("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap(),
         );
@@ -515,19 +527,15 @@ mod tests {
         hostile.client_id = descriptor.client_id.clone();
         hostile.scopes = descriptor.scopes.clone();
         // An active (non-revoked) record already exists locally; login must
-        // refuse to start (no listener, no store mutation) rather than race
-        // a second authorization against it.
+        // refuse to start (no keychain read, no store mutation) rather than
+        // silently replace it.
         let generation = hostile.generation.clone();
         let store = Arc::new(MemoryStore(StdMutex::new(Some(hostile))));
         let client = finch_providers::OAuthClient::new(dialect, store.clone()).unwrap();
-        assert!(login_browser_with(
-            &client,
-            "claude:work",
-            BrowserLoginPresentation::default(),
-            CancellationToken::new(),
-        )
-        .await
-        .is_err());
+        assert!(
+            preflight_login(&client, "claude:work").is_err(),
+            "login must refuse to start while an active Claude credential exists"
+        );
         assert_eq!(
             store.0.lock().unwrap().as_ref().unwrap().generation,
             generation
