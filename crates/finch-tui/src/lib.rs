@@ -1359,6 +1359,11 @@ pub(crate) fn plan_live_frame(
     }
     frame.cursor_visible = claimed_rects.composer.height > 0;
     let (cursor_row, cursor_col) = vm.input_cursor;
+    if claimed_rects.composer.height > 0 {
+        for line in vm.attachment_lines {
+            frame.push(format!("{DIM_GRAY}{line}{RESET}"));
+        }
+    }
     let rows_before_input = frame.physical_rows(width);
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
