@@ -62,13 +62,21 @@ fn backend() -> Result<&'static LlamaBackend> {
     BACKEND.get_or_try_init(|| {
         // Void logs BEFORE initialization to prevent Metal startup logs (e.g. `ggml_metal_device_init`) 
         // from leaking to stderr before the TUI starts.
-        unsafe extern "C" fn void_log(
+        unsafe extern "C" fn tracing_log(
             _level: llama_cpp_sys_2::ggml_log_level,
-            _text: *const ::std::os::raw::c_char,
+            text: *const ::std::os::raw::c_char,
             _user_data: *mut ::std::os::raw::c_void,
-        ) {}
+        ) {
+            if text.is_null() { return; }
+            if let Ok(msg) = std::ffi::CStr::from_ptr(text).to_str() {
+                let msg = msg.trim_end();
+                if !msg.is_empty() {
+                    tracing::info!(target: "llama", "{}", msg);
+                }
+            }
+        }
         unsafe {
-            llama_cpp_sys_2::llama_log_set(Some(void_log), std::ptr::null_mut());
+            llama_cpp_sys_2::llama_log_set(Some(tracing_log), std::ptr::null_mut());
         }
 
         let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
