@@ -349,9 +349,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_real_tool_call_is_forwarded_over_the_socket_and_the_real_reply_is_returned() {
-        let dir = tempfile::tempdir().unwrap();
+        // macOS caps `sockaddr_un.sun_path` at 104 bytes, and the supervised
+        // test `TMPDIR` is longer than that, so a socket under the default
+        // temp directory cannot be bound ("path must be shorter than
+        // SUN_LEN"). Production binds under a short path for the same reason
+        // (`ClaudeCliProvider`, `crates/finch-providers/src/claude_cli.rs`).
+        let dir = tempfile::Builder::new()
+            .prefix("fb-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let socket_path = dir.path().join("bridge.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap_or_else(|error| {
+            panic!(
+                "bind the bridge socket at {}: {error}",
+                socket_path.display()
+            )
+        });
 
         let server = tokio::spawn(async move {
             let (stream, _addr) = listener.accept().await.unwrap();

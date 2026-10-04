@@ -14,8 +14,12 @@ generation for compensation after a later application failure.
 
 For Grok login, `src/cli/grok_auth.rs` uses the same `OAuthClient` contract with the xAI dialect.
 It can refresh an existing named credential or finish a new device authorization, while its own
-presentation code stays outside this module. Both callers depend on terminal cancellation,
-expiry, and denial and on secret-free status handling.
+presentation code stays outside this module. The dialect supplies its two pinned, nonsecret
+Grok client headers through `OAuthPublicMetadata`; this module deliberately offers no generic
+header-injection surface. A recognized adjacent protocol revision can only be recovered into a
+secret-cleared tombstone through generation CAS, after which the user explicitly signs in again.
+Both callers depend on terminal cancellation, expiry, and denial and on secret-free status
+handling.
 
 Read [AGENTS.md](AGENTS.md) for security invariants, [mod.rs](mod.rs) for the module facade, and
 `cargo doc -p finch-providers --no-deps --open` for callable methods.

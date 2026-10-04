@@ -60,11 +60,11 @@ static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
     BACKEND.get_or_try_init(|| {
-        let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
         // This backend lives in the interactive frontend. Native llama.cpp
-        // stderr bypasses the TUI renderer and corrupts its cursor geometry.
-        backend.void_logs();
-        Ok(backend)
+        // stderr bypasses the TUI renderer and corrupts its cursor geometry,
+        // so its output is routed to diagnostics before anything can log.
+        crate::models::llama_log::route_native_logs_to_tracing();
+        LlamaBackend::init().context("initialize llama.cpp backend")
     })
 }
 

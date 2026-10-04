@@ -2659,7 +2659,7 @@ async fn run_query(query: &str, bypass_daemon: bool, show_program: bool) -> Resu
     let client = DaemonClient::connect(daemon_config).await?;
 
     let guard = executor.lock().await;
-    let wire_metrics = default_wire_metrics_logger();
+    let wire_metrics = wire_metrics_logger(&config);
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass("daemon", "daemon-selected", "one_shot");
     let response = client
@@ -2819,7 +2819,7 @@ async fn run_query_cloud_only(
         .first()
         .map(|provider| provider.provider_type().to_string())
         .unwrap_or_else(|| "cloud".to_string());
-    let wire_metrics = default_wire_metrics_logger();
+    let wire_metrics = wire_metrics_logger(config);
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass(&provider, model.clone(), "one_shot");
 
@@ -3054,10 +3054,11 @@ fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> Stri
     finch_programs::wire_repair_request(rejected_source, diagnostic)
 }
 
-fn default_wire_metrics_logger() -> Option<finch::metrics::MetricsLogger> {
-    dirs::home_dir()
-        .map(|home| home.join(".finch").join("metrics"))
-        .and_then(|path| finch::metrics::MetricsLogger::new(path).ok())
+/// The one-shot query's wire-adherence logger, rooted at the configured
+/// metrics directory rather than a path re-derived from the home directory,
+/// so every surface that records or reads metrics agrees on one place.
+fn wire_metrics_logger(config: &Config) -> Option<finch::metrics::MetricsLogger> {
+    finch::metrics::MetricsLogger::new(config.metrics_dir.clone()).ok()
 }
 
 fn mark_wire_rejection(
@@ -3264,8 +3265,10 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
         render_grok_auth_status_line, save_grok_named_credential, GrokAuthService,
         GrokDeviceLoginPresentation,
     };
+    use std::io::IsTerminal as _;
 
-    let service = GrokAuthService::production()?;
+    let device_surface = grok_auth_device_surface(std::io::stdout().is_terminal());
+    let service = GrokAuthService::production_for_surface(device_surface)?;
     match command {
         AuthCommand::Status { credential, .. } => {
             let status = service.status(&credential)?;
@@ -3309,6 +3312,14 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn grok_auth_device_surface(stdout_is_terminal: bool) -> finch::cli::GrokDeviceClientSurface {
+    if stdout_is_terminal {
+        finch::cli::GrokDeviceClientSurface::Cli
+    } else {
+        finch::cli::GrokDeviceClientSurface::Headless
+    }
 }
 
 async fn run_gemini_auth(command: AuthCommand) -> Result<()> {
@@ -3994,15 +4005,29 @@ fn remove_named_brain(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_brain_command, finish_first_run_setup, query_tool_state_paths,
-        register_query_vm_tools, reject_retired_session_flags, resolve_brain_name,
-        supervise_generator_loader_task, suppress_ort_logs_unless_overridden, Args, AuthCommand,
-        BrainCommand, Command,
+        execute_brain_command, finish_first_run_setup, grok_auth_device_surface,
+        query_tool_state_paths, register_query_vm_tools, reject_retired_session_flags,
+        resolve_brain_name, supervise_generator_loader_task, suppress_ort_logs_unless_overridden,
+        Args, AuthCommand, BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
     use finch::models::GeneratorState;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn grok_auth_cli_surface_tracks_interactive_vs_headless_output() {
+        assert_eq!(
+            grok_auth_device_surface(true),
+            finch::cli::GrokDeviceClientSurface::Cli,
+            "interactive `finch auth login grok-sub` must identify the official CLI surface"
+        );
+        assert_eq!(
+            grok_auth_device_surface(false),
+            finch::cli::GrokDeviceClientSurface::Headless,
+            "redirected `finch auth login grok-sub` output must identify the headless surface"
+        );
+    }
 
     #[test]
     fn query_code_search_fails_closed_without_an_application_state_root() {

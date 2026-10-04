@@ -47,6 +47,20 @@ them:
 enum, so do not add a catch-all arm. Keep the arm short: if handling takes more than a few lines,
 put a `pub(super)` method in whichever file above it belongs to and call it.
 
+**The metrics logger is injected; the event loop never derives a metrics path itself.**
+`RuntimeParts::metrics_logger` is the only source of `EventLoop::metrics_logger`, which is both
+what a turn records through and what `/metrics` reads. `Repl::run_event_loop` hands in the logger
+built from `Config::metrics_dir`; the headless test runners in `event_loop/brain.rs` hand in
+`None`, and a test that wants metrics injects its own temporary directory through
+`set_metrics_logger_for_test`. `EventLoop::new` used to build a logger from `dirs::home_dir()`,
+so every fixture provider driven through a test runner under a bare `cargo test` wrote a
+wire-adherence row into the real `~/.finch/metrics` and showed up in the user's `/metrics`
+report (issue #1629, test runs filling the report with fixture providers).
+`test_headless_runner_fixture_wire_metric_never_reaches_the_home_metrics_directory` and
+`test_injected_metrics_logger_keeps_the_fixture_wire_metric_in_the_tests_own_directory` in
+`event_loop/tests.rs` drive a real turn through a uniquely named fixture provider and fail if a
+row naming it appears under the home directory.
+
 **IPC recovery is header/status, not transcript.** Peer disconnect, home event-watch loss, and
 runner reconnect attempts update `StatusBar` (`SessionLabel`) through
 `EventLoop::project_ipc_recovery_header`. They must not call `output_manager.write_info` — that

@@ -13111,3 +13111,218 @@ async fn test_peer_turn_prompt_naming_a_patterns_command_cannot_list_or_change_o
         })
         .await;
 }
+
+/// A scripted provider whose name is unique to one metrics-isolation test, so
+/// a row carrying it can be attributed to that test wherever it lands.
+struct MetricsIsolationProvider {
+    name: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for MetricsIsolationProvider {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let text = "(say \"metrics isolation response\")";
+        Ok(crate::generators::GeneratorResponse {
+            text: text.to_string(),
+            content_blocks: vec![crate::providers::ContentBlock::text(text)],
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: self.name.to_string(),
+                model: self.name.to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+/// Every metrics row under `directory` that names `provider`, as
+/// `(file name, line)`. Reads only; a missing directory holds no rows.
+fn metrics_rows_naming(directory: &std::path::Path, provider: &str) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let file = entry.file_name().to_string_lossy().into_owned();
+        rows.extend(
+            contents
+                .lines()
+                .filter(|line| line.contains(provider))
+                .map(|line| (file.clone(), line.to_string())),
+        );
+    }
+    rows
+}
+
+/// The directory the event loop used to derive for itself, whatever `HOME`
+/// this test process was started with.
+fn home_derived_metrics_directory() -> std::path::PathBuf {
+    dirs::home_dir()
+        .expect("the test process must have a home directory to guard")
+        .join(".finch")
+        .join("metrics")
+}
+
+/// Drive one real turn (`handle_user_input` -> the real `LlmLoop` worker ->
+/// `process_query_with_tools`) through a headless runner backed by
+/// `provider`, optionally recording into `metrics`.
+async fn run_one_metrics_isolation_turn(
+    provider: &'static str,
+    metrics: Option<Arc<crate::metrics::MetricsLogger>>,
+) -> EventLoop {
+    let patterns = tempfile::tempdir()
+        .expect("isolated metrics-isolation tool state")
+        .path()
+        .join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .expect("construct metrics-isolation tool executor");
+    let mut event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::new(MetricsIsolationProvider { name: provider })
+            as Arc<dyn crate::generators::Generator>,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::new(crate::runtime::ProgramRuntime::new()),
+    );
+    if let Some(metrics) = metrics {
+        event_loop.set_metrics_logger_for_test(metrics);
+    }
+    event_loop.output_manager.disable_stdout();
+    event_loop.start_llm_worker();
+    event_loop
+        .handle_user_input("metrics isolation question".into())
+        .await
+        .expect("the metrics-isolation turn must dispatch");
+    let query_id = event_loop
+        .active_query_id
+        .read()
+        .await
+        .expect("the metrics-isolation turn must own the active slot");
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            event_loop.event_rx.recv(),
+        )
+        .await
+        .expect("the metrics-isolation turn hung before its terminal event")
+        .expect("the event channel must remain open");
+        let complete = matches!(
+            event,
+            ReplEvent::StreamingComplete { query_id: id, .. } if id == query_id
+        );
+        event_loop
+            .handle_event(event)
+            .await
+            .expect("metrics-isolation events must dispatch");
+        if complete {
+            break;
+        }
+    }
+    event_loop
+}
+
+/// Issue #1629 (test runs filling the user's `/metrics` report with fixture
+/// providers): the headless runner used to build its own logger from
+/// `dirs::home_dir()`, so a fixture provider's wire-adherence row landed in
+/// `~/.finch/metrics` of whoever ran the suite.
+#[tokio::test]
+async fn test_headless_runner_fixture_wire_metric_never_reaches_the_home_metrics_directory() {
+    const PROVIDER: &str = "metrics-isolation-uninjected-fixture";
+    let event_loop = tokio::task::LocalSet::new()
+        .run_until(run_one_metrics_isolation_turn(PROVIDER, None))
+        .await;
+
+    assert_eq!(
+        event_loop.metrics_dir_for_test(),
+        None,
+        "a headless test runner must hold no metrics logger until a test injects one"
+    );
+    let home_metrics = home_derived_metrics_directory();
+    let leaked = metrics_rows_naming(&home_metrics, PROVIDER);
+    assert!(
+        leaked.is_empty(),
+        "a fixture provider's metrics must never be written under the home directory; \
+         directory={} leaked_rows={leaked:?}",
+        home_metrics.display()
+    );
+}
+
+#[tokio::test]
+async fn test_injected_metrics_logger_keeps_the_fixture_wire_metric_in_the_tests_own_directory() {
+    const PROVIDER: &str = "metrics-isolation-injected-fixture";
+    let directory = tempfile::tempdir().expect("the test's own metrics directory");
+    let logger = Arc::new(
+        crate::metrics::MetricsLogger::new(directory.path().to_path_buf())
+            .expect("construct the test's own metrics logger"),
+    );
+    let event_loop = tokio::task::LocalSet::new()
+        .run_until(run_one_metrics_isolation_turn(PROVIDER, Some(logger)))
+        .await;
+
+    assert_eq!(
+        event_loop.metrics_dir_for_test().as_deref(),
+        Some(directory.path()),
+        "the event loop must record under exactly the directory the test injected"
+    );
+    let own = metrics_rows_naming(directory.path(), PROVIDER);
+    let wire_rows: Vec<_> = own
+        .iter()
+        .filter(|(file, _)| file.starts_with("wire-"))
+        .collect();
+    assert_eq!(
+        wire_rows.len(),
+        1,
+        "one fixture turn must record exactly one wire-adherence row in the test's own \
+         directory; directory={} rows={own:?}",
+        directory.path().display()
+    );
+    let home_metrics = home_derived_metrics_directory();
+    let leaked = metrics_rows_naming(&home_metrics, PROVIDER);
+    assert!(
+        leaked.is_empty(),
+        "an injected logger must be the only place a fixture provider's metrics land; \
+         home_directory={} leaked_rows={leaked:?} own_rows={own:?}",
+        home_metrics.display()
+    );
+}

@@ -1671,6 +1671,146 @@ fn chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
     }
 }
 
+/// Setup lists an account's models through `account_models`. The list must be
+/// exactly what a query would accept: the same catalog request, with the same
+/// credential headers, filtered the same way.
+#[tokio::test]
+async fn test_account_models_lists_only_what_a_query_would_accept() {
+    let mut server = mockito::Server::new_async().await;
+    let body = json!({
+        "models":[
+            {"slug":"gpt-6.1-sol","supported_in_api":true,"use_responses_lite":true,
+             "input_modalities":["text","image"],"context_window":1_050_000},
+            {"slug":"gpt-5.6-sol","supported_in_api":true,"use_responses_lite":true,
+             "input_modalities":["text","image"],"context_window":1_050_000},
+            {"slug":"gpt-5.6","supported_in_api":false,"use_responses_lite":true,
+             "input_modalities":["text","image"],"context_window":1_050_000},
+            {"slug":"account-only-model-finch-does-not-speak"}
+        ]
+    })
+    .to_string();
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .match_header("authorization", "Bearer subscription-secret")
+        .match_header("chatgpt-account-id", "account-1")
+        .match_header("originator", "finch")
+        .with_status(200)
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let source = Arc::new(StaticSource::new());
+    let provider = ChatGptSubscriptionProvider::for_test(
+        source.clone(),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+
+    let listed = provider
+        .account_models(CancellationToken::new())
+        .await
+        .expect("a signed-in account with selectable models must list them");
+
+    assert_eq!(
+        listed,
+        vec!["gpt-5.6-sol".to_string(), "gpt-6.1-sol".to_string()],
+        "account_models must return exactly the API-supported identifiers a query accepts, \
+         sorted; an unsupported or unknown identifier must not be offered"
+    );
+    assert_eq!(
+        (
+            source.leases.load(Ordering::SeqCst),
+            source.refreshes.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "listing models must lease the credential once and not refresh it when the catalog \
+         request is accepted (leases, refreshes)"
+    );
+    models.assert_async().await;
+}
+
+/// A rejected access token is refreshed once, exactly as a query does, and
+/// the failure text never carries either token.
+#[tokio::test]
+async fn test_account_models_refreshes_once_after_unauthorized_and_stays_secret_free() {
+    let mut server = mockito::Server::new_async().await;
+    let rejected = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::Any)
+        .match_header("authorization", "Bearer subscription-secret")
+        .with_status(401)
+        .expect(1)
+        .create_async()
+        .await;
+    let accepted = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::Any)
+        .match_header("authorization", "Bearer refreshed-subscription-secret")
+        .with_status(200)
+        .with_body(catalog_body())
+        .expect(1)
+        .create_async()
+        .await;
+    let source = Arc::new(StaticSource::new());
+    let provider = ChatGptSubscriptionProvider::for_test(
+        source.clone(),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+
+    let listed = provider
+        .account_models(CancellationToken::new())
+        .await
+        .expect("one refresh after a 401 must recover the listing");
+    assert_eq!(
+        listed,
+        vec!["gpt-5.6".to_string(), "gpt-5.6-sol".to_string()],
+        "the listing after a refreshed credential must be the refreshed account's catalog"
+    );
+    assert_eq!(
+        source.refreshes.load(Ordering::SeqCst),
+        1,
+        "a 401 on the catalog request must spend exactly one credential refresh"
+    );
+    rejected.assert_async().await;
+    accepted.assert_async().await;
+
+    let mut failing = mockito::Server::new_async().await;
+    let unavailable = failing
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::Any)
+        .with_status(503)
+        .with_body("upstream echoed subscription-secret")
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", failing.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .account_models(CancellationToken::new())
+        .await
+        .expect_err("a failed catalog request must not be reported as an empty list");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("HTTP 503"),
+        "a failed listing must name the HTTP status so setup can show why: {rendered}"
+    );
+    assert!(
+        !rendered.contains("subscription-secret"),
+        "a failed listing must never carry the access token or the response body: {rendered}"
+    );
+    unavailable.assert_async().await;
+}
+
 #[tokio::test]
 async fn empty_catalog_is_typed_actionable_and_secret_free() {
     let access_secret = "empty-catalog-access-secret";

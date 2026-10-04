@@ -39,6 +39,13 @@ not an OpenAI-compatible xAI Console API-key profile.
 Direct Meta Model API construction is `OpenAIProvider::new_meta_model_api` behind
 the distinct `CredentialProvider::MetaModelApi` mapping; endpoint overrides are
 rejected before secret resolution.
+A ChatGPT subscription's model list comes from the signed-in account, not an API key:
+`refresh_chatgpt_subscription_from_config` (`catalog.rs`) preflights the whole provider
+graph and then asks a `ChatGptAccountModels` source, whose production implementation is
+`ChatGptSubscriptionProvider::account_models`. An invalid graph, a revoked credential, or
+a profile of another provider is refused before the source is asked —
+`test_chatgpt_subscription_catalog_rejects_a_revoked_credential_before_asking_the_account`,
+`test_chatgpt_subscription_catalog_reports_the_accounts_models_as_discovered` in `catalog.rs`.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- providers::`; crate
 tests via `./scripts/test_brains.sh cargo test -p finch-providers --lib`; also
