@@ -7,6 +7,7 @@ mod common;
 mod generator_new;
 mod gguf_download;
 mod learning;
+mod llama_log; // llama.cpp native logs -> tracing diagnostics
 mod loaders;
 mod lora; // LoRA fine-tuning configuration (Python training, Phase 5)
 mod manager;
