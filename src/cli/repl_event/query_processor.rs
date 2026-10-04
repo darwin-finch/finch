@@ -9473,7 +9473,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
-            Some(query_text.to_string()),
+            Some((query_text.to_string(), Vec::new())),
         )
         .await;
         turn.task.await.expect("query task panicked");
@@ -9541,7 +9541,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
-            Some(query_text.to_string()),
+            Some((query_text.to_string(), Vec::new())),
         )
         .await;
         turn.task.await.expect("query task panicked");
@@ -9658,7 +9658,7 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&summary_gen) as Arc<dyn Generator>,
             Arc::clone(&summary_cache),
-            Some(query_text.to_string()),
+            Some((query_text.to_string(), Vec::new())),
         )
         .await;
         harness.task.await.expect("query task panicked");
