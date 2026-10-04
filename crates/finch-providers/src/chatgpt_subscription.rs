@@ -42,7 +42,13 @@ pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
 // Finch's product version. This is the released Codex version corresponding to
 // the public source revision pinned above. Update both pins together after a
 // protocol audit and live acceptance run.
-const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.151.0";
+//
+// 0.160.0 (released 2026-10-01) is ahead of the audited revision above: the
+// catalog served to 0.151.0 did not include GPT-6.1 Sol (released
+// 2026-09-29), so a config naming it failed with "does not advertise the
+// configured model". The request shape is still the one audited at 0.151.0;
+// the revision pin moves when that audit is redone.
+const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.160.0";
 const FINCH_CHATGPT_USER_AGENT: &str = concat!(
     "finch/",
     env!("CARGO_PKG_VERSION"),

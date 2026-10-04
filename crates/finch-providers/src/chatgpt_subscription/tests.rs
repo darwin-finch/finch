@@ -1645,7 +1645,7 @@ fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
 
 #[test]
 fn test_compatibility_version_is_pinned_to_audited_codex_not_finch_package() {
-    assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.151.0");
+    assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.160.0");
     assert_ne!(CHATGPT_CATALOG_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
 }
 
@@ -1680,7 +1680,7 @@ async fn empty_catalog_is_typed_actionable_and_secret_free() {
         .mock("GET", "/backend-api/codex/models")
         .match_query(mockito::Matcher::UrlEncoded(
             "client_version".into(),
-            "0.151.0".into(),
+            "0.160.0".into(),
         ))
         .match_header("authorization", format!("Bearer {access_secret}").as_str())
         .match_header("chatgpt-account-id", account_secret)
@@ -1710,7 +1710,7 @@ async fn empty_catalog_is_typed_actionable_and_secret_free() {
         .expect("empty catalog must fail");
     assert!(error.is::<SubscriptionCatalogUnavailable>());
     let rendered = error.to_string();
-    assert!(rendered.contains("pinned Codex compatibility version 0.151.0"));
+    assert!(rendered.contains("pinned Codex compatibility version 0.160.0"));
     assert!(rendered.contains("entitlement or server compatibility filtering"));
     assert!(!rendered.contains(access_secret));
     assert!(!rendered.contains(account_secret));
@@ -3629,7 +3629,7 @@ async fn test_buffered_inference_uses_the_pinned_compatibility_version() {
         .mock("GET", "/backend-api/codex/models")
         .match_query(mockito::Matcher::UrlEncoded(
             "client_version".into(),
-            "0.151.0".into(),
+            "0.160.0".into(),
         ))
         .match_header("authorization", "Bearer subscription-secret")
         .match_header("chatgpt-account-id", "account-1")

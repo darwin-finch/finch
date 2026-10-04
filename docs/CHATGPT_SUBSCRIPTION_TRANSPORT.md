@@ -26,10 +26,12 @@ The relevant source files are:
 - `codex-rs/protocol/src/openai_models.rs`
 
 Protocol drift fails closed; it is not silently treated as Platform behavior.
-Catalog discovery sends `client_version=0.151.0`, and both catalog and
-inference requests send `version: 0.151.0`. This is the released Codex
-compatibility version associated with that audited source revision, not
-Finch's application version or a claim that Finch is Codex. Updating either
+Catalog discovery sends `client_version=0.160.0`, and both catalog and
+inference requests send `version: 0.160.0`. That is a released Codex
+version, not Finch's application version or a claim that Finch is Codex. It
+is ahead of the audited source revision (which corresponds to 0.151.0): the
+catalog served to 0.151.0 omitted GPT-6.1 Sol, so the version was moved
+before the request-shape audit was redone, and that audit is still owed. Updating either
 compatibility pin requires auditing the newer public Codex catalog and
 Responses-Lite contracts, updating both pins together, and rerunning the
 focused tests plus the explicit live acceptance test.
@@ -42,7 +44,7 @@ revision, and generation are revalidated before reuse and after refresh.
 
 The production origin is exactly `https://chatgpt.com` with these routes:
 
-- `GET /backend-api/codex/models?client_version=0.151.0`
+- `GET /backend-api/codex/models?client_version=0.160.0`
 - `POST /backend-api/codex/responses`
 
 Requests use bearer authorization, `ChatGPT-Account-ID`, honest
