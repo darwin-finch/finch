@@ -24,6 +24,7 @@ pub use component::{
     MemoryRecalledView, OperationRowView, OperationView, ProgressView, StaticTextKind,
     StaticTextView, UserTurnView,
 };
+pub use markdown::{inline_link_segments, InlineLinkSegment};
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
 };

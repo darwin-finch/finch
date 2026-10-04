@@ -463,6 +463,29 @@ pub fn wizard_url(text: &str, url: &str, fg: Option<WizardColor>) -> WizardLine 
     }])
 }
 
+/// One wizard line written as markdown: inline links (`[label](target)`)
+/// become link spans in `link_fg`, everything else is plain text.
+///
+/// A link is clickable in the wizard itself — the planned frame records
+/// where each one landed ([`WizardFrame::link_at`]) — and its target says
+/// what a click does; the caller decides which targets it supports. Targets
+/// that are web addresses are also emitted as terminal hyperlinks.
+pub fn wizard_markdown(text: &str, link_fg: WizardColor) -> WizardLine {
+    WizardLine(
+        finch_ui_model::inline_link_segments(text)
+            .into_iter()
+            .map(|segment| WizardSpan {
+                fg: segment.target.as_ref().map(|_| link_fg),
+                bg: None,
+                bold: false,
+                dim: false,
+                osc8_url: segment.target,
+                text: segment.text,
+            })
+            .collect(),
+    )
+}
+
 /// A plain wizard span.
 pub fn wizard_plain(text: &str) -> WizardLine {
     WizardLine::plain(text)
@@ -1056,9 +1079,32 @@ pub struct WizardFrame {
     pub rects: WizardRects,
     /// `(first physical row, physical rows)` per logical line.
     pub row_spans: Vec<(usize, usize)>,
+    /// Where each link span landed on screen, for mouse hit-testing.
+    pub links: Vec<WizardLinkRegion>,
+}
+
+/// The cells one link occupies on one physical row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WizardLinkRegion {
+    pub row: usize,
+    /// First column of the link on this row.
+    pub start: usize,
+    /// One past its last column on this row.
+    pub end: usize,
+    pub target: String,
 }
 
 impl WizardFrame {
+    /// The target of the link under a terminal cell, if any. A click outside
+    /// every link's own cells is not a link click.
+    pub fn link_at(&self, column: u16, row: u16) -> Option<&str> {
+        let (column, row) = (usize::from(column), usize::from(row));
+        self.links
+            .iter()
+            .find(|link| link.row == row && (link.start..link.end).contains(&column))
+            .map(|link| link.target.as_str())
+    }
+
     /// Physical rows the frame occupies once clipped to `height`.
     fn clipped_row_count(&self, height: usize) -> usize {
         self.row_spans
@@ -1248,11 +1294,105 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
         }
     }
 
+    let links = collect_link_regions(&mut lines, &row_spans, width.max(1));
     WizardFrame {
         canvas: None,
         lines,
         rects,
         row_spans,
+        links,
+    }
+}
+
+/// Find every link in the lowered lines and record the cells it occupies.
+///
+/// Links are read back from the lowered bytes (the OSC 8 pair around each
+/// link span) rather than tracked through layout, so wrapping, centring and
+/// boxing cannot put a hit region somewhere other than where the text was
+/// painted. A target that is not a web address is an in-app action, not
+/// something a terminal can open, so its hyperlink wrapper is removed from
+/// the painted line once its region is recorded.
+fn collect_link_regions(
+    lines: &mut [String],
+    row_spans: &[(usize, usize)],
+    width: usize,
+) -> Vec<WizardLinkRegion> {
+    const OSC8: &str = "\x1b]8;;";
+    const OSC_END: &str = "\x1b\\";
+    let mut regions = Vec::new();
+    for (line, (first_row, _)) in lines.iter_mut().zip(row_spans) {
+        if !line.contains(OSC8) {
+            continue;
+        }
+        let mut painted = String::with_capacity(line.len());
+        let mut column = 0usize;
+        // (target, first column, whether the terminal gets the hyperlink)
+        let mut open: Option<(String, usize, bool)> = None;
+        let mut rest = line.as_str();
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix(OSC8) {
+                let Some(end) = after.find(OSC_END) else {
+                    painted.push_str(rest);
+                    break;
+                };
+                let target = &after[..end];
+                let sequence = &rest[..OSC8.len() + end + OSC_END.len()];
+                if target.is_empty() {
+                    if let Some((target, start, web)) = open.take() {
+                        push_link_rows(&mut regions, *first_row, start, column, width, &target);
+                        if web {
+                            painted.push_str(sequence);
+                        }
+                    }
+                } else {
+                    let web = target.starts_with("https://") || target.starts_with("http://");
+                    if web {
+                        painted.push_str(sequence);
+                    }
+                    open = Some((target.to_string(), column, web));
+                }
+                rest = &rest[sequence.len()..];
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix("\x1b[") {
+                // A CSI sequence occupies no cells.
+                let end = after
+                    .find(|c: char| c.is_ascii_alphabetic())
+                    .map_or(after.len(), |end| end + 1);
+                painted.push_str(&rest[..2 + end]);
+                rest = &after[end..];
+                continue;
+            }
+            let c = rest.chars().next().expect("rest is not empty");
+            column += wizard_char_width(c);
+            painted.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+        *line = painted;
+    }
+    regions
+}
+
+/// Record one link's cells, split per physical row when its line wraps.
+fn push_link_rows(
+    regions: &mut Vec<WizardLinkRegion>,
+    first_row: usize,
+    start: usize,
+    end: usize,
+    width: usize,
+    target: &str,
+) {
+    let mut column = start;
+    while column < end {
+        let row_end = ((column / width) + 1) * width;
+        let stop = end.min(row_end);
+        regions.push(WizardLinkRegion {
+            row: first_row + column / width,
+            start: column % width,
+            end: stop - (column / width) * width,
+            target: target.to_string(),
+        });
+        column = stop;
     }
 }
 
@@ -1474,6 +1614,70 @@ impl WizardHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Link regions are read back from the painted bytes, so they name the
+    /// cells the label really occupies: after a prefix, across a wrap, and
+    /// for an in-app `copy:` target, whose hyperlink wrapper must not reach
+    /// the terminal (it cannot open one).
+    #[test]
+    fn test_link_regions_cover_exactly_the_painted_label_cells() {
+        let line = wizard_markdown(
+            "go [open](https://x.test/a) or [copy AB](copy:AB)",
+            WizardColor::Cyan,
+        );
+        let mut lines = vec![lower_wizard_line(&line)];
+        let regions = collect_link_regions(&mut lines, &[(3, 1)], 80);
+        assert_eq!(
+            regions,
+            vec![
+                WizardLinkRegion {
+                    row: 3,
+                    start: 3,
+                    end: 7,
+                    target: "https://x.test/a".into()
+                },
+                WizardLinkRegion {
+                    row: 3,
+                    start: 11,
+                    end: 18,
+                    target: "copy:AB".into()
+                },
+            ],
+            "each link must cover its own label cells and nothing else; painted={lines:?}"
+        );
+        assert!(
+            lines[0].contains("\x1b]8;;https://x.test/a\x1b\\"),
+            "a web address stays a terminal hyperlink; painted={lines:?}"
+        );
+        assert!(
+            !lines[0].contains("copy:AB"),
+            "an in-app target must not be sent to the terminal as a hyperlink; painted={lines:?}"
+        );
+        assert_eq!(wizard_visible_length(&lines[0]), "go open or copy AB".len());
+
+        // The same line on a 10-column terminal wraps: "copy AB" starts at
+        // column 11, i.e. row 1 column 1, and runs to column 18 (row 1, 8).
+        let mut wrapped = vec![lower_wizard_line(&line)];
+        let regions = collect_link_regions(&mut wrapped, &[(0, 2)], 10);
+        assert_eq!(
+            regions,
+            vec![
+                WizardLinkRegion {
+                    row: 0,
+                    start: 3,
+                    end: 7,
+                    target: "https://x.test/a".into()
+                },
+                WizardLinkRegion {
+                    row: 1,
+                    start: 1,
+                    end: 8,
+                    target: "copy:AB".into()
+                },
+            ],
+            "a link on a wrapped line is located on the physical row it lands on"
+        );
+    }
 
     fn plain_view(section_lines: Vec<&str>) -> WizardView {
         WizardView {

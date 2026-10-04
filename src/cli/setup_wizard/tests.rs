@@ -1728,8 +1728,10 @@ fn test_device_code_overlay_claims_a_card_with_chrome_inside_it() {
     let rows = frame.to_shadow_buffer(80, 24).rows_as_text();
     let card_text = rows[card.y..card.y + card.height].join("\n");
     assert!(
-        card_text.contains("One-time code: CODE5678")
-            && card_text.contains("Open: https://auth.openai.com/activate"),
+        card_text.contains("Click to copy the verification code (CODE5678)")
+            && card_text.contains(
+                "Click to open the device sign-in page: https://auth.openai.com/activate"
+            ),
         "the device code and verification URL must blit through the shadow buffer; card:\n{card_text}"
     );
     assert!(
@@ -7730,8 +7732,10 @@ fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("One-time code: CODE1234")
-            && rendered.contains("Open: https://auth.openai.com/activate"),
+        rendered.contains("Click to copy the verification code (CODE1234)")
+            && rendered.contains(
+                "Click to open the device sign-in page: https://auth.openai.com/activate"
+            ),
         "the dialog must present the code and verification URL as speakable text; rendered={rendered}"
     );
     assert!(
@@ -9015,13 +9019,17 @@ fn test_device_dialog_advertises_browser_open_controls() {
     );
 }
 
+/// The device sign-in card's two links are real click targets: a left press
+/// on the "open" row opens the sign-in page, one on the "copy" row copies the
+/// code, and a press anywhere else does nothing. The handler this replaces
+/// treated a click anywhere on screen as "copy the code and open the browser".
 #[test]
 fn test_wizard_mouse_click_handles_device_auth_url() {
     let mut state = WizardState::new(None);
     state.current_section = WizardSection::Models;
     let pending = Arc::new(Mutex::new(Some(DeviceAuthPresentation {
         verification_uri: "https://example.com/oauth".into(),
-        user_code: "123".into(),
+        user_code: "AB-123".into(),
         expires_in: Duration::from_secs(300),
     })));
     let outcome = Arc::new(Mutex::new(None));
@@ -9043,11 +9051,155 @@ fn test_wizard_mouse_click_handles_device_auth_url() {
         });
     }
 
-    let mouse_down = crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: 10,
-        row: 5,
-        modifiers: crossterm::event::KeyModifiers::empty(),
+    let (width, height) = (100usize, 30usize);
+    let view = wizard_view_with_permission_target(&state, "", width, height);
+    // The frame the live loop paints and hit-tests: planned, then themed.
+    let frame = crate::cli::tui::theme_wizard_frame(
+        crate::cli::tui::plan_wizard_frame(&view, width, height),
+        &state.selected_scheme(),
+    );
+    let rows = frame.to_shadow_buffer(width, height).rows_as_text();
+    let locate = |label: &str| {
+        rows.iter()
+            .enumerate()
+            .find_map(|(row, text)| {
+                text.find(label)
+                    .map(|byte| (row, text[..byte].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("{label:?} must be on screen; rows:\n{}", rows.join("\n")))
     };
-    handle_wizard_mouse(&mut state, mouse_down);
+    let click = |column: usize, row: usize, button| {
+        handle_wizard_mouse(
+            &frame,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(button),
+                column: column as u16,
+                row: row as u16,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            },
+        )
+    };
+    let left = crossterm::event::MouseButton::Left;
+
+    let open_label = "Click to open the device sign-in page: https://example.com/oauth";
+    let (open_row, open_col) = locate(open_label);
+    let copy_label = "Click to copy the verification code (AB123)";
+    let (copy_row, copy_col) = locate(copy_label);
+    let context = format!("links={:?}\nrows:\n{}", frame.links, rows.join("\n"));
+
+    for column in [open_col, open_col + open_label.chars().count() - 1] {
+        assert_eq!(
+            click(column, open_row, left),
+            Some(WizardLinkAction::OpenUrl("https://example.com/oauth".into())),
+            "a left press on the open-page link (column {column}) must open the sign-in page; {context}"
+        );
+    }
+    for column in [copy_col, copy_col + copy_label.chars().count() - 1] {
+        assert_eq!(
+            click(column, copy_row, left),
+            Some(WizardLinkAction::CopyText("AB123".into())),
+            "a left press on the copy-code link (column {column}) must copy the code; {context}"
+        );
+    }
+    for (column, row, why) in [
+        (
+            open_col + open_label.chars().count(),
+            open_row,
+            "one cell past the link's end",
+        ),
+        (
+            open_col.saturating_sub(1),
+            open_row,
+            "one cell before the link's start",
+        ),
+        (open_col, open_row + 2, "a row that holds no link"),
+        (0, 0, "the wizard's title border"),
+    ] {
+        if column == open_col && open_col == 0 {
+            continue;
+        }
+        assert_eq!(
+            click(column, row, left),
+            None,
+            "a press on {why} is not a link click; {context}"
+        );
+    }
+    assert_eq!(
+        click(open_col, open_row, crossterm::event::MouseButton::Right),
+        None,
+        "only the left button activates a link; {context}"
+    );
+}
+
+/// The reported Gemini sign-in card: the address is a full OAuth authorize
+/// URL that wrapped across five rows of plain text, none of it clickable.
+/// A long address is not printed; one link opens it and another copies it.
+#[test]
+fn test_long_sign_in_address_is_two_links_not_wrapped_plain_text() {
+    let address = "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent\
+        &response_type=code&client_id=764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com\
+        &redirect_uri=http%3A%2F%2F127.0.0.1%3A62729%2Fcallback&scope=email+openid+profile&state=k5FQzOODWwyW5d\
+        &code_challenge=bvzipFvoBMhFb_norHwXejtkLptz5OKbbqoKS8z7T0I&code_challenge_method=S256";
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *adding_provider = Some(AddProviderStep::DeviceAuth {
+            provider_idx: 0,
+            name: "gemini-sub".into(),
+            model: "test-model".into(),
+            reference: "test:ref".into(),
+            editing_idx: None,
+            pending: Arc::new(Mutex::new(Some(DeviceAuthPresentation {
+                verification_uri: address.into(),
+                user_code: String::new(),
+                expires_in: Duration::from_secs(300),
+            }))),
+            outcome: Arc::new(Mutex::new(None)),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+    }
+
+    let (width, height) = (120usize, 30usize);
+    let view = wizard_view_with_permission_target(&state, "", width, height);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+    let rows = frame.to_shadow_buffer(width, height).rows_as_text();
+    let screen = rows.join("\n");
+    assert!(
+        !screen.contains("accounts.google.com"),
+        "a long sign-in address must not be printed across wrapped rows; screen:\n{screen}"
+    );
+    let click_on = |label: &str| {
+        let (row, column) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(row, text)| {
+                text.find(label)
+                    .map(|byte| (row, text[..byte].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("{label:?} must be on screen; screen:\n{screen}"));
+        handle_wizard_mouse(
+            &frame,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: column as u16,
+                row: row as u16,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            },
+        )
+    };
+    assert_eq!(
+        click_on("Click to open the device sign-in page"),
+        Some(WizardLinkAction::OpenUrl(address.into())),
+        "the open link must carry the whole address; links={:?}",
+        frame.links
+    );
+    assert_eq!(
+        click_on("Click to copy the sign-in address"),
+        Some(WizardLinkAction::CopyText(address.into())),
+        "the copy link must carry the whole address; links={:?}",
+        frame.links
+    );
 }

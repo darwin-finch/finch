@@ -8,9 +8,11 @@
 //! feeds native scrollback.
 //!
 //! The construct set is deliberately bounded (contract decision on #756: no
-//! markdown crate): fenced code blocks, bold/italic emphasis, inline code, and
-//! ordered/unordered list items. Anything else — headings, tables, links,
-//! blockquotes — and any malformed input passes through as literal paragraph
+//! markdown crate): fenced code blocks, bold/italic emphasis, inline code,
+//! inline links to web addresses (`[label](https://…)`), and
+//! ordered/unordered list items. Anything else — headings, tables, links to
+//! anything but an `http`/`https` address, blockquotes — and any malformed
+//! input passes through as literal paragraph
 //! text without panicking: every delimiter that does not close cleanly is
 //! emitted as ordinary characters, and an unterminated fence renders as an
 //! (open) code block so streaming output stays readable mid-block.
@@ -31,6 +33,8 @@ enum Span {
     Italic(Vec<Span>),
     /// Inline code (`` `…` ``) — literal payload.
     Code(String),
+    /// Inline link (`[label](target)`); the label is recursively parsed.
+    Link { label: Vec<Span>, target: String },
 }
 
 /// One block-level construct of the bounded subset.
@@ -68,6 +72,8 @@ mod sgr {
     pub(crate) const DIM_OFF: &str = "\x1b[22m";
     pub(crate) const CODE_FG: &str = "\x1b[36m";
     pub(crate) const FG_DEFAULT: &str = "\x1b[39m";
+    pub(crate) const UNDERLINE: &str = "\x1b[4m";
+    pub(crate) const UNDERLINE_OFF: &str = "\x1b[24m";
 }
 
 /// Recursion budget for nested emphasis. Pathological input (`***…***` nests
@@ -287,6 +293,20 @@ fn parse_inline(chars: &[char], depth: usize) -> Vec<Span> {
                     }
                 }
             }
+            '[' => match inline_link_at(chars, index) {
+                Some((label, target, after)) if depth > 0 && is_web_target(&target) => {
+                    push_text(&mut spans, &mut text);
+                    spans.push(Span::Link {
+                        label: parse_inline(&chars[label], depth - 1),
+                        target,
+                    });
+                    index = after;
+                }
+                _ => {
+                    text.push('[');
+                    index += 1;
+                }
+            },
             '\\' if index + 1 < chars.len() && chars[index + 1].is_ascii_punctuation() => {
                 text.push(chars[index + 1]);
                 index += 2;
@@ -299,6 +319,87 @@ fn parse_inline(chars: &[char], depth: usize) -> Vec<Span> {
     }
     push_text(&mut spans, &mut text);
     spans
+}
+
+/// An inline link starting at `chars[index] == '['`: `[label](target)`.
+/// Returns the label's character range, the target, and the index past the
+/// closing parenthesis. The label holds no brackets and the target no
+/// whitespace or parentheses, so anything less tidy stays literal text.
+fn inline_link_at(chars: &[char], index: usize) -> Option<(std::ops::Range<usize>, String, usize)> {
+    let label_start = index + 1;
+    let label_end = label_start
+        + chars[label_start..]
+            .iter()
+            .position(|&c| matches!(c, '[' | ']'))?;
+    if chars[label_end] != ']' || label_end == label_start {
+        return None;
+    }
+    if chars.get(label_end + 1) != Some(&'(') {
+        return None;
+    }
+    let target_start = label_end + 2;
+    let target_end = target_start
+        + chars[target_start..]
+            .iter()
+            .position(|&c| c.is_whitespace() || matches!(c, '(' | ')'))?;
+    if chars[target_end] != ')' || target_end == target_start {
+        return None;
+    }
+    Some((
+        label_start..label_end,
+        chars[target_start..target_end].iter().collect(),
+        target_end + 1,
+    ))
+}
+
+/// A target a terminal can open as a hyperlink.
+fn is_web_target(target: &str) -> bool {
+    target.starts_with("https://") || target.starts_with("http://")
+}
+
+/// One run of a line split at its inline links: plain text, or a link's
+/// label with its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineLinkSegment {
+    pub text: String,
+    pub target: Option<String>,
+}
+
+/// Split one line at its markdown inline links (`[label](target)`), for
+/// surfaces that build their own styled text and decide themselves what a
+/// target means (the setup wizard maps `copy:` targets to the clipboard).
+/// Any target is accepted here; text that is not a well-formed link stays
+/// literal.
+pub fn inline_link_segments(line: &str) -> Vec<InlineLinkSegment> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut segments = Vec::new();
+    let mut text = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        match (chars[index], inline_link_at(&chars, index)) {
+            ('[', Some((label, target, after))) => {
+                if !text.is_empty() {
+                    segments.push(InlineLinkSegment {
+                        text: std::mem::take(&mut text),
+                        target: None,
+                    });
+                }
+                segments.push(InlineLinkSegment {
+                    text: chars[label].iter().collect(),
+                    target: Some(target),
+                });
+                index = after;
+            }
+            (other, _) => {
+                text.push(other);
+                index += 1;
+            }
+        }
+    }
+    if !text.is_empty() {
+        segments.push(InlineLinkSegment { text, target: None });
+    }
+    segments
 }
 
 fn push_text(spans: &mut Vec<Span>, text: &mut String) {
@@ -400,6 +501,13 @@ fn render_spans(spans: &[Span], out: &mut String) {
                 out.push_str(sgr::CODE_FG);
                 out.push_str(text);
                 out.push_str(sgr::FG_DEFAULT);
+            }
+            Span::Link { label, target } => {
+                out.push_str(&format!("\x1b]8;;{target}\x1b\\"));
+                out.push_str(sgr::UNDERLINE);
+                render_spans(label, out);
+                out.push_str(sgr::UNDERLINE_OFF);
+                out.push_str("\x1b]8;;\x1b\\");
             }
         }
     }
@@ -572,6 +680,65 @@ mod tests {
                 String::new(),
             ],
             "outside the bounded subset everything is literal: {rendered:?}"
+        );
+    }
+
+    /// A link to a web address renders as a terminal hyperlink around its
+    /// underlined label; the address itself leaves the visible text. A link
+    /// to anything else, and a malformed one, stays literal.
+    #[test]
+    fn test_inline_web_links_render_as_hyperlinks_and_other_targets_stay_literal() {
+        let rendered = render_viewport_body("see [the docs](https://example.com/a) now\n");
+        assert_eq!(
+            rendered[0],
+            "see \x1b]8;;https://example.com/a\x1b\\\x1b[4mthe docs\x1b[24m\x1b]8;;\x1b\\ now",
+            "a web link is an OSC 8 hyperlink over its underlined label: {rendered:?}"
+        );
+        for literal in [
+            "[link](url)",
+            "[copy](copy:ABCD)",
+            "[open](https://example.com/a b)",
+            "[](https://example.com)",
+            "[unclosed](https://example.com",
+        ] {
+            let rendered = render_viewport_body(&format!("{literal}\n"));
+            assert_eq!(
+                rendered[0], literal,
+                "only a well-formed link to an http(s) address is rendered as one: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_link_segments_split_a_line_at_its_links_with_any_target() {
+        assert_eq!(
+            inline_link_segments("a [open](https://x.test/p) b [copy (AB-12)](copy:AB12)"),
+            vec![
+                InlineLinkSegment {
+                    text: "a ".into(),
+                    target: None
+                },
+                InlineLinkSegment {
+                    text: "open".into(),
+                    target: Some("https://x.test/p".into())
+                },
+                InlineLinkSegment {
+                    text: " b ".into(),
+                    target: None
+                },
+                InlineLinkSegment {
+                    text: "copy (AB-12)".into(),
+                    target: Some("copy:AB12".into())
+                },
+            ]
+        );
+        assert_eq!(
+            inline_link_segments("no [link here"),
+            vec![InlineLinkSegment {
+                text: "no [link here".into(),
+                target: None
+            }],
+            "malformed link syntax stays literal text"
         );
     }
 

@@ -388,9 +388,49 @@ pub(super) fn run_tabbed_wizard(
                 }
                 WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
             },
+            Event::Mouse(mouse) => match handle_wizard_mouse(&frame, mouse) {
+                Some(WizardLinkAction::OpenUrl(url)) => open_browser_silently(&url),
+                Some(WizardLinkAction::CopyText(text)) => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(text);
+                    }
+                }
+                None => {}
+            },
             _ => {}
         }
     }
+}
+
+/// What a click on a wizard link does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WizardLinkAction {
+    /// Open a web address in the browser.
+    OpenUrl(String),
+    /// Put text on the clipboard (a `copy:` link target).
+    CopyText(String),
+}
+
+/// Resolve a mouse event against the frame that is on screen: a left press
+/// on a link's own cells yields that link's action, and anything else —
+/// another button, a click beside the link or elsewhere in the wizard —
+/// yields nothing.
+pub(super) fn handle_wizard_mouse(
+    frame: &crate::cli::tui::WizardFrame,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<WizardLinkAction> {
+    if !matches!(
+        mouse.kind,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return None;
+    }
+    let target = frame.link_at(mouse.column, mouse.row)?;
+    if let Some(text) = target.strip_prefix("copy:") {
+        return Some(WizardLinkAction::CopyText(text.to_string()));
+    }
+    (target.starts_with("https://") || target.starts_with("http://"))
+        .then(|| WizardLinkAction::OpenUrl(target.to_string()))
 }
 
 pub(super) fn handle_save_action(state: &mut WizardState) -> Result<Option<SetupResult>> {

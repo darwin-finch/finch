@@ -18,9 +18,9 @@ use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary}
 use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
-    wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_plain,
-    wizard_selected, wizard_url, wizard_wrap, WizardCard, WizardLine, WizardSectionContent,
-    WizardView,
+    wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_markdown, wizard_paint,
+    wizard_plain, wizard_selected, wizard_url, wizard_wrap, WizardCard, WizardLine,
+    WizardSectionContent, WizardView,
 };
 
 // ─── Small shared helpers ────────────────────────────────────────────────────
@@ -1374,14 +1374,37 @@ fn device_auth_card(
         }
         None => match pending.lock().unwrap().as_ref() {
             Some(presentation) => {
-                body.push(wizard_url(
-                    &format!("Open: {}", presentation.verification_uri),
-                    &presentation.verification_uri,
-                    Some(Color::Cyan),
-                ));
+                // Both rows are links: clicking the first opens the sign-in
+                // page, clicking the second copies the code. The address and
+                // the code stay in the visible text for anyone not using a
+                // mouse, and the O / Enter keys do both at once.
+                let uri = &presentation.verification_uri;
+                // A short address is shown inside the link. A long one (a
+                // full OAuth authorize URL runs to several wrapped rows) is
+                // not worth reading on screen: the link opens it, and a
+                // second link copies it for a browser on another machine.
+                const SHOWN_ADDRESS_MAX: usize = 60;
+                if uri.chars().count() <= SHOWN_ADDRESS_MAX {
+                    body.push(wizard_markdown(
+                        &format!("[Click to open the device sign-in page: {uri}]({uri})"),
+                        Color::Cyan,
+                    ));
+                } else {
+                    body.push(wizard_markdown(
+                        &format!("[Click to open the device sign-in page]({uri})"),
+                        Color::Cyan,
+                    ));
+                    body.push(wizard_markdown(
+                        &format!("[Click to copy the sign-in address](copy:{uri})"),
+                        Color::Cyan,
+                    ));
+                }
                 if !presentation.user_code.is_empty() {
                     let code = presentation.user_code.replace("-", "");
-                    body.push(wizard_selected(&format!("One-time code: {}", code)));
+                    body.push(wizard_markdown(
+                        &format!("[Click to copy the verification code ({code})](copy:{code})"),
+                        Color::Cyan,
+                    ));
                     body.push(WizardLine::blank());
                     body.push(wizard_plain(
                         "Approve the code in your browser; this dialog finishes automatically.",
