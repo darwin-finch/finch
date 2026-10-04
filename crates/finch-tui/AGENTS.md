@@ -224,14 +224,17 @@ committed portion above the hidden tail, and the live area paints only the suffi
 above the hidden tail (`union[live_start..split]`), so a scrolled reader sees one
 contiguous window and the live suffix scrolls away like native scrollback; in follow mode
 (offset 0) nothing is clipped and frames are byte-identical to the unscrolled shape.
-Wheel ticks land on the ScrollView inside the claim, on a nested tool-result control
-inside its rect, and on nothing over the bottom chrome; the claim is the wheel hitbox,
+Wheel ticks land on the ScrollView inside the claim — a compact tool-result block under
+the pointer never takes them (#1590, nested tool output captured the wheel;
+`test_wheel_over_truncated_tool_output_scrolls_the_conversation_not_the_block` in
+`src/lib.rs`) — on the expanded tool-result surface while one is open, and on nothing over
+the bottom chrome; the claim is the wheel hitbox,
 stored from `frame.rects` by the same rebuild that rebuilds the accordion regions.
 Step sizes are the ScrollView's own (#897): a wheel tick moves `TRANSCRIPT_WHEEL_STEP_LINES`
 (3) rows and PageUp/PageDown move one page of the visible pane
-(`TranscriptScrollView::page_step`), independent of the bounded tool-result viewport's
-`WHEEL_STEP_LINES` (1) and `PAGE_STEP_LINES` (4), which keep serving the tool viewport and
-the expanded surface only. PageUp/PageDown scroll it from the keyboard, independent of
+(`TranscriptScrollView::page_step`), independent of `tool_viewport`'s
+`WHEEL_STEP_LINES` (1) and `PAGE_STEP_LINES` (4), which serve the expanded tool-result
+surface only. PageUp/PageDown scroll it from the keyboard, independent of
 mouse tracking. Mouse tracking is held by default (`mouse_capture.rs`) — the #441
 release-on-first-wheel hybrid is retired, native history stays the copyable record via
 `canonical_commit`, and while scrolled up a commit anchors the window instead of dragging

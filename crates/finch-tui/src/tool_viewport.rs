@@ -1,18 +1,21 @@
-//! Bounded child viewports for tool-use output rows.
+//! Bounded compact windows for tool-use output rows.
 //!
 //! A completed (or streaming) tool result is presented as one semantic control:
-//! its body occupies a small configured number of terminal rows, exposes
-//! truncation and scroll position in plain text, and owns the wheel events over
-//! those rows. Wheel X/Y is matched against the hit regions of the last painted
-//! frame — the same shadow-buffer ownership the accordion disclosure uses — so
-//! a wheel over the control scrolls that tool result only, never the parent
-//! console, and never releases mouse tracking to native scrollback.
+//! its body occupies a small configured number of terminal rows, always the
+//! first lines of the output, and one plain-text status row says which lines
+//! are shown, how many there are, and how to open the rest. The compact window
+//! has no scroll position of its own and claims no wheel or scroll key: those
+//! always move the surrounding conversation, whatever the pointer or the
+//! keyboard focus is on (issue #1590, a block under the pointer swallowed the
+//! wheel halfway through scrolling the conversation).
 //!
 //! The control is reusable: it applies to every row of
-//! [`NodeRole::ToolOutput`], not to one tool name. Activation (click
-//! on the window, or Enter with the row focused) opens a focused expanded
-//! surface; closing it restores the child scroll offset, disclosure grouping,
-//! and focus exactly as they were.
+//! [`NodeRole::ToolOutput`], not to one tool name. Activation (a click on the
+//! window's cells, matched against the hit regions of the last painted frame,
+//! or Enter/Space once repeated F6 has put the focus marker on the result's
+//! `Output (N)` header) opens a focused expanded surface
+//! that owns its own scrolling; closing it leaves disclosure grouping and
+//! focus exactly as they were.
 //!
 //! Permanent native scrollback is untouched by all of this: canonical commits
 //! still write the fully expanded projection exactly once
@@ -27,68 +30,34 @@ use super::view_model::{NodeRole, RowId};
 use super::accordion::RenderedTranscriptLine;
 use super::shadow_buffer;
 
-/// How many terminal rows a tool result's child viewport shows by default.
+/// How many terminal rows a tool result's compact window shows by default.
 ///
 /// This is the configured bound of the compact presentation: a long Bash
-/// result occupies this many body rows, one truncation/scroll status row, and
-/// nothing more, however long the output is.
+/// result occupies this many rows, the last of them the truncation status
+/// row, and nothing more, however long the output is.
 pub const DEFAULT_TOOL_OUTPUT_ROWS: usize = 4;
 
-/// Rows one wheel tick moves inside a bounded tool-result viewport.
+/// Rows one wheel tick moves inside the expanded tool-result surface.
 pub const WHEEL_STEP_LINES: usize = 1;
 
-/// Rows one PageUp/PageDown moves inside a bounded tool-result viewport.
+/// Rows one PageUp/PageDown moves inside the expanded tool-result surface.
 pub const PAGE_STEP_LINES: usize = 4;
 
 /// The focused surface that shows one tool result expanded.
 ///
-/// `saved_scroll` is the child viewport's scroll offset captured when the
-/// surface opened; closing writes it back, so the compact control shows the
-/// same window it did before the expansion. Disclosure grouping and accordion
-/// focus are never touched by the surface, so they restore by construction.
+/// Disclosure grouping and accordion focus are never touched by the surface,
+/// so they restore by construction when it closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedToolView {
     pub row_id: RowId,
     pub title: String,
-    pub saved_scroll: usize,
+    /// Index of the first body line shown.
     pub scroll: usize,
     /// Total body lines observed at the last surface draw.
     pub body_lines: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ChildViewport {
-    /// Index of the first body line shown in the compact window.
-    pub scroll: usize,
-    /// Total body lines observed the last time the row was projected.
-    pub body_lines: usize,
-    /// The row budget (window rows, including the status row it may need)
-    /// observed the last time the row was projected. Required to decide
-    /// whether the body already fits without scrolling: `body_lines` alone
-    /// cannot answer that, since a 2-line body scrolls under a 1-row budget
-    /// but not under a 4-row one.
-    pub budget_rows: usize,
-}
-
-/// The largest legal scroll offset for a viewport whose body has
-/// `body_lines` lines under a `budget_rows` window.
-///
-/// When the whole body already fits in the budget, the window never needs to
-/// move: the max is `0`, so a scroll attempt is a no-op instead of clipping
-/// an already-fully-visible body down to a partial, footer-bearing window
-/// (the reported bug -- a 2-line body under a 4-row budget let one scroll
-/// tick hide a line with no way back). When the body does not fit, scrolling
-/// must still be able to reach the last line, so the max stays
-/// `body_lines - 1`, matching the existing long-content behavior.
-fn max_scroll(body_lines: usize, budget_rows: usize) -> usize {
-    if body_lines <= budget_rows {
-        0
-    } else {
-        body_lines.saturating_sub(1)
-    }
-}
-
-/// The cells of one bounded child viewport, in the physical coordinates of the
+/// The cells of one compact tool-result window, in the physical coordinates of the
 /// last painted frame. Rebuilt with the accordion's hit regions after every
 /// render and resize; terminal coordinates are never persisted as identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,16 +75,18 @@ impl ToolViewportRegion {
     }
 }
 
+/// Where the compact tool-result windows of the last painted frame are, so a
+/// click or a focused Enter can be matched to the result it should expand.
 #[derive(Debug, Default)]
 pub struct ToolViewportState {
-    viewports: HashMap<RowId, ChildViewport>,
     regions: Vec<ToolViewportRegion>,
     visible_kinds: HashMap<RowId, NodeRole>,
 }
 
 impl ToolViewportState {
-    /// The tool result whose viewport owns the cell at `(column, row)`, if the
-    /// last painted frame placed a child viewport there.
+    /// The tool result whose compact window covers the cell at `(column, row)`,
+    /// if the last painted frame placed one there. Used for click-to-expand
+    /// and hover only; a wheel is never matched against it.
     pub fn region_at(&self, column: u16, row: u16) -> Option<&ToolViewportRegion> {
         self.regions
             .iter()
@@ -129,136 +100,7 @@ impl ToolViewportState {
         self.visible_kinds.get(row_id).copied()
     }
 
-    pub fn child_scroll(&self, row_id: &RowId) -> usize {
-        self.viewports
-            .get(row_id)
-            .map(|viewport| viewport.scroll)
-            .unwrap_or(0)
-    }
-
-    /// Scroll one child viewport by `delta` lines. Clamped to the body length
-    /// observed at the last projection, and to `0` when that body already
-    /// fits entirely within the last observed budget (nothing to scroll to);
-    /// returns whether anything changed.
-    pub fn scroll_child(&mut self, row_id: &RowId, delta: isize) -> bool {
-        let Some(viewport) = self.viewports.get_mut(row_id) else {
-            return false;
-        };
-        let max = max_scroll(viewport.body_lines, viewport.budget_rows);
-        let next = if delta < 0 {
-            viewport.scroll.saturating_sub(delta.unsigned_abs())
-        } else {
-            viewport.scroll.saturating_add(delta as usize).min(max)
-        };
-        if next == viewport.scroll {
-            return false;
-        }
-        viewport.scroll = next;
-        true
-    }
-
-    /// Directly set a child scroll offset (restoration after closing the
-    /// expanded surface).
-    pub fn set_child_scroll(&mut self, row_id: &RowId, scroll: usize) {
-        if let Some(viewport) = self.viewports.get_mut(row_id) {
-            viewport.scroll = scroll.min(max_scroll(viewport.body_lines, viewport.budget_rows));
-        }
-    }
-
-    /// Apply the bound to one message's projected lines.
-    ///
-    /// Consecutive body lines of a `ToolOutput` row are replaced by the
-    /// window selected by that row's child scroll offset, each line truncated
-    /// to the terminal width, plus one plain-text status row exposing the
-    /// visible range, the total, and the scroll/expand affordances. Everything
-    /// else passes through untouched, so this bound can never widen any other
-    /// row's presentation.
-    pub fn project(
-        &mut self,
-        lines: Vec<RenderedTranscriptLine>,
-        width: usize,
-        budget_rows: usize,
-    ) -> Vec<RenderedTranscriptLine> {
-        let width = width.max(1);
-        let mut projected: Vec<RenderedTranscriptLine> = Vec::with_capacity(lines.len());
-        let mut index = 0;
-        while index < lines.len() {
-            let owner = lines[index]
-                .body_of
-                .clone()
-                .filter(|_| lines[index].role == Some(NodeRole::ToolOutput));
-            let Some(owner) = owner else {
-                projected.push(lines[index].clone());
-                index += 1;
-                continue;
-            };
-            let start = index;
-            while index < lines.len()
-                && lines[index].body_of.as_ref() == Some(&owner)
-                && lines[index].role == Some(NodeRole::ToolOutput)
-            {
-                index += 1;
-            }
-            let body = &lines[start..index];
-            projected.extend(self.window(owner, body, width, budget_rows));
-        }
-        projected
-    }
-
-    /// Window one tool result's projected body lines.
-    ///
-    /// Every body line is truncated to the terminal width first, so one line
-    /// costs exactly one terminal row and the configured bound is a hard row
-    /// bound. The window holds the child scroll offset; the status row exposes
-    /// the visible range and total in plain text.
-    fn window(
-        &mut self,
-        row_id: RowId,
-        body: &[RenderedTranscriptLine],
-        width: usize,
-        budget_rows: usize,
-    ) -> Vec<RenderedTranscriptLine> {
-        let budget_rows = budget_rows.max(1);
-        let viewport = self.viewports.entry(row_id.clone()).or_default();
-        viewport.body_lines = body.len();
-        viewport.budget_rows = budget_rows;
-        viewport.scroll = viewport.scroll.min(max_scroll(body.len(), budget_rows));
-        let scroll = viewport.scroll;
-        let raw_take = budget_rows.min(body.len() - scroll);
-        let truncated_above = scroll > 0;
-        let truncated_below = scroll + raw_take < body.len();
-        let truncated = truncated_above || truncated_below;
-        // The status row costs one of the bound rows whenever the window
-        // truncates; a single-row budget shows the status alone.
-        let take = if truncated {
-            raw_take
-                .min(budget_rows.saturating_sub(1))
-                .max(if budget_rows > 1 { 1 } else { 0 })
-        } else {
-            raw_take
-        };
-        let end = scroll + take;
-
-        let mut windowed: Vec<RenderedTranscriptLine> = Vec::new();
-        windowed.extend(body[scroll..end].iter().cloned().map(|mut line| {
-            line.text = truncate_body_line(&line.text, width);
-            line
-        }));
-        if truncated {
-            windowed.push(RenderedTranscriptLine {
-                text: truncate_body_line(
-                    &format!("      {}", status_text(scroll, end, body.len())),
-                    width,
-                ),
-                body_of: Some(row_id),
-                role: Some(NodeRole::ToolOutput),
-                ..RenderedTranscriptLine::default()
-            });
-        }
-        windowed
-    }
-
-    /// Rebuild the child-viewport hit regions and the visible-kind cache from
+    /// Rebuild the compact-window hit regions and the visible-kind cache from
     /// the lines of one painted frame, using the same physical-row accounting
     /// and coordinate space as the accordion's disclosure regions.
     pub fn rebuild_hit_regions(
@@ -324,21 +166,104 @@ impl ToolViewportState {
     }
 }
 
-/// Plain-text state description for one bounded child viewport: the visible
-/// line range, the total, and the scroll/expand affordances.
-fn status_text(start: usize, end: usize, total: usize) -> String {
-    if total == 0 {
-        return String::new();
+/// Apply the compact bound to one message's projected lines.
+///
+/// Consecutive body lines of a `ToolOutput` row are replaced by their first
+/// lines, each truncated to the terminal width, plus one plain-text status row
+/// naming the visible range, the total, and how to expand the result when
+/// anything was left out. Everything else passes through untouched, so this
+/// bound can never widen any other row's presentation.
+pub fn project(
+    lines: Vec<RenderedTranscriptLine>,
+    width: usize,
+    budget_rows: usize,
+) -> Vec<RenderedTranscriptLine> {
+    let width = width.max(1);
+    let mut projected: Vec<RenderedTranscriptLine> = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let owner = lines[index]
+            .body_of
+            .clone()
+            .filter(|_| lines[index].role == Some(NodeRole::ToolOutput));
+        let Some(owner) = owner else {
+            projected.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while index < lines.len()
+            && lines[index].body_of.as_ref() == Some(&owner)
+            && lines[index].role == Some(NodeRole::ToolOutput)
+        {
+            index += 1;
+        }
+        let body = &lines[start..index];
+        projected.extend(window(owner, body, width, budget_rows));
     }
-    if start >= end {
-        return format!("… 0 lines visible of {} — ↑/↓ scroll · Enter expand", total);
+    projected
+}
+
+/// Window one tool result's projected body lines to its first rows.
+///
+/// Every body line is truncated to the terminal width first, so one line
+/// costs exactly one terminal row and the configured bound is a hard row
+/// bound. The status row costs one of the bound rows whenever lines are left
+/// out; a single-row budget shows the status alone.
+fn window(
+    row_id: RowId,
+    body: &[RenderedTranscriptLine],
+    width: usize,
+    budget_rows: usize,
+) -> Vec<RenderedTranscriptLine> {
+    let budget_rows = budget_rows.max(1);
+    let truncated = body.len() > budget_rows;
+    let take = if truncated {
+        budget_rows - 1
+    } else {
+        body.len()
+    };
+
+    let mut windowed: Vec<RenderedTranscriptLine> = body[..take]
+        .iter()
+        .cloned()
+        .map(|mut line| {
+            line.text = truncate_body_line(&line.text, width);
+            line
+        })
+        .collect();
+    if truncated {
+        windowed.push(RenderedTranscriptLine {
+            text: truncate_body_line(&format!("      {}", status_text(take, body.len())), width),
+            body_of: Some(row_id),
+            role: Some(NodeRole::ToolOutput),
+            ..RenderedTranscriptLine::default()
+        });
     }
-    format!(
-        "… lines {}–{} of {} — ↑/↓ scroll · Enter expand",
-        start + 1,
-        end,
-        total
-    )
+    windowed
+}
+
+/// The expand affordance printed on every truncated compact window: the two
+/// real ways to open the expanded view.
+///
+/// The keyboard route is spelled out because one `F6` is not enough: each
+/// press moves the `> ` focus marker to the next expandable row painted on
+/// screen, starting from the first, so the reader repeats it until the marker
+/// sits on this result's `Output (N)` header and only then presses `Enter`
+/// (on any other row `Enter` toggles that row instead; with no row focused it
+/// submits the composer).
+pub const EXPAND_HINT: &str = "open: click or F6 until > is on Output, then Enter";
+
+/// Plain-text state description for one compact tool-result window: how to
+/// expand it, then how many leading lines are shown and the total. The
+/// instruction comes first so that a terminal too narrow for the whole row
+/// cuts the counter, whose total the `Output (N)` header above also carries,
+/// rather than the instruction; it survives whole down to 60 columns.
+fn status_text(shown: usize, total: usize) -> String {
+    if shown == 0 {
+        return format!("… {EXPAND_HINT} · 0 of {total} shown");
+    }
+    format!("… {EXPAND_HINT} · lines 1–{shown} of {total}")
 }
 
 /// Truncate one body line to the terminal width so the bounded window cannot
@@ -497,8 +422,8 @@ mod tests {
         // output length; the status row names the visible range and total
         // (bound 4, output 40).
         let (row_id, projected) = projected_tool_group(40);
-        let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let state = ToolViewportState::default();
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
 
         let body = body_lines_of(&bounded);
         assert!(
@@ -537,85 +462,47 @@ mod tests {
     }
 
     #[test]
-    fn test_child_scroll_moves_the_window_within_the_bound() {
-        // Wheel/keyboard scrolling slides the window through the body without
-        // ever widening the bound; the status row tracks the new position.
-        let (row_id, projected) = projected_tool_group(40);
-        let mut state = ToolViewportState::default();
-        let _ = state.project(projected.clone(), 80, DEFAULT_TOOL_OUTPUT_ROWS);
-
-        assert!(
-            state.scroll_child(&row_id, 1),
-            "scrolling down must move the child viewport"
-        );
-        assert_eq!(state.child_scroll(&row_id), 1);
-        let rescrolled = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        let body = body_lines_of(&rescrolled)
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        assert!(
-            body[0].contains("line 1"),
-            "INVARIANT: after one scroll tick the window starts at line 1; body was {body:?}"
-        );
-        assert!(
-            !body
-                .iter()
-                .any(|text| text.contains("line 0\n") || *text == "line 0"),
-            "line 0 scrolled out of the window; body was {body:?}"
-        );
-        assert!(
-            body.last()
-                .is_some_and(|status| status.contains("lines 2–4 of 40")),
-            "INVARIANT: the status row must report the scrolled range (lines 2–4 of 40); \
-             body was {body:?}"
-        );
-        // Clamped at the end of the body: the window can slide until the last
-        // body line is its first visible line.
-        for _ in 0..100 {
-            state.scroll_child(&row_id, 1);
+    fn test_status_row_keeps_the_whole_expand_instruction_at_sixty_columns() {
+        // INVARIANT: the instruction comes first and the line counter last, so
+        // a narrower terminal cuts the counter (the Output header above still
+        // carries the total) and never the way to open the result.
+        const INSTRUCTION: &str = "open: click or F6 until > is on Output, then Enter";
+        for total in [40, 400, 40_000] {
+            let (_row_id, projected) = projected_tool_group(total);
+            for width in [80, 60] {
+                let bounded = project(projected.clone(), width, DEFAULT_TOOL_OUTPUT_ROWS);
+                let status = body_lines_of(&bounded)
+                    .last()
+                    .map(|line| line.text.clone())
+                    .unwrap_or_default();
+                assert!(
+                    status.contains(INSTRUCTION)
+                        && shadow_buffer::physical_rows(&status, width) == 1,
+                    "INVARIANT: at {width} columns with {total} output lines the status row \
+                     must carry the whole expand instruction on one row; status was {status:?}"
+                );
+            }
+            let at_eighty = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+            let status = body_lines_of(&at_eighty)
+                .last()
+                .map(|line| line.text.trim().to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                status,
+                format!("… {INSTRUCTION} · lines 1–3 of {total}"),
+                "INVARIANT: at 80 columns the status row is whole: instruction, then the \
+                 visible range and total"
+            );
         }
-        assert_eq!(
-            state.child_scroll(&row_id),
-            39,
-            "INVARIANT: scrolling clamps so the window never passes the end of the body"
-        );
     }
 
     #[test]
-    fn test_scroll_up_never_goes_above_the_first_line() {
-        let (_row_id, projected) = projected_tool_group(40);
-        let mut state = ToolViewportState::default();
-        let row_id = projected
-            .iter()
-            .find(|line| line.body_of.is_some())
-            .and_then(|line| line.body_of.clone())
-            .unwrap();
-        let _ = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        assert!(
-            !state.scroll_child(&row_id, -5),
-            "scrolling up from the first line must be a no-op, not a wraparound"
-        );
-        state.scroll_child(&row_id, 2);
-        state.scroll_child(&row_id, -10);
-        assert_eq!(
-            state.child_scroll(&row_id),
-            0,
-            "scrolling up clamps at the first line"
-        );
-    }
-
-    #[test]
-    fn test_scroll_child_is_a_noop_when_the_body_already_fits_the_budget() {
-        // REGRESSION: a 2-line tool result under the 4-row default budget
-        // already fits (window() shows both lines with no truncation and no
-        // status row); a single scroll tick must not still fire and clip the
-        // view down to a partial, footer-bearing window with no way back
-        // (the reported bug: "You can scroll those lines when there's 2
-        // visible, and 2 lines. It'll allow scrolling once").
-        let (row_id, projected) = projected_tool_group(2);
-        let mut state = ToolViewportState::default();
-        let bounded = state.project(projected.clone(), 80, DEFAULT_TOOL_OUTPUT_ROWS);
+    fn test_body_that_fits_the_budget_is_shown_whole_with_no_status_row() {
+        // A 2-line tool result under the 4-row default budget is shown in
+        // full: no truncation, and no status row offering an expansion that
+        // would reveal nothing more.
+        let (_row_id, projected) = projected_tool_group(2);
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         let body = body_lines_of(&bounded)
             .iter()
             .map(|line| line.text.clone())
@@ -624,54 +511,8 @@ mod tests {
             body,
             vec!["      line 0".to_string(), "      line 1".to_string()],
             "INVARIANT: a body that fits the budget renders with no truncation and no \
-             status row before any scroll; body was {body:?}"
+             status row; body was {body:?}"
         );
-
-        let changed = state.scroll_child(&row_id, 1);
-        assert!(
-            !changed,
-            "INVARIANT: scrolling a viewport whose total line count ({}) is within its \
-             visible budget ({DEFAULT_TOOL_OUTPUT_ROWS}) must report no available scroll \
-             positions and be a no-op, not clip the view; scroll_child returned changed=true",
-            2
-        );
-        assert_eq!(
-            state.child_scroll(&row_id),
-            0,
-            "INVARIANT: the scroll offset must stay 0 when the body already fits the budget"
-        );
-
-        // Re-projecting after the no-op scroll attempt must still show both
-        // lines, unclipped, with no scroll-status footer.
-        let rescrolled = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        let body_after = body_lines_of(&rescrolled)
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            body_after,
-            vec!["      line 0".to_string(), "      line 1".to_string()],
-            "INVARIANT: after a rejected scroll attempt the window still shows the whole \
-             body with no status footer; body was {body_after:?}"
-        );
-    }
-
-    /// A viewport whose body genuinely does not fit its budget keeps its
-    /// existing scrollable behavior unchanged: this is the adjacent
-    /// long-content case `test_child_scroll_moves_the_window_within_the_bound`
-    /// and `test_scroll_up_never_goes_above_the_first_line` already cover
-    /// above, re-asserted here beside the fits-the-budget regression so the
-    /// two cases are read together.
-    #[test]
-    fn test_scroll_child_still_scrolls_when_the_body_does_not_fit_the_budget() {
-        let (row_id, projected) = projected_tool_group(40);
-        let mut state = ToolViewportState::default();
-        let _ = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        assert!(
-            state.scroll_child(&row_id, 1),
-            "a 40-line body under a 4-row budget must still be scrollable"
-        );
-        assert_eq!(state.child_scroll(&row_id), 1);
     }
 
     #[test]
@@ -693,8 +534,7 @@ mod tests {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
-        let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 20, DEFAULT_TOOL_OUTPUT_ROWS);
+        let bounded = project(projected, 20, DEFAULT_TOOL_OUTPUT_ROWS);
 
         for line in body_lines_of(&bounded) {
             let rows = shadow_buffer::physical_rows(&line.text, 20);
@@ -718,9 +558,9 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_tool_output_creates_no_child_viewport_rows() {
-        // An empty result renders the tool call header only: no viewport rows,
-        // no regions, and scrolling it is a no-op.
+    fn test_empty_tool_output_creates_no_compact_window_rows() {
+        // An empty result renders the tool call header only: no window rows
+        // and no regions.
         let work = Arc::new(WorkUnit::new("Tools"));
         let call = work.add_row("bash(true)");
         work.complete_row_with_body(call, "no output", Vec::<String>::new());
@@ -736,7 +576,7 @@ mod tests {
             }
         };
         let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         assert!(
             body_lines_of(&bounded).is_empty(),
             "INVARIANT: an empty tool result must not produce viewport rows; projection was:\n{}",
@@ -757,8 +597,8 @@ mod tests {
 
     #[test]
     fn test_adjacent_tool_controls_window_independently() {
-        // Two tool calls in one grouped turn each own their own window: wheel
-        // scrolling the first must leave the second exactly where it was.
+        // Two tool calls in one grouped turn each own their own window and
+        // their own click target.
         let work = Arc::new(WorkUnit::new("Tools"));
         let first = work.add_row("bash(first)");
         work.complete_row_with_body(
@@ -789,7 +629,7 @@ mod tests {
             }
         };
         let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
 
         state.rebuild_hit_regions(&bounded, 0, 80);
         let regions = state.regions.clone();
@@ -802,25 +642,12 @@ mod tests {
         assert_eq!(regions[0].row_id, first_output);
         assert_eq!(regions[1].row_id, second_output);
 
-        state.scroll_child(&first_output, 3);
-        let rescrolled = state.project(
-            match crate::view_model::project_message(&message, &colors) {
-                crate::view_model::ProjectedMessage::Node(node) => {
-                    AccordionState::default().render_node(&node)
-                }
-                crate::view_model::ProjectedMessage::Plain(lines) => {
-                    AccordionState::default().render_plain(&lines.join("\n"))
-                }
-            },
-            80,
-            DEFAULT_TOOL_OUTPUT_ROWS,
-        );
-        let alpha_window = rescrolled
+        let alpha_window = bounded
             .iter()
             .filter(|line| line.body_of.as_ref() == Some(&first_output))
             .map(|line| line.text.clone())
             .collect::<Vec<_>>();
-        let beta_window = rescrolled
+        let beta_window = bounded
             .iter()
             .filter(|line| line.body_of.as_ref() == Some(&second_output))
             .map(|line| line.text.clone())
@@ -828,89 +655,68 @@ mod tests {
         assert!(
             alpha_window
                 .first()
-                .is_some_and(|text| text.contains("alpha 3")),
-            "INVARIANT: the scrolled control's window starts at its offset (alpha 3); \
+                .is_some_and(|text| text.contains("alpha 0"))
+                && alpha_window
+                    .last()
+                    .is_some_and(|text| text.contains("lines 1–3 of 40")),
+            "INVARIANT: the first control shows its own first lines and status row; \
              window was {alpha_window:?}"
         );
         assert!(
             beta_window
                 .first()
-                .is_some_and(|text| text.contains("beta 0")),
-            "INVARIANT: the unscrolled control's window must not move (beta 0); \
+                .is_some_and(|text| text.contains("beta 0"))
+                && beta_window
+                    .last()
+                    .is_some_and(|text| text.contains("lines 1–3 of 40")),
+            "INVARIANT: the second control shows its own first lines and status row; \
              window was {beta_window:?}"
         );
     }
 
     #[test]
-    fn test_interleaved_appends_preserve_child_scroll_offsets() {
-        // Output arriving while a result is open (or between wheel ticks) must
-        // not reset the user's position; the window slides with the body.
+    fn test_appended_output_keeps_the_first_lines_and_updates_the_total() {
+        // Output arriving on a row already shown must not move the compact
+        // window: it stays on the first lines and the status row reports the
+        // grown total.
         let work = Arc::new(WorkUnit::new("Tools"));
         let call = work.add_row("bash(stream)");
-        work.complete_row_with_body(
-            call,
-            "",
-            (0..10).map(|n| format!("out {n}")).collect::<Vec<_>>(),
-        );
-        work.set_complete();
         let colors = ColorScheme::default();
         let message: MessageRef = work.clone();
-        let mut state = ToolViewportState::default();
-
-        let projected = match crate::view_model::project_message(&message, &colors) {
-            crate::view_model::ProjectedMessage::Node(node) => {
-                AccordionState::default().render_node(&node)
-            }
-            crate::view_model::ProjectedMessage::Plain(lines) => {
-                AccordionState::default().render_plain(&lines.join("\n"))
-            }
-        };
-        let row_id = projected
-            .iter()
-            .find(|line| line.body_of.is_some())
-            .and_then(|line| line.body_of.clone())
-            .unwrap();
-        let _ = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        state.scroll_child(&row_id, 2);
-        assert_eq!(state.child_scroll(&row_id), 2);
-
-        // Interleaved update: five more lines arrive on the same row.
-        work.complete_row_with_body(
-            call,
-            "",
-            (0..15).map(|n| format!("out {n}")).collect::<Vec<_>>(),
-        );
-        let projected = match crate::view_model::project_message(&message, &colors) {
-            crate::view_model::ProjectedMessage::Node(node) => {
-                AccordionState::default().render_node(&node)
-            }
-            crate::view_model::ProjectedMessage::Plain(lines) => {
-                AccordionState::default().render_plain(&lines.join("\n"))
-            }
-        };
-        let rescrolled = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
-        assert_eq!(
-            state.child_scroll(&row_id),
-            2,
-            "INVARIANT: an interleaved tool update must not reset the child scroll offset \
-             (was 2, appended 5 lines)"
-        );
-        let window = rescrolled
-            .iter()
-            .filter(|line| line.body_of.is_some())
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        assert!(
-            window.first().is_some_and(|text| text.contains("out 2")),
-            "INVARIANT: the window still starts at the user's offset (out 2); window was \
-             {window:?}"
-        );
-        let status = window.last().cloned().unwrap_or_default();
-        assert!(
-            status.contains("of 15"),
-            "INVARIANT: the status row reflects the grown body (… of 15); status was \
-             {status:?}"
-        );
+        let mut windows = Vec::new();
+        for total in [10, 15] {
+            work.complete_row_with_body(
+                call,
+                "",
+                (0..total).map(|n| format!("out {n}")).collect::<Vec<_>>(),
+            );
+            work.set_complete();
+            let projected = match crate::view_model::project_message(&message, &colors) {
+                crate::view_model::ProjectedMessage::Node(node) => {
+                    AccordionState::default().render_node(&node)
+                }
+                crate::view_model::ProjectedMessage::Plain(lines) => {
+                    AccordionState::default().render_plain(&lines.join("\n"))
+                }
+            };
+            windows.push(
+                project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS)
+                    .iter()
+                    .filter(|line| line.body_of.is_some())
+                    .map(|line| line.text.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for (window, total) in windows.iter().zip([10, 15]) {
+            assert!(
+                window.first().is_some_and(|text| text.contains("out 0"))
+                    && window
+                        .last()
+                        .is_some_and(|text| text.contains(&format!("lines 1–3 of {total}"))),
+                "INVARIANT: the compact window stays on the first lines and its status row \
+                 reports the current total ({total}); window was {window:?}"
+            );
+        }
     }
 
     #[test]
@@ -919,7 +725,7 @@ mod tests {
         // disclosure regions, and only where the control's cells were painted.
         let (row_id, projected) = projected_tool_group(40);
         let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         let top = 7;
         state.rebuild_hit_regions(&bounded, top, 80);
 
@@ -939,7 +745,7 @@ mod tests {
             region.bottom.saturating_sub(region.top) + 1,
             expected_rows as u16,
             "INVARIANT: the hit region covers exactly the painted control rows \
-             ({} rows), so wheel X/Y dispatch cannot leak into neighbouring rows; \
+             ({} rows), so click X/Y dispatch cannot leak into neighbouring rows; \
              region was {region:?}",
             expected_rows
         );
@@ -961,7 +767,7 @@ mod tests {
         // interactive pane may survive a frame that painted nothing.
         let (row_id, projected) = projected_tool_group(40);
         let mut state = ToolViewportState::default();
-        let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+        let bounded = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         state.rebuild_hit_regions(&bounded, 0, 80);
         assert!(!state.regions.is_empty());
 
@@ -969,12 +775,12 @@ mod tests {
         assert!(
             state.regions.is_empty(),
             "INVARIANT: a frame that painted no control cells must leave no hit regions \
-             (an invisible pane cannot answer for a wheel)"
+             (an invisible pane cannot answer for a click)"
         );
         assert_eq!(
             state.kind_of(&row_id),
             None,
-            "a row the frame did not paint cannot answer keyboard scroll either"
+            "a row the frame did not paint cannot answer keyboard activation either"
         );
     }
 
@@ -1031,19 +837,17 @@ mod tests {
     fn test_zero_visible_lines_shows_sensible_status() {
         // When the window truncates but the budget is so small (e.g. 1 row) that only
         // the status text is visible, the status row must say 0 lines visible instead of a negative range.
-        let body: Vec<String> = (0..2).map(|n| format!("line {n}")).collect();
-        let mut state = ToolViewportState::default();
-        let (row_id, projected) = projected_tool_group(2);
+        let (_row_id, projected) = projected_tool_group(2);
         // Force the budget to 1 row.
-        let bounded = state.project(projected, 80, 1);
+        let bounded = project(projected, 80, 1);
 
         let status = body_lines_of(&bounded)
             .last()
             .map(|line| line.text.clone())
             .unwrap_or_default();
         assert!(
-            status.contains("0 lines visible of 2"),
-            "INVARIANT: a viewport with 0 visible body lines shows 0 lines visible instead \
+            status.contains("0 of 2 shown"),
+            "INVARIANT: a viewport with 0 visible body lines says 0 of 2 shown instead \
              of a negative range; status was {:?}",
             status
         );
