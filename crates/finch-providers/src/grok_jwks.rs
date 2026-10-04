@@ -248,8 +248,8 @@ impl GrokJwksVerifier {
             }
             let Some(x_val) = key.x else { continue };
             let Some(y_val) = key.y else { continue };
-            let x = decode_key_component(&x_val, "x")?;
-            let y = decode_key_component(&y_val, "y")?;
+            let Ok(x) = decode_key_component(&x_val, "x") else { continue };
+            let Ok(y) = decode_key_component(&y_val, "y") else { continue };
             if x.len() != 32 || y.len() != 32 {
                 continue;
             }
