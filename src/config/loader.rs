@@ -1252,4 +1252,98 @@ api_key = "sk-ant-legacy-key-1234567890"
             "the removed table must not be written back, file was:\n{saved}"
         );
     }
+
+    /// Every `type = "local"` `[[providers]]` table shown in a fenced `toml`
+    /// block of a checked-in document, exactly as a reader would copy it.
+    ///
+    /// Only the local table is returned: the neighbouring cloud tables carry
+    /// placeholder keys such as `sk-ant-...`, which a reader replaces and
+    /// which validation rightly refuses.
+    fn documented_local_provider_examples(document: &str) -> Vec<String> {
+        let mut examples = Vec::new();
+        let mut in_toml_fence = false;
+        let mut table: Option<String> = None;
+        let mut keep_if_local = |table: &mut Option<String>| {
+            if let Some(table) = table.take() {
+                if table.contains("type = \"local\"") {
+                    examples.push(table);
+                }
+            }
+        };
+        for line in document.lines() {
+            let trimmed = line.trim();
+            if !in_toml_fence {
+                in_toml_fence = trimmed == "```toml";
+                continue;
+            }
+            if trimmed == "```" {
+                in_toml_fence = false;
+                keep_if_local(&mut table);
+                continue;
+            }
+            if trimmed.starts_with('[') {
+                keep_if_local(&mut table);
+                if trimmed != "[[providers]]" {
+                    continue;
+                }
+                table = Some(String::new());
+            }
+            if let Some(table) = table.as_mut() {
+                table.push_str(line);
+                table.push('\n');
+            }
+        }
+        examples
+    }
+
+    #[test]
+    fn test_documented_local_provider_examples_load_as_written() {
+        // Regression for the documented local example being rejected with
+        // "unknown variant `qwen2`": the examples are read out of the
+        // checked-in documents, not copied here, so a document cannot drift
+        // from what the loader accepts without this failing.
+        let documents = [
+            (
+                "src/config/CONFIGURATION.md",
+                include_str!("CONFIGURATION.md"),
+                1,
+            ),
+            (
+                "docs/MULTI_PROVIDER_CONFIG.md",
+                include_str!("../../docs/MULTI_PROVIDER_CONFIG.md"),
+                2,
+            ),
+        ];
+        for (document_path, document, expected_examples) in documents {
+            let examples = documented_local_provider_examples(document);
+            assert_eq!(
+                examples.len(),
+                expected_examples,
+                "{document_path} must still carry its `type = \"local\"` provider examples so \
+                 they stay covered; found these tables:\n{examples:#?}"
+            );
+            for example in examples {
+                let directory = tempfile::tempdir().unwrap();
+                let config_path = directory.path().join("config.toml");
+                std::fs::write(&config_path, &example).unwrap();
+
+                let config = load_config_from_path(&config_path).unwrap_or_else(|error| {
+                    panic!(
+                        "a `type = \"local\"` example copied verbatim from {document_path} must \
+                         load through the real config loader; loader said:\n{error:#}\n\
+                         example was:\n{example}"
+                    )
+                });
+                assert!(
+                    config
+                        .providers
+                        .iter()
+                        .any(|entry| matches!(entry, ProviderEntry::Local { .. })),
+                    "the example from {document_path} must load as a local provider profile; \
+                     loaded profiles: {:?}\nexample was:\n{example}",
+                    config.providers
+                );
+            }
+        }
+    }
 }
