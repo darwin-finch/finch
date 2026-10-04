@@ -48,6 +48,23 @@ pub(super) trait ChatGptSetupRecoveryEditor {
 
 pub(super) struct TerminalChatGptSetupRecoveryEditor;
 
+
+pub(super) fn claude_setup_references(result: &SetupResult) -> std::collections::BTreeSet<String> {
+    result
+        .providers
+        .iter()
+        .filter_map(|provider| match provider {
+            ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::ClaudeSubscription,
+                credential,
+                ..
+            } => Some(credential.credential_ref.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+
 pub(super) const MAX_CHATGPT_EDITOR_INPUT_ATTEMPTS: usize = 4;
 
 pub(super) fn choose_chatgpt_setup_recovery_with_io(
@@ -141,8 +158,31 @@ pub async fn validate_and_apply_for(
         );
     }
     if chatgpt_setup_references(result).is_empty() && grok_setup_references(result).is_empty() {
+        if !claude_setup_references(result).is_empty() {
+            if let Ok(service) = crate::cli::claude_auth::ClaudeAuthService::production() {
+                for reference in claude_setup_references(result) {
+                    let _ = service.login(
+                        &reference,
+                        crate::cli::BrowserLoginPresentation { open_browser: false },
+                        tokio_util::sync::CancellationToken::new(),
+                    ).await;
+                }
+            }
+        }
         apply_and_save(result)?;
         return Ok(SetupApplyOutcome::Saved);
+    }
+    
+    if !claude_setup_references(result).is_empty() {
+        if let Ok(service) = crate::cli::claude_auth::ClaudeAuthService::production() {
+            for reference in claude_setup_references(result) {
+                let _ = service.login(
+                    &reference,
+                    crate::cli::BrowserLoginPresentation { open_browser: false },
+                    tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
+        }
     }
     if !grok_setup_references(result).is_empty() {
         for reference in grok_setup_references(result) {
