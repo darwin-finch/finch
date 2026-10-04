@@ -97,7 +97,7 @@ git add Cargo.toml && git commit -m "chore: bump version to vX.Y.Z"
 git tag vX.Y.Z && git push origin main && git push origin vX.Y.Z
 ```
 
-GitHub Actions is configured to build `finch-macos-arm64.tar.gz` (macOS 14 runner) and
+GitHub Actions is configured to build `finch-macos-arm64.tar.gz` (macOS 15 runner) and
 `finch-linux-x86_64.tar.gz` (Ubuntu 24.04 runner). Do not describe a release as ready merely because
 artifacts exist; release and installer reliability are tracked in Issues #119 and #144.
 

@@ -207,10 +207,6 @@ Rules:\n\
                         self.output_manager.write_info(info.format_with_warning());
                         self.render_tui().await?;
                     }
-                    Command::Local { query } => {
-                        // Handle /local command - query local model directly (bypass routing)
-                        self.handle_local_query(query).await?;
-                    }
                     Command::Plan(task) => {
                         self.handle_plan_task(task).await?;
                     }

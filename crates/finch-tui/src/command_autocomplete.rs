@@ -166,12 +166,6 @@ impl CommandRegistry {
                     description: "Persistent configuration and setup",
                     category: CommandCategory::Model,
                 },
-                CommandSpec {
-                    name: "/local",
-                    params: Some("<query>"),
-                    description: "Query local model directly (bypass routing)",
-                    category: CommandCategory::Model,
-                },
 
                 // Memory Commands
                 CommandSpec {
@@ -601,7 +595,30 @@ mod tests {
 
         let model = registry.by_category(CommandCategory::Model);
         assert!(model.iter().any(|cmd| cmd.name == "/model"));
-        assert!(model.iter().any(|cmd| cmd.name == "/local"));
+        assert!(model.iter().any(|cmd| cmd.name == "/provider"));
+    }
+
+    #[test]
+    fn test_removed_local_command_is_not_offered_in_the_menu() {
+        let registry = CommandRegistry::new();
+        let offered: Vec<&str> = registry
+            .match_prefix("/lo")
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert!(
+            !offered.contains(&"/local"),
+            "the slash-command menu must not offer the removed /local command; offered={offered:?}"
+        );
+        let model: Vec<&str> = registry
+            .by_category(CommandCategory::Model)
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert!(
+            !model.contains(&"/local"),
+            "the Model category must not list the removed /local command; model={model:?}"
+        );
     }
 
     #[test]

@@ -192,9 +192,9 @@ jobs:
   # second rustfmt. This job warms the macOS cache family on trusted main so
   # isolation-boundaries-macos can restore it.
   test-macos:
-    name: Test (macos-14, default)
+    name: Test (macos-15, default)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
@@ -225,7 +225,7 @@ jobs:
       continue-on-error: true
       with:
         cache-provider: github
-        shared-key: finch-cargo-v5-macos-14-${{ runner.arch }}-aarch64-apple-darwin-rust-1.98.0-debug-default_supervisor-release_apple-release-default-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        shared-key: finch-cargo-v5-macos-15-${{ runner.arch }}-aarch64-apple-darwin-rust-1.98.0-debug-default_supervisor-release_apple-release-default-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
         cache-targets: true
         cache-bin: false
         cache-workspace-crates: false

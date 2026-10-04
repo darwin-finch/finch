@@ -101,7 +101,7 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
 
 ISOLATION_WORKFLOW = "issue-56-brain-isolation.yml"
 ISOLATION_SCHEDULE = [{"cron": "0 9 * * 1"}]
-ISOLATION_JOBS = {"isolation-boundaries": "ubuntu-24.04", "isolation-boundaries-macos": "macos-14"}
+ISOLATION_JOBS = {"isolation-boundaries": "ubuntu-24.04", "isolation-boundaries-macos": "macos-15"}
 ISOLATED_BRAIN_PROOF_TESTS = (
     "isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
     "isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency",
@@ -200,12 +200,12 @@ EXPECTED_PULL_REQUEST_OPTIONS = {
 # queues forever, so the inventory is pinned; availability itself is proven
 # by the runs (the #518 Blacksmith pilot records runner identity separately).
 EXPECTED_RUNNERS = {
-    "ci.yml": ("blacksmith-8vcpu-ubuntu-2404", "macos-14", "ubuntu-24.04"),
+    "ci.yml": ("blacksmith-8vcpu-ubuntu-2404", "macos-15", "ubuntu-24.04"),
     "ci-main-breakage.yml": ("ubuntu-24.04",),
     "ci-superseded-run-cancellation.yml": ("ubuntu-24.04",),
     "docs.yml": ("ubuntu-24.04",),
     "issue-201-chatgpt-auth.yml": ("windows-2022",),
-    "issue-56-brain-isolation.yml": ("macos-14", "ubuntu-24.04"),
+    "issue-56-brain-isolation.yml": ("macos-15", "ubuntu-24.04"),
     "release.yml": ("${{ matrix.os }}", "ubuntu-latest"),
     "repository-hygiene.yml": ("ubuntu-24.04",),
 }
@@ -321,7 +321,7 @@ EXPECTED_CACHE_IDENTITIES = frozenset(
         ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "release-default-lto-false-codegen-units-16"),
         ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "cargo-audit-0.22.2"),
         ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "debug-default-test-debug-0_supervisor-release"),
-        ("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+        ("macos-15", "aarch64-apple-darwin", MACOS_FAMILY),
     )
 )
 
@@ -358,7 +358,7 @@ CACHE_SPECS = {
     },
     ("ci.yml", "test-macos"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
-        "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+        "shared-key": literal_cache_key("macos-15", "aarch64-apple-darwin", MACOS_FAMILY),
         "save-if": MAIN_SAVE_IF,
         "before": "Build binary",
         "env": NO_OVERRIDE_JOB_ENV,
@@ -411,7 +411,7 @@ CACHE_SPECS = {
     # never a writer, so it adds a cache location without adding a cache identity.
     (ISOLATION_WORKFLOW, "isolation-boundaries-macos"): {
         "name": "Restore the macOS default Cargo family",
-        "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+        "shared-key": literal_cache_key("macos-15", "aarch64-apple-darwin", MACOS_FAMILY),
         "save-if": False,
         "before": "Restore pinned isolation supervisor",
         "env": CI_SHARED_ENV,
@@ -1038,7 +1038,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 
     expected_release_matrix = [
         {
-            "os": "macos-14", "target": "aarch64-apple-darwin",
+            "os": "macos-15", "target": "aarch64-apple-darwin",
             "asset_name": "finch-macos-arm64",
             "cache_family": "debug-default_supervisor-release_apple-release-default",
         },

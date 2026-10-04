@@ -339,6 +339,22 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   surface and `muse-spark-1.3`; it never falls back to OpenCode Zen, Muse Code,
   contributor-tier models, or a custom compatible origin (#317, direct Meta Model API for Muse Spark; reviewed
   against official Meta documentation on 2026-10-01).
+- **A Gemini subscription token rejection names its step, HTTP status, and RFC 6749 error code,
+  and never upstream text.** `GeminiAuthStageError::TokenExchangeRejected` carries the step
+  (authorization-code exchange, device-code exchange, or refresh), the status, and a code from
+  the fixed vocabulary in `known_oauth_error_code` (`gemini_oauth.rs`). Google's token endpoint
+  refuses an authorization-code exchange for a desktop OAuth client that sends no
+  `client_secret` (HTTP 400 `invalid_request`, "client_secret is missing."), PKCE verifier or
+  not; that case is its own variant, `ClientSecretMissing`. Finch embeds no client secret:
+  `resolve_gemini_oauth_client` always honours `FINCH_GEMINI_CLIENT_SECRET`, including with the
+  built-in client ID, and ignores the generic `GOOGLE_CLIENT_SECRET` unless `GOOGLE_CLIENT_ID`
+  names a custom client — `test_finch_client_secret_is_kept_with_the_built_in_client_id`,
+  `test_generic_google_secret_is_not_paired_with_the_built_in_client_id` in `gemini_oauth.rs`;
+  `test_a_secretless_gemini_token_exchange_names_the_step_status_and_remedy`,
+  `test_a_rejected_gemini_token_exchange_names_the_step_status_and_oauth_code`,
+  `test_gemini_token_exchange_with_a_client_secret_completes_and_persists` in
+  `src/cli/setup_wizard/gemini_recovery.rs` (root crate) drive the real `OAuthClient` against a
+  fixture token endpoint.
 - Subscription and API billing are never automatically interchangeable.
 - **Grok subscription device login follows the pinned Grok Build public-client wire contract.**
   Initiation sends `referrer=grok-build`; initiation and polling both carry the allowlisted

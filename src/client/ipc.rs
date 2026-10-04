@@ -269,41 +269,6 @@ impl IpcClient {
         Ok(read_query_response(r)?)
     }
 
-    /// Streaming query — returns a channel of `StreamChunk`s.
-    ///
-    /// The channel is closed when the server sends the `done` sentinel.
-    pub async fn query_stream(
-        &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDefinition>,
-    ) -> Result<mpsc::UnboundedReceiver<Result<StreamChunk>>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        // Build a StreamReceiver capability that the server will call back.
-        let receiver_impl = StreamReceiverImpl { tx };
-        // capnp v0.20: new_client infers C from the receiver_impl type via FromServer.
-        let receiver_client: stream_receiver::Client = capnp_rpc::new_client(receiver_impl);
-
-        let mut req = self.client.query_stream_request();
-        {
-            let mut p = req.get();
-            crate::brain::encode_messages(
-                p.reborrow().init_messages(messages.len() as u32),
-                &messages,
-            )?;
-            write_tools(p.reborrow().init_tools(tools.len() as u32), &tools);
-            p.set_receiver(receiver_client);
-        }
-
-        // Fire and forget — the server will call back on the receiver.
-        // In capnp v0.20, spawn_local drives the future; .detach() was removed.
-        tokio::task::spawn_local(async move {
-            let _ = req.send().promise.await;
-        });
-
-        Ok(rx)
-    }
-
     // -----------------------------------------------------------------------
     // Co-Forth
     // -----------------------------------------------------------------------
@@ -331,8 +296,8 @@ impl IpcClient {
     }
 
     /// One Finch-level round of a daemon-owned Claude CLI Subscription
-    /// session for `brain` (issue #1354). Mirrors [`Self::query_stream`]'s
-    /// shape exactly, scoped to a Brain's persistent session instead of a
+    /// session for `brain` (issue #1354). Mirrors the daemon's Brain-less
+    /// `queryStream` shape exactly, scoped to a Brain's persistent session instead of a
     /// one-off Brain-less request: to answer a paused round, call again with
     /// the same messages plus the resolved `ToolResult` appended. Reuses
     /// `StreamReceiverImpl`, so a `StreamChunk::ToolCallComplete` decoded
@@ -371,7 +336,7 @@ impl IpcClient {
             p.set_model(model.unwrap_or(""));
         }
 
-        // Fire and forget, exactly like `query_stream`: the server calls
+        // Fire and forget: the server calls
         // back on `receiver` as chunks are produced, live, for however long
         // this round takes (unbounded — real interactive approval on the
         // far side of a paused round has no timeout). Awaiting the request

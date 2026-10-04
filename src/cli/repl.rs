@@ -3087,11 +3087,6 @@ impl Repl {
                         self.handle_feedback(1.0, note.clone()).await?;
                         continue;
                     }
-                    // Local model query command
-                    Command::Local { ref query } => {
-                        self.handle_local_query(query).await?;
-                        continue;
-                    }
                     // Phase 2: Persona commands
                     Command::PersonaList => {
                         self.handle_persona_list().await?;
@@ -4530,67 +4525,6 @@ impl Repl {
         }
 
         self.output_status("   Saved privately; automatic training is disabled.");
-
-        Ok(())
-    }
-
-    /// Handle /local command - query local model directly (bypass routing)
-    async fn handle_local_query(&mut self, query: &str) -> Result<()> {
-        // Show status
-        self.output_status("🔧 Local Model Query (bypassing routing)");
-
-        // Check if daemon client exists
-        if let Some(daemon_client) = &self.daemon_client {
-            // Daemon mode: use HTTP
-            if self.is_interactive {
-                self.output_user(query);
-            }
-
-            // Start response
-            let start_time = Instant::now();
-
-            // Query daemon with local_only flag
-            match daemon_client.query_local_only(query).await {
-                Ok(response) => {
-                    let elapsed = start_time.elapsed();
-
-                    // Output the response
-                    if self.is_interactive {
-                        self.output_response(&response);
-                    } else {
-                        println!("{}", response);
-                    }
-
-                    // Show timing
-                    if self.is_interactive {
-                        self.output_status(format!(
-                            "✓ Local model ({:.2}s)",
-                            elapsed.as_secs_f64()
-                        ));
-                    }
-                }
-                Err(e) => {
-                    // Show error
-                    let error_msg = format!("Error: {}", e);
-                    if self.is_interactive {
-                        self.output_error(&error_msg);
-                        self.output_status("⚠️  Local model query failed");
-                    } else {
-                        eprintln!("{}", error_msg);
-                    }
-                }
-            }
-        } else {
-            // No daemon mode - show error
-            let error_msg =
-                "Error: /local requires daemon mode. The daemon provides direct model access.";
-            if self.is_interactive {
-                self.output_status("⚠️  Daemon not available");
-                self.output_status("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
-            } else {
-                eprintln!("{}", error_msg);
-            }
-        }
 
         Ok(())
     }

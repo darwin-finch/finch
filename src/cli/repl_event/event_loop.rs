@@ -3539,63 +3539,6 @@ impl EventLoop {
         self.render_tui().await
     }
 
-    /// Handle /local command - query local model directly (bypass routing)
-    async fn handle_local_query(&mut self, query: String) -> Result<()> {
-        use crate::cli::messages::StreamingResponseMessage;
-
-        let Some(ref ipc) = self.ipc_client else {
-            self.output_manager
-                .write_error("Error: /local requires the daemon.");
-            self.output_manager
-                .write_info("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
-            return self.render_tui().await;
-        };
-
-        let msg = Arc::new(StreamingResponseMessage::new());
-        msg.append_chunk("🔧 Local Model Query (bypassing routing)\n\n");
-        self.output_manager
-            .add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
-        self.render_tui().await?;
-
-        let messages = vec![crate::providers::Message {
-            role: "user".to_string(),
-            content: vec![crate::providers::ContentBlock::Text { text: query }],
-        }];
-
-        let mut rx = match ipc.query_stream(messages, vec![]).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                msg.set_failed();
-                self.output_manager
-                    .write_error(format!("Local query failed: {}", e));
-                return self.render_tui().await;
-            }
-        };
-
-        // Drive the stream in a local task so the event loop keeps rendering
-        let msg_clone = msg.clone();
-        let output_mgr = self.output_manager.clone();
-        tokio::task::spawn_local(async move {
-            use crate::generators::StreamChunk;
-            while let Some(result) = rx.recv().await {
-                match result {
-                    Ok(StreamChunk::TextDelta(t)) => msg_clone.append_chunk(&t),
-                    Ok(_) => {} // Usage, ContentBlockComplete — ignored
-                    Err(e) => {
-                        msg_clone.set_failed();
-                        output_mgr.write_error(format!("Local query error: {}", e));
-                        return;
-                    }
-                }
-            }
-            // Channel closed = stream complete
-            msg_clone.append_chunk("\n✓ Local model (bypassed routing)");
-            msg_clone.set_complete();
-        });
-
-        Ok(())
-    }
-
     async fn handle_provider_show(&self) {
         match crate::cli::repl_event::brain_selection::resolve_selection(
             &self.available_providers,
