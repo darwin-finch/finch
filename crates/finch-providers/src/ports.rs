@@ -113,7 +113,10 @@ impl HttpTransport for ReqwestTransport {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<(StatusCode, Vec<u8>)> {
-        let builder = self.client.post(&request.endpoint);
+        let mut builder = self.client.post(&request.endpoint);
+        for (name, value) in request.metadata.grok_headers() {
+            builder = builder.header(name, value);
+        }
         let builder = match request.body {
             OAuthRequestBody::Form(fields) => builder.form(&fields),
             OAuthRequestBody::Json(value) => builder.json(&value),
@@ -244,6 +247,7 @@ mod tests {
                 OAuthHttpRequest {
                     endpoint: "https://example.invalid/token".into(),
                     body: OAuthRequestBody::Form(vec![("k".into(), "v".into())]),
+                    metadata: Default::default(),
                 },
                 Duration::from_secs(1),
                 &CancellationToken::new(),

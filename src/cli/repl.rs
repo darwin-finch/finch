@@ -2838,6 +2838,7 @@ impl Repl {
                 program_runtime: Arc::clone(&self.program_runtime),
                 agent_scheduler,
                 memory_system: self.memory_system.clone(),
+                metrics_logger: Some(Arc::new(self.metrics_logger.clone())),
                 committed_memories: Arc::clone(&self.committed_memories),
                 memory_commitment_writer: self.memory_commitment_writer.clone(),
             },
