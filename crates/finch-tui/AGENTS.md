@@ -66,6 +66,13 @@ the CLI `/help` renderer (`cli::commands::format_help`) generates its Keyboard S
 section from the same table, so help prose and key handling cannot drift (#893). Tests pin
 every entry to its real dispatcher (this module and `lib.rs`).
 
+`LiveFrameProbe` (behind the `test-support` feature) attaches a modelled terminal to a headless
+renderer: every `flush_output_safe` tick then runs its real body (`flush_output_safe_to`) against
+a byte buffer at a fixed size and feeds the bytes to the `vt_oracle` VT parser, so an application
+test can read each frame the production tick painted — scrollback and live area together —
+without a terminal. It forces nothing: a tick whose dirty gate declines to repaint records no
+frame.
+
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-tui --lib`.
 
 ## The blit pipeline: ViewModel → widget tree → claiming → paint
@@ -82,6 +89,13 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
    `TranscriptNode` conversion to `finch_ui_model::project_work_unit`. Widgets never query
    `WorkUnit`, the command registry, or each other to decide visibility; a widget with nothing
    to show claims zero rows and stays in the tree.
+   The live transcript enters through `view_model::project_live_message` instead, which also
+   returns the turn's in-progress indicator when the message owns it
+   (`finch_ui_model::project_live_work_unit`). `TuiRenderer::projected_message_lines` is the one
+   place the live transcript draws that indicator: one `turn_indicator_line` row, lowered from
+   spans, after the unit's own lines. `poll_message_changes` keys a WorkUnit on
+   `WorkUnitView::paint_key`, so a running turn repaints when the indicator's text changes (one
+   pulse frame per 200 ms), not on every 33 ms tick (#1664).
 3. **`widgets::layout`** is depth-first **frame claiming**: a parent offers a box, children
    claim sub-rectangles (`Track::{Natural, Flex, Max, Side}`), the pass records claimed rects
    and disclosure hitboxes. Resize is another pass — no widget keeps a cell count from the

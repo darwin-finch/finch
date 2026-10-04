@@ -101,6 +101,10 @@ pub struct QueryMetadata {
     /// Keeping it live across continuation requests prevents each round trip
     /// from becoming a separate anonymous transcript block.
     pub tool_work_unit: Option<Arc<WorkUnit>>,
+    /// The unit that waits on and streams from the provider for this query:
+    /// the one that owns the turn's in-progress indicator. Registered so
+    /// that cancelling the query settles it, whatever its worker is doing.
+    pub generation_work_unit: Option<Arc<WorkUnit>>,
     /// Transient live VM output for a named-Brain turn. Once the daemon
     /// publishes the correlated Result, EventLoop folds this into the run
     /// group and removes the transient unit without losing live updates.
@@ -216,6 +220,7 @@ impl QueryStateManager {
             request_route: None,
             request_metric_taken: false,
             tool_work_unit: None,
+            generation_work_unit: None,
             brain_output_work_unit: None,
         };
 
@@ -394,6 +399,24 @@ impl QueryStateManager {
         }
     }
 
+    /// Register the unit that waits on the provider for `query_id`.
+    ///
+    /// Cancelling the query settles this unit ([`Self::cancel_query`]), so no
+    /// cancellation path can leave it in progress with a running indicator.
+    /// A query that was cancelled before its worker got here — or that no
+    /// longer exists — settles the unit immediately for the same reason.
+    pub async fn set_generation_work_unit(&self, query_id: Uuid, unit: Arc<WorkUnit>) {
+        let mut states = self.states.write().await;
+        match states.get_mut(&query_id) {
+            Some(metadata) if !matches!(metadata.state, QueryState::Cancelled) => {
+                metadata.generation_work_unit = Some(unit);
+            }
+            _ => {
+                unit.set_cancelled();
+            }
+        }
+    }
+
     pub async fn tool_work_unit(&self, query_id: Uuid) -> Option<Arc<WorkUnit>> {
         self.states
             .read()
@@ -443,6 +466,14 @@ impl QueryStateManager {
             metadata.cancellation_token.cancel();
             let metric = take_request_metric(metadata, &QueryState::Cancelled);
             metadata.state = QueryState::Cancelled;
+            // Every cancellation path comes through here, and the worker may
+            // be parked inside a provider call that never looks at the
+            // token. Settle the generation unit now, under the same lock as
+            // the state change, so a cancelled turn stops owning an
+            // in-progress indicator the moment it is cancelled (#1664).
+            if let Some(unit) = metadata.generation_work_unit.take() {
+                unit.set_cancelled();
+            }
             metric
         };
         self.log_request_metric(metric);
@@ -515,6 +546,51 @@ mod tests {
         let manager = QueryStateManager::new();
         let unknown = Uuid::new_v4();
         assert!(manager.get_state(unknown).await.is_none());
+    }
+
+    /// Cancelling a query settles its registered generation unit under the
+    /// same transition, and a unit registered after the cancel (the worker
+    /// lost the race) is settled on registration. Either way no cancelled
+    /// query keeps a unit that is still in progress.
+    #[tokio::test]
+    async fn test_cancel_query_settles_the_generation_unit_whichever_side_wins_the_race() {
+        use crate::cli::messages::Message as _;
+        let manager = QueryStateManager::new();
+
+        let id = manager.create_query(vec![]).await;
+        let unit = Arc::new(WorkUnit::new("Channeling"));
+        unit.begin_provider_request();
+        manager
+            .set_generation_work_unit(id, Arc::clone(&unit))
+            .await;
+        assert_eq!(
+            unit.status(),
+            crate::cli::messages::MessageStatus::InProgress,
+            "registering a live query's unit must not settle it"
+        );
+        assert!(manager.cancel_query(id).await);
+        assert_eq!(
+            unit.status(),
+            crate::cli::messages::MessageStatus::Failed,
+            "invariant: cancelling a query gives its generation unit a terminal state"
+        );
+        assert!(
+            !manager.cancel_query(id).await,
+            "a second cancel of the same query is rejected"
+        );
+
+        let late_id = manager.create_query(vec![]).await;
+        assert!(manager.cancel_query(late_id).await);
+        let late = Arc::new(WorkUnit::new("Channeling"));
+        late.begin_provider_request();
+        manager
+            .set_generation_work_unit(late_id, Arc::clone(&late))
+            .await;
+        assert_eq!(
+            late.status(),
+            crate::cli::messages::MessageStatus::Failed,
+            "invariant: a unit registered after its query was cancelled is settled at once"
+        );
     }
 
     #[tokio::test]
