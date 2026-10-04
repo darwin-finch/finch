@@ -1,0 +1,19 @@
+_version: 1
+app:
+  name: "Finch"
+  bin: "finch"
+
+setup:
+  starting: "Starting %{app} setup wizard...\n"
+  cancelled: "Setup cancelled; configuration was not changed."
+  saved: "\n✓ Configuration saved to ~/.finch/config.toml\n  You can now run: %{bin}\n  Or start the daemon: %{bin} daemon\n"
+  banner_title: " Finch Setup "
+  read_only_hint: "This full view is read/scroll only; clipboard copying is unavailable in the setup wizard."
+
+daemon:
+  starting: "Starting %{app} in daemon mode"
+  pid_written: "Daemon PID file written"
+
+general:
+  success: "Success"
+  error: "Error"

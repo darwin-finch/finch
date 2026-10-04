@@ -1031,6 +1031,9 @@ async fn main() -> Result<()> {
     // statement in `main` can be (#364).
     finch::startup::begin();
 
+    // Initialize internationalization early from system environment
+    finch_i18n::init(None);
+
     // Suppress ONNX Runtime verbose logs BEFORE any initialization, unless the
     // operator asked for more (#223 diagnostics). Must be set early, before
     // any ONNX library code runs.
@@ -2060,7 +2063,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Note: init_tracing() is NOT called in daemon mode - we set up file logging above instead
 
-    tracing::info!("Starting Finch in daemon mode");
+    tracing::info!(
+        "{}",
+        finch_i18n::t!("daemon.starting", app = finch_i18n::PRODUCT_NAME)
+    );
 
     // Initialize daemon lifecycle (PID file management)
     let lifecycle = DaemonLifecycle::new()?;
@@ -3095,20 +3101,24 @@ fn finish_wire_metric(
 async fn run_setup() -> Result<()> {
     use finch::cli::show_setup_wizard;
 
-    println!("Starting Finch setup wizard...\n");
+    print!(
+        "{}",
+        finch_i18n::t!("setup.starting", app = finch_i18n::PRODUCT_NAME)
+    );
 
     // Run the wizard
     let result = show_setup_wizard()?;
     if finch::cli::validate_command_and_apply(&result).await?
         == finch::cli::SetupApplyOutcome::Cancelled
     {
-        println!("Setup cancelled; configuration was not changed.");
+        println!("{}", finch_i18n::t!("setup.cancelled"));
         return Ok(());
     }
 
-    println!("\n✓ Configuration saved to ~/.finch/config.toml");
-    println!("  You can now run: finch");
-    println!("  Or start the daemon: finch daemon\n");
+    print!(
+        "{}",
+        finch_i18n::t!("setup.saved", bin = finch_i18n::BIN_NAME)
+    );
 
     Ok(())
 }

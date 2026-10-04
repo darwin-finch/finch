@@ -22,6 +22,7 @@ members = [
     "crates/finch-colisp",
     "crates/finch-conversation",
     "crates/finch-generation",
+    "crates/finch-i18n",
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
@@ -46,6 +47,7 @@ default-members = [
     "crates/finch-colisp",
     "crates/finch-conversation",
     "crates/finch-generation",
+    "crates/finch-i18n",
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
@@ -68,6 +70,7 @@ finch-brain = { path = "crates/finch-brain" }
 finch-conversation = { path = "crates/finch-conversation" }
 finch-diff = { path = "crates/finch-diff" }
 finch-generation = { path = "crates/finch-generation" }
+finch-i18n = { path = "crates/finch-i18n" }
 finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
