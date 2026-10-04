@@ -120,9 +120,8 @@ impl SessionUsageLedger {
     /// stays tokens-only.
     pub fn format_status_line(&self, pricing: Option<&ModelPricingTable>) -> String {
         let mut line = format!(
-            "this session: {} in / {} out",
-            format_token_count(self.input_tokens),
-            format_token_count(self.output_tokens)
+            "this session: {}",
+            format_in_out(self.input_tokens, self.output_tokens)
         );
         if let Some(pricing) = pricing {
             if !pricing.is_empty() {
@@ -144,18 +143,16 @@ impl SessionUsageLedger {
             "Session usage (local observation of provider-reported tokens; not a billing statement):"
                 .to_string(),
             format!(
-                "  total: {} in / {} out across {} response{}",
-                format_token_count(self.input_tokens),
-                format_token_count(self.output_tokens),
+                "  total: {} across {} response{}",
+                format_in_out(self.input_tokens, self.output_tokens),
                 self.turns,
                 if self.turns == 1 { "" } else { "s" }
             ),
         ];
         for (model, usage) in &self.per_model {
             lines.push(format!(
-                "  {model}: {} in / {} out ({} response{})",
-                format_token_count(usage.input_tokens),
-                format_token_count(usage.output_tokens),
+                "  {model}: {} ({} response{})",
+                format_in_out(usage.input_tokens, usage.output_tokens),
                 usage.turns,
                 if usage.turns == 1 { "" } else { "s" }
             ));
@@ -202,6 +199,21 @@ impl SessionUsageLedger {
             .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
+}
+
+/// `N in / M out`, or `M out` alone when output was recorded but no input
+/// was. A provider response always consumes input, so a zero beside a
+/// non-zero output means the provider did not report it; printing `0 in`
+/// would state a measurement nobody made (#1671).
+fn format_in_out(input_tokens: u64, output_tokens: u64) -> String {
+    if input_tokens == 0 && output_tokens > 0 {
+        return format!("{} out", format_token_count(output_tokens));
+    }
+    format!(
+        "{} in / {} out",
+        format_token_count(input_tokens),
+        format_token_count(output_tokens)
+    )
 }
 
 /// Human token counts: 823, 3.5k, 182k, 1.2M.
@@ -355,6 +367,34 @@ mod tests {
         assert_eq!(
             line, "this session: 182k in / 31k out",
             "models without a price row must not produce a zero-dollar fake estimate; line={line:?}"
+        );
+    }
+
+    #[test]
+    fn test_session_usage_readouts_omit_input_no_provider_reported() {
+        let mut ledger = SessionUsageLedger::default();
+        ledger.record_turn("claude-cli", None, Some(1_400));
+        let line = ledger.format_status_line(None);
+        assert_eq!(
+            line, "this session: 1.4k out",
+            "unreported input must not be shown as a measured zero; line={line:?} ledger={ledger:?}"
+        );
+        let detail = ledger.format_session_detail(None);
+        assert!(
+            !detail.contains("0 in") && detail.contains("  claude-cli: 1.4k out (1 response)"),
+            "the /usage detail must not claim `0 in` either; detail={detail:?}"
+        );
+
+        ledger.record_turn("claude-cli", Some(12), Some(100));
+        let line = ledger.format_status_line(None);
+        assert_eq!(
+            line, "this session: 12 in / 1.5k out",
+            "reported input is shown as reported; line={line:?} ledger={ledger:?}"
+        );
+        let empty = SessionUsageLedger::default().format_status_line(None);
+        assert_eq!(
+            empty, "this session: 0 in / 0 out",
+            "an empty ledger still reads as nothing used; line={empty:?}"
         );
     }
 

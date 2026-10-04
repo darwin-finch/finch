@@ -231,6 +231,20 @@ command. Pinned in `event_loop/tests.rs` by
 `test_patterns_dialog_displaced_by_a_tool_approval_changes_nothing_and_answers_the_tool`, and
 `test_peer_turn_prompt_naming_a_patterns_command_cannot_list_or_change_owner_approvals`.
 
+**A turn's reply is one row with the turn's own duration, and unreported input is never shown as
+zero (#1671, every Claude CLI reply wrapped in two `(ran 0s)` rows with `0 in`).**
+`execute_wire_with_single_repair` (`query_processor.rs`) runs a plain-prose reply's wrapped `say`
+form in the same output unit as the rejected attempt, so no empty completed row precedes the reply;
+its output units are created through `OutputManager::start_reply_work_unit` from the turn's
+generation unit, so `(ran Ns)` counts from the request being sent, across tool rounds, rather than
+from the finished reply being printed. `SessionUsageLedger`'s readouts (`src/cli/usage.rs`) print
+`N out` alone when output was recorded with no input, because a provider that reports no input has
+not used zero. Pinned in `event_loop/turn_indicator_tests.rs` by
+`test_bridge_prose_reply_renders_one_reply_row_and_one_timing_row`,
+`test_completed_turn_reports_the_time_since_its_request_was_sent`,
+`test_completed_turn_with_a_tool_round_reports_the_whole_turn_time`, and
+`test_session_token_line_omits_input_the_provider_never_reported`.
+
 **Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
 whenever `register_home_brain` reached the daemon this session and the home Brain's entry was
 created or loaded in the durable store (`EventLoop::home_brain_registered`), or a visible

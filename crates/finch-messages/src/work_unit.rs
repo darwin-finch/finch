@@ -315,6 +315,18 @@ impl WorkUnit {
         }
     }
 
+    /// Create the WorkUnit that shows the reply of the turn `self` generated.
+    ///
+    /// It reads the same clock and counts from the same start, so the
+    /// duration it reports once complete is the turn's — from the request
+    /// being sent — rather than the time the finished reply took to print
+    /// (#1671: every reply said `(ran 0s)`).
+    pub fn continuing_turn(&self, id: MessageId, verb: impl Into<String>) -> Self {
+        let mut unit = Self::with_clock(id, verb, self.clock.clone());
+        unit.started_at = self.started_at;
+        unit
+    }
+
     // ── Update API ──────────────────────────────────────────────────────────
 
     /// Accumulate tokens from a text delta (approximate: counts whitespace words).

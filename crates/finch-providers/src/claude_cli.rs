@@ -1717,6 +1717,19 @@ impl ProviderBackend for ClaudeCliProvider {
                     // preamble on a resumed parked turn, which would desync
                     // `query_processor.rs`'s streamed-vs-completed check
                     // (issue #1372's investigation).
+                    //
+                    // The usage the CLI reported goes first: the
+                    // non-streaming path already returns it
+                    // (`response_from`), but this path dropped it, so a
+                    // whole session read as zero input tokens (#1671).
+                    if let Some(usage) = &record.usage {
+                        let _ = tx
+                            .send(Ok(StreamChunk::Usage {
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                            }))
+                            .await;
+                    }
                     let _ = tx
                         .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::text(
                             record.newly_streamed_text(),
@@ -2247,15 +2260,32 @@ printf '%s\n' \
             .expect("streaming must be supported");
         let mut deltas = Vec::new();
         let mut complete = None;
+        let mut usage = Vec::new();
         while let Some(chunk) = rx.recv().await {
             match chunk.unwrap() {
                 StreamChunk::TextDelta(text) => deltas.push(text),
                 StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
                     complete = Some(text);
                 }
+                StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    assert!(
+                        complete.is_none(),
+                        "usage must precede the terminal text block"
+                    );
+                    usage.push((input_tokens, output_tokens));
+                }
                 other => panic!("unexpected chunk {other:?}"),
             }
         }
+        assert_eq!(
+            usage,
+            vec![(2, 4)],
+            "INVARIANT: the usage the CLI's assistant message reported (input 2, output 4) \
+             reaches the stream exactly once; deltas={deltas:?} complete={complete:?}"
+        );
         assert_eq!(
             deltas,
             vec!["he".to_string(), "llo".to_string()],
@@ -2869,6 +2899,7 @@ printf '%s\n' \
                 StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
                     complete = Some(text);
                 }
+                StreamChunk::Usage { .. } => {}
                 other => panic!("unexpected chunk {other:?}"),
             }
         }
