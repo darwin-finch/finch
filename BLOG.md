@@ -50,7 +50,7 @@ This skips the model download, skips the daemon, and routes everything directly 
 
 For our friend with the old Intel MacBook Pro: he gets his Grok API key from `console.x.ai`, runs `finch setup`, picks Grok, and uses `finch --cloud-only`. No model download. No daemon. No Rust toolchain.
 
-The release workflow builds native binaries for Apple Silicon (`macos-14`) and Linux x86_64 (`ubuntu-24.04`) via GitHub Actions. Intel macOS support was dropped in February 2026: ONNX Runtime has no prebuilt binaries for `x86_64-apple-darwin`, and GitHub deprecated Intel Mac runners.
+The release workflow builds native binaries for Apple Silicon (`macos-15`) and Linux x86_64 (`ubuntu-24.04`) via GitHub Actions. Intel macOS support was dropped in February 2026: ONNX Runtime has no prebuilt binaries for `x86_64-apple-darwin`, and GitHub deprecated Intel Mac runners.
 
 ---
 
