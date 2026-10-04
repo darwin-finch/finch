@@ -31,7 +31,8 @@ mod tests {
         for file in ["loaders/llama_cpp.rs", "neural_embedding.rs"] {
             let source = std::fs::read_to_string(root.join(file)).expect("read backend source");
             let hook = source.find("route_native_logs_to_tracing()");
-            let init = source.find("LlamaBackend::init()");
+            // The call itself, not a mention of it in a comment.
+            let init = source.find("LlamaBackend::init().context(");
             assert!(
                 matches!((hook, init), (Some(hook), Some(init)) if hook < init),
                 "{file}: the log hook must be installed before LlamaBackend::init, or \
