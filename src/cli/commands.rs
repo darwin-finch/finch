@@ -15,7 +15,8 @@ pub enum CommandOutput {
 #[derive(Debug)]
 pub enum Command {
     Help,
-    /// An unrecognised `/command`; carries the whole typed input (for example
+    /// An unrecognised `/command`; carries the typed input, trimmed of
+    /// surrounding whitespace and trailing punctuation (for example
     /// `/bogus`, or `/patterns invalid` when only the subcommand is wrong) so
     /// the response can name it instead of dumping the full help screen.
     Unknown(String),
