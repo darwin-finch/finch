@@ -400,10 +400,18 @@ impl EventLoop {
                 // actually ran on when known, so the message is
                 // self-explanatory regardless of what other transcript
                 // events (e.g. an unrelated model switch) land nearby.
-                let error_message = match &generator_name {
+                let mut error_message = match &generator_name {
                     Some(name) => format!("Query failed ({name}): {error}"),
                     None => format!("Query failed: {error}"),
                 };
+                // A terminal provider failure has no later boundary that
+                // could consume queued input. Hand it back before the error
+                // row is written so the same row says so in words.
+                if *self.active_query_id.read().await == Some(query_id) {
+                    if let Some(notice) = self.return_pending_queries_to_draft().await {
+                        error_message = format!("{error_message}; {notice}");
+                    }
+                }
                 self.output_manager.write_error(error_message);
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
@@ -432,8 +440,6 @@ impl EventLoop {
                 // Release the turn so queued user input cannot wedge behind it.
                 if *self.active_query_id.read().await == Some(query_id) {
                     *self.active_query_id.write().await = None;
-
-                    self.return_pending_queries_to_draft().await;
                 }
             }
 
@@ -843,6 +849,7 @@ impl EventLoop {
                             false
                         };
 
+                    let mut returned_notice = None;
                     if !named_turn {
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
@@ -853,7 +860,7 @@ impl EventLoop {
                         // in-flight query; what is left goes back to the composer
                         // instead of vanishing (#1587, queued messages lost when
                         // a turn ends early).
-                        self.return_pending_queries_to_draft().await;
+                        returned_notice = self.return_pending_queries_to_draft().await;
                     }
 
                     // Plan/executing overlays cancel with the query so the
@@ -868,10 +875,14 @@ impl EventLoop {
                     }
 
                     // Show cancellation message
-                    self.output_manager.write_info(if named_turn {
+                    let cancel_message = if named_turn {
                         "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
                     } else {
                         "⚠️  Query cancelled by user (Esc)"
+                    };
+                    self.output_manager.write_info(match returned_notice {
+                        Some(notice) => format!("{cancel_message}; {notice}"),
+                        None => cancel_message.to_string(),
                     });
                     self.render_tui().await?;
 
