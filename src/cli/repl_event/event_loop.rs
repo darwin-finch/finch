@@ -5850,6 +5850,9 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod turn_indicator_tests;
+
 /// Open `content` in `$VISUAL` or `$EDITOR` (falling back to `vi`), let the user
 /// edit it, and return the saved result.  Suspends the terminal while the editor
 /// runs and restores it afterwards.

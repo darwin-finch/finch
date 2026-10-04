@@ -26,6 +26,15 @@ projection through the `Message` snapshot; the root TUI adapter has its own test
 `cli::repl_event::tool_display`. Keep those cross-layer tests at the root, not in this crate,
 to avoid a dev-dependency cycle.
 
+**Turn indicator facts (#1664):** a `WorkUnit` does not word or animate the turn's in-progress
+indicator. It carries the facts into `WorkUnitView` — `elapsed` (from its `WorkClock`, frozen at
+finish), `token_count`, and `awaiting_provider` (set by `WorkUnit::begin_provider_request`) — and
+`finch-ui-model` decides ownership and wording. `WorkUnit::format`, the non-terminal text path,
+lowers the same `TurnIndicatorView`; it must not grow its own frames, verb, or stats string again.
+`WorkClock` exists so a test advances a unit's time by exact amounts; production units use
+`WorkClock::monotonic`. `test_view_carries_the_indicator_facts_and_format_lowers_the_same_description`
+in `src/work_unit.rs`. The never-read `thinking` flag and its `set_thinking` setter are deleted.
+
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
 shared unit may be read while the event loop appends output, so preserve the existing lock and
@@ -70,8 +79,9 @@ identifier, following every re-export chain — `crates/finch-messages/src/lib.r
 which had produced confirmed false negatives on `WorkUnit::queue_agent_activity` and `MessageRef`)
 narrowed `OperationRow`, `OperationRowStatus`, `StaticMessageType`, `ToggleMemoryRow`,
 `ToolExecutionMessage`, `ToggleProgram`, `WorkRow`, `ComponentAction::{new,downcast_ref}`,
-`WorkUnit::{set_thinking,complete_row_with_diff}`, and `LiveToolMessage::{set_content,set_failed}`
-to `pub(crate)` after confirming zero external callers by any path. `ToolExecutionMessage`'s
+`WorkUnit::complete_row_with_diff`, and `LiveToolMessage::{set_content,set_failed}`
+to `pub(crate)` after confirming zero external callers by any path (`WorkUnit::set_thinking`,
+narrowed in the same audit, was later deleted with its unread field). `ToolExecutionMessage`'s
 `append_stdout`/`append_stderr`/`set_exit_code`/`set_failed` and `StaticMessage`'s
 `success`/`warning` (plus the now-unreachable `StaticMessageType::{Success,Warning}` variants and
 their `format`/`component_view` match arms) were deleted outright: zero callers anywhere,

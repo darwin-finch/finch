@@ -4,7 +4,7 @@
 //! engines consume the resulting [`TranscriptNode`] without naming Finch's
 //! conversation types.
 
-use crate::{markdown, MessageId, NodeRole, RowId};
+use crate::{component::TurnIndicatorView, markdown, MessageId, NodeRole, RowId};
 
 /// Status of a retained application message.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +124,98 @@ pub struct WorkUnitView {
     pub verb: String,
     pub rows: Vec<WorkRowView>,
     pub agent_activity: Vec<AgentActivityView>,
+    /// How long the unit has run: live while in progress, the captured
+    /// finish time afterwards.
+    pub elapsed: std::time::Duration,
+    /// Approximate tokens received from the provider for this unit.
+    pub token_count: usize,
+    /// True once the unit has been handed a provider request: it is the
+    /// turn's generation unit, so it keeps the turn indicator while it
+    /// streams a program or runs a tool round.
+    pub awaiting_provider: bool,
+}
+
+impl WorkUnitView {
+    /// What decides whether this unit paints differently from the last
+    /// frame. `elapsed` and `token_count` change on every poll while a unit
+    /// runs, but they reach the screen only through the turn indicator, so
+    /// the key carries the indicator's text instead of the raw values: an
+    /// in-progress unit repaints when its pulse frame, seconds, or token
+    /// readout changes, and never merely because time passed.
+    pub fn paint_key(&self) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            self.head,
+            self.verb,
+            self.rows,
+            self.agent_activity,
+            turn_indicator(self).map(|indicator| indicator.plain_text()),
+        )
+    }
+
+    /// A pending prose row: the unit will present assistant prose, and no
+    /// tool rows have claimed it.
+    fn is_pending_prose(&self) -> bool {
+        match &self.head.presentation {
+            WorkUnitPresentation::Assistant => self.rows.is_empty(),
+            WorkUnitPresentation::Interactive => true,
+            WorkUnitPresentation::ProgramOutput { .. } => self.head.projects_as_prose,
+            WorkUnitPresentation::Activity { .. } | WorkUnitPresentation::ProgramSource { .. } => {
+                false
+            }
+        }
+    }
+
+    /// Nothing of this unit's own is on screen yet: no text, no rows, no
+    /// child-agent activity.
+    fn has_no_content(&self) -> bool {
+        self.head.output_body_lines().is_empty()
+            && self.rows.is_empty()
+            && self.agent_activity.is_empty()
+    }
+}
+
+/// The in-progress indicator this unit owns, if it owns one.
+///
+/// A unit owns the turn's indicator while it is in progress and either is
+/// the turn's generation unit (`awaiting_provider`) or is a pending prose row
+/// with no text yet. Completed and failed units never own one, and a unit
+/// that is only a local tool group, lifecycle activity, or typed program
+/// does not either.
+pub fn turn_indicator(view: &WorkUnitView) -> Option<TurnIndicatorView> {
+    if view.head.status != MessageStatus::InProgress {
+        return None;
+    }
+    let pending_prose = view.is_pending_prose() && view.head.response_text.is_empty();
+    (view.awaiting_provider || pending_prose).then(|| TurnIndicatorView {
+        verb: view.verb.clone(),
+        elapsed: view.elapsed,
+        token_count: view.token_count,
+    })
+}
+
+/// One WorkUnit as the live transcript draws it: its transcript node, when
+/// it has anything of its own to show, and the turn indicator beneath it,
+/// when it owns one.
+#[derive(Debug, Clone)]
+pub struct LiveWorkUnit {
+    pub node: Option<TranscriptNode>,
+    pub indicator: Option<TurnIndicatorView>,
+}
+
+/// Project one WorkUnit snapshot for the live transcript.
+///
+/// The indicator is always its own row, drawn once, after the unit's
+/// content. A pending unit with nothing of its own on screen is the
+/// indicator alone — its node, whose label would repeat the same indicator
+/// text, is not drawn.
+pub fn project_live_work_unit(view: &WorkUnitView) -> LiveWorkUnit {
+    let indicator = turn_indicator(view);
+    let indicator_only = indicator.is_some() && view.is_pending_prose() && view.has_no_content();
+    LiveWorkUnit {
+        node: (!indicator_only).then(|| project_work_unit(view)),
+        indicator,
+    }
 }
 
 /// Widget props for one transcript row, projected from domain data.
@@ -181,7 +273,7 @@ pub fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
             let (body, raw_body) = assistant_body(&head.response_text);
             (
                 NodeRole::Response,
-                assistant_prose_label(&view.verb, head),
+                assistant_prose_label(view),
                 body,
                 raw_body,
                 true,
@@ -191,7 +283,7 @@ pub fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
             let (body, raw_body) = assistant_body(&head.response_text);
             (
                 NodeRole::Response,
-                assistant_prose_label(&view.verb, head),
+                assistant_prose_label(view),
                 body,
                 raw_body,
                 true,
@@ -213,7 +305,7 @@ pub fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
         ),
         WorkUnitPresentation::ProgramOutput { title } => {
             let label = if head.projects_as_prose {
-                assistant_prose_label(&view.verb, head)
+                assistant_prose_label(view)
             } else {
                 title
                     .clone()
@@ -416,14 +508,19 @@ fn assistant_prose_glyph(status: MessageStatus) -> &'static str {
     }
 }
 
-fn assistant_prose_label(verb: &str, head: &WorkUnitHead) -> String {
+/// The header label of a prose row. A pending row with no text yet has no
+/// label of its own: it reads as the turn indicator, the same description
+/// the live transcript draws, so the two can never disagree.
+fn assistant_prose_label(view: &WorkUnitView) -> String {
+    let head = &view.head;
     let glyph = assistant_prose_glyph(head.status);
     if !head.response_text.is_empty() {
         return glyph.to_string();
     }
     match head.status {
-        MessageStatus::InProgress if !verb.trim().is_empty() => format!("{glyph} {verb}\u{2026}"),
-        MessageStatus::InProgress => format!("{glyph} Working\u{2026}"),
+        MessageStatus::InProgress => turn_indicator(view)
+            .map(|indicator| indicator.plain_text())
+            .unwrap_or_else(|| glyph.to_string()),
         MessageStatus::Complete => format!("{glyph} No assistant text"),
         MessageStatus::Failed => format!("{glyph} Assistant turn failed"),
     }
@@ -511,5 +608,182 @@ fn format_progress(completed: u64, total: Option<u64>) -> String {
         }
         Some(total) => format!("[{}] {completed} / {total}", "░".repeat(WIDTH)),
         None => format!("[{}] {completed}", "…".repeat(WIDTH)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn pending(presentation: WorkUnitPresentation) -> WorkUnitView {
+        WorkUnitView {
+            head: WorkUnitHead {
+                message_id: MessageId::new(),
+                status: MessageStatus::InProgress,
+                presentation,
+                projects_as_prose: false,
+                response_text: String::new(),
+                transient_status: None,
+                progress: None,
+            },
+            verb: "Channeling".into(),
+            rows: Vec::new(),
+            agent_activity: Vec::new(),
+            elapsed: Duration::ZERO,
+            token_count: 0,
+            awaiting_provider: false,
+        }
+    }
+
+    fn tool_row(status: WorkRowStatus) -> WorkRowView {
+        WorkRowView {
+            label: "bash(ls)".into(),
+            status,
+            presentation: WorkRowPresentation::Tool,
+            body_lines: Vec::new(),
+            rendered_diffs: None,
+        }
+    }
+
+    /// INVARIANT (#1664): a unit owns the turn indicator only while it is in
+    /// progress, and only when it is the turn's generation unit or a pending
+    /// prose row with no text. Local tool groups, lifecycle activity, typed
+    /// programs, and finished units own none.
+    #[test]
+    fn test_turn_indicator_ownership_follows_the_units_state() {
+        let waiting = pending(WorkUnitPresentation::Assistant);
+
+        let mut generation_with_tools = pending(WorkUnitPresentation::Assistant);
+        generation_with_tools.awaiting_provider = true;
+        generation_with_tools
+            .rows
+            .push(tool_row(WorkRowStatus::Running));
+
+        let mut streaming_program = pending(WorkUnitPresentation::ProgramSource {
+            language: "lisp".into(),
+        });
+        streaming_program.awaiting_provider = true;
+        streaming_program.head.response_text = "(say".into();
+
+        let mut local_tools = pending(WorkUnitPresentation::Assistant);
+        local_tools.rows.push(tool_row(WorkRowStatus::Running));
+
+        let typed_program = pending(WorkUnitPresentation::ProgramSource {
+            language: "forth".into(),
+        });
+        let activity = pending(WorkUnitPresentation::Activity {
+            title: "Speculative run".into(),
+        });
+
+        let mut streaming_prose = pending(WorkUnitPresentation::Interactive);
+        streaming_prose.head.response_text = "Hello".into();
+
+        let mut complete = pending(WorkUnitPresentation::Assistant);
+        complete.awaiting_provider = true;
+        complete.head.status = MessageStatus::Complete;
+        let mut failed = complete.clone();
+        failed.head.status = MessageStatus::Failed;
+
+        let owns = [
+            ("waiting prose row", &waiting),
+            ("generation unit in a tool round", &generation_with_tools),
+            ("generation unit streaming a program", &streaming_program),
+            ("local tool group", &local_tools),
+            ("typed program", &typed_program),
+            ("lifecycle activity", &activity),
+            ("prose row with text", &streaming_prose),
+            ("completed generation unit", &complete),
+            ("failed generation unit", &failed),
+        ]
+        .map(|(name, view)| (name, turn_indicator(view).is_some()));
+        assert_eq!(
+            owns,
+            [
+                ("waiting prose row", true),
+                ("generation unit in a tool round", true),
+                ("generation unit streaming a program", true),
+                ("local tool group", false),
+                ("typed program", false),
+                ("lifecycle activity", false),
+                ("prose row with text", false),
+                ("completed generation unit", false),
+                ("failed generation unit", false),
+            ],
+            "which unit states own the turn's in-progress indicator"
+        );
+    }
+
+    /// INVARIANT (#1664): the live projection draws the indicator once. A
+    /// pending unit with nothing of its own is the indicator alone — its
+    /// node, whose label is the same indicator text, is not drawn beside it;
+    /// a unit with content keeps its node and gains the indicator after it.
+    #[test]
+    fn test_live_projection_never_draws_the_indicator_twice() {
+        let waiting = pending(WorkUnitPresentation::Assistant);
+        let live = project_live_work_unit(&waiting);
+        assert!(
+            live.node.is_none() && live.indicator.is_some(),
+            "a waiting unit is the indicator alone; live={live:?}"
+        );
+        assert_eq!(
+            project_work_unit(&waiting).label,
+            live.indicator
+                .as_ref()
+                .expect("the waiting unit owns an indicator")
+                .plain_text(),
+            "the pending node label, used outside the live transcript, is the same \
+             indicator description"
+        );
+
+        let mut tool_round = pending(WorkUnitPresentation::Assistant);
+        tool_round.awaiting_provider = true;
+        tool_round.rows.push(tool_row(WorkRowStatus::Running));
+        let live = project_live_work_unit(&tool_round);
+        let node = live.node.as_ref().expect("a tool round keeps its node");
+        let indicator = live
+            .indicator
+            .as_ref()
+            .expect("the generation unit keeps the indicator in a tool round");
+        assert!(
+            !format!("{node:?}").contains(&indicator.activity()),
+            "the node of a unit with content never repeats the indicator; node={node:?}"
+        );
+    }
+
+    /// INVARIANT (#1664): the repaint key changes exactly when the painted
+    /// indicator changes. Time passing within one pulse frame, or tokens
+    /// arriving on a unit that owns no indicator, changes nothing on screen
+    /// and must not change the key.
+    #[test]
+    fn test_paint_key_changes_only_when_the_painted_indicator_changes() {
+        let at = |millis: u64, tokens: usize| {
+            let mut view = pending(WorkUnitPresentation::Assistant);
+            view.head.message_id = MessageId::from_uuid(uuid::Uuid::nil());
+            view.elapsed = Duration::from_millis(millis);
+            view.token_count = tokens;
+            view.paint_key()
+        };
+        assert_eq!(
+            at(0, 0),
+            at(199, 0),
+            "time passing inside one pulse frame repaints nothing"
+        );
+        assert_ne!(at(0, 0), at(200, 0), "a new pulse frame repaints");
+        assert_ne!(at(0, 0), at(0, 3), "the first tokens repaint");
+
+        let finished = |millis: u64, tokens: usize| {
+            let mut view = pending(WorkUnitPresentation::Assistant);
+            view.head.message_id = MessageId::from_uuid(uuid::Uuid::nil());
+            view.head.status = MessageStatus::Complete;
+            view.elapsed = Duration::from_millis(millis);
+            view.token_count = tokens;
+            view.paint_key()
+        };
+        assert_eq!(
+            finished(0, 0),
+            finished(60_000, 900),
+            "a finished unit has no indicator, so neither time nor tokens repaint it"
+        );
     }
 }

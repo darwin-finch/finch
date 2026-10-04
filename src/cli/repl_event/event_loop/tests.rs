@@ -5776,12 +5776,6 @@ fn explicit_finch_address_strips_only_the_addressee() {
     assert_eq!(finch_addressed_prompt("ordinary prompt"), None);
 }
 use crate::cli::repl_event::query_processor::apply_sliding_window;
-// format_elapsed and format_token_count moved to tool_display; import for status-bar tests.
-use crate::cli::repl_event::tool_display::{format_elapsed, format_token_count};
-
-// Pulsing animation frames used in status-bar tests.
-const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
-
 fn claude_profile(name: &str, model: &str) -> crate::config::ProviderEntry {
     crate::config::ProviderEntry::Claude {
         api_key: "test-key".to_string(),
@@ -5858,98 +5852,6 @@ fn test_provider_profile_prefix_shared_by_two_entries_is_ambiguous() {
         Ok(0),
         "a longer, disambiguating prefix (or the exact name) still resolves"
     );
-}
-
-// --- streaming status bar format ---
-
-#[test]
-fn test_streaming_status_format() {
-    // Verify the status bar message format used during streaming
-    let verb = "Thinking"; // representative word; actual value comes from random_spinner_verb()
-    let secs = 75u64;
-    let tokens = 1600usize;
-    let elapsed_str = format_elapsed(secs);
-    let tokens_str = format_token_count(tokens);
-    let icon = THROB_FRAMES[1]; // "✳"
-    let status = format!(
-        "{} {}… ({} · ↓ {} tokens)",
-        icon, verb, elapsed_str, tokens_str
-    );
-    assert_eq!(status, "✳ Thinking… (1m 15s · ↓ 1.6k tokens)");
-}
-
-#[test]
-fn test_streaming_status_format_short() {
-    let verb = "Thinking";
-    let secs = 9u64;
-    let tokens = 42usize;
-    let icon = THROB_FRAMES[0]; // "✦"
-    let status = format!(
-        "{} {}… ({} · ↓ {} tokens)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(tokens)
-    );
-    assert_eq!(status, "✦ Thinking… (9s · ↓ 42 tokens)");
-}
-
-#[test]
-fn test_streaming_status_thinking() {
-    // While thinking (no text yet), status shows "· thinking" suffix
-    let verb = "Thinking";
-    let secs = 15u64;
-    let icon = THROB_FRAMES[2]; // "✼"
-    let status = format!("{} {}… ({} · thinking)", icon, verb, format_elapsed(secs));
-    assert_eq!(status, "✼ Thinking… (15s · thinking)");
-}
-
-#[test]
-fn test_streaming_status_with_input_tokens() {
-    // With input token count available, show ↑ input · ↓ output
-    let verb = "Thinking";
-    let input_tokens: u32 = 1250;
-    let output_tokens = 300usize;
-    let secs = 10u64;
-    let icon = THROB_FRAMES[1]; // "✳"
-    let status = format!(
-        "{} {}… ({} · ↑ {} · ↓ {} tokens)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(input_tokens as usize),
-        format_token_count(output_tokens),
-    );
-    assert_eq!(status, "✳ Thinking… (10s · ↑ 1.2k · ↓ 300 tokens)");
-}
-
-#[test]
-fn test_streaming_status_thinking_with_input_tokens() {
-    // Usage arrives before text — show ↑ input · thinking
-    let verb = "Thinking";
-    let input_tokens: u32 = 800;
-    let secs = 3u64;
-    let icon = THROB_FRAMES[0]; // "✦"
-    let status = format!(
-        "{} {}… ({} · ↑ {} · thinking)",
-        icon,
-        verb,
-        format_elapsed(secs),
-        format_token_count(input_tokens as usize),
-    );
-    assert_eq!(status, "✦ Thinking… (3s · ↑ 800 · thinking)");
-}
-
-#[test]
-fn test_throb_frames_cycle() {
-    // Frames cycle without panicking
-    let mut idx = 0usize;
-    for _ in 0..100 {
-        idx = (idx + 1) % THROB_FRAMES.len();
-        assert!(!THROB_FRAMES[idx].is_empty());
-    }
-    // After 4 steps we're back to frame 0
-    assert_eq!(THROB_FRAMES.len(), 4);
 }
 
 // compact_tool_summary, tool_result_to_display, strip_ansi, bash_smart_summary
