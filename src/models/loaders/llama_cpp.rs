@@ -22,7 +22,10 @@ use super::super::generator_new::{TextGeneration, TokenCallback};
 static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
-    BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
+    BACKEND.get_or_try_init(|| {
+        crate::models::llama_log::route_native_logs_to_tracing();
+        LlamaBackend::init().context("initialize llama.cpp backend")
+    })
 }
 
 fn prompt_contains_explicit_bos(text: &str) -> bool {
