@@ -2192,6 +2192,7 @@ impl EventLoop {
             program_runtime,
             agent_scheduler,
             memory_system,
+            metrics_logger,
             committed_memories,
             memory_commitment_writer,
         } = runtime;
@@ -2382,10 +2383,7 @@ impl EventLoop {
             terminal_agent_root_order: std::collections::VecDeque::new(),
             pending_agent_lifecycle: Vec::new(),
             feedback_logger: FeedbackLogger::new().ok(),
-            metrics_logger: dirs::home_dir()
-                .map(|h| h.join(".finch").join("metrics"))
-                .and_then(|p| crate::metrics::MetricsLogger::new(p).ok())
-                .map(Arc::new),
+            metrics_logger,
             memory_system,
             session_label,
             participant_subject,
@@ -2490,6 +2488,25 @@ impl EventLoop {
     /// (#1387) — see the field doc comment for why those two differ.
     fn exit_resume_line(&self) -> String {
         interactive_resume_instruction(&self.session_label, self.home_brain_registered)
+    }
+
+    /// Point this headless test runner's metrics at a directory the test
+    /// owns. The test runners start with no logger at all, so this is the
+    /// only way a test records a metric.
+    #[cfg(test)]
+    pub(crate) fn set_metrics_logger_for_test(
+        &mut self,
+        logger: Arc<crate::metrics::MetricsLogger>,
+    ) {
+        self.metrics_logger = Some(logger);
+    }
+
+    /// The directory this event loop records metrics under, if any.
+    #[cfg(test)]
+    pub(crate) fn metrics_dir_for_test(&self) -> Option<std::path::PathBuf> {
+        self.metrics_logger
+            .as_ref()
+            .map(|logger| logger.metrics_dir().to_path_buf())
     }
 
     #[cfg(test)]

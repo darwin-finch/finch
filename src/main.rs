@@ -2659,7 +2659,7 @@ async fn run_query(query: &str, bypass_daemon: bool, show_program: bool) -> Resu
     let client = DaemonClient::connect(daemon_config).await?;
 
     let guard = executor.lock().await;
-    let wire_metrics = default_wire_metrics_logger();
+    let wire_metrics = wire_metrics_logger(&config);
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass("daemon", "daemon-selected", "one_shot");
     let response = client
@@ -2819,7 +2819,7 @@ async fn run_query_cloud_only(
         .first()
         .map(|provider| provider.provider_type().to_string())
         .unwrap_or_else(|| "cloud".to_string());
-    let wire_metrics = default_wire_metrics_logger();
+    let wire_metrics = wire_metrics_logger(config);
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass(&provider, model.clone(), "one_shot");
 
@@ -3054,10 +3054,11 @@ fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> Stri
     finch_programs::wire_repair_request(rejected_source, diagnostic)
 }
 
-fn default_wire_metrics_logger() -> Option<finch::metrics::MetricsLogger> {
-    dirs::home_dir()
-        .map(|home| home.join(".finch").join("metrics"))
-        .and_then(|path| finch::metrics::MetricsLogger::new(path).ok())
+/// The one-shot query's wire-adherence logger, rooted at the configured
+/// metrics directory rather than a path re-derived from the home directory,
+/// so every surface that records or reads metrics agrees on one place.
+fn wire_metrics_logger(config: &Config) -> Option<finch::metrics::MetricsLogger> {
+    finch::metrics::MetricsLogger::new(config.metrics_dir.clone()).ok()
 }
 
 fn mark_wire_rejection(
