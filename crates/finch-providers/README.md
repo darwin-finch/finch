@@ -39,6 +39,11 @@ wizard asks the catalog for available models and retains the application decisio
 save. A catalog response is not proof that a model or provider path has passed end-to-end
 conformance.
 
+A ChatGPT subscription has no API key to send to a `/models` route, so it is not a
+`ModelCatalogProfile`. Setup lists a signed-in account's models through
+`ChatGptSubscriptionProvider::account_models`: the same account catalog request and filter a
+query runs before it starts a response, so an identifier it returns is one a query accepts.
+
 Provider requests keep stable conversation prefixes so service-side prompt caches can match them.
 Claude requests explicitly enable Anthropic's automatic moving-prefix cache; OpenAI API and
 ChatGPT use their service-managed implicit caches. Finch still sends complete request context to

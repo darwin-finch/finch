@@ -716,6 +716,43 @@ impl ChatGptSubscriptionProvider {
         Ok(catalog)
     }
 
+    /// Lease the bound credential and fetch the account catalog, refreshing
+    /// the credential at most once when the catalog request is rejected as
+    /// unauthorized. Returns whether that single refresh was spent.
+    async fn leased_account_catalog(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<(ChatGptCredentialLease, Catalog, bool)> {
+        let lease = self.source.lease(cancel).await?;
+        match self.account_catalog(&lease, cancel).await {
+            Ok(catalog) => Ok((lease, catalog, false)),
+            Err(error) if error.downcast_ref::<SubscriptionUnauthorized>().is_some() => {
+                let lease = self
+                    .source
+                    .refresh_after_unauthorized(&lease.generation, cancel)
+                    .await?;
+                let catalog = self.account_catalog(&lease, cancel).await?;
+                Ok((lease, catalog, true))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The model identifiers this signed-in account can select, sorted.
+    ///
+    /// This is the catalog request and filter a query uses before it starts a
+    /// response, so every identifier returned here passes that same check and
+    /// an identifier absent from it fails there as unavailable. Setup uses it
+    /// to offer a list instead of asking for an identifier from memory.
+    pub async fn account_models(&self, cancel: CancellationToken) -> Result<Vec<String>> {
+        let (_lease, catalog, _) = self.leased_account_catalog(&cancel).await?;
+        Ok(catalog
+            .models
+            .values()
+            .map(|model| model.slug.clone())
+            .collect())
+    }
+
     async fn start_response(
         &self,
         request: ProviderRequest,
@@ -728,20 +765,8 @@ impl ChatGptSubscriptionProvider {
         if body.len() > MAX_REQUEST_BYTES {
             bail!("ChatGPT subscription request exceeded the size limit");
         }
-        let mut lease = self.source.lease(&cancel).await?;
-        let mut unauthorized_retry_used = false;
-        let mut catalog = match self.account_catalog(&lease, &cancel).await {
-            Ok(catalog) => catalog,
-            Err(error) if error.downcast_ref::<SubscriptionUnauthorized>().is_some() => {
-                lease = self
-                    .source
-                    .refresh_after_unauthorized(&lease.generation, &cancel)
-                    .await?;
-                unauthorized_retry_used = true;
-                self.account_catalog(&lease, &cancel).await?
-            }
-            Err(error) => return Err(error),
-        };
+        let (mut lease, mut catalog, mut unauthorized_retry_used) =
+            self.leased_account_catalog(&cancel).await?;
         let selected = catalog
             .models
             .get(&request.model)
