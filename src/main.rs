@@ -2060,7 +2060,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Note: init_tracing() is NOT called in daemon mode - we set up file logging above instead
 
-    tracing::info!("Starting Shammah in daemon mode");
+    tracing::info!("Starting Finch in daemon mode");
 
     // Initialize daemon lifecycle (PID file management)
     let lifecycle = DaemonLifecycle::new()?;
@@ -3095,7 +3095,7 @@ fn finish_wire_metric(
 async fn run_setup() -> Result<()> {
     use finch::cli::show_setup_wizard;
 
-    println!("Starting Shammah setup wizard...\n");
+    println!("Starting Finch setup wizard...\n");
 
     // Run the wizard
     let result = show_setup_wizard()?;

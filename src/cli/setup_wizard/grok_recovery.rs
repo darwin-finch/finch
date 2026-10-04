@@ -7,7 +7,7 @@ use crate::cli::grok_auth::{
 };
 use crate::providers::{GrokAuthStageError, GrokDeviceEndpointError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum GrokSetupFailureCause {
     Cancelled,
     Expired,
@@ -16,7 +16,7 @@ pub(super) enum GrokSetupFailureCause {
     ClientRejected,
     ProviderRejected,
     Persistence,
-    ProtocolOrOther,
+    ProtocolOrOther(String),
 }
 
 pub(super) fn grok_setup_references(result: &SetupResult) -> std::collections::BTreeSet<String> {
@@ -63,7 +63,7 @@ pub(super) fn grok_setup_failure_cause(error: &anyhow::Error) -> GrokSetupFailur
     {
         return GrokSetupFailureCause::Persistence;
     }
-    GrokSetupFailureCause::ProtocolOrOther
+    GrokSetupFailureCause::ProtocolOrOther(format!("{error:#}"))
 }
 
 pub(super) fn grok_setup_failure_summary(cause: GrokSetupFailureCause) -> String {
@@ -89,8 +89,8 @@ pub(super) fn grok_setup_failure_summary(cause: GrokSetupFailureCause) -> String
         GrokSetupFailureCause::Persistence => {
             "Grok subscription sign-in was validated, but Finch could not save the named credential."
         }
-        GrokSetupFailureCause::ProtocolOrOther => {
-            "Grok subscription sign-in failed. No credential was saved. Finch will not silently switch to API-key billing."
+        GrokSetupFailureCause::ProtocolOrOther(ref e) => {
+            return format!("Grok subscription sign-in failed: {e}\nNo credential was saved. Finch will not silently switch to API-key billing.");
         }
     }
     .into()
