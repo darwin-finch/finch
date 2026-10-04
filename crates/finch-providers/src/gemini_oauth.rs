@@ -66,8 +66,23 @@ pub enum GeminiDeviceEndpointError {
 pub enum GeminiAuthStageError {
     #[error("Gemini subscription device polling response changed after browser authorization")]
     PollContract,
-    #[error("Google sign-in failed. Please try again.")]
-    TokenExchangeRejected(u16),
+    /// Google answered a token request with a non-success status. `code` is
+    /// an RFC 6749 section 5.2 error code from a fixed vocabulary, never
+    /// upstream text.
+    #[error("Google rejected the {step} (HTTP {status}, {code})")]
+    TokenExchangeRejected {
+        step: &'static str,
+        status: u16,
+        code: &'static str,
+    },
+    /// Google refused a token request because it carried no `client_secret`.
+    /// Google's token endpoint requires one for a desktop ("installed
+    /// application") OAuth client even when the request carries a PKCE
+    /// verifier.
+    #[error(
+        "Google rejected the {step} (HTTP {status}, invalid_request): this OAuth client requires a client secret and Finch sent none"
+    )]
+    ClientSecretMissing { step: &'static str, status: u16 },
     #[error("Gemini subscription token exchange response changed")]
     TokenExchangeContract,
     #[error("Gemini subscription signed identity verification failed")]
@@ -76,6 +91,32 @@ pub enum GeminiAuthStageError {
     ClientBinding,
     #[error("Gemini subscription signed account entitlement is missing or invalid")]
     AccountEntitlement,
+}
+
+/// Choose the OAuth client identity and secret from the operator's environment.
+///
+/// `FINCH_GEMINI_CLIENT_SECRET` is Finch-specific, so it is always honoured,
+/// including with the built-in client ID: Google's token endpoint refuses an
+/// authorization-code exchange for a desktop client that sends no secret.
+/// The generic `GOOGLE_CLIENT_SECRET` belongs to whatever `GOOGLE_CLIENT_ID`
+/// names, so it is ignored while Finch signs in with its built-in client ID.
+fn resolve_gemini_oauth_client(
+    finch_client_id: Option<String>,
+    google_client_id: Option<String>,
+    finch_client_secret: Option<String>,
+    google_client_secret: Option<String>,
+) -> (String, Option<String>) {
+    let non_empty = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    let client_id = non_empty(finch_client_id)
+        .or_else(|| non_empty(google_client_id))
+        .unwrap_or_else(|| GOOGLE_PUBLIC_CLIENT_ID.to_string());
+    let generic_secret = if client_id == GOOGLE_PUBLIC_CLIENT_ID {
+        None
+    } else {
+        non_empty(google_client_secret)
+    };
+    let client_secret = non_empty(finch_client_secret).or(generic_secret);
+    (client_id, client_secret)
 }
 
 /// Finch-local capability attached to a verified Gemini subscription credential.
@@ -240,16 +281,12 @@ impl<V> std::fmt::Debug for GoogleGeminiOAuthDialect<V> {
 
 impl GoogleGeminiOAuthDialect<GeminiTokenVerifierProduction> {
     pub fn production() -> Result<Self> {
-        let client_id = std::env::var("FINCH_GEMINI_CLIENT_ID")
-            .or_else(|_| std::env::var("GOOGLE_CLIENT_ID"))
-            .unwrap_or_else(|_| GOOGLE_PUBLIC_CLIENT_ID.to_string());
-        let mut client_secret = std::env::var("FINCH_GEMINI_CLIENT_SECRET")
-            .or_else(|_| std::env::var("GOOGLE_CLIENT_SECRET"))
-            .ok();
-
-        if client_id == GOOGLE_PUBLIC_CLIENT_ID {
-            client_secret = None;
-        }
+        let (client_id, client_secret) = resolve_gemini_oauth_client(
+            std::env::var("FINCH_GEMINI_CLIENT_ID").ok(),
+            std::env::var("GOOGLE_CLIENT_ID").ok(),
+            std::env::var("FINCH_GEMINI_CLIENT_SECRET").ok(),
+            std::env::var("GOOGLE_CLIENT_SECRET").ok(),
+        );
         Self::new(
             GOOGLE_OAUTH2_ORIGIN,
             GOOGLE_ACCOUNTS_ORIGIN,
@@ -557,7 +594,21 @@ where
             if oauth_error_code(&body) == Some("invalid_client") {
                 return Err(GeminiDeviceEndpointError::ClientRejected.into());
             }
-            return Err(GeminiAuthStageError::TokenExchangeRejected(status.as_u16()).into());
+            let step = match context {
+                TokenValidationContext::Browser { .. } => "authorization-code token exchange",
+                TokenValidationContext::Device => "device-code token exchange",
+                TokenValidationContext::Refresh => "token refresh",
+            };
+            let status = status.as_u16();
+            if self.client_secret.is_none() && reports_missing_client_secret(&body) {
+                return Err(GeminiAuthStageError::ClientSecretMissing { step, status }.into());
+            }
+            return Err(GeminiAuthStageError::TokenExchangeRejected {
+                step,
+                status,
+                code: known_oauth_error_code(&body),
+            }
+            .into());
         }
         let access_token = required_string(&body, "access_token")
             .context(GeminiAuthStageError::TokenExchangeContract)?;
@@ -759,6 +810,34 @@ fn oauth_error_code(body: &Value) -> Option<&str> {
     body.get("error").and_then(Value::as_str)
 }
 
+/// Map the response's `error` onto the RFC 6749 section 5.2 vocabulary so a
+/// diagnostic never carries upstream-chosen text.
+fn known_oauth_error_code(body: &Value) -> &'static str {
+    const KNOWN: [&str; 6] = [
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+    ];
+    let reported = oauth_error_code(body);
+    KNOWN
+        .into_iter()
+        .find(|known| Some(*known) == reported)
+        .unwrap_or("no recognised OAuth error code")
+}
+
+/// Google answers a secretless desktop-client token request with
+/// `invalid_request` and a description naming `client_secret`.
+fn reports_missing_client_secret(body: &Value) -> bool {
+    oauth_error_code(body) == Some("invalid_request")
+        && body
+            .get("error_description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.contains("client_secret"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +870,63 @@ mod tests {
         assert_eq!(
             dialect.descriptor().audience,
             AudienceBinding::standard(EndpointFamily::GeminiSubscription)
+        );
+    }
+
+    /// Google's token endpoint answers a secretless exchange for the built-in
+    /// desktop client with HTTP 400 `client_secret is missing.`, so an
+    /// operator-supplied Finch secret must reach the exchange instead of
+    /// being discarded.
+    #[test]
+    fn test_finch_client_secret_is_kept_with_the_built_in_client_id() {
+        let (client_id, secret) =
+            resolve_gemini_oauth_client(None, None, Some("finch-secret".into()), None);
+        assert_eq!(
+            (client_id.as_str(), secret.as_deref()),
+            (GOOGLE_PUBLIC_CLIENT_ID, Some("finch-secret")),
+            "FINCH_GEMINI_CLIENT_SECRET must survive with the built-in client ID; client_id={client_id} secret_present={}",
+            secret.is_some()
+        );
+
+        let dialect =
+            GoogleGeminiOAuthDialect::production_with_client_id(&client_id, secret.as_deref())
+                .unwrap();
+        let request = dialect
+            .authorization_code_request(&AuthorizationCodeGrant {
+                code: "code".into(),
+                verifier: "verifier".into(),
+                redirect_uri: "http://127.0.0.1:1/callback".into(),
+            })
+            .unwrap();
+        let OAuthRequestBody::Form(form) = request.body else {
+            panic!("the authorization-code exchange must be a form post");
+        };
+        let fields = form.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>();
+        assert!(
+            form.contains(&("client_secret".into(), "finch-secret".into())),
+            "the authorization-code exchange must carry the configured client secret; fields={fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_generic_google_secret_is_not_paired_with_the_built_in_client_id() {
+        let (client_id, secret) =
+            resolve_gemini_oauth_client(None, None, None, Some("other-clients-secret".into()));
+        assert_eq!(
+            (client_id.as_str(), secret),
+            (GOOGLE_PUBLIC_CLIENT_ID, None),
+            "GOOGLE_CLIENT_SECRET belongs to GOOGLE_CLIENT_ID and must not be sent for the built-in client"
+        );
+        let (client_id, secret) = resolve_gemini_oauth_client(
+            None,
+            Some("custom.apps.googleusercontent.com".into()),
+            None,
+            Some("custom-secret".into()),
+        );
+        assert_eq!(
+            (client_id.as_str(), secret.as_deref()),
+            ("custom.apps.googleusercontent.com", Some("custom-secret")),
+            "a custom GOOGLE_CLIENT_ID keeps its own GOOGLE_CLIENT_SECRET"
         );
     }
 

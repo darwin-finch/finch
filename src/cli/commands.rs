@@ -39,10 +39,6 @@ pub enum Command {
     FeedbackCritical(Option<String>), // 10x stored weight - critical strategy errors
     FeedbackMedium(Option<String>),   // 3x stored weight - improvements
     FeedbackGood(Option<String>),     // 1x stored weight - good examples
-    // Local model testing
-    Local {
-        query: String,
-    }, // Query local model directly (bypass routing)
     // MCP plugin management
     McpList,                  // List connected MCP servers
     McpTools(Option<String>), // List tools from specific server (or all if None)
@@ -540,16 +536,6 @@ impl Command {
             }));
         }
 
-        // Handle /local command with query
-        if let Some(rest) = trimmed.strip_prefix("/local ") {
-            let query = rest.trim();
-            if !query.is_empty() {
-                return Some(Command::Local {
-                    query: query.to_string(),
-                });
-            }
-        }
-
         // Handle /mcp commands with subcommands
         if trimmed == "/mcp" || trimmed == "/mcp list" {
             return Some(Command::McpList);
@@ -650,10 +636,6 @@ pub fn handle_command(
         Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => Ok(
             CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()),
         ),
-        // Local command is handled directly in REPL
-        Command::Local { .. } => Ok(CommandOutput::Status(
-            "Local command should be handled in REPL.".to_string(),
-        )),
         // Memory command is handled directly in REPL
         Command::Memory => Ok(CommandOutput::Status(
             "Memory command should be handled in REPL.".to_string(),
@@ -807,7 +789,6 @@ pub fn format_help() -> String {
          {cyan}  /provider <name>{reset}   Bind this Brain to a configured provider entry\n\
          {cyan}  /thinking <level>{reset}  Overlay reasoning effort when the provider supports it\n\
          {cyan}  /config{reset}            Persistent configuration and setup (alias of /setup)\n\
-         {cyan}  /local <query>{reset}     Query local GGUF model directly (bypass routing)\n\
          {reset}\n\
          {gray}  /model never switches accounts. /provider does.{reset}\n\
          {gray}  Overlays persist on this Brain; --model is one-shot for this invocation.{reset}\n\
@@ -1526,6 +1507,25 @@ mod tests {
             Command::parse("/brain investigate flaky tests"),
             Some(Command::Help)
         ));
+    }
+
+    #[test]
+    fn test_removed_local_command_does_not_parse_or_appear_in_help() {
+        // An unrecognised slash command parses to `Command::Help` (the
+        // parser's normal unknown-command response), never to a command of
+        // its own.
+        for input in ["/local hi", "/local", "/local   what is 2+2?"] {
+            let parsed = Command::parse(input);
+            assert!(
+                matches!(parsed, Some(Command::Help)),
+                "the removed /local command must take the parser's unknown-command path (Help), like any other unrecognised slash command; input={input:?} parsed={parsed:?}"
+            );
+        }
+        let help = format_help();
+        assert!(
+            !help.contains("/local"),
+            "format_help must not advertise the removed /local command; help={help}"
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ The system displays context-aware suggestions in the status bar based on your cu
 
 **On Error:**
 ```
-💡 Try rephrasing your query • Check /local status
+💡 Try rephrasing your query • Check /status
 ```
 
 ### Suggestion Contexts

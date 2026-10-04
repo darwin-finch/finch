@@ -9704,7 +9704,7 @@ async fn seeded_memory_system_for_test(tag: &str) -> Arc<finch_memory::MemorySys
 /// streaming branch, `start_llm_worker()` spawns the real worker task (the
 /// same call `EventLoop::run` makes in production), and a plain
 /// `ReplEvent::UserInput` is submitted exactly as `handle_user_input` does
-/// for ordinary typed text -- never `/local`, never `??`, never a queued
+/// for ordinary typed text -- never `??`, never a queued
 /// turn.
 #[tokio::test]
 async fn test_plain_streaming_local_turn_commits_memory_notice_before_echo() {
@@ -12341,6 +12341,69 @@ async fn provider_switch_activates_configured_subscription_provider() {
                 event_loop.model_selection.active_index().await,
                 1,
                 "the active generator must switch to the subscription entry index"
+            );
+        })
+        .await;
+}
+
+/// `/local` was removed (issue #1633: it sent a one-off query to whichever
+/// local model the daemon happened to load, with no history, tools, or model
+/// identity). Typed in the live session it must now get the same response as
+/// any other unrecognised slash command -- `Command::parse` maps those to
+/// `Command::Help`, so the help text is shown -- and that help must not
+/// advertise it. Compared against a slash command that never existed, so the
+/// test pins "same as unknown" rather than a particular help wording.
+#[tokio::test]
+async fn test_removed_local_command_gets_the_unknown_command_response() {
+    async fn scrollback_after(input: &str) -> Vec<String> {
+        let mut event_loop = super::EventLoop::new_provider_switch_test_runner(Vec::new(), 0, None);
+        event_loop
+            .handle_user_input(input.to_string())
+            .await
+            .expect("an unrecognised slash command must dispatch without error");
+        assert!(
+            event_loop.conversation.read().await.get_messages().is_empty(),
+            "an unrecognised slash command must not be sent to the model as a turn; input={input:?} conversation={:?}",
+            event_loop.conversation.read().await.get_messages()
+        );
+        event_loop
+            .output_manager
+            .get_messages()
+            .iter()
+            .map(|message| message.content())
+            .collect()
+    }
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let local = scrollback_after("/local hi").await;
+            let never_existed = scrollback_after("/no-such-command hi").await;
+
+            assert_eq!(
+                local.len(),
+                2,
+                "the removed /local command must produce its echo and one response row; scrollback={local:?}"
+            );
+            assert_eq!(
+                local[0], "/local hi",
+                "the typed command must be echoed first; scrollback={local:?}"
+            );
+            assert_eq!(
+                local[1..],
+                never_existed[1..],
+                "the removed /local command must get exactly the response a never-existing slash command gets; local={local:?} never_existed={never_existed:?}"
+            );
+            assert!(
+                !local[1..].iter().any(|message| {
+                    message.contains("/local")
+                        || message.contains("Local Model Query")
+                        || message.contains("not yet implemented")
+                }),
+                "the response must not come from a local-query handler or the not-implemented catch-all, and help must not advertise /local; scrollback={local:?}"
+            );
+            assert!(
+                local[1].contains("/provider <name>"),
+                "the unknown-command response is the help text, which names /provider as the way to select a provider entry; scrollback={local:?}"
             );
         })
         .await;

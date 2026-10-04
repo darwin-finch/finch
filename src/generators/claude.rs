@@ -60,7 +60,7 @@ pub const COMMAND_REFERENCE: &str = "\
 
 Basic: /help  /quit  /clear  /compact [note]  /debug  /metrics  /memory  /training
 
-Provider: /model [id]  /status  /providers  /provider <name>  /thinking [level]  /local <query>
+Provider: /model [id]  /status  /providers  /provider <name>  /thinking [level]
   /model overlays a model on this Brain (same credentials). /provider switches the named entry.
   --model is one-shot and does not persist.
 
@@ -425,8 +425,12 @@ mod tests {
             "/join-registry ",
             "/registry ",
             "/gas-send",
+            "/local",
         ] {
-            assert!(!COMMAND_REFERENCE.contains(removed));
+            assert!(
+                !COMMAND_REFERENCE.contains(removed),
+                "the system-prompt command reference must not advertise a removed command; removed={removed:?}"
+            );
         }
         for supported in ["/say <text>", "@finch <prompt>", "/who", "/whois <subject>"] {
             assert!(COMMAND_REFERENCE.contains(supported));
