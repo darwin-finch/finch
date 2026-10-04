@@ -1527,6 +1527,53 @@ fn default_configure_remote(focused_field: usize) -> AddProviderStep {
 /// in this module's production code may reference ratatui at all — a private
 /// terminal, a second painter, or a TestBackend painter would re-ship the
 /// fork this ticket removes.
+/// Running the test suite must never open a browser. The Gemini add-time
+/// flow called the real launcher (`gemini_auth::open_browser`) from its
+/// background thread, so every run of
+/// `confirming_a_gemini_sub_provider_runs_the_device_exchange_in_the_dialog`
+/// — whose fixture authorization points at `https://www.google.com/device` —
+/// opened Google's "Connect a device" page in the developer's browser.
+/// Setup code launches a browser only through `open_browser_silently`, which
+/// compiles to nothing under test.
+#[test]
+fn test_setup_wizard_launches_a_browser_only_through_the_test_inert_launcher() {
+    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/setup_wizard");
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&module_dir).expect("read setup_wizard directory") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if !name.ends_with(".rs") || name == "tests.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        for (number, line) in text.lines().enumerate() {
+            let direct_launcher = line.contains("open_browser(");
+            let raw_command = name != "input.rs"
+                && (line.contains("Command::new(\"open\")") || line.contains("xdg-open"));
+            if direct_launcher || raw_command {
+                offenders.push(format!("{name}:{}: {}", number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "setup wizard code must launch a browser only through `open_browser_silently`, \
+         which is inert under test; these lines bypass it: {offenders:#?}"
+    );
+
+    let launcher = std::fs::read_to_string(module_dir.join("input.rs")).expect("read input.rs");
+    let body = launcher
+        .split("pub(super) fn open_browser_silently(url: &str) {")
+        .nth(1)
+        .expect("open_browser_silently must exist in input.rs");
+    let guard = body.find("#[cfg(test)]");
+    let launch = body.find("Command::new");
+    assert!(
+        matches!((guard, launch), (Some(guard), Some(launch)) if guard < launch),
+        "open_browser_silently must return under #[cfg(test)] before it can spawn a process"
+    );
+}
+
 #[test]
 fn test_setup_wizard_production_does_not_construct_a_private_ratatui_terminal() {
     let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/setup_wizard");
