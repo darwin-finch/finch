@@ -128,6 +128,53 @@ fn resolved_persisted_entry(
         .cloned()
 }
 
+/// What the provider form reports when Left/Right is pressed on the Provider
+/// row of an entry whose provider type cannot be changed in place.
+pub(super) const PROVIDER_TYPE_IS_FIXED: &str =
+    "This entry's provider type is fixed. Press Esc, then A to add a different provider.";
+
+/// Whether Left/Right on the provider form's Provider row may change which
+/// provider the row is.
+///
+/// Adding a provider, or filling in the unconfigured placeholder row, chooses
+/// a provider. Editing a configured entry does not: switching its type in
+/// place kept the entry's name while replacing its model with the other
+/// provider's setup default and dropping its endpoint and credential binding,
+/// so a row named for one provider was saved as another provider's entry.
+fn form_provider_is_switchable(
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    editing_idx: Option<usize>,
+) -> bool {
+    let Some(index) = editing_idx else {
+        return true;
+    };
+    let slot = if index == 0 {
+        Some(primary_model)
+    } else {
+        tool_models.get(index - 1)
+    };
+    slot.is_some_and(is_unconfigured_placeholder)
+}
+
+/// Keep a provider form's generated name in step with its Provider row.
+///
+/// The form names a new entry after its provider. A name the user has not
+/// changed follows the provider when Left/Right selects another one; a name
+/// the user typed is left alone.
+fn follow_provider_default_name(name: &mut String, previous_idx: usize, new_idx: usize) {
+    let generated = name.trim().is_empty()
+        || CLOUD_PROVIDERS
+            .get(previous_idx)
+            .is_some_and(|(id, ..)| name == id);
+    if !generated {
+        return;
+    }
+    if let Some((id, ..)) = CLOUD_PROVIDERS.get(new_idx) {
+        *name = (*id).to_string();
+    }
+}
+
 /// Build the edited remote model from a confirmed dialog and insert it into
 /// the provider list: the edited slot, the primary slot when it is the
 /// unconfigured placeholder, or a new tool row.
@@ -670,15 +717,25 @@ pub(super) fn handle_models_input(
                         },
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
+                            name,
                             model,
                             api_key,
                             focused_field,
-                            ..
+                            editing_idx,
                         }) => {
                             match *focused_field {
+                                0 if !form_provider_is_switchable(
+                                    primary_model,
+                                    tool_models,
+                                    *editing_idx,
+                                ) =>
+                                {
+                                    *error = Some(PROVIDER_TYPE_IS_FIXED.to_string());
+                                }
                                 0 => {
                                     let new_idx = (*provider_idx + CLOUD_PROVIDERS.len() - 1)
                                         % CLOUD_PROVIDERS.len();
+                                    follow_provider_default_name(name, *provider_idx, new_idx);
                                     *provider_idx = new_idx;
                                     *api_key = remote_api_key_input(CLOUD_PROVIDERS[new_idx].0);
                                     // Reset model to default for new provider
@@ -792,14 +849,24 @@ pub(super) fn handle_models_input(
                         },
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
+                            name,
                             model,
                             api_key,
                             focused_field,
-                            ..
+                            editing_idx,
                         }) => {
                             match *focused_field {
+                                0 if !form_provider_is_switchable(
+                                    primary_model,
+                                    tool_models,
+                                    *editing_idx,
+                                ) =>
+                                {
+                                    *error = Some(PROVIDER_TYPE_IS_FIXED.to_string());
+                                }
                                 0 => {
                                     let new_idx = (*provider_idx + 1) % CLOUD_PROVIDERS.len();
+                                    follow_provider_default_name(name, *provider_idx, new_idx);
                                     *provider_idx = new_idx;
                                     *api_key = remote_api_key_input(CLOUD_PROVIDERS[new_idx].0);
                                     // Reset model to default for new provider
