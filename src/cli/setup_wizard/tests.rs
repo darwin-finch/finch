@@ -1541,7 +1541,10 @@ fn test_setup_wizard_launches_a_browser_only_through_the_test_inert_launcher() {
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(&module_dir).expect("read setup_wizard directory") {
         let path = entry.expect("entry").path();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if !name.ends_with(".rs") || name == "tests.rs" {
             continue;
         }
