@@ -3440,7 +3440,12 @@ impl EventLoop {
         // question -- see `inject_recall_prefix`). The input box itself
         // clears independently, in the input task, so this defers only the
         // scrollback row, not the user's felt responsiveness.
-        let pending_echo = if echo { Some(input.clone()) } else { None };
+        let pending_echo = if echo {
+            let b64_images = pending_images.iter().map(|(_, b64)| b64.clone()).collect();
+            Some((input.clone(), b64_images))
+        } else {
+            None
+        };
 
         // Create a new query
         let conversation_snapshot = self.conversation.read().await.snapshot();

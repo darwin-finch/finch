@@ -169,6 +169,8 @@ pub struct UserTurnView {
     pub subject: Option<String>,
     pub content_lines: Vec<String>,
     pub participant_index: Option<usize>,
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// The style roles the component renderers read (stage 4, #1141).
@@ -587,6 +589,27 @@ fn user_turn_lines(
                 line.clone(),
                 style.clone(),
             )]));
+        }
+    }
+
+    if !view.images.is_empty() {
+        if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
+            for b64 in &view.images {
+                let text = format!("\x1b]1337;File=inline=1;width=auto;height=auto:{}\x07", b64);
+                let mut line = RenderedTranscriptLine::from_spans(vec![Span::styled(
+                    text.clone(),
+                    style.clone(),
+                )]);
+                line.text = text;
+                lines.push(line);
+            }
+        } else {
+            for _ in &view.images {
+                lines.push(RenderedTranscriptLine::from_spans(vec![Span::styled(
+                    "[Image attachment: natively rendered in iTerm2]",
+                    style.clone().with_dim(true),
+                )]));
+            }
         }
     }
 
@@ -1665,6 +1688,7 @@ mod tests {
                 "third line".into(),
             ],
             participant_index: None,
+            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 3);
@@ -1693,6 +1717,7 @@ mod tests {
             subject: Some("alice@box".into()),
             content_lines: vec!["hello world".into()],
             participant_index: Some(3),
+            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 1);
