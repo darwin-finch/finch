@@ -34,6 +34,11 @@ impl EventLoop {
                         self.output_manager.write_info(help_text);
                         self.render_tui().await?;
                     }
+                    Command::Unknown(typed) => {
+                        self.output_manager
+                            .write_info(format_unknown_command(&typed));
+                        self.render_tui().await?;
+                    }
                     Command::Setup => {
                         // Suspend the inline TUI, run the full setup wizard,
                         // then resume.  The wizard manages its own terminal
