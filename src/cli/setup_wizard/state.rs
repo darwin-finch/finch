@@ -186,6 +186,17 @@ pub(super) struct WizardState {
         Option<std::sync::Arc<dyn crate::cli::grok_auth::GrokCredentialAuthenticator>>,
     pub(super) gemini_authenticator:
         Option<std::sync::Arc<dyn crate::cli::gemini_auth::GeminiCredentialAuthenticator>>,
+    /// Lists a signed-in ChatGPT subscription account's models for the
+    /// provider form. Attached only by the live wizard loop, for the same
+    /// reason as the authenticators above: a hermetic constructor must never
+    /// reach a real credential store or the network.
+    pub(super) chatgpt_account_models:
+        Option<std::sync::Arc<dyn crate::providers::ChatGptAccountModels>>,
+    /// Whether the provider form fetches its model list on its own once it has
+    /// a usable key or signed-in credential. On in the live wizard; off in
+    /// hermetic constructors so a test that types a key makes no request it
+    /// did not ask for. Ctrl+R refreshes either way.
+    pub(super) auto_catalog_refresh: bool,
     pub(super) save_error: Option<String>,
     /// The hand-written `[colors]` overrides of the configuration being
     /// edited. The wizard only selects a theme; these are carried through
@@ -456,6 +467,8 @@ impl WizardState {
             chatgpt_authenticator: None,
             grok_authenticator: None,
             gemini_authenticator: None,
+            chatgpt_account_models: None,
+            auto_catalog_refresh: false,
             save_error: None,
         }
     }

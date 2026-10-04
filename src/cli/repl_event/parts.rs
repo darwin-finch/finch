@@ -85,6 +85,13 @@ pub struct RuntimeParts {
     pub program_runtime: Arc<crate::runtime::ProgramRuntime>,
     pub agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
     pub memory_system: Option<Arc<finch_memory::MemorySystem>>,
+    /// Where this session records source-free metrics, and what `/metrics`
+    /// reads. Injected, never derived from the home directory inside the
+    /// event loop: production hands in the logger built from
+    /// `Config::metrics_dir`, and the headless test runners hand in `None`
+    /// so a fixture provider cannot write a row into a real user's report
+    /// (issue #1629).
+    pub metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
     /// Local mirror of the selected Brain's committed (byte-stable) memory
     /// set (#940), shared with `LlmRuntime`'s copy so both the attach-time
     /// hydration (`EventLoop`) and the per-turn render (`LlmLoop`) see the

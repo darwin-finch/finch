@@ -2,7 +2,9 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-use crate::config::{Config, CredentialProvider, CredentialResolver, ProviderEntry};
+use crate::config::{
+    Config, CredentialProvider, CredentialResolver, ProviderCredential, ProviderEntry,
+};
 use crate::providers::{
     preflight_provider_config, refresh, CatalogAuth, ModelCatalog, ModelCatalogProfile,
     ProviderEndpoints,
@@ -113,6 +115,94 @@ pub async fn refresh_from_config(
         auth,
     );
     refresh(&profile, cache_dir).await
+}
+
+/// Where the ChatGPT subscription account catalogue is served. Recorded on
+/// the returned catalogue for display and identity; the request itself is
+/// built by the subscription transport.
+pub const CHATGPT_SUBSCRIPTION_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+
+/// How long a subscription account listing may take before setup reports it
+/// as failed. The transport's own request timeout is sized for streaming
+/// responses and is far too long for a form that is waiting on a list.
+const CHATGPT_ACCOUNT_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Lists the models a signed-in ChatGPT subscription account can select.
+///
+/// A subscription has no API key to send to a `/models` route: the account
+/// catalogue is reachable only through the stored, refreshable sign-in.
+/// The production implementation asks the subscription transport, which
+/// applies every credential check a query applies; a test supplies a
+/// scripted one so no test touches a real credential store.
+#[async_trait::async_trait]
+pub trait ChatGptAccountModels: Send + Sync {
+    /// The selectable model identifiers for the account bound to `credential`.
+    async fn account_models(&self, credential: &ProviderCredential) -> Result<Vec<String>>;
+}
+
+/// The live listing: the same account catalogue request a query makes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProductionChatGptAccountModels;
+
+#[async_trait::async_trait]
+impl ChatGptAccountModels for ProductionChatGptAccountModels {
+    async fn account_models(&self, credential: &ProviderCredential) -> Result<Vec<String>> {
+        crate::providers::ChatGptSubscriptionProvider::production(credential, None, None)?
+            .account_models(tokio_util::sync::CancellationToken::new())
+            .await
+    }
+}
+
+/// Revalidate a named ChatGPT subscription profile and list what its account
+/// can select. An invalid provider graph, or a profile that is not a ChatGPT
+/// subscription, returns before `source` is asked for anything.
+pub async fn refresh_chatgpt_subscription_from_config(
+    config: &Config,
+    profile_name: &str,
+    source: &dyn ChatGptAccountModels,
+) -> Result<ModelCatalog> {
+    preflight_provider_config(config)?;
+    let entry = config
+        .providers
+        .iter()
+        .find(|entry| entry.profile_name() == profile_name)
+        .with_context(|| format!("provider profile '{profile_name}' was not found"))?;
+    let ProviderEntry::Credentialed {
+        provider: CredentialProvider::ChatgptSubscription,
+        credential,
+        ..
+    } = entry
+    else {
+        bail!("provider profile '{profile_name}' is not a ChatGPT subscription");
+    };
+    let credentials = crate::config::credential_index(config.credentials())?;
+    let metadata = credentials
+        .get(credential.credential_ref.as_str())
+        .expect("Config::validate checked the named credential reference");
+    let mut models = tokio::time::timeout(
+        CHATGPT_ACCOUNT_MODELS_TIMEOUT,
+        source.account_models(metadata),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "ChatGPT did not answer the account model listing within {} seconds",
+            CHATGPT_ACCOUNT_MODELS_TIMEOUT.as_secs()
+        )
+    })??;
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        bail!("ChatGPT returned no selectable models for this account");
+    }
+    Ok(ModelCatalog {
+        provider: "chatgpt".to_string(),
+        profile_id: profile_name.to_string(),
+        models_url: CHATGPT_SUBSCRIPTION_MODELS_URL.to_string(),
+        models,
+        source: crate::providers::CatalogSource::Discovered,
+        refreshed_at: chrono::Utc::now(),
+    })
 }
 
 #[cfg(test)]
@@ -301,6 +391,133 @@ mod tests {
             ProviderEndpoints::new(server_url, "/v1/chat/completions", "/custom/catalog/models"),
             auth,
         )
+    }
+
+    struct ScriptedAccountModels {
+        models: Vec<String>,
+        asked: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatGptAccountModels for ScriptedAccountModels {
+        async fn account_models(&self, _credential: &ProviderCredential) -> Result<Vec<String>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(self.models.clone())
+        }
+    }
+
+    fn chatgpt_subscription_config() -> Config {
+        let scopes = crate::providers::chatgpt_required_scopes();
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::ChatgptSubscription,
+            credential: CredentialBinding {
+                credential_ref: "chatgpt:default".into(),
+                audience: Some(AudienceBinding::standard(
+                    EndpointFamily::ChatgptSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: scopes.clone(),
+            },
+            model: Some("gpt-6.1-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("chatgpt".into()),
+            reasoning_effort: None,
+        };
+        let credential = ProviderCredential {
+            name: "chatgpt:default".into(),
+            kind: CredentialKind::OauthDevice,
+            provider: CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+            tenant: None,
+            project: None,
+            account: Some("account-123".into()),
+            scopes,
+            secret_ref: "oauth-store:chatgpt:default".into(),
+            lifecycle: CredentialLifecycle::Active {
+                expires_at: None,
+                refreshable: true,
+            },
+            revocation: Default::default(),
+        };
+        Config::with_providers(vec![profile]).with_credentials(vec![credential])
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_subscription_catalog_reports_the_accounts_models_as_discovered() {
+        let source = ScriptedAccountModels {
+            models: vec!["gpt-6.1-sol".into(), "gpt-5.6".into(), "gpt-6.1-sol".into()],
+            asked: AtomicUsize::new(0),
+        };
+        let catalog = refresh_chatgpt_subscription_from_config(
+            &chatgpt_subscription_config(),
+            "chatgpt",
+            &source,
+        )
+        .await
+        .expect("a valid signed-in ChatGPT subscription profile must list its account's models");
+
+        assert_eq!(
+            catalog.models,
+            vec!["gpt-5.6".to_string(), "gpt-6.1-sol".to_string()],
+            "the catalogue must be the account's models, sorted and without duplicates"
+        );
+        assert_eq!(
+            (
+                catalog.source.clone(),
+                catalog.provider.as_str(),
+                catalog.profile_id.as_str(),
+                source.asked.load(Ordering::SeqCst)
+            ),
+            (
+                crate::providers::CatalogSource::Discovered,
+                "chatgpt",
+                "chatgpt",
+                1
+            ),
+            "an account listing must be reported as discovered for the named profile, from \
+             exactly one request (source, provider, profile, requests)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_subscription_catalog_rejects_a_revoked_credential_before_asking_the_account(
+    ) {
+        let mut config = chatgpt_subscription_config();
+        config.revoke_credential("chatgpt:default").unwrap();
+        let source = ScriptedAccountModels {
+            models: vec!["gpt-6.1-sol".into()],
+            asked: AtomicUsize::new(0),
+        };
+
+        let error = refresh_chatgpt_subscription_from_config(&config, "chatgpt", &source)
+            .await
+            .expect_err("a revoked credential must not be used to list an account's models");
+
+        assert!(
+            format!("{error:#}").contains("revoked"),
+            "the refusal must name the revocation: {error:#}"
+        );
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            0,
+            "the account must not be asked when the provider graph is invalid: {error:#}"
+        );
+
+        let not_a_subscription = live_catalog_config("http://127.0.0.1:1", None);
+        let error =
+            refresh_chatgpt_subscription_from_config(&not_a_subscription, "primary", &source)
+                .await
+                .expect_err("an API-key profile is not a ChatGPT subscription");
+        assert!(
+            format!("{error:#}").contains("is not a ChatGPT subscription")
+                && source.asked.load(Ordering::SeqCst) == 0,
+            "a profile of another provider must be refused without asking any account: {error:#}"
+        );
     }
 
     #[tokio::test]
