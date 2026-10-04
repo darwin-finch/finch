@@ -53,7 +53,7 @@ pub enum ComponentView {
     /// content is fully known at construction — there is nothing to page
     /// through, so this component carries no Input/Output split and no
     /// bounded/scrollable child viewport (the tool-result control in
-    /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolOutput`
+    /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolCall`
     /// rows only, which this component never emits). Each row's recalled
     /// text is collapsed behind its identity/summary line by default and
     /// expands on click (#1235), the same component-owned disclosure
@@ -1418,10 +1418,10 @@ mod tests {
         }
     }
 
-    /// A memory row's body lines carry no [`NodeRole::ToolOutput`] tagging
+    /// A memory row's body lines carry no [`NodeRole::ToolCall`] tagging
     /// (indeed, no role at all) and no `body_of` owner — the bounded
     /// tool-result viewport in `finch-tui`'s `tool_viewport.rs` keys
-    /// exclusively off `role == Some(NodeRole::ToolOutput)`, so a memory row
+    /// exclusively off `role == Some(NodeRole::ToolCall)`, so a memory row
     /// can never be mistaken for a paginated tool result, however long its
     /// recalled text is.
     #[test]

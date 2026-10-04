@@ -83,8 +83,6 @@ pub enum NodeRole {
     Output,
     ToolGroup,
     ToolCall,
-    Input,
-    ToolOutput,
 }
 
 /// One rendered transcript line: semantic text plus the row metadata the

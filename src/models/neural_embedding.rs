@@ -60,9 +60,18 @@ static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
     BACKEND.get_or_try_init(|| {
+        // Void logs BEFORE initialization to prevent Metal startup logs (e.g. `ggml_metal_device_init`) 
+        // from leaking to stderr before the TUI starts.
+        unsafe extern "C" fn void_log(
+            _level: llama_cpp_sys_2::ggml_log_level,
+            _text: *const ::std::os::raw::c_char,
+            _user_data: *mut ::std::os::raw::c_void,
+        ) {}
+        unsafe {
+            llama_cpp_sys_2::llama_log_set(Some(void_log), std::ptr::null_mut());
+        }
+
         let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
-        // This backend lives in the interactive frontend. Native llama.cpp
-        // stderr bypasses the TUI renderer and corrupts its cursor geometry.
         backend.void_logs();
         Ok(backend)
     })
