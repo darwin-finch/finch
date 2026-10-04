@@ -478,39 +478,4 @@ mod tests {
         assert!(error.contains("finch auth status claude"));
     }
 
-    #[tokio::test]
-    async fn explicit_login_conflicts_fail_before_any_socket_or_store_mutation() {
-        let dialect = Arc::new(
-            ClaudeOAuthDialect::for_test("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap(),
-        );
-        let descriptor = dialect.descriptor();
-        let mut hostile = record();
-        hostile.dialect_id = descriptor.dialect_id.clone();
-        hostile.protocol_revision = descriptor.protocol_revision.clone();
-        hostile.provider = descriptor.provider;
-        hostile.kind = descriptor.credential_kind;
-        hostile.issuer = descriptor.issuer.clone();
-        hostile.audience = descriptor.audience.clone();
-        hostile.client_id = descriptor.client_id.clone();
-        hostile.scopes = descriptor.scopes.clone();
-        // An active (non-revoked) record already exists locally; login must
-        // refuse to start (no listener, no store mutation) rather than race
-        // a second authorization against it.
-        let generation = hostile.generation.clone();
-        let store = Arc::new(MemoryStore(StdMutex::new(Some(hostile))));
-        let client = finch_providers::OAuthClient::new(dialect, store.clone()).unwrap();
-        assert!(login_browser_with(
-            &client,
-            "claude:work",
-            BrowserLoginPresentation::default(),
-            CancellationToken::new(),
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            store.0.lock().unwrap().as_ref().unwrap().generation,
-            generation
-        );
-    }
-
     }

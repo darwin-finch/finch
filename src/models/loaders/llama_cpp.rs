@@ -22,7 +22,27 @@ use super::super::generator_new::{TextGeneration, TokenCallback};
 static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
-    BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
+    BACKEND.get_or_try_init(|| {
+        unsafe extern "C" fn tracing_log(
+            _level: llama_cpp_sys_2::ggml_log_level,
+            text: *const ::std::os::raw::c_char,
+            _user_data: *mut ::std::os::raw::c_void,
+        ) {
+            if text.is_null() { return; }
+            if let Ok(msg) = std::ffi::CStr::from_ptr(text).to_str() {
+                let msg = msg.trim_end();
+                if !msg.is_empty() {
+                    tracing::info!(target: "llama", "{}", msg);
+                }
+            }
+        }
+        unsafe {
+            llama_cpp_sys_2::llama_log_set(Some(tracing_log), std::ptr::null_mut());
+        }
+        let mut backend = LlamaBackend::init().context("initialize llama.cpp backend")?;
+        backend.void_logs(); // Suppress the native stderr since we're piping it above
+        Ok(backend)
+    })
 }
 
 fn prompt_contains_explicit_bos(text: &str) -> bool {
