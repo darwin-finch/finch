@@ -43,6 +43,19 @@ pub enum QueryState {
     Cancelled,
 }
 
+/// Which provider entry and model a query runs on, for its request metric.
+/// Identities only; never prompt or response text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRoute {
+    /// Provider entry (profile) name.
+    pub provider: String,
+    /// Model the entry was asked for.
+    pub model: String,
+    /// Local or cloud by the entry's kind; `None` when no configured entry
+    /// matches the generator.
+    pub kind: Option<crate::metrics::ProviderKind>,
+}
+
 /// Metadata for a query
 #[derive(Debug, Clone)]
 pub struct QueryMetadata {
@@ -77,6 +90,13 @@ pub struct QueryMetadata {
     /// When this query was created
     pub created_at: std::time::Instant,
 
+    /// Bound by the LLM worker when it picks the generator for this query.
+    pub request_route: Option<RequestRoute>,
+
+    /// Set by the first terminal transition, so a query yields exactly one
+    /// request metric however many paths later try to close it.
+    pub request_metric_taken: bool,
+
     /// One reactive tool activity block for the entire provider/tool loop.
     /// Keeping it live across continuation requests prevents each round trip
     /// from becoming a separate anonymous transcript block.
@@ -90,6 +110,47 @@ pub struct QueryMetadata {
 /// Manages state for all in-flight queries
 pub struct QueryStateManager {
     states: Arc<RwLock<HashMap<Uuid, QueryMetadata>>>,
+    /// Where a query's request metric is appended when it first reaches a
+    /// terminal state. Unset means nothing is recorded.
+    request_metrics: std::sync::RwLock<Option<Arc<crate::metrics::MetricsLogger>>>,
+}
+
+/// Provider and model shown for a query that ended before the LLM worker
+/// bound a generator to it.
+const UNBOUND_REQUEST_IDENTITY: &str = "not bound";
+
+/// Build the one request metric a query yields, on its first terminal
+/// transition. Returns `None` for a non-terminal state and for every later
+/// terminal transition of the same query.
+fn take_request_metric(
+    metadata: &mut QueryMetadata,
+    state: &QueryState,
+) -> Option<crate::metrics::RequestMetric> {
+    let outcome = match state {
+        QueryState::Completed { .. } => crate::metrics::RequestOutcome::Completed,
+        QueryState::Failed { .. } => crate::metrics::RequestOutcome::Failed,
+        QueryState::Cancelled => crate::metrics::RequestOutcome::Cancelled,
+        QueryState::Processing | QueryState::ExecutingTools { .. } => return None,
+    };
+    if metadata.request_metric_taken {
+        return None;
+    }
+    metadata.request_metric_taken = true;
+    let elapsed_ms = u64::try_from(metadata.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (provider, model, kind) = match &metadata.request_route {
+        Some(route) => (route.provider.as_str(), route.model.as_str(), route.kind),
+        None => (UNBOUND_REQUEST_IDENTITY, UNBOUND_REQUEST_IDENTITY, None),
+    };
+    // The wire-adherence vocabulary: a turn the daemon asked this runner to
+    // perform for a named Brain, or one the session's own user typed.
+    let surface = if metadata.brain_turn_provenance.is_some() {
+        "named_brain"
+    } else {
+        "interactive"
+    };
+    Some(crate::metrics::RequestMetric::turn(
+        provider, model, kind, outcome, surface, elapsed_ms,
+    ))
 }
 
 impl QueryStateManager {
@@ -97,6 +158,45 @@ impl QueryStateManager {
     pub fn new() -> Self {
         Self {
             states: Arc::new(RwLock::new(HashMap::new())),
+            request_metrics: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Record one source-free request metric per query into `logger` from
+    /// now on. The event loop calls this with its injected logger; a manager
+    /// nobody calls it on records nothing.
+    pub fn record_request_metrics_to(&self, logger: Option<Arc<crate::metrics::MetricsLogger>>) {
+        *self
+            .request_metrics
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = logger;
+    }
+
+    /// Bind the provider entry and model this query runs on. The LLM worker
+    /// calls it each time it picks a generator for the query, so the metric
+    /// names the generator that last served the turn.
+    pub async fn bind_request_route(&self, query_id: Uuid, route: RequestRoute) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.request_route = Some(route);
+        }
+    }
+
+    /// Append a taken request metric. Called after the state lock is
+    /// released; a write failure is logged and never fails the query.
+    fn log_request_metric(&self, metric: Option<crate::metrics::RequestMetric>) {
+        let Some(metric) = metric else {
+            return;
+        };
+        let logger = self
+            .request_metrics
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(logger) = logger else {
+            return;
+        };
+        if let Err(error) = logger.log(&metric) {
+            tracing::warn!("failed to record request metric: {error}");
         }
     }
 
@@ -113,6 +213,8 @@ impl QueryStateManager {
             cancellation_token: CancellationToken::new(),
             invocation_metadata: None,
             created_at: std::time::Instant::now(),
+            request_route: None,
+            request_metric_taken: false,
             tool_work_unit: None,
             brain_output_work_unit: None,
         };
@@ -153,9 +255,16 @@ impl QueryStateManager {
 
     /// Update the state of a query
     pub async fn update_state(&self, query_id: Uuid, state: QueryState) {
-        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+        let metric = {
+            let mut states = self.states.write().await;
+            let Some(metadata) = states.get_mut(&query_id) else {
+                return;
+            };
+            let metric = take_request_metric(metadata, &state);
             metadata.state = state;
-        }
+            metric
+        };
+        self.log_request_metric(metric);
     }
 
     /// Enter tool execution unless cancellation already won the race with a
@@ -206,26 +315,34 @@ impl QueryStateManager {
         content: Vec<crate::providers::ContentBlock>,
         conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>,
     ) -> bool {
-        let mut states = self.states.write().await;
-        let Some(metadata) = states.get_mut(&query_id) else {
-            return false;
+        let metric = {
+            let mut states = self.states.write().await;
+            let Some(metadata) = states.get_mut(&query_id) else {
+                return false;
+            };
+            if metadata.cancellation_token.is_cancelled()
+                || matches!(
+                    metadata.state,
+                    QueryState::Cancelled
+                        | QueryState::Failed { .. }
+                        | QueryState::Completed { .. }
+                )
+            {
+                return false;
+            }
+            conversation
+                .write()
+                .await
+                .add_message(crate::providers::Message {
+                    role: "assistant".to_string(),
+                    content,
+                });
+            let state = QueryState::Completed { response };
+            let metric = take_request_metric(metadata, &state);
+            metadata.state = state;
+            metric
         };
-        if metadata.cancellation_token.is_cancelled()
-            || matches!(
-                metadata.state,
-                QueryState::Cancelled | QueryState::Failed { .. } | QueryState::Completed { .. }
-            )
-        {
-            return false;
-        }
-        conversation
-            .write()
-            .await
-            .add_message(crate::providers::Message {
-                role: "assistant".to_string(),
-                content,
-            });
-        metadata.state = QueryState::Completed { response };
+        self.log_request_metric(metric);
         true
     }
 
@@ -312,18 +429,23 @@ impl QueryStateManager {
 
     /// Cancel a query
     pub async fn cancel_query(&self, query_id: Uuid) -> bool {
-        let mut states = self.states.write().await;
-        let Some(metadata) = states.get_mut(&query_id) else {
-            return false;
+        let metric = {
+            let mut states = self.states.write().await;
+            let Some(metadata) = states.get_mut(&query_id) else {
+                return false;
+            };
+            if matches!(
+                metadata.state,
+                QueryState::Completed { .. } | QueryState::Failed { .. } | QueryState::Cancelled
+            ) {
+                return false;
+            }
+            metadata.cancellation_token.cancel();
+            let metric = take_request_metric(metadata, &QueryState::Cancelled);
+            metadata.state = QueryState::Cancelled;
+            metric
         };
-        if matches!(
-            metadata.state,
-            QueryState::Completed { .. } | QueryState::Failed { .. } | QueryState::Cancelled
-        ) {
-            return false;
-        }
-        metadata.cancellation_token.cancel();
-        metadata.state = QueryState::Cancelled;
+        self.log_request_metric(metric);
         true
     }
 

@@ -60,6 +60,31 @@ report (issue #1629, test runs filling the report with fixture providers).
 `event_loop/tests.rs` drive a real turn through a uniquely named fixture provider and fail if a
 row naming it appears under the home directory.
 
+**A request is one user turn, and each turn records exactly one source-free request metric.**
+The unit is the query id: every tool round and provider continuation of a turn runs under it, so
+a turn that makes five provider calls is one request. `QueryStateManager` (`query_state.rs`)
+owns the recording because it is the one place every terminal transition already passes through
+under one lock: `try_publish_completion_content` (completed), `update_state` (failed), and
+`cancel_query` (cancelled). `take_request_metric` builds the row on the first terminal
+transition and sets `QueryMetadata::request_metric_taken`, so a provider that answers after a
+cancel, or a second path closing the same query, adds nothing. The row is appended after the
+state lock is released, and a write failure is logged, never surfaced into the turn.
+`LlmLoop::spawn_query` binds the provider entry name, model, and local-or-cloud kind (the
+configured `ProviderEntry::is_local`, never a guess: a generator no entry matches is recorded
+without a kind); `process_query_with_tools` rebinds when its routing step picks the separate
+on-device generator. The row holds identities, an outcome, and a duration only; it does not hash
+the prompt. Duration is the whole turn, including tool execution and time spent waiting on an
+approval prompt. Before this, nothing under `repl_event/` recorded a request, so `/metrics`
+showed zeros after real turns (issue #1629, `/metrics` request counters always zero). The
+daemon's HTTP `GET /metrics` endpoint is a separate surface tracked by issue #131 (make daemon
+health and metrics truthful with request route provenance); it should adopt this row shape
+rather than a second vocabulary. Tests, all in `event_loop/tests.rs` on the real worker:
+`test_completed_turn_records_exactly_one_request_metric_for_its_cloud_provider_entry`,
+`test_turn_on_a_local_provider_entry_is_counted_as_local`,
+`test_failed_turn_records_exactly_one_failed_request_metric`,
+`test_cancelled_turn_records_exactly_one_cancelled_request_metric_despite_late_completion`,
+`test_turn_with_a_tool_round_records_one_request_metric_not_one_per_provider_call`.
+
 **IPC recovery is header/status, not transcript.** Peer disconnect, home event-watch loss, and
 runner reconnect attempts update `StatusBar` (`SessionLabel`) through
 `EventLoop::project_ipc_recovery_header`. They must not call `output_manager.write_info` — that

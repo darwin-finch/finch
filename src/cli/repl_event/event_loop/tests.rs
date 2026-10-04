@@ -12560,3 +12560,565 @@ async fn test_injected_metrics_logger_keeps_the_fixture_wire_metric_in_the_tests
         home_metrics.display()
     );
 }
+
+/// What a [`RequestMetricProvider`] does on each provider call.
+enum RequestMetricScript {
+    /// Every call answers.
+    Succeed,
+    /// Every call returns a provider error.
+    Fail,
+    /// The first call blocks until released; every call then answers.
+    BlockFirstCall,
+    /// The first call asks for the `late_probe` tool; the second answers.
+    ToolRoundThenSucceed,
+}
+
+/// A scripted provider for the request-metric tests. Its name is the provider
+/// entry (profile) name and its model is distinct, so a row can be checked
+/// for both.
+struct RequestMetricProvider {
+    name: &'static str,
+    script: RequestMetricScript,
+    calls: std::sync::atomic::AtomicUsize,
+    first_call_started: tokio::sync::Notify,
+    release_first_call: tokio::sync::Notify,
+}
+
+const REQUEST_METRIC_MODEL: &str = "request-metric-model";
+const REQUEST_METRIC_PROMPT: &str = "request metric question PROMPT_SENTINEL_1629";
+const REQUEST_METRIC_ANSWER: &str = "request metric ANSWER_SENTINEL_1629";
+
+impl RequestMetricProvider {
+    fn new(name: &'static str, script: RequestMetricScript) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            script,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first_call_started: tokio::sync::Notify::new(),
+            release_first_call: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn answer(&self) -> crate::generators::GeneratorResponse {
+        let text = format!("(say \"{REQUEST_METRIC_ANSWER}\")");
+        crate::generators::GeneratorResponse {
+            content_blocks: vec![crate::providers::ContentBlock::text(&text)],
+            text,
+            tool_uses: Vec::new(),
+            metadata: crate::generators::ResponseMetadata {
+                generator: self.name.to_string(),
+                model: REQUEST_METRIC_MODEL.to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for RequestMetricProvider {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.script {
+            RequestMetricScript::Succeed => Ok(self.answer()),
+            RequestMetricScript::Fail => anyhow::bail!("scripted request-metric provider failure"),
+            RequestMetricScript::BlockFirstCall => {
+                if call == 0 {
+                    self.first_call_started.notify_one();
+                    self.release_first_call.notified().await;
+                }
+                Ok(self.answer())
+            }
+            RequestMetricScript::ToolRoundThenSucceed => {
+                if call > 0 {
+                    return Ok(self.answer());
+                }
+                let tool = crate::tools::ToolUse {
+                    id: "request-metric-tool".into(),
+                    name: "late_probe".into(),
+                    input: serde_json::json!({}),
+                };
+                let mut response = self.answer();
+                response
+                    .content_blocks
+                    .push(crate::providers::ContentBlock::ToolUse {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        input: tool.input.clone(),
+                    });
+                response.tool_uses.push(tool);
+                Ok(response)
+            }
+        }
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::providers::Message>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn model_name(&self) -> &str {
+        REQUEST_METRIC_MODEL
+    }
+}
+
+fn request_metric_cloud_entry(name: &str) -> crate::config::ProviderEntry {
+    crate::config::ProviderEntry::Claude {
+        api_key: "test-api-key".to_string(),
+        model: None,
+        base_url: None,
+        chat_path: None,
+        models_path: None,
+        name: Some(name.to_string()),
+    }
+}
+
+fn request_metric_local_entry(name: &str) -> crate::config::ProviderEntry {
+    crate::config::ProviderEntry::Local {
+        inference_provider: crate::models::InferenceProvider::LlamaCpp,
+        execution_target: crate::config::ExecutionTarget::Auto,
+        model_family: crate::models::ModelFamily::Gemma2,
+        model_size: crate::models::ModelSize::Medium,
+        model_path: None,
+        managed_artifact: None,
+        enabled: true,
+        name: Some(name.to_string()),
+    }
+}
+
+/// A headless event loop on the real worker, backed by `provider`, with
+/// `entries` as the session's configured provider entries and a metrics
+/// logger over a directory the test owns.
+struct RequestMetricSession {
+    event_loop: EventLoop,
+    metrics: Arc<crate::metrics::MetricsLogger>,
+    directory: tempfile::TempDir,
+    probe_executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RequestMetricSession {
+    fn start(
+        provider: &Arc<RequestMetricProvider>,
+        entries: Vec<crate::config::ProviderEntry>,
+    ) -> Self {
+        let probe_executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(LateProviderProbe {
+            executions: Arc::clone(&probe_executions),
+        }));
+        let definitions = registry.definitions();
+        let patterns = tempfile::tempdir()
+            .expect("isolated request-metric tool state")
+            .path()
+            .join("patterns.json");
+        let executor = crate::tools::ToolExecutor::new(
+            registry,
+            crate::tools::PermissionManager::new(),
+            patterns,
+        )
+        .expect("construct request-metric tool executor");
+        let mut event_loop = EventLoop::new_test_runner(
+            "request-metric-test",
+            Arc::clone(provider) as Arc<dyn crate::generators::Generator>,
+            definitions,
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::new(crate::runtime::ProgramRuntime::new()),
+            entries,
+            0,
+            None,
+        );
+        let directory = tempfile::tempdir().expect("the test's own metrics directory");
+        let metrics = Arc::new(
+            crate::metrics::MetricsLogger::new(directory.path().to_path_buf())
+                .expect("construct the test's own metrics logger"),
+        );
+        event_loop.set_metrics_logger_for_test(Arc::clone(&metrics));
+        event_loop.output_manager.disable_stdout();
+        event_loop.start_llm_worker();
+        Self {
+            event_loop,
+            metrics,
+            directory,
+            probe_executions,
+        }
+    }
+
+    /// Submit one user turn through the real input path and return its id.
+    async fn submit(&mut self, text: &str) -> uuid::Uuid {
+        self.event_loop
+            .handle_user_input(text.into())
+            .await
+            .expect("the request-metric turn must dispatch");
+        self.event_loop
+            .active_query_id
+            .read()
+            .await
+            .expect("the request-metric turn must own the active slot")
+    }
+
+    /// Dispatch events until `query_id` reaches a terminal event.
+    async fn pump_until_terminal(&mut self, query_id: uuid::Uuid) {
+        loop {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.event_loop.event_rx.recv(),
+            )
+            .await
+            .expect("the request-metric turn hung before its terminal event")
+            .expect("the event channel must remain open");
+            let terminal = matches!(
+                &event,
+                ReplEvent::StreamingComplete { query_id: id, .. }
+                    | ReplEvent::QueryFailed { query_id: id, .. } if *id == query_id
+            );
+            self.event_loop
+                .handle_event(event)
+                .await
+                .expect("request-metric events must dispatch");
+            if terminal {
+                break;
+            }
+        }
+    }
+
+    /// Every request row in the test's directory, as raw lines.
+    fn request_rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(self.directory.path())
+            .expect("read the test's own metrics directory")
+            .flatten()
+        {
+            if entry.file_name().to_string_lossy().starts_with("wire-") {
+                continue;
+            }
+            let contents =
+                std::fs::read_to_string(entry.path()).expect("read a request metrics file");
+            rows.extend(contents.lines().map(str::to_string));
+        }
+        rows
+    }
+
+    fn summary(&self) -> crate::metrics::RequestSummary {
+        self.metrics
+            .request_summary_last_24_hours()
+            .expect("the request summary must be readable")
+    }
+}
+
+/// The request rows must stay source-free at the production boundary, not
+/// only in the type's own serialization test.
+fn assert_request_rows_are_source_free(rows: &[String]) {
+    for row in rows {
+        for sentinel in [
+            "PROMPT_SENTINEL_1629",
+            "ANSWER_SENTINEL_1629",
+            "test-api-key",
+        ] {
+            assert!(
+                !row.contains(sentinel),
+                "a request metric must carry no prompt, response, or credential text; \
+                 sentinel={sentinel:?} row={row}"
+            );
+        }
+    }
+}
+
+/// Issue #1629 ("/metrics request counters are always zero"): nothing under
+/// `src/cli/repl_event/` recorded a request, so the live session's `/metrics`
+/// block stayed at zero after real turns.
+#[tokio::test]
+async fn test_completed_turn_records_exactly_one_request_metric_for_its_cloud_provider_entry() {
+    const PROVIDER: &str = "request-metric-cloud-entry";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let provider = RequestMetricProvider::new(PROVIDER, RequestMetricScript::Succeed);
+            let mut session =
+                RequestMetricSession::start(&provider, vec![request_metric_cloud_entry(PROVIDER)]);
+            assert_eq!(
+                session.summary().total,
+                0,
+                "no request may be recorded before a turn runs; rows={:?}",
+                session.request_rows()
+            );
+
+            let query_id = session.submit(REQUEST_METRIC_PROMPT).await;
+            session.pump_until_terminal(query_id).await;
+
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                rows.len(),
+                1,
+                "one completed user turn must record exactly one request metric; \
+                 rows={rows:?} summary={summary:?}"
+            );
+            assert_eq!(
+                (
+                    summary.total,
+                    summary.completed,
+                    summary.failed,
+                    summary.cancelled
+                ),
+                (1, 1, 0, 0),
+                "a completed turn must be counted as completed; rows={rows:?} summary={summary:?}"
+            );
+            assert_eq!(
+                summary.groups,
+                vec![crate::metrics::RequestGroupSummary {
+                    provider: PROVIDER.into(),
+                    model: REQUEST_METRIC_MODEL.into(),
+                    kind: Some(crate::metrics::ProviderKind::Cloud),
+                    total: 1,
+                    completed: 1,
+                    failed: 0,
+                    cancelled: 0,
+                    avg_completed_ms: summary.avg_completed_ms,
+                }],
+                "the turn must be attributed to its provider entry, model, and the entry's \
+                 kind; rows={rows:?}"
+            );
+            assert!(
+                rows[0].contains("\"surface\":\"interactive\""),
+                "a turn the session's own user typed is the interactive surface; rows={rows:?}"
+            );
+            assert_request_rows_are_source_free(&rows);
+
+            let report = crate::cli::commands::format_metrics(&session.metrics)
+                .expect("/metrics must render");
+            for expected in [
+                "  1 request: 1 completed, 0 failed, 0 cancelled",
+                "  By provider kind: 1 cloud, 0 local",
+                "  request-metric-cloud-entry/request-metric-model (cloud): 1 total, 1 completed",
+            ] {
+                assert!(
+                    report.contains(expected),
+                    "/metrics must reflect the turn the event loop just ran; \
+                     missing={expected:?} report={report:?}"
+                );
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_turn_on_a_local_provider_entry_is_counted_as_local() {
+    const PROVIDER: &str = "request-metric-local-entry";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let provider = RequestMetricProvider::new(PROVIDER, RequestMetricScript::Succeed);
+            let mut session =
+                RequestMetricSession::start(&provider, vec![request_metric_local_entry(PROVIDER)]);
+            let query_id = session.submit(REQUEST_METRIC_PROMPT).await;
+            session.pump_until_terminal(query_id).await;
+
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                (
+                    summary.total,
+                    summary.local,
+                    summary.cloud,
+                    summary.unclassified
+                ),
+                (1, 1, 0, 0),
+                "local versus cloud must be the configured provider entry's kind; \
+                 rows={rows:?} summary={summary:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_failed_turn_records_exactly_one_failed_request_metric() {
+    const PROVIDER: &str = "request-metric-failing-entry";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let provider = RequestMetricProvider::new(PROVIDER, RequestMetricScript::Fail);
+            let mut session =
+                RequestMetricSession::start(&provider, vec![request_metric_cloud_entry(PROVIDER)]);
+            let query_id = session.submit(REQUEST_METRIC_PROMPT).await;
+            session.pump_until_terminal(query_id).await;
+
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                rows.len(),
+                1,
+                "one failed user turn must record exactly one request metric; \
+                 rows={rows:?} summary={summary:?}"
+            );
+            assert_eq!(
+                (
+                    summary.total,
+                    summary.completed,
+                    summary.failed,
+                    summary.cancelled
+                ),
+                (1, 0, 1, 0),
+                "a provider failure must be counted as failed; rows={rows:?} summary={summary:?}"
+            );
+            assert_eq!(
+                summary.avg_completed_ms, None,
+                "a failed turn must not contribute a completion time; summary={summary:?}"
+            );
+            assert_eq!(
+                summary.groups[0].provider, PROVIDER,
+                "the failure must be attributed to the provider entry; summary={summary:?}"
+            );
+            assert_request_rows_are_source_free(&rows);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_cancelled_turn_records_exactly_one_cancelled_request_metric_despite_late_completion()
+{
+    const PROVIDER: &str = "request-metric-cancelled-entry";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let provider =
+                RequestMetricProvider::new(PROVIDER, RequestMetricScript::BlockFirstCall);
+            let mut session =
+                RequestMetricSession::start(&provider, vec![request_metric_cloud_entry(PROVIDER)]);
+            let idle_handles = Arc::strong_count(&provider);
+
+            session.submit(REQUEST_METRIC_PROMPT).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                provider.first_call_started.notified(),
+            )
+            .await
+            .expect("the turn hung before reaching the provider");
+
+            session
+                .event_loop
+                .handle_event(ReplEvent::CancelQuery)
+                .await
+                .expect("the user's cancel must dispatch");
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                (rows.len(), summary.total, summary.cancelled),
+                (1, 1, 1),
+                "cancelling a turn must record exactly one cancelled request at the moment \
+                 of cancellation; rows={rows:?} summary={summary:?}"
+            );
+
+            // Hostile timing: the provider answers after the cancel. Its
+            // worker task holds provider handles until it returns, so the
+            // handle count falling back to idle is the structural signal
+            // that the late completion has fully run.
+            provider.release_first_call.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while Arc::strong_count(&provider) > idle_handles {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cancelled turn's worker hung after its provider was released");
+            while let Ok(event) = session.event_loop.event_rx.try_recv() {
+                session
+                    .event_loop
+                    .handle_event(event)
+                    .await
+                    .expect("late events of a cancelled turn must dispatch");
+            }
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                (
+                    rows.len(),
+                    summary.total,
+                    summary.completed,
+                    summary.failed,
+                    summary.cancelled
+                ),
+                (1, 1, 0, 0, 1),
+                "a provider completing after the cancel must not add or change a request \
+                 metric; rows={rows:?} summary={summary:?}"
+            );
+
+            // The next turn is its own unit.
+            let next = session.submit("request metric follow-up").await;
+            session.pump_until_terminal(next).await;
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                (
+                    rows.len(),
+                    summary.total,
+                    summary.completed,
+                    summary.failed,
+                    summary.cancelled
+                ),
+                (2, 2, 1, 0, 1),
+                "the turn after a cancelled one must record its own single request metric; \
+                 rows={rows:?} summary={summary:?}"
+            );
+            assert_request_rows_are_source_free(&rows);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_turn_with_a_tool_round_records_one_request_metric_not_one_per_provider_call() {
+    const PROVIDER: &str = "request-metric-tool-round-entry";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let provider =
+                RequestMetricProvider::new(PROVIDER, RequestMetricScript::ToolRoundThenSucceed);
+            let mut session =
+                RequestMetricSession::start(&provider, vec![request_metric_cloud_entry(PROVIDER)]);
+            let query_id = session.submit(REQUEST_METRIC_PROMPT).await;
+            session.pump_until_terminal(query_id).await;
+
+            let provider_calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+            let tool_runs = session
+                .probe_executions
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let rows = session.request_rows();
+            let summary = session.summary();
+            assert_eq!(
+                (provider_calls, tool_runs),
+                (2, 1),
+                "the scripted turn must really have made a tool round; rows={rows:?}"
+            );
+            assert_eq!(
+                (rows.len(), summary.total, summary.completed),
+                (1, 1, 1),
+                "a request is one user turn: its tool rounds must not each record a metric; \
+                 provider_calls={provider_calls} tool_runs={tool_runs} rows={rows:?} \
+                 summary={summary:?}"
+            );
+        })
+        .await;
+}

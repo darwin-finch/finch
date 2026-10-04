@@ -24,21 +24,85 @@ pub struct ResponseComparison {
     pub divergence: Option<f64>,
 }
 
+/// Whether the provider entry that served a request runs a model on this
+/// machine (`ProviderEntry::Local`) or reaches one somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// A `Local` provider entry.
+    Local,
+    /// Every other provider entry.
+    Cloud,
+}
+
+/// How a request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOutcome {
+    /// The provider's final answer was published to the conversation.
+    Completed,
+    /// The provider or the turn failed terminally.
+    Failed,
+    /// The user, a reset, or a Brain cancellation ended the turn first.
+    Cancelled,
+}
+
+/// One request, source-free: no prompt text, tool arguments, response text,
+/// or credentials.
+///
+/// Two generations of row share this shape so one reader serves both:
+///
+/// - **Turn rows** (interactive session, issue #1629): one per user turn,
+///   written when the turn completes, fails, or is cancelled. They carry
+///   `provider`, `model`, `provider_kind`, `outcome`, and `surface`;
+///   `response_time_ms` is the whole turn including tool rounds. They do not
+///   hash the prompt, so `query_hash` is empty.
+/// - **Routing rows** (the daemon's HTTP message route and the pre-event-loop
+///   REPL): `routing_decision` plus router/validator fields, and none of the
+///   turn fields. They were only ever written after a successful response.
+///
+/// Every field but `timestamp` is optional on read, and unknown fields are
+/// ignored, so a row from an older or newer build never makes the report
+/// fail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestMetric {
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
     pub query_hash: String,
+    #[serde(default)]
     pub routing_decision: String,
+    #[serde(default)]
     pub pattern_id: Option<String>,
+    #[serde(default)]
     pub confidence: Option<f64>,
+    #[serde(default)]
     pub forward_reason: Option<String>,
+    #[serde(default)]
     pub response_time_ms: u64,
     /// Response comparison data
     #[serde(default)]
     pub comparison: ResponseComparison,
     /// Router confidence scores
+    #[serde(default)]
     pub router_confidence: Option<f64>,
+    #[serde(default)]
     pub validator_confidence: Option<f64>,
+    /// Provider entry (profile) name that served the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model the provider entry was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Local or cloud, by the provider entry's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<ProviderKind>,
+    /// How the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RequestOutcome>,
+    /// Receiver surface, using the wire-adherence vocabulary
+    /// (`interactive`, `one_shot`, `named_brain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 /// One terminal provider-wire attempt, including whether bounded repair was
@@ -105,7 +169,64 @@ impl RequestMetric {
             comparison,
             router_confidence,
             validator_confidence,
+            provider: None,
+            model: None,
+            provider_kind: None,
+            outcome: None,
+            surface: None,
         }
+    }
+
+    /// One finished turn of a live session. Takes only identities and a
+    /// duration: there is no parameter through which prompt text, tool
+    /// arguments, or a response could reach the row.
+    pub fn turn(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        provider_kind: Option<ProviderKind>,
+        outcome: RequestOutcome,
+        surface: impl Into<String>,
+        response_time_ms: u64,
+    ) -> Self {
+        // `routing_decision` keeps the vocabulary an older build's reader
+        // understands, so a mixed-version file still summarises there.
+        let routing_decision = match provider_kind {
+            Some(ProviderKind::Local) => "local",
+            Some(ProviderKind::Cloud) => "forward",
+            None => "unknown",
+        };
+        Self {
+            timestamp: Utc::now(),
+            query_hash: String::new(),
+            routing_decision: routing_decision.to_string(),
+            pattern_id: None,
+            confidence: None,
+            forward_reason: None,
+            response_time_ms,
+            comparison: ResponseComparison::default(),
+            router_confidence: None,
+            validator_confidence: None,
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            provider_kind,
+            outcome: Some(outcome),
+            surface: Some(surface.into()),
+        }
+    }
+
+    /// How this request ended. Routing rows predate the field and were only
+    /// written after a successful response.
+    pub fn effective_outcome(&self) -> RequestOutcome {
+        self.outcome.unwrap_or(RequestOutcome::Completed)
+    }
+
+    /// Local or cloud. Routing rows carry it as `routing_decision`.
+    pub fn effective_provider_kind(&self) -> Option<ProviderKind> {
+        self.provider_kind.or(match self.routing_decision.as_str() {
+            "local" => Some(ProviderKind::Local),
+            "forward" | "local_attempted" => Some(ProviderKind::Cloud),
+            _ => None,
+        })
     }
 }
 
@@ -337,6 +458,83 @@ mod tests {
             &["legacy local source", "legacy provider source"],
         );
         assert_eq!(rewritten["comparison"]["quality_score"], 0.75);
+    }
+
+    #[test]
+    fn test_turn_metric_serializes_only_identities_outcome_and_duration() {
+        let metric = RequestMetric::turn(
+            "ChatGPT Personal",
+            "gpt-5.6-sol",
+            Some(ProviderKind::Cloud),
+            RequestOutcome::Cancelled,
+            "interactive",
+            1234,
+        );
+        let value = serde_json::to_value(&metric).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("a request metric serializes as an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "comparison",
+                "confidence",
+                "forward_reason",
+                "model",
+                "outcome",
+                "pattern_id",
+                "provider",
+                "provider_kind",
+                "query_hash",
+                "response_time_ms",
+                "router_confidence",
+                "routing_decision",
+                "surface",
+                "timestamp",
+                "validator_confidence",
+            ],
+            "a turn row must carry exactly the source-free key set; a new key needs a \
+             deliberate decision here; value={value}"
+        );
+        assert_eq!(
+            value["query_hash"], "",
+            "a turn row must not carry a hash derived from the prompt; value={value}"
+        );
+        assert_eq!(value["provider"], "ChatGPT Personal");
+        assert_eq!(value["model"], "gpt-5.6-sol");
+        assert_eq!(value["provider_kind"], "cloud");
+        assert_eq!(value["outcome"], "cancelled");
+        assert_eq!(value["surface"], "interactive");
+        assert_eq!(value["routing_decision"], "forward");
+        assert_eq!(value["response_time_ms"], 1234);
+        assert_json_tree_excludes_response_sources(&value, &[]);
+    }
+
+    #[test]
+    fn test_request_metric_reads_rows_with_missing_and_unknown_fields() {
+        let sparse: RequestMetric = serde_json::from_str(
+            r#"{"timestamp":"2026-10-04T12:00:00Z","some_future_field":{"nested":1}}"#,
+        )
+        .expect("a row holding only a timestamp and an unknown field must still parse");
+        assert_eq!(sparse.effective_outcome(), RequestOutcome::Completed);
+        assert_eq!(sparse.effective_provider_kind(), None);
+        assert_eq!(sparse.response_time_ms, 0);
+
+        let routing: RequestMetric = serde_json::from_str(
+            r#"{"timestamp":"2026-10-04T12:00:00Z","query_hash":"h",
+                "routing_decision":"local_attempted","response_time_ms":9}"#,
+        )
+        .expect("a routing row without the turn fields must still parse");
+        assert_eq!(
+            routing.effective_provider_kind(),
+            Some(ProviderKind::Cloud),
+            "a routing row that fell through to a cloud provider counts as cloud"
+        );
+        assert!(routing.provider.is_none() && routing.outcome.is_none());
     }
 
     #[test]

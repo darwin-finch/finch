@@ -872,6 +872,16 @@ aggregate routing/quality data, never raw query, response, or tool content.
 Legacy metric records containing response fields remain readable, but new
 records do not serialize those fields.
 
+The record above is the routing row written by the daemon's HTTP message route.
+An interactive session writes one row per user turn to the same file when the
+turn completes, fails, or is cancelled. A turn row adds `provider` (the provider
+entry name), `model`, `provider_kind` (`local` or `cloud`, by the entry's kind),
+`outcome` (`completed`, `failed`, `cancelled`), and `surface`; its
+`response_time_ms` covers the whole turn including tool rounds, and its
+`query_hash` is empty because a turn row does not hash the prompt. Every field
+except `timestamp` is optional on read and unknown fields are ignored. The
+`/metrics` command summarises both kinds of row for the last 24 hours.
+
 ### Explicit Feedback Format
 
 ```json
