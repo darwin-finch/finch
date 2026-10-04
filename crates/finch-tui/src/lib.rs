@@ -1306,7 +1306,7 @@ pub(crate) fn plan_live_frame(
             None
         };
         frame.push(
-            span_render::lower_rendered_line(line, hover_bg, None)
+            span_render::lower_rendered_line(line, hover_bg, None, None)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -4514,6 +4514,7 @@ impl TuiRenderer {
                         None
                     },
                     Some(span_render::span_color_from_spec(&self.colors.background)),
+                    Some(span_render::span_color_from_spec(&self.colors.messages.assistant)),
                 )
             })
             .collect::<Vec<_>>();
@@ -8731,15 +8732,15 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0], None, None)
+                && span_render::lower_rendered_line(&literal_state[0], None, None, None)
                     == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0], None, None)
+                && !span_render::lower_rendered_line(&literal_state[0], None, None, None)
                     .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
             literal_state[0],
-            span_render::lower_rendered_line(&literal_state[0], None, None)
+            span_render::lower_rendered_line(&literal_state[0], None, None, None)
         );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
@@ -10931,7 +10932,7 @@ mod tests {
         );
         // The scroll-window source is the projection itself; the lowering the
         // full-viewport paint applies renders the same bytes as the seam.
-        let lowered = span_render::lower_rendered_line(&styled[0], None, None);
+        let lowered = span_render::lower_rendered_line(&styled[0], None, None, None);
         assert_eq!(
             lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
             "the scrolled paint shows the styled row; got {lowered:?}"
@@ -11083,8 +11084,8 @@ mod tests {
         // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
         // Even when lowered in isolation (without line 0 having been painted),
         // continuation lines MUST contain ANSI foreground and background escape sequences!
-        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None, None);
-        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None, None);
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None, None, None);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None, None, None);
 
         assert_ne!(lowered_line1, "second line");
         assert_ne!(lowered_line2, "third line");

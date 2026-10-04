@@ -1215,7 +1215,7 @@ async fn main() -> Result<()> {
             if temp_config.features.debug_logging {
                 // Set RUST_LOG to debug if not already set by user
                 if std::env::var("RUST_LOG").is_err() {
-                    std::env::set_var("RUST_LOG", "debug");
+                    std::env::set_var("RUST_LOG", "debug,hyper=info,hyper_util=info,h2=info,rustls=info,reqwest=info");
                 }
             }
         }
@@ -2005,7 +2005,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         if temp_config.features.debug_logging {
             // Set RUST_LOG to debug if not already set by user
             if std::env::var("RUST_LOG").is_err() {
-                std::env::set_var("RUST_LOG", "debug");
+                std::env::set_var("RUST_LOG", "debug,hyper=info,hyper_util=info,h2=info,rustls=info,reqwest=info");
             }
         }
     }
