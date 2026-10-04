@@ -195,6 +195,304 @@ fn enter_opens_provider_editor_and_saves_public_name() {
     }
 }
 
+// ── the provider form must not turn one provider's entry into another's ────
+
+/// A saved configuration shaped like the reported one: a ChatGPT subscription
+/// on a non-default model, an API-key provider with its own endpoint, and an
+/// OpenAI-compatible endpoint.
+fn three_saved_providers_config(metrics_dir: std::path::PathBuf) -> crate::config::Config {
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, EndpointFamily, ProviderCredential,
+    };
+    let scopes = crate::providers::chatgpt_required_scopes();
+    let compatible_url = "https://compatible.example/v1";
+    let providers = vec![
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::ChatgptSubscription,
+            credential: CredentialBinding {
+                credential_ref: "chatgpt:default".into(),
+                audience: Some(AudienceBinding::standard(
+                    EndpointFamily::ChatgptSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: scopes.clone(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("ChatGPT Personal".into()),
+            reasoning_effort: None,
+        },
+        ProviderEntry::Grok {
+            api_key: "xai-test-preserved".into(),
+            model: Some("grok-code-fast-1".into()),
+            base_url: Some("https://xai-compatible.example/v1".into()),
+            chat_path: None,
+            models_path: None,
+            name: Some("Grok Build".into()),
+        },
+        compatible_test_profile("Ciru", "ciru:default", compatible_url),
+    ];
+    let chatgpt = ProviderCredential {
+        name: "chatgpt:default".into(),
+        kind: CredentialKind::OauthDevice,
+        provider: CredentialProvider::ChatgptSubscription,
+        issuer: "openai-chatgpt".into(),
+        audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+        tenant: None,
+        project: None,
+        account: Some("account-123".into()),
+        scopes,
+        secret_ref: "oauth-store:chatgpt:default".into(),
+        lifecycle: CredentialLifecycle::Active {
+            expires_at: None,
+            refreshable: true,
+        },
+        revocation: Default::default(),
+    };
+    crate::config::Config::with_providers_and_paths(providers, metrics_dir).with_credentials(vec![
+        chatgpt,
+        compatible_test_credential("ciru:default", "CIRU_API_KEY", compatible_url),
+    ])
+}
+
+/// One line per provider: type, name and model, in list order.
+fn provider_summary(providers: &[ProviderEntry]) -> Vec<String> {
+    providers
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} · {} · {}",
+                entry.provider_type(),
+                entry.profile_name(),
+                entry.model().unwrap_or("(none)")
+            )
+        })
+        .collect()
+}
+
+/// What the wizard would write to disk for its current state.
+fn saved_providers(state: &WizardState, metrics_dir: std::path::PathBuf) -> Vec<ProviderEntry> {
+    let result = build_setup_result(state).expect("the wizard state must build a setup result");
+    config_from_setup_result_with_paths(&result, metrics_dir).providers
+}
+
+fn models_section_error(state: &WizardState) -> Option<String> {
+    match state.sections.get(&WizardSection::Models) {
+        Some(SectionState::Models { error, .. }) => error.clone(),
+        _ => None,
+    }
+}
+
+#[test]
+fn test_editing_a_saved_provider_cannot_turn_it_into_another_provider_with_left_right() {
+    let directory = tempfile::tempdir().unwrap();
+    let metrics_dir = directory.path().join("metrics");
+    let config = three_saved_providers_config(metrics_dir.clone());
+    let before = provider_summary(&config.providers);
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+
+    // Select the second row ("Grok Build"), open its edit form, move up from
+    // the Name row to the Provider row, press Left twice, confirm.
+    handle_wizard_key(&mut state, key(KeyCode::Down)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                focused_field: 0,
+                editing_idx: Some(1),
+                ..
+            })
+        ),
+        "precondition: the edit form for the second row must be open with the Provider row focused; step={:?}",
+        get_step(&state)
+    );
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    let reported = models_section_error(&state);
+    let step_after_left = format!("{:?}", get_step(&state));
+    let screen_after_left = render_wizard_text(&state);
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+
+    let saved = saved_providers(&state, metrics_dir);
+    let after = provider_summary(&saved);
+    assert_eq!(
+        after, before,
+        "editing a saved entry must not change its provider type: the row named 'Grok Build' \
+         must still be the Grok API entry with its own model, not another provider's entry \
+         carrying that provider's default model under the old name.\nsaved providers: {after:#?}"
+    );
+    assert!(
+        matches!(
+            saved.get(1),
+            Some(ProviderEntry::Grok { api_key, base_url, .. })
+                if api_key == "xai-test-preserved"
+                    && base_url.as_deref() == Some("https://xai-compatible.example/v1")
+        ),
+        "the edited entry must keep its API key and custom endpoint; saved providers: {after:#?}"
+    );
+    assert_eq!(
+        reported.as_deref(),
+        Some(PROVIDER_TYPE_IS_FIXED),
+        "pressing Left on a saved entry's Provider row must say why nothing changed; \
+         step after Left: {step_after_left}"
+    );
+    assert!(
+        screen_after_left.contains("provider type is fixed"),
+        "the reason must be on screen while the edit form is open, not only in wizard state; \
+         screen:\n{screen_after_left}"
+    );
+}
+
+#[test]
+fn test_editing_a_saved_provider_keeps_its_model_after_left_right_on_the_provider_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let metrics_dir = directory.path().join("metrics");
+    let config = three_saved_providers_config(metrics_dir.clone());
+    let before = provider_summary(&config.providers);
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+
+    // Open the ChatGPT subscription's edit form, move up to the Provider row,
+    // press Right then Left (back to where it started), confirm.
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+
+    let after = provider_summary(&saved_providers(&state, metrics_dir));
+    assert_eq!(
+        after, before,
+        "Right then Left on a saved entry's Provider row must leave the entry as it was: the \
+         ChatGPT subscription must keep the model it was saved with (gpt-5.6-sol), not be reset \
+         to the setup default for its provider type.\nsaved providers: {after:#?}"
+    );
+}
+
+#[test]
+fn test_add_form_generated_name_follows_the_provider_and_a_typed_name_is_kept() {
+    let directory = tempfile::tempdir().unwrap();
+    let metrics_dir = directory.path().join("metrics");
+    let config = three_saved_providers_config(metrics_dir.clone());
+
+    // `a`, Enter opens the add form for the first provider (ChatGPT
+    // subscription) with the generated name "chatgpt"; Up reaches the
+    // Provider row; Left selects another provider; Enter adds it.
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+    handle_wizard_key(&mut state, key(KeyCode::Char('a'))).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    let Some(AddProviderStep::ConfigureRemote {
+        provider_idx, name, ..
+    }) = get_step(&state)
+    else {
+        panic!(
+            "the add form must stay open after Left on the Provider row; step={:?}",
+            get_step(&state)
+        );
+    };
+    let selected_id = CLOUD_PROVIDERS[*provider_idx].0;
+    assert_ne!(
+        selected_id, "chatgpt",
+        "precondition: Left on the Provider row of an add form must select another provider"
+    );
+    assert_eq!(
+        name, selected_id,
+        "a generated name must follow the selected provider: a '{selected_id}' entry must not be \
+         named after the provider the form opened with"
+    );
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    let saved = saved_providers(&state, metrics_dir);
+    let summary = provider_summary(&saved);
+    assert!(
+        !saved.iter().any(|entry| entry.profile_name() == "chatgpt"),
+        "no saved entry may be named 'chatgpt' when no ChatGPT entry was added; \
+         saved providers: {summary:#?}"
+    );
+    assert!(
+        saved
+            .iter()
+            .any(|entry| entry.profile_name() == selected_id),
+        "the added entry must be saved under its own provider's name '{selected_id}'; \
+         saved providers: {summary:#?}"
+    );
+
+    // A name the user typed is theirs: changing the provider leaves it alone.
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+    handle_wizard_key(&mut state, key(KeyCode::Char('a'))).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Char('2'))).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { name, .. }) if name == "chatgpt2"
+        ),
+        "a typed name must survive a provider change; step={:?}",
+        get_step(&state)
+    );
+}
+
+#[test]
+fn test_editing_the_unconfigured_placeholder_can_still_choose_a_provider() {
+    // The first-run row is an unconfigured placeholder, and Enter on it opens
+    // the same form in edit mode. Choosing a provider there must keep working.
+    let config = crate::config::Config::with_providers_and_paths(
+        vec![ProviderEntry::Claude {
+            api_key: String::new(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".to_string()),
+        }],
+        std::path::PathBuf::from("unused-test-metrics"),
+    );
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+    handle_wizard_key(&mut state, key(KeyCode::Enter)).unwrap();
+    for _ in 0..3 {
+        handle_wizard_key(&mut state, key(KeyCode::Up)).unwrap();
+    }
+    handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+    let Some(AddProviderStep::ConfigureRemote {
+        provider_idx,
+        name,
+        editing_idx: Some(0),
+        ..
+    }) = get_step(&state)
+    else {
+        panic!(
+            "the placeholder's form must stay open in edit mode; step={:?}",
+            get_step(&state)
+        );
+    };
+    let selected_id = CLOUD_PROVIDERS[*provider_idx].0;
+    assert_ne!(
+        selected_id,
+        "claude",
+        "Right on the unconfigured placeholder's Provider row must select another provider; \
+         error={:?}",
+        models_section_error(&state)
+    );
+    assert_eq!(
+        name, selected_id,
+        "the placeholder's generated name must follow the selected provider"
+    );
+}
+
 #[test]
 fn peer_discovery_and_context_lines_have_distinct_rows() {
     assert_ne!(SETTINGS_AUTO_DISCOVER_IDX, SETTINGS_CONTEXT_IDX);
