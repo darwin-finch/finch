@@ -1359,6 +1359,11 @@ pub(crate) fn plan_live_frame(
     }
     frame.cursor_visible = claimed_rects.composer.height > 0;
     let (cursor_row, cursor_col) = vm.input_cursor;
+    if claimed_rects.composer.height > 0 {
+        for line in vm.attachment_lines {
+            frame.push(format!("{DIM_GRAY}{line}{RESET}"));
+        }
+    }
     let rows_before_input = frame.physical_rows(width);
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
@@ -2412,6 +2417,11 @@ impl TuiRenderer {
     /// borrow it for the planning call.
     fn live_frame_sources(&mut self, term_width: usize) -> LiveFrameSources {
         let input_lines = self.input_textarea.lines().to_vec();
+        let attachment_lines = self
+            .pending_images
+            .iter()
+            .map(|(index, _, media_type)| format!("  ▣ Image {index} · {media_type}"))
+            .collect();
         let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
         let mut effective_status = compute_effective_status(
@@ -2468,6 +2478,7 @@ impl TuiRenderer {
         LiveFrameSources {
             input_cursor: self.input_textarea.cursor(),
             ghost_text: self.ghost_text.clone(),
+            attachment_lines,
             input_lines,
             effective_status,
             cwd_label,
@@ -2907,6 +2918,7 @@ fn find_parent_transcript_row<'a>(
 /// Owned state for one live-frame blit, gathered once so the ViewModel can
 /// borrow it for the planning call.
 struct LiveFrameSources {
+    attachment_lines: Vec<String>,
     input_lines: Vec<String>,
     input_cursor: (usize, usize),
     ghost_text: Option<String>,
@@ -2935,6 +2947,7 @@ fn live_view_model<'a>(
     view_model::LiveViewModel {
         terminal_width,
         terminal_height,
+        attachment_lines: &sources.attachment_lines,
         input_lines: &sources.input_lines,
         input_cursor: sources.input_cursor,
         ghost_text: sources.ghost_text.as_deref(),
@@ -4110,7 +4123,10 @@ impl TuiRenderer {
                 return true;
             }
             let text = selection::selected_text(&self.selection_index, active);
-            let _ = self.copy_selection_to_clipboard(&text);
+            if let Err(error) = self.copy_selection_to_clipboard(&text) {
+                tracing::debug!(%error, "Mouse selection copy failed");
+                self.set_operation_status("Copy failed (Hold Option ⌥ to use terminal selection)");
+            }
             self.live_area_dirty = true;
             return true;
         }
@@ -4129,14 +4145,10 @@ impl TuiRenderer {
 
     /// System clipboard copy (#221): the same `arboard` crate already used
     /// for the OAuth device-code copy (`grok_auth.rs`, `chatgpt_auth.rs`).
-    /// A no-op for empty text. On a mouse-release copy, the caller (below)
-    /// discards the result deliberately: a clipboard failure (no clipboard
-    /// provider, a headless/sandboxed session) never breaks the selection
-    /// itself — it stays highlighted either way, so the text is still
-    /// readable and selectable again on the next drag, with no status-line
-    /// noise for a gesture that has no explicit confirmation step anyway.
-    /// [`Self::copy_active_selection_to_clipboard`] (Ctrl+C) does use the
-    /// result, since a keyboard shortcut has no other feedback at all.
+    /// A no-op for empty text. A clipboard failure (no clipboard provider,
+    /// headless/sandboxed session, iTerm2 mouse capture conflicts) doesn't
+    /// break the visual selection, but we now surface the error to the user
+    /// on the status line as a UX fallback.
     fn copy_selection_to_clipboard(&self, text: &str) -> Result<(), arboard::Error> {
         if text.is_empty() {
             return Ok(());
@@ -4393,7 +4405,7 @@ impl TuiRenderer {
             let mut autocomplete = self.autocomplete_state.clone();
             let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
             vm.hovered_row = self.hovered_row.as_ref();
-            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
+            vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
@@ -4424,7 +4436,7 @@ impl TuiRenderer {
             expanded_lines.as_deref(),
         );
         vm.hovered_row = self.hovered_row.as_ref();
-        vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
+        vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
@@ -6666,6 +6678,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
+            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -11931,6 +11944,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
+            attachment_lines: &[],
             input_lines,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -12012,6 +12026,7 @@ mod tests {
                 hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
+                attachment_lines: &[],
                 input_lines: &input_lines,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12189,6 +12204,7 @@ mod tests {
                 hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
+                attachment_lines: &[],
                 input_lines: &draft,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12282,6 +12298,7 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
+            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,

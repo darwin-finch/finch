@@ -365,6 +365,12 @@ impl OutputManager {
         self.add_trait_message(msg);
     }
 
+    /// Write a user message with attached images
+    pub fn write_user_with_images(&self, content: impl Into<String>, images: Vec<String>) {
+        let msg = Arc::new(UserQueryMessage::new(content).with_images(images));
+        self.add_trait_message(msg);
+    }
+
     /// Project an attributed shared-Brain participant message. `invokes_model`
     /// distinguishes an addressed prompt from relay-only conversation.
     pub fn write_brain_participant(

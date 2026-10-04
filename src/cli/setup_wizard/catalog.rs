@@ -158,6 +158,12 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "",
         "get key at console.anthropic.com",
     ),
+    (
+        "claude-sub",
+        "Claude Pro subscription",
+        "claude-sonnet-5",
+        "device sign-in uses Claude Pro entitlement; not an Anthropic API key and not Console billing",
+    ),
     ("openai", "OpenAI API", "", "get key at platform.openai.com"),
     (
         "openai-compatible",
@@ -220,6 +226,10 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
             ..
         } => Some("grok-sub"),
         ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ClaudeSubscription,
+            ..
+        } => Some("claude-sub"),
+        ProviderEntry::Credentialed {
             provider: crate::config::CredentialProvider::Xai,
             ..
         }
@@ -262,7 +272,13 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
 pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
     !matches!(
         provider.to_ascii_lowercase().as_str(),
-        "chatgpt" | "grok-sub" | "gemini-sub" | "openai-compatible" | "ollama" | "finch"
+        "chatgpt"
+            | "grok-sub"
+            | "claude-sub"
+            | "gemini-sub"
+            | "openai-compatible"
+            | "ollama"
+            | "finch"
     )
 }
 
@@ -904,6 +920,25 @@ pub(super) fn provider_entry_from_remote_model(
                 project: None,
                 account: None,
                 required_scopes: crate::providers::chatgpt_required_scopes(),
+            },
+            model,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name,
+            reasoning_effort: None,
+        },
+        _ if provider.eq_ignore_ascii_case("claude-sub") => ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ClaudeSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "claude-sub:default".into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::ClaudeSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::claude_required_scopes(),
             },
             model,
             base_url: None,

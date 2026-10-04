@@ -9407,7 +9407,12 @@ async fn test_pending_user_message_without_tools_drains_on_streaming_complete() 
         .await;
 }
 
-type ObservedLlmQueryWithEcho = (Uuid, String, Vec<crate::providers::Message>, Option<String>);
+type ObservedLlmQueryWithEcho = (
+    Uuid,
+    String,
+    Vec<crate::providers::Message>,
+    Option<(String, Vec<String>)>,
+);
 
 /// Like `observe_llm_queries`, but also captures `pending_echo` -- the value
 /// `process_query_with_tools` uses to defer a query's scrollback echo until
