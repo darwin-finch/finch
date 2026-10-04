@@ -15,6 +15,11 @@ pub enum CommandOutput {
 #[derive(Debug)]
 pub enum Command {
     Help,
+    /// An unrecognised `/command`; carries the typed input, trimmed of
+    /// surrounding whitespace and trailing punctuation (for example
+    /// `/bogus`, or `/patterns invalid` when only the subcommand is wrong) so
+    /// the response can name it instead of dumping the full help screen.
+    Unknown(String),
     Quit,
     Metrics,
     Memory,
@@ -588,9 +593,9 @@ impl Command {
             }
         }
 
-        // Any unrecognized /command → show help instead of falling through to Forth/NL.
+        // Any unrecognized /command → name it instead of falling through to Forth/NL.
         if trimmed.starts_with('/') {
-            return Some(Command::Help);
+            return Some(Command::Unknown(trimmed.to_string()));
         }
 
         None
@@ -607,6 +612,7 @@ pub fn handle_command(
     match command {
         // Long-form outputs go to scrollback
         Command::Help => Ok(CommandOutput::Message(format_help())),
+        Command::Unknown(typed) => Ok(CommandOutput::Message(format_unknown_command(&typed))),
         Command::Metrics => Ok(CommandOutput::Message(format_metrics(metrics_logger)?)),
         Command::Training => Ok(CommandOutput::Message(format_training(router, validator)?)),
 
@@ -736,6 +742,12 @@ fn parse_word_id(s: &str) -> Option<usize> {
         .or_else(|| s.strip_prefix('w'))
         .unwrap_or(s);
     digits.parse::<usize>().ok()
+}
+
+/// One-line response for an unrecognised `/command`, naming the command the
+/// user typed instead of dumping the full `/help` screen.
+pub fn format_unknown_command(typed: &str) -> String {
+    format!("Unknown command: {typed}. Type /help for the list.")
 }
 
 pub fn format_help() -> String {
@@ -1150,7 +1162,7 @@ mod tests {
         ));
         assert!(matches!(
             Command::parse("/legacy-forth 2 3 + ."),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
         let help = format_help();
         assert!(help.contains("/forth <source>"));
@@ -1265,7 +1277,7 @@ mod tests {
             "/registry peer.example",
             "/gas-send peer.example 100",
         ] {
-            assert!(matches!(Command::parse(source), Some(Command::Help)));
+            assert!(matches!(Command::parse(source), Some(Command::Unknown(_))));
         }
     }
 
@@ -1281,7 +1293,7 @@ mod tests {
             "/eval-each",
             "/eval",
         ] {
-            assert!(matches!(Command::parse(source), Some(Command::Help)));
+            assert!(matches!(Command::parse(source), Some(Command::Unknown(_))));
         }
         assert!(matches!(Command::parse("/run"), Some(Command::StackRun)));
     }
@@ -1306,7 +1318,7 @@ mod tests {
             "/prove",
             "/box-diff",
         ] {
-            assert!(matches!(Command::parse(source), Some(Command::Help)));
+            assert!(matches!(Command::parse(source), Some(Command::Unknown(_))));
         }
     }
 
@@ -1314,7 +1326,7 @@ mod tests {
     fn irc_shaped_say_does_not_become_a_brain_relay() {
         assert!(matches!(
             Command::parse("/say #engineering hello"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
         assert!(matches!(
             Command::parse("/brain say #engineering hello"),
@@ -1371,7 +1383,7 @@ mod tests {
             "/connect peer.example:8000",
             "/disconnect peer.example",
         ] {
-            assert!(matches!(Command::parse(source), Some(Command::Help)));
+            assert!(matches!(Command::parse(source), Some(Command::Unknown(_))));
         }
     }
 
@@ -1502,23 +1514,24 @@ mod tests {
     #[test]
     fn rejects_legacy_brain_worker_commands() {
         // A Brain is a detachable session, not a spelling for a background
-        // task. Unknown `/brain` subcommands intentionally fall back to help.
+        // task. Unknown `/brain` subcommands intentionally fall back to the
+        // unknown-command response.
         assert!(matches!(
             Command::parse("/brain investigate flaky tests"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
     }
 
     #[test]
     fn test_removed_local_command_does_not_parse_or_appear_in_help() {
-        // An unrecognised slash command parses to `Command::Help` (the
+        // An unrecognised slash command parses to `Command::Unknown` (the
         // parser's normal unknown-command response), never to a command of
         // its own.
         for input in ["/local hi", "/local", "/local   what is 2+2?"] {
             let parsed = Command::parse(input);
             assert!(
-                matches!(parsed, Some(Command::Help)),
-                "the removed /local command must take the parser's unknown-command path (Help), like any other unrecognised slash command; input={input:?} parsed={parsed:?}"
+                matches!(parsed, Some(Command::Unknown(_))),
+                "the removed /local command must take the parser's unknown-command path (Unknown), like any other unrecognised slash command; input={input:?} parsed={parsed:?}"
             );
         }
         let help = format_help();
@@ -1576,14 +1589,14 @@ mod tests {
             _ => panic!("Expected PatternsRemove command"),
         }
 
-        // Test empty ID — catch-all returns Help (unknown /command with no ID)
+        // Test empty ID — catch-all returns Unknown (unknown /command with no ID)
         assert!(matches!(
             Command::parse("/patterns remove "),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
         assert!(matches!(
             Command::parse("/patterns rm "),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
     }
 
@@ -1627,17 +1640,17 @@ mod tests {
         assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));
         // The removed command spelling must not dispatch anything provider
         // related; only /provider remains. Unrecognized slash commands fall
-        // through to the help catch-all.
+        // through to the unknown-command catch-all.
         assert!(
-            matches!(Command::parse("/teacher"), Some(Command::Help)),
+            matches!(Command::parse("/teacher"), Some(Command::Unknown(_))),
             "the removed spelling must not dispatch a provider action"
         );
         assert!(
-            matches!(Command::parse("/teacher list"), Some(Command::Help)),
+            matches!(Command::parse("/teacher list"), Some(Command::Unknown(_))),
             "the removed spelling must not dispatch a provider action"
         );
         assert!(
-            matches!(Command::parse("/teacher grok"), Some(Command::Help)),
+            matches!(Command::parse("/teacher grok"), Some(Command::Unknown(_))),
             "the removed spelling must not switch providers"
         );
         assert!(matches!(
@@ -1732,18 +1745,18 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_patterns_command() {
-        // Invalid/incomplete /commands → catch-all returns Help
+        // Invalid/incomplete /commands → catch-all returns Unknown
         assert!(matches!(
             Command::parse("/patterns invalid"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
         assert!(matches!(
             Command::parse("/patterns remove"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         )); // Missing ID
         assert!(matches!(
             Command::parse("/patterns rm"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         )); // Missing ID
     }
 
@@ -1802,20 +1815,29 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_invalid() {
-        // Invalid subcommands → catch-all returns Help
+        // Invalid subcommands → catch-all returns Unknown
         assert!(matches!(
             Command::parse("/mcp invalid"),
-            Some(Command::Help)
+            Some(Command::Unknown(_))
         ));
         // Note: "/mcp " (with trailing space) is trimmed to "/mcp" which matches McpList
     }
 
     #[test]
     fn test_parse_mcp_case_sensitive() {
-        // Uppercase /commands don't match known commands → catch-all returns Help
-        assert!(matches!(Command::parse("/MCP list"), Some(Command::Help)));
-        assert!(matches!(Command::parse("/mcp LIST"), Some(Command::Help)));
-        assert!(matches!(Command::parse("/Mcp list"), Some(Command::Help)));
+        // Uppercase /commands don't match known commands → catch-all returns Unknown
+        assert!(matches!(
+            Command::parse("/MCP list"),
+            Some(Command::Unknown(_))
+        ));
+        assert!(matches!(
+            Command::parse("/mcp LIST"),
+            Some(Command::Unknown(_))
+        ));
+        assert!(matches!(
+            Command::parse("/Mcp list"),
+            Some(Command::Unknown(_))
+        ));
     }
 
     #[test]

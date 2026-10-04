@@ -3802,8 +3802,9 @@ fn run_samples() -> Result<()> {
 /// The `finch samples` REPL instructions, as data so a test can compile them.
 ///
 /// No `/lisp` prefix: there is no such command. `Command::parse`'s catch-all
-/// turns any unrecognised `/word` into `Command::Help`, so the first version of
-/// these lines printed the help screen. The REPL routes a bare leading `(` to
+/// treats any unrecognised `/word` as an unknown command (it used to turn it
+/// into `Command::Help`, so the first version of these lines printed the help
+/// screen). The REPL routes a bare leading `(` to
 /// the typed Lisp path -- `src/cli/repl_event/event_loop.rs` states the rule --
 /// so that is what these are.
 ///

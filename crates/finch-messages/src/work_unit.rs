@@ -1,19 +1,25 @@
 // WorkUnit - Unified message type for one AI generation turn
 //
 // A WorkUnit covers the full lifecycle of one AI response:
-//   1. Streaming phase  → animated "✦ Channeling… (Xs · thinking)" header
+//   1. Waiting and streaming → the turn indicator
+//      "✦ Channeling… (Xs · thinking)", then "(Xs · ↓ N tokens)"
 //   2. Tool call phase  → sub-rows with "⎿ bash(cmd)…" / "⎿ bash(cmd) N lines"
 //   3. Complete phase   → "⏺ response text" with collapsed sub-rows
 //
 // WorkUnit replaces the combination of StreamingResponseMessage + OperationMessage.
-// It lives in the shadow buffer, rendered by the blit cycle (~100ms tick).
-// The throb animation is TIME-DRIVEN — no external counter required.
+//
+// The indicator's wording and animation are not built here. A WorkUnit
+// carries the facts (verb, elapsed time, token count, whether it has been
+// handed a provider request) into its `WorkUnitView`; `finch-ui-model`'s
+// `turn_indicator` decides whether the unit owns the turn's indicator and
+// `TurnIndicatorView` is the one description every surface renders from —
+// the live transcript row, the pending node label, and `format()` below.
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Curated word list for the thinking spinner verb.
 const SPINNER_WORDS: &[&str] = &[
@@ -56,14 +62,44 @@ pub fn random_spinner_verb() -> &'static str {
 
 use super::{
     AgentActivityView, AgentToolView, ComponentView, Message, MessageId, MessageStatus, OutputVm,
-    ProgramSourceVm, SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView,
-    WorkUnitHead, WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
+    ProgramSourceVm, SayTurnStatus, SayTurnView, TurnIndicatorView, WorkRowPresentation,
+    WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation, WorkUnitView,
+    WorkUnitViewModel,
 };
 use finch_diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use finch_theme::{ColorScheme, MessageBand};
 
-// Animation frames: small → large → small (creates a "throb" pulse effect)
-const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
+/// Where a WorkUnit reads the time from.
+///
+/// Production units read the monotonic clock. A test hands in a clock it
+/// advances by hand, so the indicator's pulse frame and elapsed seconds are
+/// exact values rather than whatever the wall clock happened to say.
+#[derive(Clone)]
+pub struct WorkClock(Arc<dyn Fn() -> Duration + Send + Sync>);
+
+impl WorkClock {
+    /// The process's monotonic clock.
+    pub fn monotonic() -> Self {
+        let epoch = Instant::now();
+        Self(Arc::new(move || epoch.elapsed()))
+    }
+
+    /// A clock that reports whatever `now` returns: the time since an origin
+    /// of the caller's choosing.
+    pub fn from_fn(now: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    fn now(&self) -> Duration {
+        (self.0)()
+    }
+}
+
+impl Default for WorkClock {
+    fn default() -> Self {
+        Self::monotonic()
+    }
+}
 
 const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
@@ -172,8 +208,12 @@ struct WorkUnitInner {
     response_text: String,
     /// Approximate token count (accumulated from text deltas)
     token_count: usize,
-    /// True while in the "thinking" phase (before tokens arrive)
-    thinking: bool,
+    /// True once this unit has been handed a provider request: it is the
+    /// turn's generation unit and owns the turn indicator while in progress.
+    awaiting_provider: bool,
+    /// True when the turn was cancelled rather than failing on its own. A
+    /// cancelled unit is terminal and reads "Turn cancelled".
+    cancelled: bool,
     /// Sub-rows for tool calls
     rows: Vec<WorkRow>,
     /// Overall status of this unit
@@ -211,15 +251,16 @@ struct WorkUnitInner {
 
 /// A unified message covering one AI generation turn.
 ///
-/// Created once per turn — before streaming begins.
-/// Blit cycle calls `format()` every ~100ms; the throb icon is computed
-/// purely from `started_at.elapsed()`, no external counter needed.
+/// Created once per turn — before streaming begins. Each snapshot
+/// (`domain_view`) captures the unit's elapsed time from its clock; the
+/// indicator's pulse frame is a function of that captured value.
 pub struct WorkUnit {
     id: MessageId,
-    /// Verb shown in the animated header: "Channeling", "Building", etc.
+    /// Verb shown in the turn indicator: "Channeling", "Building", etc.
     verb: String,
-    /// When this unit started — drives time-driven animation
-    started_at: Instant,
+    clock: WorkClock,
+    /// The clock's reading when this unit started.
+    started_at: Duration,
     inner: Arc<RwLock<WorkUnitInner>>,
 }
 
@@ -244,14 +285,21 @@ impl WorkUnit {
     /// Reconstruct a WorkUnit with the stable ID carried by retained/canonical
     /// session data so disclosure state survives frontend reconnects.
     pub fn with_id(id: MessageId, verb: impl Into<String>) -> Self {
+        Self::with_clock(id, verb, WorkClock::monotonic())
+    }
+
+    /// Create a WorkUnit that reads elapsed time from `clock`.
+    pub fn with_clock(id: MessageId, verb: impl Into<String>, clock: WorkClock) -> Self {
         Self {
             id,
             verb: verb.into(),
-            started_at: Instant::now(),
+            started_at: clock.now(),
+            clock,
             inner: Arc::new(RwLock::new(WorkUnitInner {
                 response_text: String::new(),
                 token_count: 0,
-                thinking: false,
+                awaiting_provider: false,
+                cancelled: false,
                 rows: Vec::new(),
                 status: MessageStatus::InProgress,
                 requested_terminal: None,
@@ -278,18 +326,19 @@ impl WorkUnit {
             .token_count += count;
     }
 
-    /// Set the "thinking" flag shown in the animated status line.
-    ///
-    /// Issue #1063 audit: zero callers outside this crate's own
-    /// `test_set_thinking`; narrowed from `pub`. Note for the record: the
-    /// in-progress header's own "· thinking" text is actually driven by
-    /// `token_count == 0` (see `format`), not by this `thinking` field, so
-    /// this setter currently has no live production reader either way.
-    pub(crate) fn set_thinking(&self, thinking: bool) {
+    /// How long this unit has run, by its clock.
+    fn elapsed(&self) -> Duration {
+        self.clock.now().saturating_sub(self.started_at)
+    }
+
+    /// Record that this unit has been handed a provider request. From here
+    /// until it completes or fails it is the turn's generation unit: it owns
+    /// the turn indicator while it waits, streams, and runs tool rounds.
+    pub fn begin_provider_request(&self) {
         self.inner
             .write()
             .unwrap_or_else(|p| p.into_inner())
-            .thinking = thinking;
+            .awaiting_provider = true;
     }
 
     /// Set the final response text (call after streaming ends).
@@ -433,9 +482,7 @@ impl WorkUnit {
         Some(SayTurnView {
             message_id: self.id,
             vm: inner.say_vm.as_ref()?.clone(),
-            elapsed: inner
-                .elapsed_at_finish
-                .unwrap_or_else(|| self.started_at.elapsed()),
+            elapsed: inner.elapsed_at_finish.unwrap_or_else(|| self.elapsed()),
         })
     }
 
@@ -685,7 +732,7 @@ impl WorkUnit {
         } else {
             WorkRowStatus::Complete(summary)
         };
-        let elapsed = self.started_at.elapsed();
+        let elapsed = self.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         for row in &mut inner.rows {
             if matches!(row.status, WorkRowStatus::Running) {
@@ -846,12 +893,12 @@ impl WorkUnit {
                 .into_iter()
                 .map(|line| finch_diff::sanitize_terminal(&line)),
         );
-        finish_requested_terminal(&mut inner, self.started_at.elapsed());
+        finish_requested_terminal(&mut inner, self.elapsed());
     }
 
     /// Mark the whole WorkUnit complete (stops animation, shows final content).
     pub fn set_complete(&self) {
-        let elapsed = self.started_at.elapsed();
+        let elapsed = self.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if inner
             .agent_activity
@@ -875,7 +922,7 @@ impl WorkUnit {
 
     /// Mark the whole WorkUnit failed.
     pub fn set_failed(&self) {
-        let elapsed = self.started_at.elapsed();
+        let elapsed = self.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if inner
             .agent_activity
@@ -887,6 +934,35 @@ impl WorkUnit {
         }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
+    }
+
+    /// Give a unit that is still in progress its terminal state because its
+    /// turn was cancelled. Returns whether this call settled it.
+    ///
+    /// A unit that already completed or failed is left exactly as it is, so
+    /// a cancel that loses the race with a completion changes nothing, and a
+    /// second cancel is a no-op. The unit stops owning the turn indicator at
+    /// once, even when a child agent is still running and the terminal
+    /// status itself has to wait for it.
+    pub fn set_cancelled(&self) -> bool {
+        let elapsed = self.elapsed();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress || inner.cancelled {
+            return false;
+        }
+        inner.cancelled = true;
+        inner.awaiting_provider = false;
+        if inner
+            .agent_activity
+            .iter()
+            .any(|row| matches!(row.status, WorkRowStatus::Running))
+        {
+            inner.requested_terminal = Some(MessageStatus::Failed);
+            return true;
+        }
+        inner.elapsed_at_finish = Some(elapsed);
+        inner.status = MessageStatus::Failed;
+        true
     }
 }
 
@@ -916,7 +992,7 @@ impl Message for WorkUnit {
 
     fn format(&self, colors: &ColorScheme) -> String {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        let elapsed = self.started_at.elapsed();
+        let elapsed = self.elapsed();
 
         match inner.status {
             MessageStatus::InProgress => {
@@ -996,24 +1072,22 @@ impl Message for WorkUnit {
                     return out;
                 }
 
-                // Time-driven throb: frame changes every 200 ms, no external counter
-                let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
-                let icon = THROB_FRAMES[frame_idx];
-                let secs = elapsed.as_secs();
-
-                let stats = if inner.token_count == 0 {
-                    format!("{} · thinking", fmt_elapsed(secs))
-                } else {
-                    format!(
-                        "{} · ↓ {} tokens",
-                        fmt_elapsed(secs),
-                        fmt_tokens(inner.token_count)
-                    )
+                // The plain-text lowering of the turn indicator. Its marker,
+                // wording, and stats come from the one shared description;
+                // only the fixed colours of this non-terminal path are local.
+                let indicator = TurnIndicatorView {
+                    verb: self.verb.clone(),
+                    elapsed,
+                    token_count: inner.token_count,
                 };
-
                 let mut out = format!(
-                    "{}{}{}  {}… ({}){}",
-                    CYAN, icon, RESET, self.verb, stats, RESET
+                    "{}{}{}  {} ({}){}",
+                    CYAN,
+                    indicator.marker(),
+                    RESET,
+                    indicator.activity(),
+                    indicator.stats(),
+                    RESET
                 );
 
                 for (row_index, row) in inner.rows.iter().enumerate() {
@@ -1212,6 +1286,7 @@ impl WorkUnit {
             response_text: inner.response_text.clone(),
             transient_status: inner.transient_status.clone(),
             progress: inner.progress,
+            cancelled: inner.cancelled,
         }
     }
 
@@ -1235,8 +1310,12 @@ impl WorkUnit {
                 response_text: inner.response_text.clone(),
                 transient_status: inner.transient_status.clone(),
                 progress: inner.progress,
+                cancelled: inner.cancelled,
             },
             verb: self.verb.clone(),
+            elapsed: inner.elapsed_at_finish.unwrap_or_else(|| self.elapsed()),
+            token_count: inner.token_count,
+            awaiting_provider: inner.awaiting_provider,
             rows: inner
                 .rows
                 .iter()
@@ -1877,15 +1956,6 @@ mod tests {
         assert_eq!(inner.token_count, 0);
     }
 
-    #[test]
-    fn test_set_thinking() {
-        let wu = WorkUnit::new("X");
-        wu.set_thinking(true);
-        assert!(wu.inner.read().unwrap().thinking);
-        wu.set_thinking(false);
-        assert!(!wu.inner.read().unwrap().thinking);
-    }
-
     // ── Response text ────────────────────────────────────────────────────────
 
     #[test]
@@ -2085,6 +2155,115 @@ mod tests {
         assert!(canonical.contains("result"));
     }
 
+    /// A clock that never advances, so a pending unit's indicator text is
+    /// one exact string.
+    fn stopped_clock() -> WorkClock {
+        WorkClock::from_fn(|| Duration::ZERO)
+    }
+
+    /// The view carries what the indicator needs — elapsed time, token count,
+    /// and whether the unit was handed a provider request — and `format()`
+    /// lowers the same description the live transcript renders.
+    #[test]
+    fn test_view_carries_the_indicator_facts_and_format_lowers_the_same_description() {
+        let now = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let reading = Arc::clone(&now);
+        let unit = WorkUnit::with_clock(
+            MessageId::new(),
+            "Channeling",
+            WorkClock::from_fn(move || *reading.lock().unwrap()),
+        );
+        unit.begin_provider_request();
+        unit.add_tokens("three whole words");
+        *now.lock().unwrap() = Duration::from_millis(18_250);
+
+        let view = unit.domain_view(&colors());
+        assert_eq!(
+            (view.elapsed, view.token_count, view.awaiting_provider),
+            (Duration::from_millis(18_250), 3, true),
+            "invariant: the view carries the unit's elapsed time, token count, and \
+             provider-request state; view={view:?}"
+        );
+        let indicator = finch_ui_model::turn_indicator(&view)
+            .expect("an in-progress generation unit owns the turn indicator");
+        assert_eq!(
+            indicator.plain_text(),
+            "\u{2733} Channeling\u{2026} (18s \u{b7} \u{2193} 3 tokens)",
+            "invariant: 18.25 s selects pulse frame 91 % 4 = 3; indicator={indicator:?}"
+        );
+        let formatted = finch_ui_model::strip_ansi(&unit.format(&colors()));
+        assert_eq!(
+            formatted.split_whitespace().collect::<Vec<_>>().join(" "),
+            indicator.plain_text(),
+            "invariant: the non-terminal `format()` text is the same indicator \
+             description, differing only in spacing and colour; formatted={formatted:?}"
+        );
+
+        unit.set_complete();
+        *now.lock().unwrap() = Duration::from_secs(60);
+        let finished = unit.domain_view(&colors());
+        assert_eq!(
+            (finished.elapsed, finch_ui_model::turn_indicator(&finished)),
+            (Duration::from_millis(18_250), None),
+            "invariant: a completed unit's elapsed time is frozen at its finish and it \
+             owns no indicator; view={finished:?}"
+        );
+    }
+
+    /// A cancelled unit is terminal exactly once: it stops owning the turn
+    /// indicator, reads `Turn cancelled`, freezes its elapsed time, and
+    /// neither a second cancel nor a cancel that lost the race with a
+    /// completion changes anything.
+    #[test]
+    fn test_cancel_settles_an_in_progress_unit_exactly_once() {
+        let now = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let reading = Arc::clone(&now);
+        let unit = WorkUnit::with_clock(
+            MessageId::new(),
+            "Channeling",
+            WorkClock::from_fn(move || *reading.lock().unwrap()),
+        );
+        unit.begin_provider_request();
+        *now.lock().unwrap() = Duration::from_secs(4);
+
+        assert!(unit.set_cancelled(), "the first cancel settles the unit");
+        *now.lock().unwrap() = Duration::from_secs(30);
+        assert!(!unit.set_cancelled(), "a second cancel is a no-op");
+
+        let view = unit.domain_view(&colors());
+        let row = try_project_for_test(&unit, &colors()).unwrap();
+        assert_eq!(
+            (
+                view.head.status,
+                view.elapsed,
+                finch_ui_model::turn_indicator(&view),
+                row.label.as_str(),
+            ),
+            (
+                MessageStatus::Failed,
+                Duration::from_secs(4),
+                None,
+                "\u{2298} Turn cancelled",
+            ),
+            "invariant: a cancelled unit is terminal, frozen at its cancel time, owns no \
+             indicator, and says it was cancelled; view={view:?} row={row:?}"
+        );
+
+        let finished = WorkUnit::new("Channeling");
+        finished.set_response("done");
+        finished.set_complete();
+        assert!(
+            !finished.set_cancelled(),
+            "a cancel that arrives after completion must not change the unit"
+        );
+        let view = finished.domain_view(&colors());
+        assert_eq!(
+            (view.head.status, view.head.cancelled),
+            (MessageStatus::Complete, false),
+            "invariant: a completed unit stays completed; view={view:?}"
+        );
+    }
+
     #[test]
     fn test_assistant_prose_with_words_is_labelled_by_status_glyph_alone() {
         let unit = WorkUnit::new("Channeling");
@@ -2136,12 +2315,12 @@ mod tests {
     #[test]
     fn test_a_wordless_row_with_a_useless_verb_still_names_its_state() {
         for verb in ["", "   ", "\t"] {
-            let pending = WorkUnit::new(verb);
+            let pending = WorkUnit::with_clock(MessageId::new(), verb, stopped_clock());
             let row = try_project_for_test(&pending, &colors()).unwrap();
             assert_eq!(
-                row.label, "\u{25cb} Working\u{2026}",
+                row.label, "\u{2726} Working\u{2026} (0s \u{b7} thinking)",
                 "invariant: a verb that carries no words falls back to words, never \
-                 to a bare glyph — an unreadable row is the defect this label \
+                 to a bare marker — an unreadable row is the defect this label \
                  exists to prevent (#350, Key Principle 5); verb={verb:?}; \
                  projected row: {row:?}"
             );
@@ -2150,13 +2329,14 @@ mod tests {
 
     #[test]
     fn test_wordless_assistant_row_still_names_its_state_in_words() {
-        let pending = WorkUnit::new("Channeling");
+        let pending = WorkUnit::with_clock(MessageId::new(), "Channeling", stopped_clock());
         let row = try_project_for_test(&pending, &colors()).unwrap();
         assert_eq!(
-            row.label, "\u{25cb} Channeling\u{2026}",
+            row.label, "\u{2726} Channeling\u{2026} (0s \u{b7} thinking)",
             "invariant: an assistant row with no words of its own yet keeps readable \
-             text naming what is happening — a bare glyph is not an accessible \
-             interface (#350, Key Principle 5); projected row: {row:?}"
+             text naming what is happening — the turn indicator's verb, elapsed time, \
+             and `thinking`; a bare marker is not an accessible interface (#350, \
+             Key Principle 5); projected row: {row:?}"
         );
         assert!(
             row.body.is_empty(),
@@ -2675,7 +2855,7 @@ mod tests {
         let f = wu.format(&colors());
         assert!(f.contains("Channeling"), "should contain verb: {}", f);
         assert!(f.contains("thinking"), "should contain 'thinking': {}", f);
-        let has_throb = THROB_FRAMES.iter().any(|fr| f.contains(fr));
+        let has_throb = ["✦", "✳", "✼"].iter().any(|fr| f.contains(fr));
         assert!(has_throb, "should contain a throb frame: {}", f);
     }
 
