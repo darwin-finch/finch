@@ -42,7 +42,13 @@ pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
 // Finch's product version. This is the released Codex version corresponding to
 // the public source revision pinned above. Update both pins together after a
 // protocol audit and live acceptance run.
-const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.151.0";
+//
+// 0.160.0 (released 2026-10-01) is ahead of the audited revision above: the
+// catalog served to 0.151.0 did not include GPT-6.1 Sol (released
+// 2026-09-29), so a config naming it failed with "does not advertise the
+// configured model". The request shape is still the one audited at 0.151.0;
+// the revision pin moves when that audit is redone.
+const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.160.0";
 const FINCH_CHATGPT_USER_AGENT: &str = concat!(
     "finch/",
     env!("CARGO_PKG_VERSION"),
@@ -172,12 +178,32 @@ impl fmt::Display for SubscriptionCatalogNoSelectableModel {
 
 impl std::error::Error for SubscriptionCatalogNoSelectableModel {}
 
+/// The configured model is not one the signed-in account offers for API use.
+/// Carries both sides so the message says what to change it to.
 #[derive(Debug)]
-struct SubscriptionRequestedModelUnavailable;
+struct SubscriptionRequestedModelUnavailable {
+    requested: String,
+    advertised: Vec<String>,
+}
+
+impl SubscriptionRequestedModelUnavailable {
+    fn new(requested: &str, catalog: &Catalog) -> Self {
+        Self {
+            requested: requested.to_string(),
+            advertised: catalog.models.keys().cloned().collect(),
+        }
+    }
+}
 
 impl fmt::Display for SubscriptionRequestedModelUnavailable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ChatGPT account does not advertise the configured supported model")
+        write!(
+            formatter,
+            "ChatGPT account does not advertise the configured model '{}'; \
+             this account offers: {}. Switch with /model or change the provider's model in setup.",
+            self.requested,
+            self.advertised.join(", ")
+        )
     }
 }
 
@@ -719,7 +745,7 @@ impl ChatGptSubscriptionProvider {
         let selected = catalog
             .models
             .get(&request.model)
-            .ok_or(SubscriptionRequestedModelUnavailable)?;
+            .ok_or_else(|| SubscriptionRequestedModelUnavailable::new(&request.model, &catalog))?;
         if !catalog_model_matches_request(selected, &request.model) {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
         }
@@ -747,10 +773,9 @@ impl ChatGptSubscriptionProvider {
                     .refresh_after_unauthorized(&lease.generation, &cancel)
                     .await?;
                 catalog = self.account_catalog(&lease, &cancel).await?;
-                let refreshed_model = catalog
-                    .models
-                    .get(&request.model)
-                    .ok_or(SubscriptionRequestedModelUnavailable)?;
+                let refreshed_model = catalog.models.get(&request.model).ok_or_else(|| {
+                    SubscriptionRequestedModelUnavailable::new(&request.model, &catalog)
+                })?;
                 if !catalog_model_matches_request(refreshed_model, &request.model) {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
