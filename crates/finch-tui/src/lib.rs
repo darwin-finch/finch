@@ -1614,9 +1614,9 @@ pub struct TuiRenderer {
     // painted frame plus in-flight toggles until the next projection.
     accordion: AccordionState,
 
-    // Bounded child viewports for tool-use output rows (#656): per-row scroll
-    // offsets, the hit regions of the last painted frame, and the focused
-    // expanded surface. Presentation-only, like the accordion state.
+    // Bounded compact windows for tool-use output rows (#656): the click hit
+    // regions of the last painted frame, and the focused expanded surface.
+    // Presentation-only, like the accordion state.
     tool_viewports: ToolViewportState,
     pub(crate) expanded_tool: Option<ExpandedToolView>,
     diagnostic_console: diagnostic_console::DiagnosticConsoleState,
@@ -7160,6 +7160,14 @@ mod tests {
             terminal.diagnostic()
         );
 
+        let commits_before = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        )
+        .emit
+        .len();
+        let printed_before = renderer.printed_ids.clone();
+
         // Wheel up with the pointer on the block.
         let mut bytes = Vec::new();
         let claimed = renderer.handle_mouse_to(
@@ -7194,6 +7202,21 @@ mod tests {
             "INVARIANT: the wheel keeps mouse tracking held and emits nothing itself; \
              tracking was {:?}, bytes {bytes:?}",
             renderer.mouse_tracking
+        );
+
+        let commits_after = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        )
+        .emit
+        .len();
+        assert!(
+            commits_before == commits_after && printed_before == renderer.printed_ids,
+            "INVARIANT: a wheel over a tool-output block must not make a canonical commit \
+             eligible or change what was written to native scrollback; eligible commits \
+             before={commits_before}, after={commits_after}; printed ids before \
+             {printed_before:?}, after {:?}",
+            renderer.printed_ids
         );
 
         // Wheel down twice with the pointer on the block's status row: the
@@ -7231,20 +7254,62 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let (mut renderer, mut terminal, output_row) =
             painted_long_conversation_with_truncated_tool_output();
-        // F6 until the block has focus.
-        for _ in 0..8 {
-            if renderer.accordion.focused.as_ref() == Some(&output_row) {
-                break;
-            }
+        let (_, status_row) = compact_block_rows(&terminal);
+        let hint = terminal.row(usize::from(status_row));
+        // The row the `> ` focus marker is on, read off the screen.
+        let marked_row = |terminal: &VtOracle| {
+            (0..LONG_CONVERSATION_HEIGHT)
+                .map(|row| terminal.row(row))
+                .find(|row| row.starts_with("> "))
+                .unwrap_or_default()
+        };
+
+        // One F6 from idle lands on the first expandable row on screen, the
+        // tool group, not on the block: the hint must not promise that a
+        // single F6 followed by Enter expands the output (Enter there would
+        // collapse the whole group instead).
+        assert!(
+            renderer.handle_accordion_key(key(KeyCode::F(6))),
+            "F6 must move the accordion focus"
+        );
+        repaint_long_conversation(&mut renderer, &mut terminal);
+        let after_one_press = marked_row(&terminal);
+        assert_vt(
+            after_one_press.contains("Tools (1 call)")
+                && !hint.contains("F6 then Enter")
+                && hint.contains("F6 until > is on Output, then Enter")
+                && !hint.contains("↑/↓ scroll"),
+            &format!(
+                "INVARIANT: the status row's keyboard instruction must be literally true. \
+                 One F6 puts the focus marker on {after_one_press:?}, not on the Output row, \
+                 so the hint must say to repeat F6 until the marker is on Output and must \
+                 not read as one F6 then Enter, nor promise inline scrolling; hint was \
+                 {hint:?}"
+            ),
+            &terminal,
+        );
+
+        // Follow the hint literally: F6 until the marker is on Output.
+        let mut presses = 1;
+        while !marked_row(&terminal).contains("Output (40)") {
             assert!(
-                renderer.handle_accordion_key(key(KeyCode::F(6))),
-                "F6 must move the accordion focus"
+                presses < 8 && renderer.handle_accordion_key(key(KeyCode::F(6))),
+                "F6 must reach the Output row within the rows on screen; after {presses} \
+                 presses the marker was on {:?}\n{}",
+                marked_row(&terminal),
+                terminal.diagnostic()
             );
+            presses += 1;
+            repaint_long_conversation(&mut renderer, &mut terminal);
         }
-        assert_eq!(
-            renderer.accordion.focused.as_ref(),
-            Some(&output_row),
-            "F6 reaches the tool-output block"
+        assert_vt(
+            presses > 1 && renderer.accordion.focused.as_ref() == Some(&output_row),
+            &format!(
+                "INVARIANT: the `> ` marker on the Output row means the block holds keyboard \
+                 focus; it took {presses} F6 presses, focus was {:?}",
+                renderer.accordion.focused
+            ),
+            &terminal,
         );
 
         assert!(
@@ -7277,14 +7342,12 @@ mod tests {
             &terminal,
         );
 
-        // The status row names the route just taken and the key about to be
-        // pressed, and promises no inline scrolling.
-        let (_, status_row) = compact_block_rows(&terminal);
-        let hint = terminal.row(usize::from(status_row));
-        assert!(
-            hint.contains("F6 then Enter") && !hint.contains("↑/↓ scroll"),
-            "INVARIANT: the compact block's status row names the real keyboard route to the \
-             expanded view and promises no inline scrolling; row was {hint:?}"
+        // The marker is still on Output after the page keys, so Enter is the
+        // key the hint says it is.
+        assert_vt(
+            marked_row(&terminal).contains("Output (40)"),
+            "INVARIANT: the focus marker is on the Output row when Enter is pressed",
+            &terminal,
         );
 
         // Enter opens the expanded view; it scrolls there.

@@ -12,7 +12,8 @@
 //! The control is reusable: it applies to every row of
 //! [`NodeRole::ToolOutput`], not to one tool name. Activation (a click on the
 //! window's cells, matched against the hit regions of the last painted frame,
-//! or Enter/Space with the row focused by F6) opens a focused expanded surface
+//! or Enter/Space once repeated F6 has put the focus marker on the result's
+//! `Output (N)` header) opens a focused expanded surface
 //! that owns its own scrolling; closing it leaves disclosure grouping and
 //! focus exactly as they were.
 //!
@@ -243,17 +244,26 @@ fn window(
 }
 
 /// The expand affordance printed on every truncated compact window: the two
-/// real ways to open the expanded view. `F6` is the key that moves keyboard
-/// focus onto the result; `Enter` alone would submit the composer.
-pub const EXPAND_HINT: &str = "click, or F6 then Enter, to expand";
+/// real ways to open the expanded view.
+///
+/// The keyboard route is spelled out because one `F6` is not enough: each
+/// press moves the `> ` focus marker to the next expandable row painted on
+/// screen, starting from the first, so the reader repeats it until the marker
+/// sits on this result's `Output (N)` header and only then presses `Enter`
+/// (on any other row `Enter` toggles that row instead; with no row focused it
+/// submits the composer).
+pub const EXPAND_HINT: &str = "open: click or F6 until > is on Output, then Enter";
 
-/// Plain-text state description for one compact tool-result window: how many
-/// leading lines are shown, the total, and how to expand.
+/// Plain-text state description for one compact tool-result window: how to
+/// expand it, then how many leading lines are shown and the total. The
+/// instruction comes first so that a terminal too narrow for the whole row
+/// cuts the counter, whose total the `Output (N)` header above also carries,
+/// rather than the instruction; it survives whole down to 60 columns.
 fn status_text(shown: usize, total: usize) -> String {
     if shown == 0 {
-        return format!("… 0 lines visible of {total} — {EXPAND_HINT}");
+        return format!("… {EXPAND_HINT} · 0 of {total} shown");
     }
-    format!("… lines 1–{shown} of {total} — {EXPAND_HINT}")
+    format!("… {EXPAND_HINT} · lines 1–{shown} of {total}")
 }
 
 /// Truncate one body line to the terminal width so the bounded window cannot
@@ -439,13 +449,6 @@ mod tests {
              text (lines 1–3 of 40: three window rows plus the status row inside the \
              4-row bound and 40 output lines); status was {status:?}"
         );
-        assert_eq!(
-            status.trim(),
-            "… lines 1–3 of 40 — click, or F6 then Enter, to expand",
-            "INVARIANT: the status row names the two real ways to open the expanded view \
-             (a click on the block; F6 to focus it, then Enter) and promises no inline \
-             scrolling, which the compact window does not have"
-        );
         assert!(
             !bounded.iter().any(|line| line.text.contains("line 39")),
             "INVARIANT: output past the bound must not leak into the compact projection"
@@ -456,6 +459,41 @@ mod tests {
             None,
             "kind cache is only populated by the hit-region rebuild, not by projection"
         );
+    }
+
+    #[test]
+    fn test_status_row_keeps_the_whole_expand_instruction_at_sixty_columns() {
+        // INVARIANT: the instruction comes first and the line counter last, so
+        // a narrower terminal cuts the counter (the Output header above still
+        // carries the total) and never the way to open the result.
+        const INSTRUCTION: &str = "open: click or F6 until > is on Output, then Enter";
+        for total in [40, 400, 40_000] {
+            let (_row_id, projected) = projected_tool_group(total);
+            for width in [80, 60] {
+                let bounded = project(projected.clone(), width, DEFAULT_TOOL_OUTPUT_ROWS);
+                let status = body_lines_of(&bounded)
+                    .last()
+                    .map(|line| line.text.clone())
+                    .unwrap_or_default();
+                assert!(
+                    status.contains(INSTRUCTION)
+                        && shadow_buffer::physical_rows(&status, width) == 1,
+                    "INVARIANT: at {width} columns with {total} output lines the status row \
+                     must carry the whole expand instruction on one row; status was {status:?}"
+                );
+            }
+            let at_eighty = project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
+            let status = body_lines_of(&at_eighty)
+                .last()
+                .map(|line| line.text.trim().to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                status,
+                format!("… {INSTRUCTION} · lines 1–3 of {total}"),
+                "INVARIANT: at 80 columns the status row is whole: instruction, then the \
+                 visible range and total"
+            );
+        }
     }
 
     #[test]
@@ -808,8 +846,8 @@ mod tests {
             .map(|line| line.text.clone())
             .unwrap_or_default();
         assert!(
-            status.contains("0 lines visible of 2"),
-            "INVARIANT: a viewport with 0 visible body lines shows 0 lines visible instead \
+            status.contains("0 of 2 shown"),
+            "INVARIANT: a viewport with 0 visible body lines says 0 of 2 shown instead \
              of a negative range; status was {:?}",
             status
         );

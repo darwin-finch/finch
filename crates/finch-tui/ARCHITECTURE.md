@@ -150,7 +150,8 @@ path; the dialog-option `markdown` preview keeps its own rendering.
   the output: each body line is truncated to the terminal width, so the bound is
   a hard row bound; when lines are left out, one plain-text status row names the
   visible range, the total, and how to open the rest
-  (`… lines 1–3 of 40 — click, or F6 then Enter, to expand`).
+  (`… open: click or F6 until > is on Output, then Enter · lines 1–3 of 40`;
+  instruction first, so a narrow terminal cuts the counter, not the way in).
 - The compact window has no scroll position and claims no wheel or scroll key
   (#1590, a block under the pointer swallowed the wheel halfway through
   scrolling the conversation): a wheel anywhere in the transcript claim, a
@@ -159,8 +160,9 @@ path; the dialog-option `markdown` preview keeps its own rendering.
   claimed by nobody. `ToolViewportState` holds only the hit regions, rebuilt
   from physical-row geometry after every frame and resize, mirroring the
   accordion; they serve click-to-expand and hover.
-- Click on the control's cells, or Enter/Space with the row focused via F6,
-  opens a focused expanded surface (title bar, scrolled body, plain-text
+- Click on the control's cells, or Enter/Space once the `> ` focus marker is on
+  the result's `Output (N)` header (F6 moves it one expandable on-screen row per
+  press, so it usually takes several), opens a focused expanded surface (title bar, scrolled body, plain-text
   footer) at the first line. Up/Down/PageUp/PageDown/Home/End and the wheel
   scroll it, Esc/q/Enter close it, and closing leaves disclosure grouping and
   focus as they were. Ctrl+C and other unclaimed keys fall through to the input
@@ -184,6 +186,6 @@ Virtual row helpers:
 - `crates/finch-tui/src/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
 - `crates/finch-tui/src/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `crates/finch-tui/src/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
-- `crates/finch-tui/src/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
+- `crates/finch-tui/src/tool_viewport.rs` — bounded tool-result controls: compact window projection, click hit regions, expanded surface
 - `crates/finch-tui/src/dialog.rs` — Dialog state machine and approval control pin
 - `crates/finch-tui/src/wizard_host.rs` — the setup wizard's widget host: view snapshot, claiming plan, shadow-buffer row-diff blit (#812)
