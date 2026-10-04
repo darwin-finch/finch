@@ -34,7 +34,7 @@ const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const DEFAULT_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_CACHE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const CLOCK_SKEW_SECONDS: i64 = 60;
+const CLOCK_SKEW_SECONDS: i64 = 300;
 const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 /// Bounded, single-flight verifier for the exact pinned xAI issuer.
@@ -237,25 +237,30 @@ impl GrokJwksVerifier {
         let mut keys = BTreeMap::new();
         for key in document.keys {
             if key.kty != "EC"
-                || key.crv != "P-256"
+                || key.crv.as_deref() != Some("P-256")
                 || key.key_use.as_deref().is_some_and(|value| value != "sig")
                 || key.alg.as_deref().is_some_and(|value| value != "ES256")
             {
-                bail!("xAI JWKS contains a key outside the pinned ES256 signing contract");
+                continue;
             }
             if key.kid.trim().is_empty() || key.kid.len() > 256 || keys.contains_key(&key.kid) {
-                bail!("xAI JWKS contains a missing, duplicate, or ambiguous key identifier");
+                continue;
             }
-            let x = decode_key_component(&key.x, "x")?;
-            let y = decode_key_component(&key.y, "y")?;
+            let Some(x_val) = key.x else { continue };
+            let Some(y_val) = key.y else { continue };
+            let Ok(x) = decode_key_component(&x_val, "x") else { continue };
+            let Ok(y) = decode_key_component(&y_val, "y") else { continue };
             if x.len() != 32 || y.len() != 32 {
-                bail!("xAI JWKS P-256 coordinates are invalid");
+                continue;
             }
             let mut uncompressed = Vec::with_capacity(65);
             uncompressed.push(0x04);
             uncompressed.extend_from_slice(&x);
             uncompressed.extend_from_slice(&y);
             keys.insert(key.kid, Arc::new(VerifiedEcKey { uncompressed }));
+        }
+        if keys.is_empty() {
+            bail!("xAI JWKS contains no supported keys");
         }
         Ok((keys, cache_lifetime(cache_control.as_deref())))
     }
@@ -447,9 +452,9 @@ struct Jwk {
     #[serde(default)]
     alg: Option<String>,
     kid: String,
-    crv: String,
-    x: String,
-    y: String,
+    crv: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
 }
 
 #[derive(Deserialize)]
