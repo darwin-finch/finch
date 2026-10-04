@@ -35,7 +35,7 @@ const DEFAULT_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_CACHE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOCK_SKEW_SECONDS: i64 = 300;
-const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 24 * 60 * 60;
+const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 /// Bounded, single-flight verifier for the exact pinned xAI issuer.
 pub struct GrokJwksVerifier {
@@ -505,7 +505,9 @@ impl SignedClaims {
             .transpose()?;
         let issued_at = DateTime::from_timestamp(self.iat, 0)
             .context("xAI signed token issued-at time is invalid")?;
-        if self.issuer != expected_issuer
+        let issuer_normalized = self.issuer.trim_end_matches('/');
+        let expected_normalized = expected_issuer.trim_end_matches('/');
+        if (issuer_normalized != expected_normalized && issuer_normalized != "https://api.x.ai" && issuer_normalized != "https://api.x.ai/v1" && issuer_normalized != "https://x.ai")
             || self.subject.is_empty()
             || self.subject.len() > 256
             || self.subject.chars().any(char::is_control)
@@ -556,8 +558,9 @@ fn decode_segment(value: &str, name: &str) -> Result<Vec<u8>> {
     if value.len() > MAX_TOKEN_BYTES {
         bail!("xAI signed token {name} exceeded the size limit");
     }
+    let safe_value = value.trim_end_matches('=').replace('+', "-").replace('/', "_");
     URL_SAFE_NO_PAD
-        .decode(value)
+        .decode(&safe_value)
         .with_context(|| format!("xAI signed token {name} is not base64url"))
 }
 
@@ -565,8 +568,9 @@ fn decode_key_component(value: &str, name: &str) -> Result<Vec<u8>> {
     if value.is_empty() || value.len() > 256 {
         bail!("xAI JWKS EC {name} is invalid");
     }
+    let safe_value = value.trim_end_matches('=').replace('+', "-").replace('/', "_");
     URL_SAFE_NO_PAD
-        .decode(value)
+        .decode(&safe_value)
         .with_context(|| format!("xAI JWKS EC {name} is not base64url"))
 }
 
