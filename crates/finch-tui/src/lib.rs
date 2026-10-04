@@ -4100,7 +4100,10 @@ impl TuiRenderer {
                 return true;
             }
             let text = selection::selected_text(&self.selection_index, active);
-            let _ = self.copy_selection_to_clipboard(&text);
+            if let Err(error) = self.copy_selection_to_clipboard(&text) {
+                tracing::debug!(%error, "Mouse selection copy failed");
+                self.set_operation_status("Copy failed (Hold Option ⌥ to use terminal selection)");
+            }
             self.live_area_dirty = true;
             return true;
         }
@@ -4119,14 +4122,10 @@ impl TuiRenderer {
 
     /// System clipboard copy (#221): the same `arboard` crate already used
     /// for the OAuth device-code copy (`grok_auth.rs`, `chatgpt_auth.rs`).
-    /// A no-op for empty text. On a mouse-release copy, the caller (below)
-    /// discards the result deliberately: a clipboard failure (no clipboard
-    /// provider, a headless/sandboxed session) never breaks the selection
-    /// itself — it stays highlighted either way, so the text is still
-    /// readable and selectable again on the next drag, with no status-line
-    /// noise for a gesture that has no explicit confirmation step anyway.
-    /// [`Self::copy_active_selection_to_clipboard`] (Ctrl+C) does use the
-    /// result, since a keyboard shortcut has no other feedback at all.
+    /// A no-op for empty text. A clipboard failure (no clipboard provider,
+    /// headless/sandboxed session, iTerm2 mouse capture conflicts) doesn't
+    /// break the visual selection, but we now surface the error to the user
+    /// on the status line as a UX fallback.
     fn copy_selection_to_clipboard(&self, text: &str) -> Result<(), arboard::Error> {
         if text.is_empty() {
             return Ok(());
