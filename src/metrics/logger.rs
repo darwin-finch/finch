@@ -9,6 +9,14 @@ use std::path::PathBuf;
 
 use super::types::{RequestMetric, WireAdherenceMetric};
 
+/// Appends and reads source-free metric rows under one directory.
+///
+/// The directory is always chosen by the caller. Nothing in this type, or in
+/// the code that records through it, derives a path from the home directory:
+/// production passes `Config::metrics_dir`, and a test passes its own
+/// temporary directory (issue #1629, test runs filling the user's real
+/// `/metrics` report with fixture providers).
+#[derive(Debug, Clone)]
 pub struct MetricsLogger {
     metrics_dir: PathBuf,
 }
@@ -24,6 +32,11 @@ impl MetricsLogger {
         })?;
 
         Ok(Self { metrics_dir })
+    }
+
+    /// The directory this logger appends to and reads from.
+    pub fn metrics_dir(&self) -> &std::path::Path {
+        &self.metrics_dir
     }
 
     /// Log a request metric to today's JSONL file
