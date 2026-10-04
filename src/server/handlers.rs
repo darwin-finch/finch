@@ -546,6 +546,26 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
     }
     if let BrainEventKind::TaskListReplaced { tasks } = &kind {
         validate_submitted_brain_tasks(tasks)?;
+        // A running turn replaces its own task list (`todo_write`) through
+        // this path. The lane below is held until that turn returns, so
+        // queueing behind it made the tool wait for itself until it timed out
+        // (#1585). The store serialises the append and assigns its sequence
+        // under its own lock, and a run's context reads the task list at or
+        // before its request, so a replacement between a turn's request and
+        // result needs no lane, like the approval decision below.
+        let accepted = match mutation {
+            Some(receipt) => {
+                store
+                    .push_idempotent(name, &attachment.subject, kind, receipt)?
+                    .event
+            }
+            None => store.push(name, &attachment.subject, kind)?,
+        };
+        return Ok(BrainSubmissionOutcome {
+            accepted,
+            run: None,
+            result: None,
+        });
     }
     if let BrainEventKind::ApprovalDecided {
         request_seq,

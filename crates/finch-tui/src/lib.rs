@@ -2095,6 +2095,8 @@ impl TuiRenderer {
         self.mark_dirty();
     }
 
+    /// The composer's current draft text, lines joined by `\n`. Paired with
+    /// [`Self::restore_input_draft`] by callers that put text back ahead of it.
     pub fn get_input_draft(&self) -> String {
         self.input_textarea.lines().join("\n")
     }

@@ -3368,6 +3368,46 @@ impl EventLoop {
         }
     }
 
+    /// Move the queued turns the user typed back into the composer draft, in
+    /// the order they were queued and ahead of whatever is being typed right
+    /// now, and return the sentence that says so for the caller's own
+    /// transcript row (`None` when nothing was returned).
+    ///
+    /// Used when the turn the queue was waiting behind ends without a
+    /// boundary that could consume it (provider failure, Escape): the text
+    /// must neither run later out of order nor disappear (#1587, queued
+    /// messages lost when a turn ends early). The draft is read and
+    /// replaced under one renderer lock, so a keystroke cannot land between
+    /// the two and be overwritten. The caller repaints.
+    ///
+    /// Only entries queued with `echo = true` go back. That flag is what
+    /// marks text the transcript would show as the user's own message; an
+    /// unechoed entry is a prompt Finch generated (the `/plan` vocabulary
+    /// synthesis), which the user never saw and must not find in their
+    /// input box, so it is discarded with the turn it was queued behind.
+    async fn return_pending_queries_to_draft(&mut self) -> Option<String> {
+        let mut lines: Vec<String> = self
+            .take_pending_queries()
+            .into_iter()
+            .filter_map(|(text, echo, _chat_only)| echo.then_some(text))
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let returned = lines.len();
+        let mut tui = self.tui_renderer.lock().await;
+        let current_draft = tui.get_input_draft();
+        if !current_draft.is_empty() {
+            lines.push(current_draft);
+        }
+        tui.restore_input_draft(&lines.join("\n"));
+        Some(if returned == 1 {
+            "1 queued message returned to the input box".to_string()
+        } else {
+            format!("{returned} queued messages returned to the input box")
+        })
+    }
+
     /// Write the scrollback echo for queued turns being merged onto an
     /// in-flight tool round's continuation (`finalize_tool_execution`).
     ///

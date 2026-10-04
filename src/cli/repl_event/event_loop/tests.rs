@@ -9779,6 +9779,372 @@ async fn test_cancel_does_not_refire_queued_turn_out_of_order() {
         .await;
 }
 
+/// Queue two turns behind an in-flight tool round, the fixture every
+/// "queued text must end up in exactly one place" test below starts from.
+async fn queue_two_turns_behind_tool_round(event_loop: &mut EventLoop) {
+    for input in ["first queued", "second queued"] {
+        event_loop
+            .handle_event(ReplEvent::UserInput {
+                input: input.to_string(),
+            })
+            .await
+            .expect("queuing a user turn during ExecutingTools must succeed");
+    }
+    assert_eq!(
+        event_loop
+            .pending_queries
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["first queued", "second queued"],
+        "the fixture must hold both turns on pending_queries in FIFO order"
+    );
+}
+
+/// Text unique to the prompt `/plan` generates from the vocabulary stack.
+const GENERATED_PROMPT_NEEDLE: &str = "building a vocabulary";
+
+/// Queue a prompt the user never typed, through the real `/plan` path: with
+/// two words on the vocabulary stack it synthesises a prompt and submits it
+/// with `echo = false`, which queues behind the in-flight turn.
+async fn queue_generated_plan_prompt(event_loop: &mut EventLoop) {
+    event_loop
+        .stack
+        .lock()
+        .await
+        .extend(["alpha".to_string(), "beta".to_string()]);
+    event_loop
+        .handle_event(ReplEvent::UserInput {
+            input: "/plan".to_string(),
+        })
+        .await
+        .expect("/plan with two stacked words must queue its synthesis prompt");
+    let last = event_loop.pending_queries.back();
+    assert!(
+        matches!(last, Some((text, false, true)) if text.contains(GENERATED_PROMPT_NEEDLE)),
+        "the fixture must hold the generated prompt, unechoed, at the back of the queue; last={last:?}"
+    );
+}
+
+/// The transcript must say in words how many queued messages went back to
+/// the input box; the composer changing is not announced on its own.
+fn assert_return_announced_once(
+    output: &crate::cli::output_manager::OutputManager,
+    expected: &str,
+) {
+    let rows: Vec<String> = output
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect();
+    let announcing = rows
+        .iter()
+        .filter(|row| row.contains("returned to the input box"))
+        .collect::<Vec<_>>();
+    assert!(
+        announcing.len() == 1 && announcing[0].contains(expected),
+        "exactly one transcript row must state {expected:?}; rows={rows:?}"
+    );
+}
+
+/// How many times `needle` appears across the composer draft, the
+/// provider-visible conversation, and the transcript's rows: the three
+/// places queued text can end up.
+async fn queued_text_locations(
+    event_loop: &EventLoop,
+    output: &crate::cli::output_manager::OutputManager,
+    needle: &str,
+) -> (usize, usize, usize) {
+    let draft = event_loop.tui_renderer.lock().await.get_input_draft();
+    let in_conversation = event_loop
+        .conversation
+        .read()
+        .await
+        .get_messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| {
+            matches!(block, crate::providers::ContentBlock::Text { text } if text.contains(needle))
+        })
+        .count();
+    let in_transcript = output
+        .get_messages()
+        .iter()
+        .filter(|message| message.content().contains(needle))
+        .count();
+    (
+        draft.matches(needle).count(),
+        in_conversation,
+        in_transcript,
+    )
+}
+
+/// The issue's literal scenario (#1587, queued messages lost when a tool
+/// fails or times out): a tool that times out still completes its round, so
+/// text queued behind it must ride the continuation, once, in order.
+#[tokio::test]
+async fn test_queued_messages_ride_the_continuation_when_the_tool_times_out() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let tool_id = "call_times_out";
+            let (query_id, round_token) =
+                start_executing_tools_query(&mut event_loop, tool_id).await;
+            queue_two_turns_behind_tool_round(&mut event_loop).await;
+
+            event_loop
+                .handle_event(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id: tool_id.to_string(),
+                    result: Err(anyhow::anyhow!(
+                        "Tool execution timed out after 30 seconds. \
+                         Try restarting or check daemon logs for errors."
+                    )),
+                })
+                .await
+                .expect("a timed-out tool result must still finalize its round");
+
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                    .await
+                    .expect("a timed-out tool round must still send its continuation (hung waiting for LlmRequest::Query)")
+                    .expect("the LLM request channel must stay open for the continuation");
+            assert_eq!(
+                observed.0, query_id,
+                "the continuation must reuse the in-flight query; observed={observed:?}"
+            );
+            let last = observed
+                .2
+                .last()
+                .expect("the continuation must carry the tool-result turn");
+            assert!(
+                matches!(
+                    last.content.as_slice(),
+                    [
+                        crate::providers::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error: Some(true)
+                        },
+                        crate::providers::ContentBlock::Text { text: first },
+                        crate::providers::ContentBlock::Text { text: second },
+                    ] if tool_use_id == tool_id
+                        && content.contains("timed out")
+                        && first == "first queued"
+                        && second == "second queued"
+                ),
+                "the provider must see the timeout result followed by both queued turns in order; last={last:?}"
+            );
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "the tool-round boundary must consume the queue; queued={:?}",
+                event_loop.pending_queries
+            );
+            for needle in ["first queued", "second queued"] {
+                let found = queued_text_locations(&event_loop, &output, needle).await;
+                assert_eq!(
+                    found,
+                    (0, 1, 1),
+                    "after a timed-out tool, {needle:?} must be in the conversation once and echoed once, and not in the draft; (draft, conversation, transcript)={found:?}"
+                );
+            }
+        })
+        .await;
+}
+
+/// A provider error in the middle of a tool round ends the turn with no
+/// later boundary to consume the queue. Every queued turn must come back to
+/// the composer once, in order, ahead of the text being typed, and none may
+/// run or be echoed.
+#[tokio::test]
+async fn test_provider_failure_mid_round_returns_queued_messages_ahead_of_the_draft() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let (query_id, _round_token) =
+                start_executing_tools_query(&mut event_loop, "call_provider_fails").await;
+            queue_two_turns_behind_tool_round(&mut event_loop).await;
+            queue_generated_plan_prompt(&mut event_loop).await;
+            event_loop
+                .tui_renderer
+                .lock()
+                .await
+                .restore_input_draft("half typed");
+
+            event_loop
+                .handle_event(ReplEvent::QueryFailed {
+                    query_id,
+                    error: "provider returned 529 overloaded".to_string(),
+                    generator_name: None,
+                })
+                .await
+                .expect("QueryFailed must dispatch");
+
+            let draft = event_loop.tui_renderer.lock().await.get_input_draft();
+            assert_eq!(
+                draft, "first queued\nsecond queued\nhalf typed",
+                "a failed turn must return every queued message to the composer in order, keeping the text being typed after them; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "returned turns must leave the queue so they cannot also run later; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                None,
+                "the failed turn must release the active-query slot"
+            );
+            // A late completion for the failed query must not start anything.
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: "late prose".to_string(),
+                })
+                .await
+                .expect("a late StreamingComplete for the failed query must be discarded");
+            assert!(
+                observed_rx.try_recv().is_err(),
+                "a failed turn must not dispatch a queued turn to the provider"
+            );
+            for needle in ["first queued", "second queued"] {
+                let found = queued_text_locations(&event_loop, &output, needle).await;
+                assert_eq!(
+                    found,
+                    (1, 0, 0),
+                    "after a provider failure, {needle:?} must be in the draft exactly once and nowhere else; (draft, conversation, transcript)={found:?}"
+                );
+            }
+            let generated =
+                queued_text_locations(&event_loop, &output, GENERATED_PROMPT_NEEDLE).await;
+            assert_eq!(
+                generated,
+                (0, 0, 0),
+                "a prompt the user never typed must not be put in the composer, sent, or echoed; (draft, conversation, transcript)={generated:?}"
+            );
+            assert_return_announced_once(&output, "2 queued messages returned to the input box");
+        })
+        .await;
+}
+
+/// Escape during a tool round must not throw away what the user queued
+/// behind it. The queued turns must not run (#463, queued turn must not
+/// execute out of order after cancel); they return to the composer once, in
+/// order, ahead of the text being typed.
+#[tokio::test]
+async fn test_cancel_returns_queued_messages_ahead_of_the_draft() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let (query_id, _round_token) =
+                start_executing_tools_query(&mut event_loop, "call_cancelled").await;
+            queue_two_turns_behind_tool_round(&mut event_loop).await;
+            queue_generated_plan_prompt(&mut event_loop).await;
+            event_loop
+                .tui_renderer
+                .lock()
+                .await
+                .restore_input_draft("half typed");
+
+            event_loop
+                .handle_event(ReplEvent::CancelQuery)
+                .await
+                .expect("CancelQuery must dispatch");
+
+            let draft = event_loop.tui_renderer.lock().await.get_input_draft();
+            assert_eq!(
+                draft, "first queued\nsecond queued\nhalf typed",
+                "Escape must return every queued message to the composer in order, keeping the text being typed after them; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "returned turns must leave the queue so they cannot re-fire after a later turn; queued={:?}",
+                event_loop.pending_queries
+            );
+            // The cancelled provider may still report either terminal event.
+            event_loop
+                .handle_event(ReplEvent::QueryFailed {
+                    query_id,
+                    error: "request aborted".to_string(),
+                    generator_name: None,
+                })
+                .await
+                .expect("a late QueryFailed for the cancelled query must be discarded");
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: "late prose".to_string(),
+                })
+                .await
+                .expect("a late StreamingComplete for the cancelled query must be discarded");
+            assert!(
+                observed_rx.try_recv().is_err(),
+                "a cancelled turn must not dispatch a queued turn to the provider"
+            );
+            for needle in ["first queued", "second queued", "half typed"] {
+                let found = queued_text_locations(&event_loop, &output, needle).await;
+                assert_eq!(
+                    found,
+                    (1, 0, 0),
+                    "after Escape, {needle:?} must be in the draft exactly once and nowhere else, including after the cancelled provider's late terminal events; (draft, conversation, transcript)={found:?}"
+                );
+            }
+            let generated =
+                queued_text_locations(&event_loop, &output, GENERATED_PROMPT_NEEDLE).await;
+            assert_eq!(
+                generated,
+                (0, 0, 0),
+                "a prompt the user never typed must not be put in the composer, sent, or echoed; (draft, conversation, transcript)={generated:?}"
+            );
+            assert_return_announced_once(&output, "2 queued messages returned to the input box");
+        })
+        .await;
+}
+
+/// The ordinary Escape case: the composer is empty when the cancel is
+/// handled (Escape only requests a cancel from an empty draft), so the
+/// returned messages are the whole draft.
+#[tokio::test]
+async fn test_cancel_with_empty_draft_returns_queued_messages_in_order() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let (_query_id, _round_token) =
+                start_executing_tools_query(&mut event_loop, "call_cancelled_empty").await;
+            queue_two_turns_behind_tool_round(&mut event_loop).await;
+
+            event_loop
+                .handle_event(ReplEvent::CancelQuery)
+                .await
+                .expect("CancelQuery must dispatch");
+
+            let draft = event_loop.tui_renderer.lock().await.get_input_draft();
+            assert_eq!(
+                draft, "first queued\nsecond queued",
+                "Escape on an empty composer must leave exactly the queued messages in it, in order; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert!(
+                event_loop.pending_queries.is_empty() && observed_rx.try_recv().is_err(),
+                "returned turns must neither stay queued nor be dispatched; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_return_announced_once(&output, "2 queued messages returned to the input box");
+        })
+        .await;
+}
+
 fn completed_execution_outcome(output: &str) -> crate::runtime::ExecutionOutcome {
     crate::runtime::ExecutionOutcome {
         execution_id: uuid::Uuid::new_v4(),
