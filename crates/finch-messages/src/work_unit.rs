@@ -2008,7 +2008,11 @@ mod tests {
         let running = try_project_for_test(&unit, &colors()).unwrap();
         assert!(running.default_open);
         assert!(running.children[0].default_open);
-        assert_eq!(running.children[0].children.len(), 0);
+        assert_eq!(running.children[0].children.len(), 1);
+        assert_eq!(
+            running.children[0].children[0].role,
+            finch_ui_model::NodeRole::Input
+        );
 
         unit.fail_row(row, "catalog unavailable");
         unit.set_failed();
@@ -2229,7 +2233,7 @@ mod tests {
         let output = projected.children[0]
             .children
             .iter()
-            .find(|child| child.role == finch_ui_model::NodeRole::ToolCall)
+            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
             .unwrap();
         assert!(output.default_open);
     }
@@ -2641,7 +2645,7 @@ mod tests {
         let output = call
             .children
             .iter()
-            .find(|child| child.role == finch_ui_model::NodeRole::ToolCall)
+            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
             .unwrap_or_else(|| {
                 panic!("loop body must be an expandable output child; call={call:?}")
             });

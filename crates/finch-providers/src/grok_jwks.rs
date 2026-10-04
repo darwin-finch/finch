@@ -34,8 +34,8 @@ const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const DEFAULT_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_CACHE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const CLOCK_SKEW_SECONDS: i64 = 300;
-const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 30 * 24 * 60 * 60;
+const CLOCK_SKEW_SECONDS: i64 = 60;
+const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 /// Bounded, single-flight verifier for the exact pinned xAI issuer.
 pub struct GrokJwksVerifier {
@@ -237,30 +237,25 @@ impl GrokJwksVerifier {
         let mut keys = BTreeMap::new();
         for key in document.keys {
             if key.kty != "EC"
-                || key.crv.as_deref() != Some("P-256")
+                || key.crv != "P-256"
                 || key.key_use.as_deref().is_some_and(|value| value != "sig")
                 || key.alg.as_deref().is_some_and(|value| value != "ES256")
             {
-                continue;
+                bail!("xAI JWKS contains a key outside the pinned ES256 signing contract");
             }
             if key.kid.trim().is_empty() || key.kid.len() > 256 || keys.contains_key(&key.kid) {
-                continue;
+                bail!("xAI JWKS contains a missing, duplicate, or ambiguous key identifier");
             }
-            let Some(x_val) = key.x else { continue };
-            let Some(y_val) = key.y else { continue };
-            let Ok(x) = decode_key_component(&x_val, "x") else { continue };
-            let Ok(y) = decode_key_component(&y_val, "y") else { continue };
+            let x = decode_key_component(&key.x, "x")?;
+            let y = decode_key_component(&key.y, "y")?;
             if x.len() != 32 || y.len() != 32 {
-                continue;
+                bail!("xAI JWKS P-256 coordinates are invalid");
             }
             let mut uncompressed = Vec::with_capacity(65);
             uncompressed.push(0x04);
             uncompressed.extend_from_slice(&x);
             uncompressed.extend_from_slice(&y);
             keys.insert(key.kid, Arc::new(VerifiedEcKey { uncompressed }));
-        }
-        if keys.is_empty() {
-            bail!("xAI JWKS contains no supported keys");
         }
         Ok((keys, cache_lifetime(cache_control.as_deref())))
     }
@@ -452,9 +447,9 @@ struct Jwk {
     #[serde(default)]
     alg: Option<String>,
     kid: String,
-    crv: Option<String>,
-    x: Option<String>,
-    y: Option<String>,
+    crv: String,
+    x: String,
+    y: String,
 }
 
 #[derive(Deserialize)]
@@ -505,9 +500,7 @@ impl SignedClaims {
             .transpose()?;
         let issued_at = DateTime::from_timestamp(self.iat, 0)
             .context("xAI signed token issued-at time is invalid")?;
-        let issuer_normalized = self.issuer.trim_end_matches('/');
-        let expected_normalized = expected_issuer.trim_end_matches('/');
-        if (issuer_normalized != expected_normalized && issuer_normalized != "https://api.x.ai" && issuer_normalized != "https://api.x.ai/v1" && issuer_normalized != "https://x.ai")
+        if self.issuer != expected_issuer
             || self.subject.is_empty()
             || self.subject.len() > 256
             || self.subject.chars().any(char::is_control)
@@ -558,9 +551,8 @@ fn decode_segment(value: &str, name: &str) -> Result<Vec<u8>> {
     if value.len() > MAX_TOKEN_BYTES {
         bail!("xAI signed token {name} exceeded the size limit");
     }
-    let safe_value = value.trim_end_matches('=').replace('+', "-").replace('/', "_");
     URL_SAFE_NO_PAD
-        .decode(&safe_value)
+        .decode(value)
         .with_context(|| format!("xAI signed token {name} is not base64url"))
 }
 
@@ -568,9 +560,8 @@ fn decode_key_component(value: &str, name: &str) -> Result<Vec<u8>> {
     if value.is_empty() || value.len() > 256 {
         bail!("xAI JWKS EC {name} is invalid");
     }
-    let safe_value = value.trim_end_matches('=').replace('+', "-").replace('/', "_");
     URL_SAFE_NO_PAD
-        .decode(&safe_value)
+        .decode(value)
         .with_context(|| format!("xAI JWKS EC {name} is not base64url"))
 }
 

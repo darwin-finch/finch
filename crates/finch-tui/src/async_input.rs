@@ -8,13 +8,6 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::{ComposerDispatch, TuiRenderer};
 
-/// Add an image attachment without changing the provider-visible text draft.
-fn attach_pasted_image(tui: &mut TuiRenderer, base64_data: String, media_type: String) {
-    tui.image_counter += 1;
-    tui.pending_images
-        .push((tui.image_counter, base64_data, media_type));
-}
-
 // ---------------------------------------------------------------------------
 // InputEvent — discriminated input events sent to the event loop
 // ---------------------------------------------------------------------------
@@ -417,7 +410,19 @@ fn handle_composer_shortcuts(tui: &mut TuiRenderer, key: KeyEvent) -> (bool, Opt
     } else if COMPOSER_PASTE_IMAGE.owns(&key) {
         // Cmd+V on macOS / Ctrl+V: check clipboard for images
         if let Some((b64, media_type)) = try_grab_clipboard_image() {
-            attach_pasted_image(tui, b64, media_type);
+            tui.image_counter += 1;
+            let idx = tui.image_counter;
+            tui.pending_images.push((idx, b64, media_type));
+
+            // Insert marker into textarea
+            let marker = format!("[Image #{}]", idx);
+            let current = tui.input_textarea.lines().join("\n");
+            let new_text = if current.trim().is_empty() {
+                marker
+            } else {
+                format!("{}\n{}", current, marker)
+            };
+            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&new_text);
             (true, None)
         } else {
             // No image - pass V to textarea for text paste
@@ -844,29 +849,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn test_attach_pasted_image_keeps_provider_visible_draft_unchanged() {
-        let mut renderer = headless_renderer();
-        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("describe this");
-
-        attach_pasted_image(
-            &mut renderer,
-            "encoded-image".to_string(),
-            "image/png".to_string(),
-        );
-
-        assert_eq!(
-            renderer.input_textarea.lines(),
-            ["describe this"],
-            "an image attachment must not insert a synthetic marker into the provider-visible draft"
-        );
-        assert_eq!(
-            renderer.pending_images,
-            vec![(1, "encoded-image".to_string(), "image/png".to_string())],
-            "the attachment must retain its index, base64 data, and media type"
-        );
-    }
-
-    #[test]
     fn quit_message_uses_the_ipc_control_wire() {
         let encoded = encode_quit_message();
         let mut cursor = encoded.as_slice();
@@ -1239,15 +1221,16 @@ mod tests {
                     assert_eq!(submitted, None, "{why}: paste never submits a command");
                     assert!(
                         modified,
-                        "{why}: Ctrl+V must request a repaint for an image attachment or \
-                         pass text paste through to the composer"
+                        "{why}: Ctrl+V always modifies the draft (image marker or \
+                         text paste fallback)"
                     );
-                    if !renderer.pending_images.is_empty() {
+                    let pasted_image = !renderer.pending_images.is_empty();
+                    if pasted_image {
                         let draft = renderer.input_textarea.lines().join("");
                         assert!(
-                            draft.is_empty(),
-                            "{why}: a clipboard image must not add a provider-visible marker \
-                             to the draft; draft={draft:?}"
+                            draft.contains("[Image #"),
+                            "{why}: a clipboard image must leave its [Image #N] \
+                             marker in the draft; draft={draft:?}"
                         );
                     }
                     let cmd_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);

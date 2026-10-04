@@ -66,7 +66,6 @@ impl fmt::Display for GrayDim {
 pub struct UserQueryMessage {
     id: MessageId,
     content: String,
-    images: Vec<String>,
 }
 
 impl UserQueryMessage {
@@ -74,13 +73,7 @@ impl UserQueryMessage {
         Self {
             id: MessageId::new(),
             content: content.into(),
-            images: Vec::new(),
         }
-    }
-
-    pub fn with_images(mut self, images: Vec<String>) -> Self {
-        self.images = images;
-        self
     }
 }
 
@@ -95,7 +88,6 @@ impl Message for UserQueryMessage {
             subject: None,
             content_lines: self.content.lines().map(str::to_owned).collect(),
             participant_index: None,
-            images: self.images.clone(),
         }))
     }
 
@@ -183,7 +175,6 @@ impl Message for BrainParticipantMessage {
             subject: Some(self.subject.clone()),
             content_lines: self.content.lines().map(str::to_owned).collect(),
             participant_index: Some(self.palette_index()),
-            images: Vec::new(),
         }))
     }
 

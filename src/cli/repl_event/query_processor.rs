@@ -1767,7 +1767,7 @@ pub(crate) async fn process_query_with_tools(
     // current question in the provider request (`inject_recall_prefix`).
     // `None` for tool continuations, queued turns that already echoed
     // immediately, and any turn that must not echo at all.
-    pending_echo: Option<(String, Vec<String>)>,
+    pending_echo: Option<String>,
 ) {
     tracing::debug!(
         "process_query_with_tools starting for query_id: {:?}",
@@ -1979,12 +1979,8 @@ pub(crate) async fn process_query_with_tools(
         // is: ordering "before the response" only holds because nothing
         // async separates this call from the WorkUnit created for the
         // response a few lines below.
-        if let Some((text, images)) = pending_echo {
-            if images.is_empty() {
-                output_manager.write_user(text);
-            } else {
-                output_manager.write_user_with_images(text, images);
-            }
+        if let Some(text) = pending_echo {
+            output_manager.write_user(text);
         }
         // This execution contract is required on *every* provider inference,
         // including internal empty-query continuations after tool results.
@@ -8555,7 +8551,7 @@ mod tests {
         main_gen: Arc<dyn Generator>,
         summary_gen: Arc<dyn Generator>,
         summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
     ) -> SummarizedTurnHarness {
         let colors = crate::theme::ColorScheme::default();
         let output = Arc::new(OutputManager::new(colors.clone()));
@@ -8646,7 +8642,7 @@ mod tests {
         memory_system: Arc<finch_memory::MemorySystem>,
         recall_k: usize,
         memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
     ) -> SummarizedTurnHarness {
         spawn_turn_with_memory_and_window(
             conversation,
@@ -8676,7 +8672,7 @@ mod tests {
         memory_system: Arc<finch_memory::MemorySystem>,
         recall_k: usize,
         memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
         max_verbatim: usize,
     ) -> SummarizedTurnHarness {
         let colors = crate::theme::ColorScheme::default();
@@ -8778,7 +8774,7 @@ mod tests {
         memory_system: Arc<finch_memory::MemorySystem>,
         recall_k: usize,
         memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
     ) -> SummarizedTurnHarness {
         let colors = crate::theme::ColorScheme::default();
         let output = Arc::new(OutputManager::new(colors.clone()));
@@ -9473,7 +9469,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
-            Some((query_text.to_string(), Vec::new())),
+            Some(query_text.to_string()),
         )
         .await;
         turn.task.await.expect("query task panicked");
@@ -9541,7 +9537,7 @@ mod tests {
             Arc::clone(&memory),
             3,
             crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
-            Some((query_text.to_string(), Vec::new())),
+            Some(query_text.to_string()),
         )
         .await;
         turn.task.await.expect("query task panicked");
@@ -9658,7 +9654,7 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn Generator>,
             Arc::clone(&summary_gen) as Arc<dyn Generator>,
             Arc::clone(&summary_cache),
-            Some((query_text.to_string(), Vec::new())),
+            Some(query_text.to_string()),
         )
         .await;
         harness.task.await.expect("query task panicked");

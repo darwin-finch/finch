@@ -177,7 +177,6 @@ impl AccordionState {
             body_of: None,
             component_owned: false,
             single_focus_target: false,
-            image_attachment: None,
         });
         if !expanded {
             return;
@@ -200,7 +199,6 @@ impl AccordionState {
                 body_of: expandable.then(|| row.id.clone()),
                 component_owned: false,
                 single_focus_target: false,
-                image_attachment: None,
             });
         }
         for child in &row.children {

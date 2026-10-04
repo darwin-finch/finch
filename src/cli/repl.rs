@@ -5479,9 +5479,7 @@ mod model_download_status_tests {
     }
 }
 
-pub async fn register_co_forth_tool_words(
-    runtime: &crate::runtime::ProgramRuntime,
-) -> anyhow::Result<()> {
+pub async fn register_co_forth_tool_words(runtime: &crate::runtime::ProgramRuntime) -> anyhow::Result<()> {
     let out = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
             language: finch_programs::ProgramLanguage::Forth,

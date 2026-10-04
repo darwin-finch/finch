@@ -598,8 +598,6 @@ async fn countdown_status(lifetime: Duration, cancel: CancellationToken) {
 }
 
 fn open_browser(url: &str) -> Result<()> {
-    #[cfg(test)]
-    return Ok(());
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg("--").arg(url).status();
     #[cfg(target_os = "linux")]

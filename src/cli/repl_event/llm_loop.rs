@@ -238,7 +238,7 @@ impl LlmLoop {
         no_tools: bool,
         publication: Option<tokio::sync::oneshot::Receiver<()>>,
         spawned: Option<tokio::sync::oneshot::Sender<()>>,
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
     ) {
         // Reset the execution graph on fresh queries (not tool continuations).
         if !query.is_empty() {

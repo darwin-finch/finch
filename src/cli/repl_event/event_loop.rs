@@ -2814,14 +2814,14 @@ impl EventLoop {
                         ReplEvent::NamedBrainProgramFinished { .. } => "NamedBrainProgramFinished",
                         ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
                     };
-                    tracing::trace!("[EVENT_LOOP] Received event: {}", event_name);
-                    tracing::trace!("Received event: {:?}", event);
+                    tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
+                    tracing::debug!("Received event: {:?}", event);
                     if matches!(event, ReplEvent::Shutdown) {
                         should_exit = true;
                     } else {
-                        tracing::trace!("[EVENT_LOOP] Handling {}...", event_name);
+                        tracing::debug!("[EVENT_LOOP] Handling {}...", event_name);
                         self.handle_event(event).await?;
-                        tracing::trace!("[EVENT_LOOP] {} handled", event_name);
+                        tracing::debug!("[EVENT_LOOP] {} handled", event_name);
                     }
                 }
 
@@ -3440,12 +3440,7 @@ impl EventLoop {
         // question -- see `inject_recall_prefix`). The input box itself
         // clears independently, in the input task, so this defers only the
         // scrollback row, not the user's felt responsiveness.
-        let pending_echo = if echo {
-            let b64_images = pending_images.iter().map(|(_, b64)| b64.clone()).collect();
-            Some((input.clone(), b64_images))
-        } else {
-            None
-        };
+        let pending_echo = if echo { Some(input.clone()) } else { None };
 
         // Create a new query
         let conversation_snapshot = self.conversation.read().await.snapshot();

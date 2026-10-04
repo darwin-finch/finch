@@ -1215,7 +1215,7 @@ async fn main() -> Result<()> {
             if temp_config.features.debug_logging {
                 // Set RUST_LOG to debug if not already set by user
                 if std::env::var("RUST_LOG").is_err() {
-                    std::env::set_var("RUST_LOG", "debug,hyper=info,hyper_util=info,h2=info,rustls=info,reqwest=info");
+                    std::env::set_var("RUST_LOG", "debug");
                 }
             }
         }
@@ -2005,7 +2005,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         if temp_config.features.debug_logging {
             // Set RUST_LOG to debug if not already set by user
             if std::env::var("RUST_LOG").is_err() {
-                std::env::set_var("RUST_LOG", "debug,hyper=info,hyper_util=info,h2=info,rustls=info,reqwest=info");
+                std::env::set_var("RUST_LOG", "debug");
             }
         }
     }
@@ -5077,10 +5077,11 @@ mod build_query_tool_executor_tests2 {
     async fn test_co_forth_executable_words() {
         let runtime = finch::runtime::ProgramRuntime::new();
         let _ = finch::cli::register_co_forth_tool_words(&runtime).await;
-        let outcome = execute_one_shot_wire_source(&runtime, "code_outline \"src/main.rs\"")
-            .await
-            .unwrap();
-
+        let outcome = execute_one_shot_wire_source(
+            &runtime,
+            "code_outline \"src/main.rs\"",
+        ).await.unwrap();
+        
         let diags = format!("{:?}", outcome.diagnostics);
         assert!(!diags.contains("E-LINK-002"));
     }

@@ -53,7 +53,7 @@ pub enum ComponentView {
     /// content is fully known at construction — there is nothing to page
     /// through, so this component carries no Input/Output split and no
     /// bounded/scrollable child viewport (the tool-result control in
-    /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolCall`
+    /// `finch-tui`'s `tool_viewport.rs` applies to `NodeRole::ToolOutput`
     /// rows only, which this component never emits). Each row's recalled
     /// text is collapsed behind its identity/summary line by default and
     /// expands on click (#1235), the same component-owned disclosure
@@ -169,8 +169,6 @@ pub struct UserTurnView {
     pub subject: Option<String>,
     pub content_lines: Vec<String>,
     pub participant_index: Option<usize>,
-    #[serde(default)]
-    pub images: Vec<String>,
 }
 
 /// The style roles the component renderers read (stage 4, #1141).
@@ -589,17 +587,6 @@ fn user_turn_lines(
                 line.clone(),
                 style.clone(),
             )]));
-        }
-    }
-
-    if !view.images.is_empty() {
-        for b64 in &view.images {
-            let mut line = RenderedTranscriptLine::from_spans(vec![Span::styled(
-                "[Image attachment: natively rendered in iTerm2]",
-                style.clone().with_dim(true),
-            )]);
-            line.image_attachment = Some(b64.clone());
-            lines.push(line);
         }
     }
 
@@ -1418,10 +1405,10 @@ mod tests {
         }
     }
 
-    /// A memory row's body lines carry no [`NodeRole::ToolCall`] tagging
+    /// A memory row's body lines carry no [`NodeRole::ToolOutput`] tagging
     /// (indeed, no role at all) and no `body_of` owner — the bounded
     /// tool-result viewport in `finch-tui`'s `tool_viewport.rs` keys
-    /// exclusively off `role == Some(NodeRole::ToolCall)`, so a memory row
+    /// exclusively off `role == Some(NodeRole::ToolOutput)`, so a memory row
     /// can never be mistaken for a paginated tool result, however long its
     /// recalled text is.
     #[test]
@@ -1678,7 +1665,6 @@ mod tests {
                 "third line".into(),
             ],
             participant_index: None,
-            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 3);
@@ -1707,7 +1693,6 @@ mod tests {
             subject: Some("alice@box".into()),
             content_lines: vec!["hello world".into()],
             participant_index: Some(3),
-            images: vec![],
         };
         let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
         assert_eq!(lines.len(), 1);
@@ -1715,29 +1700,5 @@ mod tests {
         let expected_style =
             SpanStyle::fg(PALETTE.user_foreground).with_bg(PALETTE.participant_backgrounds[3]);
         assert_eq!(lines[0].spans[0].style, expected_style);
-    }
-
-    #[test]
-    fn test_user_turn_lines_with_images() {
-        let view = UserTurnView {
-            marker: '❯',
-            subject: None,
-            content_lines: vec!["what is this?".into()],
-            participant_index: None,
-            images: vec!["base64image1==".into(), "base64image2==".into()],
-        };
-        let lines = component_lines(&ComponentView::UserTurn(view), &PALETTE);
-        assert_eq!(lines.len(), 3); // 1 content line + 2 image lines
-        assert_eq!(lines[0].text, " ❯ what is this?");
-        assert_eq!(
-            lines[1].text,
-            "[Image attachment: natively rendered in iTerm2]"
-        );
-        assert_eq!(lines[1].image_attachment.as_deref(), Some("base64image1=="));
-        assert_eq!(
-            lines[2].text,
-            "[Image attachment: natively rendered in iTerm2]"
-        );
-        assert_eq!(lines[2].image_attachment.as_deref(), Some("base64image2=="));
     }
 }

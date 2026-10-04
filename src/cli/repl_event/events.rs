@@ -303,8 +303,7 @@ pub enum LlmRequest {
         /// the current question in the provider request; see
         /// `inject_recall_prefix`). `None` for continuations, queued turns
         /// that already echoed immediately, and any turn that must not echo.
-        /// Tuple is (text, base64_images).
-        pending_echo: Option<(String, Vec<String>)>,
+        pending_echo: Option<String>,
     },
 }
 

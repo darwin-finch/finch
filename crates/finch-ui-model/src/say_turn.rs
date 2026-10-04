@@ -137,7 +137,6 @@ fn body_line(text: String) -> RenderedTranscriptLine {
         body_of: None,
         component_owned: false,
         single_focus_target: false,
-        image_attachment: None,
     }
 }
 
@@ -159,7 +158,6 @@ fn toggle_content_line(
         body_of: None,
         component_owned: true,
         single_focus_target: true,
-        image_attachment: None,
     }
 }
 

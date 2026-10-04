@@ -79,7 +79,6 @@ pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, Use
 pub(crate) use output_layer::MessageVisitor;
 pub use output_layer::OutputManagerLayer;
 pub use output_manager::{OutputManager, VmOutputProjection};
-pub use repl::register_co_forth_tool_words;
 pub use repl::{Repl, ReplMode, ReplModeState};
 pub use repl_event::{format_token_count, format_tool_label, EventLoop, ReplEvent};
 pub(crate) use repl_event::{
@@ -96,3 +95,4 @@ pub use tui::{
     DialogResult, QuestionOptionView, QuestionView, TabbedDialog, TabbedDialogResult,
     TuiOutputPort, TuiRenderer, TuiStatusPort,
 };
+pub use repl::register_co_forth_tool_words;

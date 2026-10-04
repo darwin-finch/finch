@@ -36,10 +36,10 @@ impl TestDaemon {
             .context("daemon integration tests require supervisor authority")?;
         let brain_address = proof.brain_address().to_owned();
         let test_port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let daemon_address = format!("127.0.0.1:{}", test_port);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let daemon_address = format!("127.0.0.1:{}", test_port);
         let socket_root = std::env::var("FINCH_TEST_SOCKET_ROOT").unwrap_or_default();
         let ipc_socket = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(PathBuf::from)
@@ -998,10 +998,8 @@ async fn test_daemon_start_exits_with_0_on_successful_startup() -> Result<()> {
         .env("HOME", &home)
         .env("ANTHROPIC_API_KEY", "sk-ant-1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890");
 
-    let output = command
-        .output()
-        .expect("failed to execute finch daemon-start");
-
+    let output = command.output().expect("failed to execute finch daemon-start");
+    
     if !output.status.success() {
         let log = std::fs::read_to_string(finch_dir.join("daemon.log")).unwrap_or_default();
         panic!(
@@ -1012,10 +1010,7 @@ async fn test_daemon_start_exits_with_0_on_successful_startup() -> Result<()> {
     }
 
     let pid_file = finch_dir.join("daemon.pid");
-    assert!(
-        pid_file.exists(),
-        "daemon.pid must exist after daemon-start"
-    );
+    assert!(pid_file.exists(), "daemon.pid must exist after daemon-start");
 
     // Clean up
     let mut stop = Command::new(env!("CARGO_BIN_EXE_finch"));

@@ -1306,7 +1306,7 @@ pub(crate) fn plan_live_frame(
             None
         };
         frame.push(
-            span_render::lower_rendered_line(line, hover_bg, None, None)
+            span_render::lower_rendered_line(line, hover_bg, None)
                 .trim_end_matches('\r')
                 .to_string(),
         );
@@ -1359,11 +1359,6 @@ pub(crate) fn plan_live_frame(
     }
     frame.cursor_visible = claimed_rects.composer.height > 0;
     let (cursor_row, cursor_col) = vm.input_cursor;
-    if claimed_rects.composer.height > 0 {
-        for line in vm.attachment_lines {
-            frame.push(format!("{DIM_GRAY}{line}{RESET}"));
-        }
-    }
     let rows_before_input = frame.physical_rows(width);
     let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
@@ -2149,10 +2144,7 @@ fn prepare_canonical_commit(stdout: &mut impl Write, bg: crossterm::style::Color
     Ok(())
 }
 
-fn prepare_canonical_commit_guarded(
-    stdout: &mut impl Write,
-    bg: crossterm::style::Color,
-) -> Result<()> {
+fn prepare_canonical_commit_guarded(stdout: &mut impl Write, bg: crossterm::style::Color) -> Result<()> {
     match prepare_canonical_commit(stdout, bg) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -2249,11 +2241,7 @@ impl TuiRenderer {
                 }
                 if retained_window.is_none() {
                     self.viewport_invalidated = true;
-                    return self.redraw_full_viewport_inner_to(
-                        out,
-                        true,
-                        Some((term_width, term_h)),
-                    );
+                    return self.redraw_full_viewport_inner_to(out, true, Some((term_width, term_h)));
                 }
             }
             reanchor_shrinking_live_frame(out, self.last_live_frame_rows, rows, term_h)?;
@@ -2417,11 +2405,6 @@ impl TuiRenderer {
     /// borrow it for the planning call.
     fn live_frame_sources(&mut self, term_width: usize) -> LiveFrameSources {
         let input_lines = self.input_textarea.lines().to_vec();
-        let attachment_lines = self
-            .pending_images
-            .iter()
-            .map(|(index, _, media_type)| format!("  ▣ Image {index} · {media_type}"))
-            .collect();
         let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
         let mut effective_status = compute_effective_status(
@@ -2478,7 +2461,6 @@ impl TuiRenderer {
         LiveFrameSources {
             input_cursor: self.input_textarea.cursor(),
             ghost_text: self.ghost_text.clone(),
-            attachment_lines,
             input_lines,
             effective_status,
             cwd_label,
@@ -2918,7 +2900,6 @@ fn find_parent_transcript_row<'a>(
 /// Owned state for one live-frame blit, gathered once so the ViewModel can
 /// borrow it for the planning call.
 struct LiveFrameSources {
-    attachment_lines: Vec<String>,
     input_lines: Vec<String>,
     input_cursor: (usize, usize),
     ghost_text: Option<String>,
@@ -2947,7 +2928,6 @@ fn live_view_model<'a>(
     view_model::LiveViewModel {
         terminal_width,
         terminal_height,
-        attachment_lines: &sources.attachment_lines,
         input_lines: &sources.input_lines,
         input_cursor: sources.input_cursor,
         ghost_text: sources.ghost_text.as_deref(),
@@ -2995,10 +2975,7 @@ impl TuiRenderer {
 
         if !plan.emit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(
-                &mut stdout,
-                self.colors.background.to_color().into(),
-            )?;
+            prepare_canonical_commit_guarded(&mut stdout, self.colors.background.to_color().into())?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -3665,7 +3642,7 @@ impl TuiRenderer {
         let Some(focused) = self.accordion.focused.clone() else {
             return false;
         };
-        if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolCall) {
+        if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolOutput) {
             return false;
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
@@ -4123,10 +4100,7 @@ impl TuiRenderer {
                 return true;
             }
             let text = selection::selected_text(&self.selection_index, active);
-            if let Err(error) = self.copy_selection_to_clipboard(&text) {
-                tracing::debug!(%error, "Mouse selection copy failed");
-                self.set_operation_status("Copy failed (Hold Option ⌥ to use terminal selection)");
-            }
+            let _ = self.copy_selection_to_clipboard(&text);
             self.live_area_dirty = true;
             return true;
         }
@@ -4145,10 +4119,14 @@ impl TuiRenderer {
 
     /// System clipboard copy (#221): the same `arboard` crate already used
     /// for the OAuth device-code copy (`grok_auth.rs`, `chatgpt_auth.rs`).
-    /// A no-op for empty text. A clipboard failure (no clipboard provider,
-    /// headless/sandboxed session, iTerm2 mouse capture conflicts) doesn't
-    /// break the visual selection, but we now surface the error to the user
-    /// on the status line as a UX fallback.
+    /// A no-op for empty text. On a mouse-release copy, the caller (below)
+    /// discards the result deliberately: a clipboard failure (no clipboard
+    /// provider, a headless/sandboxed session) never breaks the selection
+    /// itself — it stays highlighted either way, so the text is still
+    /// readable and selectable again on the next drag, with no status-line
+    /// noise for a gesture that has no explicit confirmation step anyway.
+    /// [`Self::copy_active_selection_to_clipboard`] (Ctrl+C) does use the
+    /// result, since a keyboard shortcut has no other feedback at all.
     fn copy_selection_to_clipboard(&self, text: &str) -> Result<(), arboard::Error> {
         if text.is_empty() {
             return Ok(());
@@ -4294,7 +4272,7 @@ impl TuiRenderer {
                 view_model::ProjectedMessage::Plain(_) => return None,
             };
             return find_transcript_row(&root, row_id)
-                .filter(|row| row.role == view_model::NodeRole::ToolCall)
+                .filter(|row| row.role == view_model::NodeRole::ToolOutput)
                 .map(|row| row.body.clone());
         }
         None
@@ -4405,7 +4383,7 @@ impl TuiRenderer {
             let mut autocomplete = self.autocomplete_state.clone();
             let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
             vm.hovered_row = self.hovered_row.as_ref();
-            vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
+            vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
@@ -4436,7 +4414,7 @@ impl TuiRenderer {
             expanded_lines.as_deref(),
         );
         vm.hovered_row = self.hovered_row.as_ref();
-        vm.hover_bg = Some(span_render::component_style_palette(&self.colors).hover_background);
+        vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
@@ -4514,25 +4492,14 @@ impl TuiRenderer {
                         None
                     },
                     Some(span_render::span_color_from_spec(&self.colors.background)),
-                    Some(span_render::span_color_from_spec(&self.colors.messages.assistant)),
                 )
             })
             .collect::<Vec<_>>();
 
         let paint = if synchronized_update_open {
-            continue_full_viewport_paint(
-                out,
-                plan,
-                &painted_transcript,
-                self.colors.background.to_color().into(),
-            )
+            continue_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
         } else {
-            begin_full_viewport_paint(
-                out,
-                plan,
-                &painted_transcript,
-                self.colors.background.to_color().into(),
-            )
+            begin_full_viewport_paint(out, plan, &painted_transcript, self.colors.background.to_color().into())
         };
         if let Err(error) = paint {
             let _ = execute!(out, EndSynchronizedUpdate);
@@ -6679,7 +6646,6 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
-            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -8580,13 +8546,8 @@ mod tests {
         let plan = viewport_redraw_plan(12, 6, 2);
         let mut bytes = Vec::new();
 
-        begin_full_viewport_paint(
-            &mut bytes,
-            plan,
-            &["old".into(), "new".into()],
-            crossterm::style::Color::Reset,
-        )
-        .expect("paint commands");
+        begin_full_viewport_paint(&mut bytes, plan, &["old".into(), "new".into()], crossterm::style::Color::Reset)
+            .expect("paint commands");
 
         let commands = String::from_utf8(bytes).expect("ANSI commands are UTF-8");
         assert!(
@@ -8638,8 +8599,7 @@ mod tests {
             .collect::<Vec<_>>();
         let plan = viewport_redraw_plan(8, 2, 1);
         let mut bytes = Vec::new();
-        begin_full_viewport_paint(&mut bytes, plan, &text, crossterm::style::Color::Reset)
-            .expect("production viewport paint");
+        begin_full_viewport_paint(&mut bytes, plan, &text, crossterm::style::Color::Reset).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
         assert!(
             !raw.contains("[collapsed]") && !raw.contains("[expanded]"),
@@ -8732,15 +8692,15 @@ mod tests {
         );
         assert!(
             literal_state[0].spans.is_empty()
-                && span_render::lower_rendered_line(&literal_state[0], None, None, None)
+                && span_render::lower_rendered_line(&literal_state[0], None, None)
                     == literal_state[0].text
-                && !span_render::lower_rendered_line(&literal_state[0], None, None, None)
+                && !span_render::lower_rendered_line(&literal_state[0], None, None)
                     .contains(&original_header),
             "compacting a styled disclosure must clear spans tied to the original header so the \
              paint seam emits the compact text; original={original_header:?} compact={:?} \
              painted={:?}",
             literal_state[0],
-            span_render::lower_rendered_line(&literal_state[0], None, None, None)
+            span_render::lower_rendered_line(&literal_state[0], None, None)
         );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
@@ -8973,9 +8933,7 @@ mod tests {
             bytes: Vec::new(),
             flushes: 0,
         };
-        assert!(
-            prepare_canonical_commit_guarded(&mut output, crossterm::style::Color::Reset).is_err()
-        );
+        assert!(prepare_canonical_commit_guarded(&mut output, crossterm::style::Color::Reset).is_err());
 
         let raw = String::from_utf8(output.bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
@@ -10932,7 +10890,7 @@ mod tests {
         );
         // The scroll-window source is the projection itself; the lowering the
         // full-viewport paint applies renders the same bytes as the seam.
-        let lowered = span_render::lower_rendered_line(&styled[0], None, None, None);
+        let lowered = span_render::lower_rendered_line(&styled[0], None, None);
         assert_eq!(
             lowered, "\x1b[33mweights.safetensors [░░░░░░░░░░] 0%\x1b[0m",
             "the scrolled paint shows the styled row; got {lowered:?}"
@@ -11084,8 +11042,8 @@ mod tests {
         // Test scrolling down: line 0 is off screen, so only line 1 is lowered.
         // Even when lowered in isolation (without line 0 having been painted),
         // continuation lines MUST contain ANSI foreground and background escape sequences!
-        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None, None, None);
-        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None, None, None);
+        let lowered_line1 = span_render::lower_rendered_line(&lines[1], None, None);
+        let lowered_line2 = span_render::lower_rendered_line(&lines[2], None, None);
 
         assert_ne!(lowered_line1, "second line");
         assert_ne!(lowered_line2, "third line");
@@ -11945,7 +11903,6 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: height,
-            attachment_lines: &[],
             input_lines,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -12027,7 +11984,6 @@ mod tests {
                 hovered_row: None,
                 terminal_width: width,
                 terminal_height: height,
-                attachment_lines: &[],
                 input_lines: &input_lines,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12205,7 +12161,6 @@ mod tests {
                 hovered_row: None,
                 terminal_width: w,
                 terminal_height: h,
-                attachment_lines: &[],
                 input_lines: &draft,
                 input_cursor: (0, 0),
                 ghost_text: None,
@@ -12299,7 +12254,6 @@ mod tests {
             hovered_row: None,
             terminal_width: width,
             terminal_height: 24,
-            attachment_lines: &[],
             input_lines: &draft,
             input_cursor: (0, 0),
             ghost_text: None,
@@ -12922,13 +12876,7 @@ mod tests {
                 Vec::new()
             };
             let mut bytes = Vec::new();
-            begin_full_viewport_paint(
-                &mut bytes,
-                plan,
-                &transcript,
-                crossterm::style::Color::Reset,
-            )
-            .unwrap();
+            begin_full_viewport_paint(&mut bytes, plan, &transcript, crossterm::style::Color::Reset).unwrap();
             let mut active_rows = write_live_frame(&mut bytes, &frame, width).unwrap();
             execute!(bytes, EndSynchronizedUpdate).unwrap();
             terminal.feed(&bytes);

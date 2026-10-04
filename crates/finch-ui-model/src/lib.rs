@@ -83,6 +83,8 @@ pub enum NodeRole {
     Output,
     ToolGroup,
     ToolCall,
+    Input,
+    ToolOutput,
 }
 
 /// One rendered transcript line: semantic text plus the row metadata the
@@ -123,8 +125,6 @@ pub struct RenderedTranscriptLine {
     /// because its multiline content is one in-place toggle. Other component
     /// and legacy rows retain their existing per-line traversal behavior.
     pub single_focus_target: bool,
-    /// Base64 encoded image data for inline terminal rendering.
-    pub image_attachment: Option<String>,
 }
 
 impl RenderedTranscriptLine {

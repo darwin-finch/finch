@@ -1648,7 +1648,6 @@ dependencies = [
  "indicatif 0.17.11",
  "k256",
  "llama-cpp-2",
- "llama-cpp-sys-2",
  "mdns-sd",
  "mockito",
  "nix 0.29.0",

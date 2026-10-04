@@ -1163,7 +1163,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             let output_row = call
                 .children
                 .iter()
-                .find(|child| child.role == crate::cli::test_projection::NodeRole::ToolCall)
+                .find(|child| child.role == crate::cli::test_projection::NodeRole::ToolOutput)
                 .unwrap_or_else(|| {
                     panic!("long loop diagnostic must be expandable output; call={call:?}")
                 });
@@ -2475,8 +2475,18 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert_eq!(tool.role, crate::cli::test_projection::NodeRole::ToolCall);
     assert_eq!(tool.id.message_id, unit.id());
     assert_eq!(tool.id.path, vec![1, 1]);
-    assert_eq!(tool.children.len(), 0);
-    assert!(tool.body.iter().any(|line| line == "value=7"));
+    assert_eq!(tool.children.len(), 2);
+    assert_eq!(
+        tool.children[0].role,
+        crate::cli::test_projection::NodeRole::Input
+    );
+    assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
+    assert_eq!(
+        tool.children[1].role,
+        crate::cli::test_projection::NodeRole::ToolOutput
+    );
+    assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
+    assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
 
     let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
     assert!(canonical.contains("read_cache"));
@@ -9291,10 +9301,11 @@ async fn test_pending_user_messages_restored_in_order_when_continuation_fails() 
                 "QueryFailed must drain the queue and restore to composer; queued={:?}",
                 event_loop.pending_queries
             );
-
+            
             let restored = event_loop.tui_renderer.lock().await.get_input_draft();
             assert_eq!(
-                restored, "steer now\nand also this",
+                restored,
+                "steer now\nand also this",
                 "the queued turns must be restored into the TUI input composer"
             );
 
@@ -9397,12 +9408,7 @@ async fn test_pending_user_message_without_tools_drains_on_streaming_complete() 
         .await;
 }
 
-type ObservedLlmQueryWithEcho = (
-    Uuid,
-    String,
-    Vec<crate::providers::Message>,
-    Option<(String, Vec<String>)>,
-);
+type ObservedLlmQueryWithEcho = (Uuid, String, Vec<crate::providers::Message>, Option<String>);
 
 /// Like `observe_llm_queries`, but also captures `pending_echo` -- the value
 /// `process_query_with_tools` uses to defer a query's scrollback echo until

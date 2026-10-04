@@ -4,10 +4,6 @@
 mod adapters; // Local model adapters (chat templates, token IDs)
 mod bootstrap; // Progressive bootstrap for instant startup
 mod common;
-
-
-
-
 mod generator_new;
 mod gguf_download;
 mod learning;
