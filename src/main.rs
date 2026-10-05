@@ -2419,8 +2419,8 @@ async fn build_query_tool_executor(
     Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::{
-        BashTool, CodeOutlineTool, EditTool, FindCodeTool, GlobTool, GrepTool, PatchTool, ReadTool,
-        WebFetchTool, WriteTool,
+        BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool, CodeOutlineTool,
+        EditTool, FindCodeTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -2439,6 +2439,14 @@ async fn build_query_tool_executor(
     )));
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
+    let background_tasks = Arc::new(finch::brain::BackgroundTaskManager::new());
+    registry.register(Box::new(BackgroundBashTool::new(Arc::clone(
+        &background_tasks,
+    ))));
+    registry.register(Box::new(BackgroundPollTool::new(Arc::clone(
+        &background_tasks,
+    ))));
+    registry.register(Box::new(BackgroundStopTool::new(background_tasks)));
     registry.register(Box::new(EditTool));
     registry.register(Box::new(PatchTool));
     registry.register(Box::new(WriteTool));

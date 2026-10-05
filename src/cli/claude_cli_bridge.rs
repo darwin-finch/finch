@@ -81,13 +81,24 @@ pub async fn run() -> Result<()> {
 /// The tool implementations this bridge advertises over `tools/list` — never
 /// executed here. Real execution happens in the frontend, over the socket.
 pub(crate) fn register_tool_schemas(registry: &mut ToolRegistry) {
-    use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+    use crate::tools::{
+        BackgroundBashTool, BackgroundPollTool, BackgroundStopTool, BashTool, EditTool, GlobTool,
+        GrepTool, ReadTool, WriteTool,
+    };
     registry.register(Box::new(ReadTool));
     registry.register(Box::new(WriteTool));
     registry.register(Box::new(EditTool));
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
     registry.register(Box::new(BashTool));
+    let dummy_tasks = std::sync::Arc::new(crate::brain::BackgroundTaskManager::new());
+    registry.register(Box::new(BackgroundBashTool::new(std::sync::Arc::clone(
+        &dummy_tasks,
+    ))));
+    registry.register(Box::new(BackgroundPollTool::new(std::sync::Arc::clone(
+        &dummy_tasks,
+    ))));
+    registry.register(Box::new(BackgroundStopTool::new(dummy_tasks)));
 }
 
 /// Handle one JSON-RPC request. Returns `None` for a notification (no `id`,
@@ -300,6 +311,17 @@ mod tests {
                  {double_prefixed:?}: got {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn background_task_tools_are_advertised_by_tool_list() {
+        let names: Vec<String> = tool_list(&registry())
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"background_bash".to_string()));
+        assert!(names.contains(&"background_poll".to_string()));
+        assert!(names.contains(&"background_stop".to_string()));
     }
 
     #[tokio::test]
