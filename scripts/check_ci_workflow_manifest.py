@@ -186,6 +186,7 @@ ESCAPE_API_ALLOWLIST = (
     "crates/finch-brain/src/lib.rs:.process_group(0)",
     "crates/finch-brain/src/lib.rs:if nix::libc::setpgid(0, 0) == -1 {",
     "src/daemon/spawn.rs:if nix::libc::setsid() == -1 {",
+    "src/tools/implementations/bash.rs:command.process_group(0);",
     "tests/no_external_provider_binary_test.rs:.process_group(0);",
 )
 
