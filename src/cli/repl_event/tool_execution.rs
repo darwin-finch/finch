@@ -25,7 +25,8 @@ use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
 use crate::tools::{
-    generate_tool_signature, ToolExecutor, ToolLoop, ToolLoopResult, ToolLoopTerminal,
+    generate_tool_signature, PermissionCheck, ToolExecutor, ToolLoop, ToolLoopResult,
+    ToolLoopTerminal,
 };
 use crate::tools::{LiveOutput, LiveOutputSink, ToolUse};
 
@@ -291,6 +292,29 @@ impl ToolExecutionCoordinator {
                     return;
                 }
             }
+
+            // Check permissions before asking for approval. A command that the
+            // denylist will refuse must never reach an approval dialog (it must
+            // be rejected before asking the user for approval; issue #1670).
+            let permission_check = {
+                let executor = tool_executor.lock().await;
+                executor
+                    .permissions()
+                    .check_tool_use(&tool_use.name, &tool_use.input)
+            };
+            if let PermissionCheck::Deny(reason) = permission_check {
+                publish_tool_result(
+                    &event_tx,
+                    &tool_loop,
+                    query_id,
+                    round_token,
+                    tool_use.id.clone(),
+                    Err(anyhow::anyhow!("{reason}")),
+                )
+                .await;
+                return;
+            }
+
             // Generate tool signature for approval checking
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
 
@@ -479,6 +503,30 @@ impl ToolExecutionCoordinator {
                     if loop_guard.admit_execution(&tool_use.id).is_err() {
                         return;
                     }
+                }
+            }
+
+            // Check permissions before asking for approval. A tool call that the
+            // denylist will refuse must never reach an approval dialog (it must
+            // be rejected before asking the user for approval; issue #1670).
+            for (tool_use, _, _) in &calls {
+                let permission_check = {
+                    let executor = tool_executor.lock().await;
+                    executor
+                        .permissions()
+                        .check_tool_use(&tool_use.name, &tool_use.input)
+                };
+                if let PermissionCheck::Deny(reason) = permission_check {
+                    deny_changeset(
+                        &event_tx,
+                        &tool_loop,
+                        query_id,
+                        round_token,
+                        &calls,
+                        &reason,
+                    )
+                    .await;
+                    return;
                 }
             }
 
@@ -867,6 +915,219 @@ mod tests {
                 );
             }
             other => panic!("Normal must emit ToolApprovalNeeded for write, not {other:?}"),
+        }
+    }
+
+    struct BashProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for BashProbe {
+        fn name(&self) -> &str {
+            "bash"
+        }
+
+        fn effect(&self) -> ExecutionEffect {
+            ExecutionEffect::ExternalWrite
+        }
+
+        fn description(&self) -> &str {
+            "probe: bash tool"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            ToolInputSchema::simple(vec![("command", "command")])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            Ok("bash-probe-success".to_string())
+        }
+    }
+
+    fn coordinator_with_bash_probe() -> (
+        ToolExecutionCoordinator,
+        mpsc::UnboundedReceiver<ReplEvent>,
+        tempfile::TempDir,
+        Arc<RwLock<ConversationHistory>>,
+    ) {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BashProbe));
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for bash probe");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::new(OutputManager::new(ColorScheme::default())),
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+        (coordinator, events, tempdir, conversation)
+    }
+
+    #[tokio::test]
+    async fn test_denylisted_command_rejected_before_approval_dialog() {
+        let (coordinator, mut events, _tempdir, conversation) = coordinator_with_bash_probe();
+
+        for denylisted_cmd in [
+            "echo evil > /dev/sda",
+            "rm -rf /",
+            "echo evil 2> /dev/disk0",
+        ] {
+            let query_id = Uuid::new_v4();
+            let tool_use = ToolUse::new(
+                "bash".to_string(),
+                serde_json::json!({"command": denylisted_cmd}),
+            );
+            let tool_id = tool_use.id.clone();
+            let round_token = conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: "bash".into(),
+                            input: tool_use.input.clone(),
+                        }],
+                    },
+                )
+                .expect("stage round");
+            let work_unit = coordinator.output_manager.start_work_unit("bash");
+            let row_idx = work_unit.add_row(format!("bash({denylisted_cmd})"));
+            coordinator.spawn_tool_execution(
+                query_id,
+                round_token,
+                tool_use,
+                work_unit,
+                row_idx,
+                None,
+                None,
+            );
+
+            // Invariant (issue #1670 acceptance criterion 2):
+            // A command that the denylist will refuse must never reach an approval dialog
+            // (it must be rejected before asking the user for approval).
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("denylisted tool execution must emit an event")
+                .expect("event channel must stay open");
+
+            match event {
+                ReplEvent::ToolResult {
+                    tool_id: received_tool_id,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(received_tool_id, tool_id);
+                    let err = result.expect_err("denylisted command must fail");
+                    assert!(
+                        err.to_string().contains("Blocked:"),
+                        "denial error must be a Blocked error; got {err}"
+                    );
+                }
+                ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
+                    panic!(
+                        "invariant broken: denylisted command {:?} reached approval dialog!",
+                        tool_use.input["command"]
+                    );
+                }
+                other => {
+                    panic!("unexpected event: {other:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_allowed_dev_null_command_reaches_approval_and_succeeds_on_approval() {
+        let (coordinator, mut events, _tempdir, conversation) = coordinator_with_bash_probe();
+
+        let safe_cmd = "sleep 25; tail -40 /tmp/test_1650.log; echo \"---\"; ps -p 97997 > /dev/null && echo RUNNING || echo DONE";
+        let query_id = Uuid::new_v4();
+        let tool_use = ToolUse::new("bash".to_string(), serde_json::json!({"command": safe_cmd}));
+        let tool_id = tool_use.id.clone();
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_id.clone(),
+                        name: "bash".into(),
+                        input: tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage round");
+        let work_unit = coordinator.output_manager.start_work_unit("bash");
+        let row_idx = work_unit.add_row(format!("bash({safe_cmd})"));
+        coordinator.spawn_tool_execution(
+            query_id,
+            round_token,
+            tool_use,
+            work_unit,
+            row_idx,
+            None,
+            None,
+        );
+
+        // 1. Must ask for approval (not blocked by denylist)
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("tool execution must emit an event")
+            .expect("event channel must stay open");
+
+        let response_tx = match event {
+            ReplEvent::ToolApprovalNeeded {
+                tool_use,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(tool_use.name, "bash");
+                response_tx
+            }
+            ReplEvent::ToolResult { result, .. } => {
+                panic!("allowed /dev/null command was unexpectedly refused before approval: {result:?}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        };
+
+        // 2. User approves: answer Yes (ConfirmationResult::ApproveOnce)
+        response_tx
+            .send(ConfirmationResult::ApproveOnce)
+            .expect("send approval response");
+
+        // 3. Must execute and succeed (NOT refused as dangerous device access)
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("tool execution must emit result event")
+            .expect("event channel must stay open");
+
+        match event {
+            ReplEvent::ToolResult {
+                tool_id: received_tool_id,
+                result,
+                ..
+            } => {
+                assert_eq!(received_tool_id, tool_id);
+                let output = result.expect("command must succeed after approval");
+                assert_eq!(output, "bash-probe-success");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 

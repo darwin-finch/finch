@@ -25,23 +25,110 @@ const BASH_DENIED_SUBSTRINGS: &[(&str, &str)] = &[
     (":(){ :|:& };:", "Fork bombs are blocked"),
     ("sudo", "Privilege escalation requires manual execution"),
     ("chmod 777", "Unsafe permission changes are blocked"),
-    ("> /dev/", "Direct device access is dangerous"),
     ("mkfs", "Filesystem operations are dangerous"),
     ("fdisk", "Disk partitioning is dangerous"),
 ];
 
-/// Tools whose discrete path argument is `file_path`.
-const FILE_PATH_TOOLS: &[&str] = &["read", "write", "edit", "patch"];
+/// Allowed redirect targets under `/dev/` (e.g. `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty`).
+/// Writes or redirects to real devices remain blocked.
+pub const ALLOWED_DEVICE_REDIRECTS: &[&str] =
+    &["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
+
+/// True when a command contains a write redirection (e.g. `>`, `>>`, `2>`, `&>`) targeting
+/// a `/dev/` path that is NOT on the safe device allowlist.
+pub fn has_dangerous_device_redirect(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let dev_prefix = b"/dev/";
+
+    let mut i = 0;
+    while i + dev_prefix.len() <= len {
+        if &bytes[i..i + dev_prefix.len()] == dev_prefix {
+            // Check if this "/dev/" is preceded by a write redirection operator (ending with '>')
+            // Look backwards, skipping optional opening quote ('"' or '\'') and whitespace
+            let mut j = i;
+            let mut quoted = None;
+            if j > 0 && (bytes[j - 1] == b'"' || bytes[j - 1] == b'\'') {
+                quoted = Some(bytes[j - 1]);
+                j -= 1;
+            }
+            while j > 0 && (bytes[j - 1] == b' ' || bytes[j - 1] == b'\t') {
+                j -= 1;
+            }
+
+            // In bash, write redirects end with '>' (e.g. '>', '>>', '>&', '>|', '<>', '2>', '&>')
+            // If the operator was '>|' or '>&', bytes[j-1] would be '|' or '&' and bytes[j-2] would be '>'
+            let mut is_write_redirect = false;
+            if j > 0 {
+                if bytes[j - 1] == b'>' {
+                    is_write_redirect = true;
+                } else if (bytes[j - 1] == b'|' || bytes[j - 1] == b'&')
+                    && j >= 2
+                    && bytes[j - 2] == b'>'
+                {
+                    is_write_redirect = true;
+                }
+            }
+
+            if is_write_redirect {
+                let target_start = i;
+                let mut target_end = i + dev_prefix.len();
+                if let Some(q) = quoted {
+                    while target_end < len && bytes[target_end] != q {
+                        target_end += 1;
+                    }
+                } else {
+                    while target_end < len {
+                        let b = bytes[target_end];
+                        if b.is_ascii_whitespace()
+                            || matches!(
+                                b,
+                                b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'"' | b'\''
+                            )
+                        {
+                            break;
+                        }
+                        target_end += 1;
+                    }
+                }
+
+                let target = &command[target_start..target_end];
+                if !ALLOWED_DEVICE_REDIRECTS.contains(&target) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    false
+}
+
+/// Returns the denial reason if a bash command is denylisted.
+pub fn check_bash_command_denial(command: &str) -> Option<&'static str> {
+    for (pattern, reason) in BASH_DENIED_SUBSTRINGS {
+        if command.contains(pattern) {
+            return Some(reason);
+        }
+    }
+
+    if has_dangerous_device_redirect(command) {
+        return Some("Direct device access is dangerous");
+    }
+
+    None
+}
 
 /// True when a bash command is denylisted on the one-shot path.
 ///
 /// Patterns consult this at match time so a stored `*` grant cannot admit
 /// `rm -rf` (or the rest of the denylist) after seeing a harmless command.
 pub fn bash_command_is_denylisted(command: &str) -> bool {
-    BASH_DENIED_SUBSTRINGS
-        .iter()
-        .any(|(pattern, _)| command.contains(pattern))
+    check_bash_command_denial(command).is_some()
 }
+
+/// Tools whose discrete path argument is `file_path`.
+const FILE_PATH_TOOLS: &[&str] = &["read", "write", "edit", "patch"];
 
 /// Workspace root used for path-argument containment.
 ///
@@ -633,11 +720,9 @@ impl PermissionManager {
     fn check_bash_safety(&self, input: &Value) -> Option<String> {
         let command = input.get("command")?.as_str()?;
 
-        for (pattern, reason) in BASH_DENIED_SUBSTRINGS {
-            if command.contains(pattern) {
-                warn!("Blocked dangerous bash command: {}", command);
-                return Some(format!("Blocked: {}", reason));
-            }
+        if let Some(reason) = check_bash_command_denial(command) {
+            warn!("Blocked dangerous bash command: {}", command);
+            return Some(format!("Blocked: {}", reason));
         }
 
         None
@@ -857,6 +942,114 @@ mod tests {
                 "Failed to block: {}",
                 cmd
             );
+        }
+    }
+
+    #[test]
+    fn test_allowed_device_redirects_not_blocked() {
+        let allowed_commands = [
+            // Standard /dev/null redirects
+            "ps -p 97997 > /dev/null && echo RUNNING || echo DONE",
+            "sleep 25; tail -40 /tmp/test_1650.log; echo \"---\"; ps -p 97997 > /dev/null && echo RUNNING || echo DONE",
+            "echo \"hello\" >/dev/null",
+            "echo \"hello\" >> /dev/null",
+            "echo \"hello\" >>/dev/null",
+            "echo \"err\" 2> /dev/null",
+            "echo \"err\" 2>/dev/null",
+            "echo \"err\" 2>> /dev/null",
+            "cmd &> /dev/null",
+            "cmd &>/dev/null",
+            "cmd >| /dev/null",
+            "cmd > /dev/null 2>&1",
+            "cmd 2>&1 > /dev/null",
+            "echo \"quoted\" > \"/dev/null\"",
+            "echo \"quoted\" > '/dev/null'",
+            // /dev/stdout, /dev/stderr, /dev/tty
+            "echo \"hello\" > /dev/stdout",
+            "echo \"hello\" >/dev/stdout",
+            "echo \"err\" 2> /dev/stderr",
+            "echo \"err\" 2>/dev/stderr",
+            "echo \"prompt\" > /dev/tty",
+            "echo \"prompt\" >/dev/tty",
+            "cmd > /dev/stdout 2> /dev/stderr",
+            "echo \"quoted\" > \"/dev/stdout\"",
+            "echo \"quoted\" > '/dev/stderr'",
+            "echo \"quoted\" > \"/dev/tty\"",
+        ];
+
+        for cmd in allowed_commands {
+            assert!(
+                !bash_command_is_denylisted(cmd),
+                "invariant: command with allowed redirect must not be denylisted: {cmd}"
+            );
+
+            // Test for both Owner and Peer
+            for role in [PermissionManager::new(), PermissionManager::for_peer()] {
+                let input = serde_json::json!({"command": cmd});
+                let check = role.check_tool_use("bash", &input);
+                assert!(
+                    !matches!(check, PermissionCheck::Deny(_)),
+                    "invariant: allowed device redirect must not be Denied; got {check:?} for {cmd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_blocked_real_device_redirects() {
+        let blocked_commands = [
+            "echo evil > /dev/sda",
+            "echo evil >/dev/sda",
+            "echo evil >> /dev/sda",
+            "echo evil 2> /dev/sda",
+            "echo evil 2>/dev/sda",
+            "echo evil &> /dev/sda",
+            "echo evil >| /dev/sda",
+            "echo evil > /dev/sda1",
+            "echo evil > /dev/disk0",
+            "echo evil > /dev/disk1s1",
+            "echo evil > /dev/rdisk0",
+            "echo evil > /dev/zero",
+            "echo evil > /dev/mem",
+            "echo evil > /dev/kmem",
+            "echo evil > /dev/urandom",
+            "echo evil > /dev/nullifier",
+            "echo evil > /dev/null/evil",
+            "echo evil > /dev/null 2> /dev/sda",
+            "echo evil > /dev/sda 2> /dev/null",
+            "echo evil > \"/dev/sda\"",
+            "echo evil > '/dev/sda'",
+            "echo evil > \"/dev/disk0\"",
+        ];
+
+        for cmd in blocked_commands {
+            assert!(
+                bash_command_is_denylisted(cmd),
+                "invariant: write redirect to real device must be denylisted: {cmd}"
+            );
+
+            // Test for both Owner and Peer
+            for (role_name, role) in [
+                ("owner", PermissionManager::new()),
+                ("peer", PermissionManager::for_peer()),
+            ] {
+                let input = serde_json::json!({"command": cmd});
+                let check = role.check_tool_use("bash", &input);
+                match check {
+                    PermissionCheck::Deny(ref reason) => {
+                        assert!(
+                            reason.contains("Direct device access is dangerous"),
+                            "invariant: {role_name} write to real device must be blocked as \
+                             'Direct device access is dangerous'; got {reason:?} for {cmd}"
+                        );
+                    }
+                    other => {
+                        panic!(
+                            "invariant: {role_name} write to real device must be Denied; got {other:?} for {cmd}"
+                        );
+                    }
+                }
+            }
         }
     }
 
