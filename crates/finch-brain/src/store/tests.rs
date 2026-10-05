@@ -8682,3 +8682,177 @@ fn test_sweep_ignores_a_directory_symlink_without_mutating_its_target() {
         "ignoring a directory symlink must not create resident Brain state"
     );
 }
+
+#[test]
+fn test_client_disappears_without_detaching_reconciles_to_zero_attached() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let writer = BrainStore::with_root("box.local", Some(root.clone()));
+    writer
+        .push(
+            "abandoned",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap();
+    let attachment = writer
+        .attach("abandoned", "alice@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    writer
+        .activate_connection(
+            "abandoned",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+
+    let initial_summaries = writer.list_summaries_unhydrated();
+    assert_eq!(initial_summaries.len(), 1);
+    assert_eq!(initial_summaries[0].attached.len(), 1);
+
+    drop(writer);
+
+    let restarted = BrainStore::with_root("box.local", Some(root.clone()));
+    let reconciled = restarted.reconcile_dangling_attachments();
+    assert_eq!(reconciled, 1, "exactly one Brain had a dangling attachment");
+
+    let summaries = restarted.list_summaries_unhydrated();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].attached.len(),
+        0,
+        "ATTACHED must return to 0 after daemon restart when client disappeared without detaching; got {summaries:?}"
+    );
+    assert_eq!(
+        restarted.resident_brain_count(),
+        0,
+        "reconciling dangling attachments must not leave Brains resident in memory"
+    );
+
+    let snapshot = restarted.snapshot("abandoned").unwrap();
+    let restored = snapshot
+        .attachments
+        .into_iter()
+        .find(|candidate| candidate.attachment_id == attachment.attachment_id)
+        .unwrap();
+    assert!(!restored.connected);
+    assert_eq!(restored.connection_id, None);
+
+    let reattached = restarted
+        .attach(
+            "abandoned",
+            "alice@box.local",
+            AttachmentRole::Driver,
+            Some(attachment.attachment_id),
+        )
+        .unwrap();
+    assert!(!reattached.connected);
+    let activated = restarted
+        .activate_connection(
+            "abandoned",
+            reattached.attachment_id,
+            reattached.connection_id.unwrap(),
+        )
+        .unwrap();
+    assert!(activated.connected);
+}
+
+#[test]
+fn test_dangling_attachment_reconciled_allows_unused_brain_to_be_swept() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let writer = BrainStore::with_root("box.local", Some(root.clone()));
+    let attachment = writer
+        .attach(
+            "provisional",
+            "alice@box.local",
+            AttachmentRole::Driver,
+            None,
+        )
+        .unwrap();
+    writer
+        .activate_connection(
+            "provisional",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+    drop(writer);
+
+    let metadata_path = root.join("provisional").join("metadata.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    let old_enough = unix_millis().saturating_sub(BrainStore::SWEEP_MIN_AGE_MS + 60_000);
+    value["created_ms"] = serde_json::json!(old_enough);
+    std::fs::write(&metadata_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let restarted = BrainStore::with_root("box.local", Some(root.clone()));
+    let reconciled = restarted.reconcile_dangling_attachments();
+    assert_eq!(reconciled, 1);
+
+    let swept = restarted.sweep_unused(BrainStore::SWEEP_MIN_AGE_MS);
+    assert_eq!(
+        swept, 1,
+        "unused Brain with dead attachment must be swept after reconciliation"
+    );
+    assert!(!root.join("provisional").exists());
+}
+
+#[test]
+fn test_reconcile_dangling_attachments_skips_corrupt_brain_and_reconciles_remaining() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let writer = BrainStore::with_root("box.local", Some(root.clone()));
+    writer
+        .push(
+            "valid",
+            "alice@box.local",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap();
+    let attachment = writer
+        .attach("valid", "alice@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    writer
+        .activate_connection(
+            "valid",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+
+    let corrupt_attachment = writer
+        .attach("corrupt", "mallory@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    writer
+        .activate_connection(
+            "corrupt",
+            corrupt_attachment.attachment_id,
+            corrupt_attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+    drop(writer);
+
+    // Corrupt the metadata of the "corrupt" brain so ensure_loaded fails on it
+    std::fs::write(
+        root.join("corrupt").join("metadata.json"),
+        b"not valid json",
+    )
+    .unwrap();
+
+    let restarted = BrainStore::with_root("box.local", Some(root.clone()));
+    let reconciled = restarted.reconcile_dangling_attachments();
+    // Valid brain reconciled successfully, corrupt brain skipped without crashing or leaving resident brains
+    assert_eq!(reconciled, 1);
+    assert_eq!(restarted.resident_brain_count(), 0);
+
+    let summaries = restarted.list_summaries_unhydrated();
+    let valid_summary = summaries.iter().find(|s| s.name == "valid").unwrap();
+    assert_eq!(valid_summary.attached.len(), 0);
+}

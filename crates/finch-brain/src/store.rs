@@ -4378,6 +4378,68 @@ impl BrainStore {
     ///
     /// A candidate that fails either gate is never hydrated, repaired, or
     /// deleted.
+    /// Reconcile any Brains on disk that have dangling transport attachments
+    /// from a prior process run, without leaving them resident in memory.
+    pub fn reconcile_dangling_attachments(&self) -> usize {
+        let Some(root) = &self.root else {
+            return 0;
+        };
+        let mut total_reconciled = 0;
+        for name in self.list_names_unhydrated() {
+            let directory = root.join(&name);
+            let metadata_path = directory.join("metadata.json");
+            let events_path = directory.join("events.jsonl");
+            if !metadata_path.exists() || !events_path.exists() {
+                continue;
+            }
+            let projection = journal::scan_readonly(&events_path);
+            let has_dangling = projection
+                .attachments
+                .values()
+                .any(|attachment| attachment.connected && attachment.connection_id.is_some());
+            if has_dangling {
+                let was_resident = self
+                    .brains
+                    .read()
+                    .expect("shared brain lock poisoned")
+                    .contains_key(&name);
+                match self.ensure_loaded(&name) {
+                    Ok(()) => {
+                        if !was_resident {
+                            self.brains
+                                .write()
+                                .expect("shared brain lock poisoned")
+                                .remove(&name);
+                            self.initializations
+                                .write()
+                                .expect("shared Brain initialization lock poisoned")
+                                .remove(&name);
+                        }
+                        total_reconciled += 1;
+                    }
+                    Err(error) => {
+                        if !was_resident {
+                            self.brains
+                                .write()
+                                .expect("shared brain lock poisoned")
+                                .remove(&name);
+                            self.initializations
+                                .write()
+                                .expect("shared Brain initialization lock poisoned")
+                                .remove(&name);
+                        }
+                        tracing::warn!(
+                            brain = %name,
+                            %error,
+                            "reconcile dangling attachments: could not load Brain"
+                        );
+                    }
+                }
+            }
+        }
+        total_reconciled
+    }
+
     pub fn sweep_unused(&self, min_age_ms: u64) -> usize {
         let now = unix_millis();
         let mut removed = 0usize;
@@ -5759,9 +5821,39 @@ impl BrainStore {
                 );
             }
         }
-        for attachment in state.attachments.values_mut() {
+        let dangling_attachments: Vec<_> = state
+            .attachments
+            .values()
+            .filter(|attachment| attachment.connected && attachment.connection_id.is_some())
+            .map(|attachment| {
+                (
+                    attachment.attachment_id,
+                    attachment.connection_id.unwrap(),
+                    attachment.subject.clone(),
+                )
+            })
+            .collect();
+        for (attachment_id, connection_id, subject) in dangling_attachments {
             // A process restart disconnects every transport projection;
             // reconnect appends a fresh ClientAttached event.
+            let event = BrainEvent {
+                schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                brain_id: state.brain_id,
+                seq: state.revision + 1,
+                environment_generation: self.environment.generation,
+                sender: subject,
+                created_ms: unix_millis(),
+                run_id: None,
+                mutation: None,
+                kind: BrainEventKind::ClientDetached {
+                    attachment_id,
+                    connection_id,
+                },
+            };
+            self.append_event(name, &event)?;
+            state.apply(event);
+        }
+        for attachment in state.attachments.values_mut() {
             attachment.connected = false;
             attachment.connection_id = None;
         }
