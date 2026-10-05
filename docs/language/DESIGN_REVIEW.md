@@ -2126,6 +2126,91 @@ stackless futures achieve high density and low latency but impose viral `async`/
    surviving suspension must be owned values (`Copy`, `Unique`, `Shared`, or moved data). This eliminates
    the self-referential pointer problem that forced Rust to introduce `Pin<&mut T>`.
 
+### 86. Finite provenance sets for returned borrows eliminate Rust-style lifetime algebra — DECIDED
+
+**Finding.** Earlier wording in Section 8 restricted returned borrows to tracing to "exactly one input owner"
+(`|Origin| = 1`). This artificially prevented fundamental multi-input selection functions such as
+`Item which(Item a, Item b)` or `T max(T a, T b)` from returning borrowed views, creating pressure to either
+clone data, resort to macro expansion, or introduce Rust-style lifetime parameters (`'a`). In Rust, lifetime
+parameters create viral contagion across type definitions, functions, and interfaces, causing immense friction
+in UI frameworks, graph structures, and interactive applications.
+
+**Decision (owner, 2026-10-04).**
+1. *Finite Provenance Sets:* A returned borrow may trace to a finite provenance set of input parameters,
+   recorded in the callable's contract as `returns-loan<arg(i)...>` (e.g. `returns-loan<arg(0), arg(1)>`).
+2. *Set Union at Joins:* At control-flow joins (`if`/`else`, `match`) within the callee, the returned loan
+   origin is computed as the simple set union of reachable input origins: $\text{Origin} = \bigcup_{p \in \text{paths}} \text{Origin}(p)$.
+   The callee requires no lifetime solver, outlives relations, or subtyping lattice.
+3. *Caller-Side Lock Union:* At the call site, the caller maps parameter ordinals to actual argument places
+   and places an active shared loan on all members of the provenance set. While the returned view is live:
+   - Any move or destruction of any member of the provenance set is rejected (`F-DIAG-LOAN-CONFLICT`).
+   - Any exclusive (mutable) borrow of any member of the provenance set is rejected.
+   - Shared reads of members of the set remain legal.
+   Upon the view's last use, the loans on all members of the set are simultaneously released.
+4. *Zero Lifetime Contagion in Structs:* Structs and nominal types do not carry lifetime parameters. Long-lived
+   graphs, UI trees, and event models use first-class ownership carriers (`Unique`, `Shared`, `Weak`, or arena
+   identifiers), eliminating the `Rc<RefCell<T>>` borrow-panic failure mode and lifetime contagion.
+5. *Conservative Multi-Borrow Rule:* When multiple borrows from distinct inputs must be extracted independently,
+   callers project them through separate accessor calls rather than bundling them into a flat conservative union,
+   preserving fine-grained borrow independence.
+
+**Architectural Comparison with Rust and Developer Correction Patterns.**
+The deliberate absence of source lifetime parameters (`'a`) removes the primary vector of cognitive overhead
+and structural rigidity that caused numerous complex projects (such as Linux GUI toolkits, game engines, and DOM
+parsers) to abandon Rust. By identifying the specific expressiveness boundaries where Rust allows patterns that
+Finch restricts, developers can apply clean, idiomatic architectures:
+
+1. *Structs Storing Borrowed References (`struct View<'a>`):*
+   - *Rust:* Permits structs to store bare references by annotating the struct with `'a`. This creates viral contagion:
+     every container, wrapper, and consumer of that struct must also declare `'a`.
+   - *Finch:* Structs and variants cannot store bare borrowed references.
+   - *Correction:* Store owned values (`String`, `Vector`), first-class reference-counted handles (`Shared<T>`, `Weak<T>`),
+     or arena entity indices (`u32`). Ephemeral views are passed directly as function arguments.
+2. *Disjoint Multi-Borrow Returns (`(&'a mut A, &'b mut B)`):*
+   - *Rust:* Can return a tuple containing two borrows tied to separate input lifetimes, allowing the caller to release
+     or mutate one while holding the other.
+   - *Finch:* A callable returning a composite aggregate of borrows computes its provenance as the conservative union
+     of all input sources, locking all source arguments until the composite return is released.
+   - *Correction:* Avoid monolithic multi-borrow functions. Provide distinct accessor methods (`s.get_a()` and
+     `o.get_b()`) so the caller tracks exact, independent provenance for each projection.
+3. *Loans Surviving Suspension (`yield` / `async`):*
+   - *Rust:* Permits `async fn` to hold `&T` across an `.await` boundary, which forced Rust into the complex `Pin<&mut T>`
+     abstraction and self-referential lifetime machinery.
+   - *Finch:* Loans strictly cannot cross suspension points (Spec §7, §8).
+   - *Correction:* Hold owned data or `Shared<T>` across suspension, or re-acquire the borrow immediately after resuming.
+     This ensures stackless state machine frames are 100% safe, `@nogc`, deterministic, and require no `Pin`.
+4. *UI Hierarchies and Cyclic Graphs:*
+   - *Rust:* Strict single-ownership and exclusive borrowing (`&mut`) turn cyclic parent/child/sibling relationships into
+     a maze of `Rc<RefCell<Widget>>`, producing silent runtime borrow panics and reference cycle memory leaks.
+   - *Finch:* Clean first-class `Shared<T>` / `Weak<T>` lifecycle kernel (Spec §8.1) handles parent/child relationships
+     with deterministic cleanup. Event dispatch utilizes stackless fibers and typed effects rather than callbacks
+     holding exclusive references to mutable application state.
+
+### 87. Compile-time syntax quasiquoting (`syntax { ... }`), macro call sugar, and generic differentiation — DECIDED
+
+**Finding.** When macros generate code to inline expressions or specialize operations at compile time, requiring
+callers to wrap invocations in verbose `mixin(name(a, b))` forms creates syntax clutter. Additionally, referring
+to syntax quasiquoting blocks as "templates" collides directly with generic types and functions. In C-like
+grammars, compile-time argument passing must also clearly distinguish explicit generic instantiation from macro
+expansion.
+
+**Decision (owner, 2026-10-04).**
+1. *C-like Quasiquoting Block (`syntax { ... }`):* Syntax quasiquoting in the C-like frontend is written
+   `syntax { ... }`, with `$ident` and `$(expr)` interpolation. The keyword `template` is reserved exclusively
+   for generic types and functions, preventing semantic collision.
+2. *Macro Call-Site Shorthand (`name!(args...)`):* In the C-like frontend, invoking a compile-time function
+   that accepts `syntax` parameters and returns `syntax` uses `name!(args...)`. This is reader sugar for
+   `mixin(name(syntax { arg1 }, ...))` (matching CoLisp `@name form` and Co-Forth `syntax[ ... ] mixin`).
+   Arguments are passed unevaluated as `syntax` objects, and the returned AST is spliced in-place.
+3. *Syntactic Distinction from Explicit Generic Calls:*
+   - Compile-time template instantiation for runtime generic functions is written `callee!(T)(runtime_args...)`,
+     where `!(...)` provides the compile-time type/value arguments and `(...)` supplies the runtime argument list.
+   - Macro invocations (`name!(args...)`) have no trailing runtime argument list unless the generated AST
+     itself evaluates to a callable that is immediately invoked (`makeAdder!(5)(10)`).
+4. *First-Class AST Reflection and Structural Optimization:* CTFE functions operate on `syntax` as a typed
+   value, providing inspectable queries (`is_literal`, `node_kind`, `type_of`) and pattern matching. This allows
+   macros to evaluate constant expressions, elide dead branches, and optimize code before emitting the spliced AST.
+
 ## Cross-cutting conclusions
 
 The architecture is coherent: two readers, one semantic construction boundary, one verifier, and

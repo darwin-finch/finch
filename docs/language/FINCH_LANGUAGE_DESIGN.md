@@ -6752,22 +6752,47 @@ of a block is its value. The rule "a trailing expression without `;` is the bloc
 onto that exactly. `&&` and `||` lower to `if`; `%` and the bitwise operators lower to prelude
 calls such as `remainder` and `shift-left`.
 
-**Metaprogramming.** No quasi-quotation is required. Three pieces cover it:
+**Metaprogramming and syntax expansion (Revised 2026-10-04, Finding 87).** Metaprogramming is unified
+around typed compile-time functions returning `syntax`:
 
-- *Building code:* a parsed, parameterized syntax template whose instantiation yields a `syntax`
-  value, in the manner of D's `mixin template`. A bare `syntax { ... }` block with no parameters is
-  only a constant and earns little; the parameters are what make it compose with ordinary
-  compile-time functions. This is quasi-quotation in substance, with the holes declared by name up
-  front rather than marked inline.
-- *Inspecting code:* compiler hooks. `function-spec-of`, `members-of`, `fields-of`, and
-  `modules-of` already exist for this; a function's body is reached through `FunctionSpec`. A
-  template cannot do this job, so the reflection records must be specified precisely (design
-  review finding 69).
-- *Splicing code:* `mixin`, unchanged.
+- *Building code:* a parsed quasiquote block written `syntax { ... }` in the C-like frontend, with
+  `$ident` and `$(expr)` interpolation. The term "template" is avoided here to prevent any collision
+  with generic type/function templates. In Co-Forth, retained syntax uses `syntax[ ... ]`; in CoLisp,
+  quasiquotation uses `` `(...) `` with `,` unquoting.
+- *Inspecting code:* first-class reflection and CTFE queries (`is_literal`, `node_kind`, `type_of`,
+  `function-spec-of`, `members-of`, `fields-of`). CTFE functions can pattern-match on syntax nodes to
+  evaluate constant expressions, elide dead branches, and optimize code before returning it.
+- *Calling macros:* call-site invocation uses the shorthand `name!(args...)`, which desugars to
+  `mixin(name(syntax { arg1 }, ...))` (matching CoLisp `@name form` and Co-Forth `syntax[ ... ] mixin`).
+  Arguments are captured unevaluated as `syntax` objects, and the resulting AST is spliced in-place.
+- *Distinction from generic calls:* non-comptime generic functions with explicit type parameters use
+  `callee!(T)(runtime_args...)`, strictly separating the compile-time template instantiation `!(...)`
+  from runtime execution `(...)`.
+- *Splicing code:* `mixin`, unchanged. D-style unvalidated string mixins have no counterpart: generated
+  text never becomes source.
 
-D's string mixins have no counterpart: generated text never becomes source. Calling a macro needs
-nothing special in any frontend, because an argument to a callee with a `syntax` parameter is
-retained unevaluated. A macro written in CoLisp is callable from the C-like syntax once compiled.
+**Returned borrows, finite provenance sets, and lifetime-free ergonomics (Added 2026-10-04, Finding 86).**
+The language rejects Rust-style lifetime parameters (`'a`), which cause viral contagion across types
+and cripple graph-heavy architectures like UIs, scene graphs, and game engines. While earlier drafts
+restricted returned borrows to a single input origin (`|Origin| = 1`), Finch generalizes this to
+**Finite Provenance Sets** (`returns-loan<arg(i)...>`). At control-flow branches, the return provenance is
+simply the set union of reachable input origins. At call sites, the caller locks all members of the
+provenance set with shared loans until the returned view's last use.
+
+*Addressing expressiveness boundaries with Rust:*
+1. *Structs storing borrows:* Rust's `struct View<'a>` forces lifetime annotations into every enclosing
+   struct and container. Finch forbids bare borrows in structs; structs store owned data, first-class
+   reference-counted handles (`Shared<T>`, `Weak<T>`), or arena indices (`u32`), completely eliminating
+   lifetime contagion and `Rc<RefCell<T>>` runtime borrow panics.
+2. *Disjoint multi-borrow returns:* Where Rust uses multi-lifetime tuples (`(&'a mut A, &'b mut B)`), Finch
+   conservatively unions provenance across composite returns. Callers maintain disjoint borrow independence
+   by projecting through separate accessor functions (`s.part_a()` and `o.part_b()`).
+3. *Suspension safety without `Pin`:* Rust allows holding borrows across `.await`, necessitating the complex
+   `Pin<&mut T>` wrapper. Finch strictly bans loans across suspension points, ensuring stackless state
+   machine activation frames are 100% `@nogc`, deterministic, and self-contained. State surviving suspension
+   must be owned or reference-counted.
+4. *UI event dispatch:* Instead of callbacks holding mutable references to widgets, interactive systems in
+   Finch communicate via typed message-passing effects and lightweight suspending fibers.
 
 ### What the exercise asks of the language
 

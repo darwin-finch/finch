@@ -871,8 +871,24 @@ parent for the reborrow's lexical extent. At a control-flow join, the state is t
 state valid on every incoming edge.
 
 Loans MUST NOT escape their traced owner, cross suspension, enter durable storage, transfer to a
-task, or cross FFI. A returned borrow is legal only when it traces to exactly one input owner and the
-callable contract records that origin. No source lifetime parameters exist in version 0.1.
+task, or cross FFI. A returned borrow is legal only when it traces to a finite set of input parameters
+and the callable contract records that provenance set (`returns-loan<arg(i)...>`). At a control-flow
+join within the callee, the returned loan origin is the set union of reachable input origins. At the
+call site, the caller registers an active loan on every argument place mapped to the provenance set,
+forbidding moves and exclusive access on any member of the set until the returned view reaches its
+last use. Multiple-input provenance unions introduce no source lifetime parameters (`'a`). No source
+lifetime parameters exist in version 0.1.
+
+Aggregates and nominal types (records, variants) store owned data or explicit handles (`Copy`,
+`Unique<T>`, `Shared<T>`, `Weak<T>`, or inline aggregates); they cannot declare borrowed reference
+fields or type lifetime parameters. Long-lived graphs, cyclic structures, and UI hierarchies manage
+identity and back-references through explicit weak handles (`Weak<T>`) or arena indices. When a callable
+returns a composite aggregate carrying borrowed views derived from multiple inputs, the composite view's
+provenance is the conservative union of all contributing inputs. To maintain disjoint borrow
+independence across distinct caller places (where modifying one source place must not conflict with a
+view into another), callers project each borrow through a separate accessor callable rather than a
+monolithic multi-borrow return. Because loans cannot cross suspension, stackless state machine activation
+records store only owned values, eliminating self-referential pointers and requiring no `Pin` wrapper.
 
 Ownership is proven at compile time and erased. No run-time state records who owns a value, whether
 a place has been moved from, or which loans are live. For every read of a place the compiler
@@ -1260,9 +1276,22 @@ checks. They cannot replace an already published declaration.
 `@Name form` is reader sugar for `(mixin (Name form))`, applied to the next form only. Stacking is
 left-to-right syntactically and therefore innermost-first semantically: `@A @B F` becomes
 `(mixin (A (mixin (B F))))`. `Name` resolves normally and MUST return `syntax`; otherwise ordinary call
-typing rejects the expansion. Declaration metadata is structured syntax produced and reflected by
-these transformations, not a second magic attribute mechanism. Core attributes are namespaced and
-may be imported or renamed like other compile-time bindings.
+typing rejects the expansion.
+
+In the C-like frontend, syntax quasiquotation is expressed using `syntax { ... }`, with `$ident` and
+`$(expr)` unquoting/interpolation (avoiding collision with generic type templates). Macro invocation
+at the call site uses the shorthand `name!(args...)`, which is reader sugar for
+`mixin(name(syntax { arg1 }, ...))`. Arguments to a macro call are passed unevaluated as `syntax`
+objects, and the returned `syntax` AST is spliced in-place into the caller's AST. This is
+syntactically distinct from a generic function call with explicit template arguments, written
+`callee!(T)(runtime_args...)`, where `!(...)` supplies compile-time type/value arguments and the
+trailing `(...)` supplies runtime call arguments. First-class `syntax` reflection and pattern matching
+allow CTFE functions to inspect AST structure, type information, and literals to perform compile-time
+optimizations such as dead-branch elision before splicing.
+
+Declaration metadata is structured syntax produced and reflected by these transformations, not a
+second magic attribute mechanism. Core attributes are namespaced and may be imported or renamed like
+other compile-time bindings.
 
 ## 12. Control, cleanup, tail calls, and resumability
 
