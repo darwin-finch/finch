@@ -1165,11 +1165,12 @@ mod tests {
     /// reviewer is never handed a view that shows nothing to approve.
     #[tokio::test]
     async fn test_change_too_large_to_render_is_refused() {
-        let bulk = "x\n".repeat(300_000);
-        let (_dir, path) = temp_file("huge.txt", &format!("{bulk}MARKER\n"));
+        let bulk = "x\n".repeat(30_000);
+        let (_dir, path) = temp_file("huge.txt", &bulk);
+        let replacement = "y\n".repeat(30_000);
         let opened = Arc::new(Mutex::new(false));
         let flag = opened.clone();
-        let error = review_and_apply_edit(&path, "MARKER", "REPLACED", false, move |a: String| {
+        let error = review_and_apply_edit(&path, &bulk, &replacement, false, move |a: String| {
             *flag.lock().unwrap() = true;
             Box::pin(async move { Ok(Some(a)) })
                 as std::pin::Pin<
@@ -1189,7 +1190,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            format!("{bulk}MARKER\n"),
+            bulk,
             "a refused edit must leave the file untouched"
         );
     }
