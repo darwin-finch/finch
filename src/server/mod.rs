@@ -781,6 +781,13 @@ impl AgentServer {
         // something to do; per #380's lesson, an unchanging "nothing swept"
         // must stay silent rather than confirm itself every restart.
         let brain_store = crate::brain::BrainStore::new(machine);
+        let reconciled = brain_store.reconcile_dangling_attachments();
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                "daemon startup: reconciled dangling Brain attachments"
+            );
+        }
         let swept = brain_store.sweep_unused(crate::brain::BrainStore::SWEEP_MIN_AGE_MS);
         if swept > 0 {
             tracing::info!(

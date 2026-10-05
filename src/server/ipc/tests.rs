@@ -3365,3 +3365,122 @@ async fn test_brain_created_through_real_ipc_records_creating_clients_cwd_not_da
         })
         .await;
 }
+
+#[test]
+fn test_client_disconnect_or_daemon_restart_resets_attached_count_to_zero() {
+    let local = tokio::task::LocalSet::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    local.block_on(&runtime, async {
+        let temp = tempfile::tempdir().unwrap();
+        let brain_root = temp.path().join("brains");
+        let store = crate::brain::BrainStore::with_root("box.local", Some(brain_root.clone()));
+        store
+            .push(
+                "shared",
+                "alice",
+                crate::brain::BrainEventKind::Prompt {
+                    text: "hello".into(),
+                    attached_mentions: Vec::new(),
+                },
+            )
+            .unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::BrainCredentialAuthority::ephemeral([201; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+
+        // Case 1: Client attaches over IPC, then exits/is killed (stream dropped without detaching)
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+        let handler_server = std::sync::Arc::clone(&server);
+        let handler = tokio::task::spawn_local(async move {
+            super::handle_connection(server_stream, handler_server).await
+        });
+
+        let client = crate::client::IpcClient::from_stream(client_stream)
+            .await
+            .unwrap();
+        let attachment = client
+            .brain_attach(
+                "shared",
+                "alice",
+                crate::brain::AttachmentRole::Driver,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut events = client.brain_watch("shared", &attachment).await.unwrap();
+        let _snapshot = events.recv().await.unwrap().unwrap();
+
+        // While client is connected, ATTACHED is 1
+        let summaries = store.list_summaries_unhydrated();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].attached.len(), 1);
+
+        // Client disappears without calling detach (drops stream)
+        drop(events);
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .unwrap();
+
+        // After client exits, ATTACHED count returns to 0
+        let summaries = store.list_summaries_unhydrated();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].attached.len(),
+            0,
+            "ATTACHED must return to 0 after client exits: {summaries:?}"
+        );
+
+        // Case 2: Client attaches, and the daemon restarts while client is still attached
+        let (server_stream2, client_stream2) = tokio::net::UnixStream::pair().unwrap();
+        let handler_server2 = std::sync::Arc::clone(&server);
+        let handler2 = tokio::task::spawn_local(async move {
+            super::handle_connection(server_stream2, handler_server2).await
+        });
+
+        let client2 = crate::client::IpcClient::from_stream(client_stream2)
+            .await
+            .unwrap();
+        let attachment2 = client2
+            .brain_attach("shared", "bob", crate::brain::AttachmentRole::Driver, None)
+            .await
+            .unwrap();
+        let mut events2 = client2.brain_watch("shared", &attachment2).await.unwrap();
+        let _ = events2.recv().await.unwrap().unwrap();
+
+        // Bob is now attached
+        let summaries = store.list_summaries_unhydrated();
+        assert_eq!(summaries[0].attached.len(), 1);
+
+        // Daemon crashes / killed abruptly: abort handler without teardown
+        handler2.abort();
+        drop(events2);
+        drop(client2);
+        drop(server);
+        drop(store);
+
+        // Next daemon start: new store/server starts up over the same root
+        let restarted = crate::brain::BrainStore::with_root("box.local", Some(brain_root));
+        let reconciled = restarted.reconcile_dangling_attachments();
+        assert_eq!(reconciled, 1);
+
+        // ATTACHED returns to 0 no later than the next daemon start (#1661)
+        let summaries = restarted.list_summaries_unhydrated();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].attached.len(),
+            0,
+            "ATTACHED must return to 0 after daemon restart: {summaries:?}"
+        );
+    });
+}

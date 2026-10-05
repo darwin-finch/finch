@@ -4724,6 +4724,78 @@ mod tests {
     }
 
     #[test]
+    fn brain_ls_reports_zero_attached_after_client_disappears_across_daemon_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let writer = finch::brain::BrainStore::with_root("cli-test", Some(root.clone()));
+        writer
+            .push(
+                "restarted-brain",
+                "alice",
+                finch::brain::BrainEventKind::Prompt {
+                    text: "hello".into(),
+                    attached_mentions: Vec::new(),
+                },
+            )
+            .expect("prompt");
+        let attachment = writer
+            .attach(
+                "restarted-brain",
+                "alice@box.local",
+                finch::brain::AttachmentRole::Driver,
+                None,
+            )
+            .expect("attach");
+        writer
+            .activate_connection(
+                "restarted-brain",
+                attachment.attachment_id,
+                attachment.connection_id.expect("connection"),
+            )
+            .expect("activate");
+
+        // Client disappears without detaching (daemon killed or restart)
+        drop(writer);
+
+        // Daemon starts up and reconciles dangling attachments
+        let daemon_store = finch::brain::BrainStore::with_root("daemon", Some(root.clone()));
+        daemon_store.reconcile_dangling_attachments();
+        drop(daemon_store);
+
+        // CLI runs `finch brain ls`
+        let cli_store = finch::brain::BrainStore::with_root("cli", Some(root));
+        let mut out = Vec::new();
+        execute_brain_command(BrainCommand::Ls { json: true }, &cli_store, false, &mut out)
+            .expect("list named Brains as JSON");
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(text.trim()).expect("ls --json must be a JSON array");
+        assert_eq!(parsed.len(), 1);
+        let attached = parsed[0]["attached"].as_array().expect("attached array");
+        assert_eq!(
+            attached.len(),
+            0,
+            "attached sessions must return to 0 across daemon restart after client disappears; got {text}"
+        );
+
+        // Also test plain text format output
+        let mut text_out = Vec::new();
+        execute_brain_command(
+            BrainCommand::Ls { json: false },
+            &cli_store,
+            false,
+            &mut text_out,
+        )
+        .expect("list named Brains as plain text");
+        let formatted = String::from_utf8(text_out).expect("utf8");
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let fields: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(fields[0], "restarted-brain");
+        assert_eq!(fields[3], "0", "ATTACHED column must be 0: {formatted}");
+    }
+
+    #[test]
     fn brain_ls_json_empty_store_emits_empty_array() {
         let (_temp, store) = isolated_brain_store();
         let mut out = Vec::new();
