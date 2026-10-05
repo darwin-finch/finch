@@ -856,6 +856,35 @@ fn committed_named_brain_memory_pair(
     Ok((prompt, output))
 }
 
+static LOGGED_REPLAY_ERRORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Returns true if this (brain, cause) error has not yet been logged, and records it.
+/// If it has already been logged, returns false (so duplicate logs are suppressed).
+pub(crate) fn should_log_replay_error(brain: &str, cause: &str) -> bool {
+    let mut logged = LOGGED_REPLAY_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    logged.insert((brain.to_string(), cause.to_string()))
+}
+
+/// Clears logged errors for this Brain once memory projection succeeds.
+pub(crate) fn clear_replay_error(brain: &str) {
+    let mut logged = LOGGED_REPLAY_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    logged.retain(|(b, _)| b != brain);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_replay_errors_for_test() {
+    let mut logged = LOGGED_REPLAY_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    logged.clear();
+}
+
 /// Reissue semantic-memory projection from the canonical Brain log whenever
 /// a runner registers. Deterministic Brain/run/role identities make exact
 /// replays no-ops, while a missed callback or rebuilt memory index recovers.
@@ -914,16 +943,21 @@ pub(crate) async fn replay_committed_named_brain_memory(
             )
             .await
         {
-            Ok(_) => projected += 1,
+            Ok(_) => {
+                projected += 1;
+                clear_replay_error(&name);
+            }
             Err(crate::server::RunnerProjectionError::Unavailable(error)) => return Err(error),
             Err(crate::server::RunnerProjectionError::Rejected(message)) => {
-                tracing::warn!(
-                    brain = %name,
-                    run_id = %run.run_id.0,
-                    error = %message,
-                    "skipping memory replay for one Brain run; the rest of the \
-                     replay continues"
-                );
+                if should_log_replay_error(&name, &message) {
+                    tracing::warn!(
+                        brain = %name,
+                        run_id = %run.run_id.0,
+                        error = %message,
+                        "skipping memory replay for one Brain run; the rest of the \
+                         replay continues"
+                    );
+                }
             }
         }
     }

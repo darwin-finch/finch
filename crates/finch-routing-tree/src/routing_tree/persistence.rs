@@ -445,6 +445,8 @@ pub fn load_routing_tree_within(
     // `bucket_deflated` exists to avoid persisting redundantly (module doc). A dual entry replays
     // normally down to its own `divergence_node_id`, takes the OTHER child there once, then
     // continues normally (a dual copy never spawns further dual copies, matching insertion).
+    let mut membership_tuples: Vec<(usize, usize, bool, Option<usize>)> =
+        Vec::with_capacity(memberships.len());
     for m in &memberships {
         anyhow::ensure!(
             m.point_id < points.len(),
@@ -490,18 +492,7 @@ pub fn load_routing_tree_within(
         let mut cur = 0usize; // root is always node 0
         let mut traversed = 0usize;
         let mut encountered_divergence = false;
-        while cur != m.leaf_node_id {
-            anyhow::ensure!(
-                cur < nodes.len(),
-                "load_routing_tree: membership for point {} traversed to missing node {cur}",
-                m.point_id
-            );
-            anyhow::ensure!(
-                !nodes[cur].is_leaf,
-                "load_routing_tree: membership for point {} targets leaf {} but traversal stopped at different leaf {cur}",
-                m.point_id,
-                m.leaf_node_id
-            );
+        while !nodes[cur].is_leaf {
             traversed += 1;
             anyhow::ensure!(
                 traversed <= nodes.len(),
@@ -541,6 +532,21 @@ pub fn load_routing_tree_within(
                         m.point_id
                     ))?
             };
+            anyhow::ensure!(
+                cur < nodes.len(),
+                "load_routing_tree: membership for point {} traversed to missing node {cur}",
+                m.point_id
+            );
+        }
+        if cur != m.leaf_node_id {
+            tracing::warn!(
+                point_id = m.point_id,
+                recorded_leaf = m.leaf_node_id,
+                repaired_leaf = cur,
+                "load_routing_tree: auto-repairing membership for point {}: recorded leaf was {}, traversal reached leaf {cur}",
+                m.point_id,
+                m.leaf_node_id
+            );
         }
         anyhow::ensure!(
             !m.is_dual || encountered_divergence,
@@ -549,15 +555,13 @@ pub fn load_routing_tree_within(
             m.divergence_node_id,
             m.leaf_node_id
         );
-        nodes[m.leaf_node_id].bucket_ids.push(m.point_id);
-        nodes[m.leaf_node_id].bucket_deflated.push(x);
-        nodes[m.leaf_node_id].bucket_is_dual.push(m.is_dual);
+        let target_leaf = cur;
+        nodes[target_leaf].bucket_ids.push(m.point_id);
+        nodes[target_leaf].bucket_deflated.push(x);
+        nodes[target_leaf].bucket_is_dual.push(m.is_dual);
+        membership_tuples.push((target_leaf, m.point_id, m.is_dual, m.divergence_node_id));
     }
 
-    let membership_tuples: Vec<(usize, usize, bool, Option<usize>)> = memberships
-        .iter()
-        .map(|m| (m.leaf_node_id, m.point_id, m.is_dual, m.divergence_node_id))
-        .collect();
     let mut tree = tree;
     tree.install_loaded_state(nodes, points, removed_flag, &membership_tuples);
     Ok((tree, metadata))
@@ -1394,6 +1398,80 @@ mod tests {
         assert!(
             error.to_string().contains("replay never encountered"),
             "a valid decision id is not sufficient unless replay actually encounters it; got {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_routing_tree_auto_repairs_traversal_mismatch_and_preserves_recall() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("test_schema.sql")).unwrap();
+
+        let points = test_corpus(20);
+        let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
+        for (i, p) in points.iter().enumerate() {
+            let pid = tree.insert(p.clone());
+            assert_eq!(pid, i);
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
+        }
+        save_dirty_nodes(&mut tree, &conn).unwrap();
+
+        let mut leaves = Vec::new();
+        for id in 0..tree.node_count() {
+            if tree.is_leaf(id) {
+                leaves.push(id);
+            }
+        }
+        assert!(
+            leaves.len() >= 2,
+            "tree must have split into at least 2 leaves"
+        );
+
+        // Pick point 0 and find which leaf it is currently in
+        let cur_leaf: usize = conn
+            .query_row(
+                "SELECT leaf_node_id FROM routing_leaf_membership WHERE is_dual = 0 AND point_id = 0",
+                [],
+                |r| r.get::<_, i64>(0).map(|id| id as usize),
+            )
+            .unwrap();
+        let other_leaf = leaves.iter().copied().find(|&l| l != cur_leaf).unwrap();
+
+        // Corrupt membership table so point 0 points to other_leaf
+        conn.execute(
+            "UPDATE routing_leaf_membership SET leaf_node_id = ?1 WHERE point_id = 0 AND is_dual = 0",
+            params![other_leaf as i64],
+        )
+        .unwrap();
+
+        // Hydration must now succeed and auto-repair point 0 into cur_leaf
+        let (loaded, metadata) =
+            load_routing_tree(&conn, RoutingConfig::default(), DIM, 7).unwrap();
+        assert_eq!(metadata.len(), points.len());
+
+        // Assert point 0 was auto-repaired into cur_leaf
+        assert!(
+            loaded.bucket_of(cur_leaf).contains(&0),
+            "point 0 must be auto-repaired into cur_leaf where traversal stopped"
+        );
+        assert!(
+            !loaded.bucket_of(other_leaf).contains(&0),
+            "point 0 must not remain in other_leaf"
+        );
+
+        // Recall for point 0 must succeed
+        let result = loaded.descend_adaptive(&points[0], None, false);
+        assert_eq!(
+            result.best_point_id,
+            Some(0),
+            "recall for auto-repaired point must find point 0"
         );
     }
 }

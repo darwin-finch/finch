@@ -222,15 +222,21 @@ pub(super) async fn dispatch_named_brain_run(
                 )?;
             }
             if projects_memory {
-                if let Err(error) =
-                    project_committed_named_brain_memory(store, runners, name, run).await
-                {
-                    tracing::warn!(
-                        brain = name,
-                        run_id = %run.run_id.0,
-                        %error,
-                        "could not project committed Brain turn into memory"
-                    );
+                match project_committed_named_brain_memory(store, runners, name, run).await {
+                    Ok(_) => {
+                        super::clear_replay_error(name);
+                    }
+                    Err(error) => {
+                        let cause = error.to_string();
+                        if super::should_log_replay_error(name, &cause) {
+                            tracing::warn!(
+                                brain = name,
+                                run_id = %run.run_id.0,
+                                %error,
+                                "could not project committed Brain turn into memory"
+                            );
+                        }
+                    }
                 }
             }
             if let Some(commit_ack) = commit_ack {
