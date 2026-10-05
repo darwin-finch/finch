@@ -1198,7 +1198,7 @@ fn handle_models_key(state: &mut WizardState, key: crossterm::event::KeyEvent) -
                         catalog_error,
                     );
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(AddProviderStep::DeviceAuth { pending, .. }) =
                         adding_provider.as_ref()
                     {
@@ -2085,7 +2085,7 @@ fn handle_models_key(state: &mut WizardState, key: crossterm::event::KeyEvent) -
         if *editing_model_mode {
             // Editing model name for the selected entry
             match key.code {
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     model_input.push(c);
                 }
                 KeyCode::Backspace => {
@@ -2129,7 +2129,7 @@ fn handle_models_key(state: &mut WizardState, key: crossterm::event::KeyEvent) -
                 return Ok(false);
             }
             match key.code {
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if *selected_idx == 0 {
                         if let ModelConfig::Remote { api_key, .. } = primary_model {
                             api_key.push(c);
@@ -2508,7 +2508,7 @@ pub(super) fn handle_personas_input(
                     let to_eol = after.find('\n').unwrap_or(after.chars().count());
                     *cursor_pos += to_eol;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let byte = char_to_byte(prompt_input, *cursor_pos);
                     prompt_input.insert(byte, c);
                     *cursor_pos += 1;
@@ -2689,7 +2689,7 @@ pub(super) fn handle_features_input_impl(
         if *editing_hf_token {
             // In HF token editing mode
             match key.code {
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     hf_token.push(c);
                 }
                 KeyCode::Backspace => {
@@ -2705,7 +2705,9 @@ pub(super) fn handle_features_input_impl(
 
         if *editing_finch_api_key {
             match key.code {
-                KeyCode::Char(c) => finch_api_key.push(c),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    finch_api_key.push(c)
+                }
                 KeyCode::Backspace => {
                     finch_api_key.pop();
                 }

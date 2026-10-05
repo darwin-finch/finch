@@ -10330,3 +10330,233 @@ fn test_setup_list_scrolling_leaves_no_stale_row_between_frames() {
         }
     }
 }
+
+#[test]
+fn test_ctrl_s_does_not_modify_text_fields_in_setup_forms() {
+    // 1. Add/Edit Compatible Connection form
+    let draft = OpenAiCompatibleDraft {
+        name: "compat".into(),
+        base_url: "https://api.example.com/v1".into(),
+        chat_path: "/chat/completions".into(),
+        models_path: "/models".into(),
+        model: "gpt-4o".into(),
+        credential_ref: "test-key".into(),
+        secret_env: "TEST_KEY".into(),
+        credential_kind: crate::config::CredentialKind::Bearer,
+        streaming: Some(true),
+        tools: Some(true),
+        parallel_tool_calls: Some(false),
+        image_input: Some(false),
+        context_window_tokens: "128000".into(),
+        max_output_tokens: "4096".into(),
+        tool_choice: crate::config::OpenAiCompatibleToolChoice::Auto,
+        strict_tool_schemas: Some(false),
+        original_profile: None,
+        original_credential: None,
+    };
+    for field_idx in 0..=6 {
+        let mut state = state_with_step(AddProviderStep::ConfigureCompatibleConnection {
+            draft: draft.clone(),
+            focused_field: field_idx,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+        let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        handle_wizard_key(&mut state, ctrl_s).unwrap();
+        let Some(SectionState::Models {
+            adding_provider:
+                Some(AddProviderStep::ConfigureCompatibleConnection {
+                    draft: after_draft, ..
+                }),
+            ..
+        }) = state.sections.get(&WizardSection::Models)
+        else {
+            panic!("expected ConfigureCompatibleConnection");
+        };
+        assert_eq!(
+            after_draft.name, draft.name,
+            "Ctrl+S modified name in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.base_url, draft.base_url,
+            "Ctrl+S modified base_url in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.chat_path, draft.chat_path,
+            "Ctrl+S modified chat_path in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.models_path, draft.models_path,
+            "Ctrl+S modified models_path in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.model, draft.model,
+            "Ctrl+S modified model in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.credential_ref, draft.credential_ref,
+            "Ctrl+S modified credential_ref in field {field_idx}"
+        );
+        assert_eq!(
+            after_draft.secret_env, draft.secret_env,
+            "Ctrl+S modified secret_env in field {field_idx}"
+        );
+    }
+
+    // 2. Configure Remote provider form
+    for field_idx in [1, 2, 3] {
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: 0,
+            name: "provider-name".into(),
+            model: "model-name".into(),
+            api_key: Some("api-key-value".into()),
+            focused_field: field_idx,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+        let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        handle_wizard_key(&mut state, ctrl_s).unwrap();
+        let Some(SectionState::Models {
+            adding_provider:
+                Some(AddProviderStep::ConfigureRemote {
+                    name,
+                    model,
+                    api_key,
+                    ..
+                }),
+            ..
+        }) = state.sections.get(&WizardSection::Models)
+        else {
+            panic!("expected ConfigureRemote");
+        };
+        assert_eq!(
+            name, "provider-name",
+            "Ctrl+S modified name in field {field_idx}"
+        );
+        assert_eq!(
+            model, "model-name",
+            "Ctrl+S modified model in field {field_idx}"
+        );
+        assert_eq!(
+            api_key.as_deref(),
+            Some("api-key-value"),
+            "Ctrl+S modified api_key in field {field_idx}"
+        );
+    }
+
+    // 3. Configure Local provider form
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Qwen2,
+        size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
+        execution: ExecutionTarget::Cpu,
+        model_path: "/path/to/model.gguf".into(),
+        focused_field: 5,
+        editing_idx: None,
+    });
+    state.current_section = WizardSection::Models;
+    let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    handle_wizard_key(&mut state, ctrl_s).unwrap();
+    let Some(SectionState::Models {
+        adding_provider: Some(AddProviderStep::ConfigureLocal { model_path, .. }),
+        ..
+    }) = state.sections.get(&WizardSection::Models)
+    else {
+        panic!("expected ConfigureLocal");
+    };
+    assert_eq!(
+        model_path, "/path/to/model.gguf",
+        "Ctrl+S modified model_path in ConfigureLocal"
+    );
+
+    // 4. Inline model name editing
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        editing_model_mode,
+        model_input,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *editing_model_mode = true;
+        *model_input = "claude-3-5".into();
+    }
+    let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    handle_wizard_key(&mut state, ctrl_s).unwrap();
+    if let Some(SectionState::Models { model_input, .. }) =
+        state.sections.get(&WizardSection::Models)
+    {
+        assert_eq!(model_input, "claude-3-5", "Ctrl+S modified model_input");
+    }
+
+    // 5. Inline API key editing
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        editing_mode,
+        primary_model,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *editing_mode = true;
+        if let ModelConfig::Remote { api_key, .. } = primary_model {
+            *api_key = "secret_key".into();
+        }
+    }
+    let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    handle_wizard_key(&mut state, ctrl_s).unwrap();
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get(&WizardSection::Models)
+    {
+        if let ModelConfig::Remote { api_key, .. } = primary_model {
+            assert_eq!(
+                api_key, "secret_key",
+                "Ctrl+S modified primary_model api_key"
+            );
+        }
+    }
+
+    // 6. Features section: HF token editing
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Features;
+    if let Some(SectionState::Features {
+        editing_hf_token,
+        hf_token,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Features)
+    {
+        *editing_hf_token = true;
+        *hf_token = "hf_initial".into();
+    }
+    let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    handle_wizard_key(&mut state, ctrl_s).unwrap();
+    if let Some(SectionState::Features { hf_token, .. }) =
+        state.sections.get(&WizardSection::Features)
+    {
+        assert_eq!(hf_token, "hf_initial", "Ctrl+S modified hf_token");
+    }
+
+    // 7. Features section: Finch API key editing
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Features;
+    if let Some(SectionState::Features {
+        editing_finch_api_key,
+        finch_api_key,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Features)
+    {
+        *editing_finch_api_key = true;
+        *finch_api_key = "finch_initial".into();
+    }
+    let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    handle_wizard_key(&mut state, ctrl_s).unwrap();
+    if let Some(SectionState::Features { finch_api_key, .. }) =
+        state.sections.get(&WizardSection::Features)
+    {
+        assert_eq!(
+            finch_api_key, "finch_initial",
+            "Ctrl+S modified finch_api_key"
+        );
+    }
+}
