@@ -10,10 +10,39 @@ pub struct MistralAdapter;
 
 impl LocalModelAdapter for MistralAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // Mistral instruction format (no explicit system role)
         // System message is prepended to user message
         // Reference: https://docs.mistral.ai/guides/prompting_capabilities/
-        format!("<s>[INST] {}\n\n{} [/INST]", system, user_message)
+        let mut prompt = String::from("<s>");
+        let mut system_injected = system.is_empty();
+        for (role, content) in history {
+            if *role == "user" {
+                if !system_injected {
+                    prompt.push_str(&format!("[INST] {}\n\n{} [/INST]", system, content));
+                    system_injected = true;
+                } else {
+                    prompt.push_str(&format!("[INST] {} [/INST]", content));
+                }
+            } else {
+                prompt.push_str(&format!("{}</s>", content));
+            }
+        }
+        if !system_injected {
+            prompt.push_str(&format!("[INST] {}\n\n{} [/INST]", system, user_message));
+        } else {
+            prompt.push_str(&format!("[INST] {} [/INST]", user_message));
+        }
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {

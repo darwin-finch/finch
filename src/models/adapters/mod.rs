@@ -26,7 +26,18 @@ use std::fmt;
 /// Local model adapter for formatting prompts and handling model-specific behavior
 pub trait LocalModelAdapter: Send + Sync {
     /// Format a prompt with system message using model's chat template
-    fn format_chat_prompt(&self, system: &str, user_message: &str) -> String;
+    fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    /// Format a multi-turn conversation with system message and history turns using model's chat template
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String;
 
     /// Get model's EOS (End of Sequence) token ID
     fn eos_token_id(&self) -> u32;
@@ -111,6 +122,65 @@ impl AdapterRegistry {
     }
 }
 
+/// Parse multi-turn history and final question from a serialized query string.
+/// Returns `(history, final_question)`.
+pub fn parse_history_from_query(query: &str) -> (Vec<(&str, &str)>, &str) {
+    if !query.starts_with("user: ") && !query.starts_with("assistant: ") {
+        return (Vec::new(), query);
+    }
+
+    let mut turns = Vec::new();
+    let mut current_role;
+    let mut current_start;
+
+    let len = query.len();
+    let mut i;
+
+    if query.starts_with("user: ") {
+        current_role = "user";
+        current_start = 6;
+        i = 6;
+    } else if query.starts_with("assistant: ") {
+        current_role = "assistant";
+        current_start = 11;
+        i = 11;
+    } else {
+        return (Vec::new(), query);
+    }
+
+    while i < len {
+        if i + 2 <= len && &query[i..i + 2] == "\n\n" {
+            let after = &query[i + 2..];
+            if after.starts_with("user: ") {
+                let content = query[current_start..i].trim();
+                turns.push((current_role, content));
+                current_role = "user";
+                current_start = i + 2 + 6;
+                i = current_start;
+                continue;
+            } else if after.starts_with("assistant: ") {
+                let content = query[current_start..i].trim();
+                turns.push((current_role, content));
+                current_role = "assistant";
+                current_start = i + 2 + 11;
+                i = current_start;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    let remaining = &query[current_start..];
+    if let Some(sep) = remaining.find("\n\n") {
+        let content = remaining[..sep].trim();
+        let question = remaining[sep + 2..].trim();
+        turns.push((current_role, content));
+        (turns, question)
+    } else {
+        (turns, remaining.trim())
+    }
+}
+
 // #781: this module previously declared a second `ModelFamily` enum (with
 // `from_name` and `AdapterRegistry::from_family`) competing with
 // `unified_loader::ModelFamily`. Both had no production caller and drifted
@@ -147,5 +217,28 @@ mod tests {
         // (Gemma has no `<|begin_of_text|>`/`<|eot_id|>` tokens in its vocab).
         let gemma = AdapterRegistry::get_adapter("Gemma 2 9B");
         assert_eq!(gemma.family_name(), "Gemma");
+    }
+
+    #[test]
+    fn test_parse_history_from_query() {
+        // Single turn
+        let (history, question) = parse_history_from_query("What is 2+2?");
+        assert!(history.is_empty());
+        assert_eq!(question, "What is 2+2?");
+
+        // Multi-turn
+        let query = "user: earlier turn\n\nassistant: earlier reply\n\ncurrent question";
+        let (history, question) = parse_history_from_query(query);
+        assert_eq!(
+            history,
+            vec![("user", "earlier turn"), ("assistant", "earlier reply")]
+        );
+        assert_eq!(question, "current question");
+
+        // Multi-paragraph question
+        let query = "user: q1\n\nassistant: a1\n\npara 1\n\npara 2";
+        let (history, question) = parse_history_from_query(query);
+        assert_eq!(history, vec![("user", "q1"), ("assistant", "a1")]);
+        assert_eq!(question, "para 1\n\npara 2");
     }
 }

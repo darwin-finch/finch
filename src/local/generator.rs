@@ -68,6 +68,37 @@ pub(super) fn nonempty_text_content(block: &crate::providers::ContentBlock) -> O
     }
 }
 
+/// Strip synthetic sender tag prefixes like `[username]\n` or `[username] ` from user message text.
+///
+/// In multi-participant or tagged chat environments, turns may be prepended with a sender
+/// identifier (e.g. `[alice]\nHello` or `[user] Hello`). Preserves valid arrays or bracketed
+/// expressions like `[1, 2, 3]` by requiring that the bracketed content has no newlines or commas
+/// and is followed immediately by a newline, colon-space, or space.
+pub(crate) fn strip_sender_tag(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('[') {
+        return text;
+    }
+
+    if let Some(close_bracket) = trimmed.find(']') {
+        let tag = &trimmed[1..close_bracket];
+        if !tag.is_empty() && !tag.contains('\n') && !tag.contains(',') {
+            let after = &trimmed[close_bracket + 1..];
+            if let Some(rest) = after.strip_prefix("\r\n") {
+                return rest;
+            } else if let Some(rest) = after.strip_prefix('\n') {
+                return rest;
+            } else if let Some(rest) = after.strip_prefix(": ") {
+                return rest;
+            } else if let Some(rest) = after.strip_prefix(' ') {
+                return rest;
+            }
+        }
+    }
+
+    text
+}
+
 /// Shown when `prompt_parts` finds a last "user"-role message but it carries
 /// no `ContentBlock::Text` -- concretely, a tool result posted back after a
 /// tool call (`Message::with_content("user", vec![ContentBlock::ToolResult
@@ -377,7 +408,7 @@ impl TemplateGenerator {
             .rposition(|message| message.role == "user")
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
         let last_user_message = &messages[last_user_idx];
-        let current_question =
+        let current_question_raw =
             last_user_message
                 .content
                 .iter()
@@ -402,6 +433,7 @@ impl TemplateGenerator {
                         anyhow::anyhow!("No user message found")
                     }
                 })?;
+        let current_question = strip_sender_tag(current_question_raw);
 
         // Fresh recall is injected as a synthetic [user(memory), assistant(ack)]
         // pair, wrapped in a `<retrieved_memory>` tag, immediately before the
@@ -446,10 +478,15 @@ impl TemplateGenerator {
                     .filter_map(nonempty_text_content)
                     .collect::<Vec<_>>()
                     .join("\n");
-                if text.is_empty() {
+                let clean_text = if message.role == "user" {
+                    strip_sender_tag(&text)
+                } else {
+                    &text
+                };
+                if clean_text.is_empty() {
                     None
                 } else {
-                    Some(format!("{}: {}", message.role, text))
+                    Some(format!("{}: {}", message.role, clean_text))
                 }
             })
             .collect();
@@ -1499,6 +1536,57 @@ mod tests {
             query.contains("current question"),
             "the current question must still be present in the composed query: {query:?}"
         );
+    }
+
+    #[test]
+    fn multi_turn_prompt_formats_native_chatml_boundaries_without_raw_user_prefix() {
+        let mut generator = TemplateGenerator::with_models(PatternClassifier::new(), None, "Qwen");
+
+        let messages = vec![
+            crate::providers::Message::user("[alice]\nHello there!"),
+            crate::providers::Message::assistant("Hello alice, how can I help?"),
+            crate::providers::Message::user("[alice]\nWhat is 2+2?"),
+        ];
+
+        let (system, query) = generator.prompt_parts(&messages).unwrap();
+        let formatted = generator.format_chat_prompt_with_system(&system, &query);
+
+        // ChatML structure must contain native boundaries for each turn
+        assert!(
+            formatted.contains("<|im_start|>user\nHello there!<|im_end|>\n"),
+            "formatted prompt must contain native ChatML boundary for first user turn: {formatted}"
+        );
+        assert!(
+            formatted.contains("<|im_start|>assistant\nHello alice, how can I help?<|im_end|>\n"),
+            "formatted prompt must contain native ChatML boundary for assistant turn: {formatted}"
+        );
+        assert!(
+            formatted.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"),
+            "formatted prompt must end with native ChatML boundary for question and assistant prompt: {formatted}"
+        );
+
+        // Prompt must not contain raw `user: [` framing
+        assert!(
+            !formatted.contains("user: ["),
+            "formatted prompt must not contain raw user: [ framing: {formatted}"
+        );
+        assert!(
+            !formatted.contains("[alice]"),
+            "formatted prompt must have sender tag stripped: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_strip_sender_tag() {
+        assert_eq!(strip_sender_tag("[alice]\nhello"), "hello");
+        assert_eq!(strip_sender_tag("[alice]\r\nhello"), "hello");
+        assert_eq!(strip_sender_tag("[alice] hello"), "hello");
+        assert_eq!(strip_sender_tag("[alice]: hello"), "hello");
+        assert_eq!(strip_sender_tag("  [alice]\nhello"), "hello");
+        // Genuine arrays should be preserved
+        assert_eq!(strip_sender_tag("[1, 2, 3]"), "[1, 2, 3]");
+        // No tag
+        assert_eq!(strip_sender_tag("plain text"), "plain text");
     }
 }
 

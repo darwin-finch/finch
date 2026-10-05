@@ -13,12 +13,31 @@ pub struct DeepSeekAdapter;
 
 impl LocalModelAdapter for DeepSeekAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // DeepSeek uses a simple format with special tokens
         // Format: <｜begin▁of▁sentence｜>{system}\n\n### Instruction:\n{user}\n\n### Response:\n
-        format!(
-            "<｜begin▁of▁sentence｜>{}\n\n### Instruction:\n{}\n\n### Response:\n",
-            system, user_message
-        )
+        let mut prompt = format!("<｜begin▁of▁sentence｜>{}\n\n", system);
+        for (role, content) in history {
+            if *role == "assistant" {
+                prompt.push_str(&format!("### Response:\n{}\n\n", content));
+            } else {
+                prompt.push_str(&format!("### Instruction:\n{}\n\n", content));
+            }
+        }
+        prompt.push_str(&format!(
+            "### Instruction:\n{}\n\n### Response:\n",
+            user_message
+        ));
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {
