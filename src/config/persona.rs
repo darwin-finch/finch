@@ -161,6 +161,23 @@ impl Persona {
     pub fn to_system_message(&self) -> String {
         let mut prompt = self.behavior.system_prompt.clone();
 
+        // Optionally include examples
+        if !self.behavior.examples.is_empty() {
+            prompt.push_str("\n\nExample interactions:\n");
+            for example in &self.behavior.examples {
+                prompt.push_str(&format!(
+                    "\nUser: {}\nAssistant: {}\n",
+                    example.user, example.assistant
+                ));
+            }
+        }
+
+        let mut preamble_parts = Vec::new();
+        if !prompt.contains("Finch") {
+            preamble_parts
+                .push("You are Finch, an experimental terminal coding assistant.".to_string());
+        }
+
         // Prepend user's name if known
         let git_name_fallback: Option<String> = if self.behavior.git_name.is_none() {
             std::process::Command::new("git")
@@ -180,18 +197,11 @@ impl Persona {
             .or_else(|| git_name_fallback.as_deref());
 
         if let Some(name) = user_name {
-            prompt = format!("The user's name is {}.\n\n{}", name, prompt);
+            preamble_parts.push(format!("The user's name is {}.", name));
         }
 
-        // Optionally include examples
-        if !self.behavior.examples.is_empty() {
-            prompt.push_str("\n\nExample interactions:\n");
-            for example in &self.behavior.examples {
-                prompt.push_str(&format!(
-                    "\nUser: {}\nAssistant: {}\n",
-                    example.user, example.assistant
-                ));
-            }
+        if !preamble_parts.is_empty() {
+            prompt = format!("{}\n\n{}", preamble_parts.join("\n\n"), prompt);
         }
 
         prompt
@@ -453,6 +463,23 @@ system_prompt = "Simple assistant."
         // May have a "The user's name is …" prefix from git config — the core
         // system prompt must appear somewhere in the result.
         assert!(msg.contains(&persona.behavior.system_prompt));
+    }
+
+    #[test]
+    fn test_to_system_message_declares_assistant_identity_finch() {
+        let persona = Persona::default();
+        let msg = persona.to_system_message();
+        assert!(
+            msg.contains("You are Finch, an experimental terminal coding assistant."),
+            "System prompt must explicitly declare Finch identity: got {msg}"
+        );
+
+        let builtin = Persona::load_builtin("expert-coder").unwrap();
+        let msg_builtin = builtin.to_system_message();
+        assert!(
+            msg_builtin.contains("You are Finch, an experimental terminal coding assistant."),
+            "Builtin persona must explicitly declare Finch identity: got {msg_builtin}"
+        );
     }
 
     #[test]
