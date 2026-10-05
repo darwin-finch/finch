@@ -616,14 +616,19 @@ impl ModelConfig {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn is_configured(&self) -> bool {
         match self {
             Self::Local { .. } => true, // Local models are always "configured"
             Self::Remote {
                 api_key, persisted, ..
             } => {
-                !api_key.is_empty() || matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+                !api_key.is_empty()
+                    || matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+                    || matches!(
+                        persisted,
+                        Some(ProviderEntry::OpenAiCompatible { credential, .. })
+                            if !credential.credential_ref.trim().is_empty()
+                    )
             }
         }
     }

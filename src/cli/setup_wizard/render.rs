@@ -334,6 +334,7 @@ fn provider_row_display(model: &ModelConfig, primary: bool) -> String {
                 name,
                 api_key,
                 model,
+                persisted,
                 ..
             } => {
                 let key_display = if provider.eq_ignore_ascii_case("chatgpt")
@@ -341,8 +342,14 @@ fn provider_row_display(model: &ModelConfig, primary: bool) -> String {
                     || provider.eq_ignore_ascii_case("gemini-sub")
                 {
                     "Named device credential".to_string()
+                } else if let Some(ProviderEntry::OpenAiCompatible { credential, .. }) = persisted {
+                    if credential.credential_ref.trim().is_empty() {
+                        "Not configured".to_string()
+                    } else {
+                        format!("credential: {}", credential.credential_ref)
+                    }
                 } else if api_key.is_empty() {
-                    "[Not configured]".to_string()
+                    "Not configured".to_string()
                 } else {
                     mask_secret(api_key, 10, 4)
                 };
@@ -400,27 +407,33 @@ fn models_section_lines(
         width,
     )];
 
-    let has_key = match primary_model {
-        ModelConfig::Remote {
-            provider,
-            api_key,
-            persisted,
-            ..
-        } if provider.eq_ignore_ascii_case("chatgpt")
-            || provider.eq_ignore_ascii_case("grok-sub")
-            || provider.eq_ignore_ascii_case("gemini-sub") =>
-        {
-            matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
-        }
-        ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
-        ModelConfig::Local { .. } => true,
-    };
+    let has_key = primary_model.is_configured();
     const GEMINI_SUB_DETAIL: &str = "Gemini subscription uses Google Gemini via device sign-in; AI Studio API keys are a separate provider and are never used automatically.";
     const GROK_SUB_DETAIL: &str = "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically.";
     const CHATGPT_DETAIL: &str = "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate.";
-    const NO_KEY_DETAIL: &str =
+    const CLAUDE_NO_KEY_DETAIL: &str =
         "Press Enter or E to Paste your API key, or add a provider with A.\n\
          No key yet? Get one at console.anthropic.com/keys";
+    const OPENAI_NO_KEY_DETAIL: &str =
+        "Press Enter or E to Paste your API key, or add a provider with A.\n\
+         No key yet? Get one at platform.openai.com";
+    const GROK_NO_KEY_DETAIL: &str =
+        "Press Enter or E to Paste your API key, or add a provider with A.\n\
+         No key yet? Get one at console.x.ai";
+    const NEUTRAL_NO_KEY_DETAIL: &str =
+        "Press Enter or E to configure your credentials, or add a provider with A.";
+    let no_key_detail = match primary_model {
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("openai") => {
+            OPENAI_NO_KEY_DETAIL
+        }
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok") => {
+            GROK_NO_KEY_DETAIL
+        }
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("claude") => {
+            CLAUDE_NO_KEY_DETAIL
+        }
+        _ => NEUTRAL_NO_KEY_DETAIL,
+    };
     let has_key_detail = format!(
         "Primary provider configured. Press A to add more providers ({} total).",
         1 + tool_models.len()
@@ -436,7 +449,7 @@ fn models_section_lines(
             CHATGPT_DETAIL.to_string()
         }
         _ if has_key => has_key_detail.clone(),
-        _ => NO_KEY_DETAIL.to_string(),
+        _ => no_key_detail.to_string(),
     };
 
     // #1305: same class of bug as #1297 -- the no-key variant is two
@@ -455,7 +468,10 @@ fn models_section_lines(
         GROK_SUB_DETAIL,
         CHATGPT_DETAIL,
         has_key_detail.as_str(),
-        NO_KEY_DETAIL,
+        CLAUDE_NO_KEY_DETAIL,
+        OPENAI_NO_KEY_DETAIL,
+        GROK_NO_KEY_DETAIL,
+        NEUTRAL_NO_KEY_DETAIL,
     ]
     .into_iter()
     .map(rows_for)
