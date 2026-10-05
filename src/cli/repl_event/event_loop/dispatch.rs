@@ -449,7 +449,9 @@ impl EventLoop {
                 // Its worker may still report invalidation after a newer turn
                 // has claimed the slot; that terminal event is deliberately
                 // idempotent and must not touch the newer owner or its queue.
-                if !self.query_states.cancel_query(query_id).await {
+                let is_active = *self.active_query_id.read().await == Some(query_id);
+                let cancelled = self.query_states.cancel_query(query_id).await;
+                if !cancelled && !is_active {
                     return Ok(());
                 }
                 self.tool_coordinator
@@ -459,11 +461,21 @@ impl EventLoop {
                 self.conversation.write().await.abort_staged(query_id);
                 self.close_active_tool_rows(query_id, "cancelled by conversation reset")
                     .await;
-                if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
-                    pending.cancellation_requested = true;
-                    self.finish_named_brain_turn(query_id, String::new()).await;
-                }
-                if *self.active_query_id.read().await == Some(query_id) {
+                let is_named_waiting_for_tools =
+                    if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
+                        pending.cancellation_requested = true;
+                        if pending.active_tool_ids.is_empty() {
+                            self.finish_named_brain_turn(query_id, String::new()).await;
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                if !is_named_waiting_for_tools
+                    && *self.active_query_id.read().await == Some(query_id)
+                {
                     *self.active_query_id.write().await = None;
                 }
                 self.tool_call_history.write().await.remove(&query_id);
@@ -495,6 +507,9 @@ impl EventLoop {
                         if *self.active_query_id.read().await == Some(query_id) {
                             *self.active_query_id.write().await = None;
                         }
+                        self.output_manager
+                            .write_info("⚠️  Named Brain turn cancelled (Esc)");
+                        self.render_tui().await?;
                     }
                     return Ok(());
                 }
@@ -841,16 +856,21 @@ impl EventLoop {
                     self.pending_approvals.write().await.remove(&qid);
                     self.conversation.write().await.abort_staged(qid);
                     self.close_active_tool_rows(qid, "cancelled").await;
-                    let named_turn =
-                        if let Some(pending) = self.pending_named_brain_turns.get_mut(&qid) {
-                            pending.cancellation_requested = true;
-                            true
-                        } else {
-                            false
-                        };
-
                     let mut returned_notice = None;
-                    if !named_turn {
+                    let cancel_message = if let Some(pending) =
+                        self.pending_named_brain_turns.get_mut(&qid)
+                    {
+                        pending.cancellation_requested = true;
+                        if pending.active_tool_ids.is_empty() {
+                            self.finish_named_brain_turn(qid, String::new()).await;
+                            *self.active_query_id.write().await = None;
+                            self.tool_call_history.write().await.remove(&qid);
+                            returned_notice = self.return_pending_queries_to_draft().await;
+                            "⚠️  Query cancelled by user (Esc)"
+                        } else {
+                            "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
+                        }
+                    } else {
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
                         // Take the queue off rather than let it re-fire after a
@@ -861,7 +881,8 @@ impl EventLoop {
                         // instead of vanishing (#1587, queued messages lost when
                         // a turn ends early).
                         returned_notice = self.return_pending_queries_to_draft().await;
-                    }
+                        "⚠️  Query cancelled by user (Esc)"
+                    };
 
                     // Plan/executing overlays cancel with the query so the
                     // user doesn't have to press Esc again to escape.
@@ -873,13 +894,6 @@ impl EventLoop {
                             self.update_plan_mode_indicator(&ReplMode::Normal);
                         }
                     }
-
-                    // Show cancellation message
-                    let cancel_message = if named_turn {
-                        "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
-                    } else {
-                        "⚠️  Query cancelled by user (Esc)"
-                    };
                     self.output_manager.write_info(match returned_notice {
                         Some(notice) => format!("{cancel_message}; {notice}"),
                         None => cancel_message.to_string(),

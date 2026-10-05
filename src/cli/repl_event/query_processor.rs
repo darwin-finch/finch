@@ -2137,7 +2137,19 @@ pub(crate) async fn process_query_with_tools(
                         .and_then(|metadata| metadata.brain_turn_provenance.as_ref()),
                 );
 
-                while let Some(result) = rx.recv().await {
+                loop {
+                    let result = tokio::select! {
+                        _ = stream_cancellation.cancelled() => {
+                            let _ = event_tx.send(ReplEvent::QueryContextInvalidated { query_id });
+                            return;
+                        }
+                        maybe_result = rx.recv() => {
+                            match maybe_result {
+                                Some(result) => result,
+                                None => break,
+                            }
+                        }
+                    };
                     if stream_cancellation.is_cancelled()
                         || !query_states.accepts_provider_projection(query_id).await
                     {
