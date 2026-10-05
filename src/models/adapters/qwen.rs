@@ -96,7 +96,11 @@ impl QwenAdapter {
         while let Some(think_start) = without_think.find("<think>") {
             if let Some(think_end) = without_think[think_start..].find("</think>") {
                 let end_pos = think_start + think_end + "</think>".len();
-                without_think = format!("{}{}", &without_think[..think_start], &without_think[end_pos..]);
+                without_think = format!(
+                    "{}{}",
+                    &without_think[..think_start],
+                    &without_think[end_pos..]
+                );
             } else {
                 without_think = without_think.replace("<think>", "");
                 break;
@@ -411,7 +415,11 @@ The greatest journey across all time and land.
 Forever and always, my promise is true,
 In this life and the next, I belong with you.";
 
-        assert!(poem.len() > 500, "Poem must be >500 chars (was {})", poem.len());
+        assert!(
+            poem.len() > 500,
+            "Poem must be >500 chars (was {})",
+            poem.len()
+        );
         let raw = format!("{}<|im_end|>", poem);
         let cleaned = adapter.clean_output(&raw);
         assert_eq!(cleaned, poem);
@@ -433,7 +441,11 @@ In this life and the next, I belong with you.";
                    "A warmth that keeps me safe through every winter night.\n")))
 ```"#;
 
-        assert!(program.len() > 500, "Program must be >500 chars (was {})", program.len());
+        assert!(
+            program.len() > 500,
+            "Program must be >500 chars (was {})",
+            program.len()
+        );
         let raw = format!("{}<|im_end|>", program);
         let cleaned = adapter.clean_output(&raw);
         assert_eq!(cleaned, program);
@@ -461,7 +473,10 @@ In this life and the next, I belong with you.";
 
         let raw = "As an AI assistant, I can help you with your question.\nHere is the answer: 42.<|im_end|>";
         let cleaned = adapter.clean_output(raw);
-        assert_eq!(cleaned, "As an AI assistant, I can help you with your question.\nHere is the answer: 42.");
+        assert_eq!(
+            cleaned,
+            "As an AI assistant, I can help you with your question.\nHere is the answer: 42."
+        );
     }
 
     #[test]
@@ -473,4 +488,3 @@ In this life and the next, I belong with you.";
         assert_eq!(cleaned, "Hello world!");
     }
 }
-
