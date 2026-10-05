@@ -5270,6 +5270,129 @@ async fn reflected_live_secret_in_error_detail_is_redacted() {
     inference.assert_async().await;
 }
 
+#[tokio::test]
+async fn test_chatgpt_subscription_usage_limit_exhausted_reports_plain_words_and_next_step() {
+    let mut server = mockito::Server::new_async().await;
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .with_status(200)
+        .with_body(catalog_body())
+        .create_async()
+        .await;
+    let inference = server
+        .mock("POST", RESPONSES_PATH)
+        .with_status(429)
+        .with_body(
+            json!({
+                "error": {
+                    "message": "The usage limit has been reached",
+                    "type": "usage_limit"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        !error.contains("wait a moment"),
+        "exhausted allowance must not tell the user to wait a moment, got: {error}"
+    );
+    assert!(
+        error.contains("usage allowance has been exhausted"),
+        "error must explain that the usage allowance has been exhausted, got: {error}"
+    );
+    assert!(
+        error.contains("reset time is unknown"),
+        "when reset time is omitted by provider, error must say reset time is unknown, got: {error}"
+    );
+    assert!(
+        error.contains("/provider"),
+        "error must suggest next step such as /provider, got: {error}"
+    );
+    assert!(
+        error.contains("The usage limit has been reached"),
+        "error must retain the provider's detail, got: {error}"
+    );
+    models.assert_async().await;
+    inference.assert_async().await;
+}
+
+#[tokio::test]
+async fn test_chatgpt_subscription_usage_limit_with_reset_time_shows_reset_time() {
+    let mut server = mockito::Server::new_async().await;
+    let models = server
+        .mock("GET", "/backend-api/codex/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "client_version".into(),
+            CHATGPT_CATALOG_CLIENT_VERSION.into(),
+        ))
+        .with_status(200)
+        .with_body(catalog_body())
+        .create_async()
+        .await;
+    let inference = server
+        .mock("POST", RESPONSES_PATH)
+        .with_status(429)
+        .with_header("retry-after", "2026-10-04T12:00:00Z")
+        .with_body(
+            json!({
+                "error": {
+                    "message": "The usage limit has been reached",
+                    "type": "usage_limit"
+                }
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let provider = ChatGptSubscriptionProvider::for_test(
+        Arc::new(StaticSource::new()),
+        &format!("{}/backend-api/codex", server.url()),
+        DEFAULT_MODEL,
+    )
+    .unwrap();
+    let error = provider
+        .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        !error.contains("wait a moment"),
+        "exhausted allowance must not tell the user to wait a moment, got: {error}"
+    );
+    assert!(
+        error.contains("usage allowance has been exhausted"),
+        "error must explain that the usage allowance has been exhausted, got: {error}"
+    );
+    assert!(
+        error.contains("resets at 2026-10-04T12:00:00Z") || error.contains("2026-10-04T12:00:00Z"),
+        "error must display stated reset time, got: {error}"
+    );
+    assert!(
+        error.contains("/provider"),
+        "error must suggest next step such as /provider, got: {error}"
+    );
+    models.assert_async().await;
+    inference.assert_async().await;
+}
+
 #[test]
 fn hostile_origin_route_and_request_preflight_fail_before_credentials() {
     let source = Arc::new(StaticSource::new());

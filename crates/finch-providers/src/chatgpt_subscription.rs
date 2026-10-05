@@ -216,6 +216,11 @@ struct SubscriptionResponseRejected {
     /// body, when one could be safely identified. See
     /// [`extract_error_detail`] for what is and is not surfaced.
     detail: Option<String>,
+    /// Whether the error indicates that the account's usage allowance or quota
+    /// has been exhausted (rather than a momentary burst rate limit).
+    is_usage_limit: bool,
+    /// Reset time extracted from Retry-After header or response body, if any.
+    reset_time: Option<String>,
 }
 
 impl SubscriptionResponseRejected {
@@ -223,10 +228,19 @@ impl SubscriptionResponseRejected {
     /// misbehaving endpoint reflects it back inside an otherwise-safe
     /// `error.message`, it is redacted before display — belt-and-suspenders
     /// alongside the field whitelist in [`extract_error_detail`].
-    fn new(status: StatusCode, body: &[u8], live_secret: &str) -> Self {
+    fn new(
+        status: StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: &[u8],
+        live_secret: &str,
+    ) -> Self {
+        let is_usage_limit = is_usage_limit_error(body);
+        let reset_time = extract_reset_time(headers, body, live_secret);
         Self {
             status,
             detail: extract_error_detail(body, live_secret),
+            is_usage_limit,
+            reset_time,
         }
     }
 }
@@ -239,11 +253,38 @@ impl fmt::Display for SubscriptionResponseRejected {
             .map(|detail| format!(": {detail}"))
             .unwrap_or_default();
         if self.status == StatusCode::TOO_MANY_REQUESTS {
-            write!(
-                formatter,
-                "ChatGPT subscription hit a rate limit (HTTP {}); wait a moment before retrying{detail_suffix}",
-                self.status
-            )
+            if self.is_usage_limit {
+                let reset_desc = match self.reset_time.as_deref() {
+                    Some(time) => {
+                        if time.starts_with("in ") {
+                            format!("resets {time}")
+                        } else if time.ends_with('s')
+                            || time.ends_with("sec")
+                            || time.ends_with("seconds")
+                            || time.ends_with("min")
+                            || time.ends_with("minutes")
+                            || time.ends_with('h')
+                            || time.ends_with("hours")
+                        {
+                            format!("resets in {time}")
+                        } else {
+                            format!("resets at {time}")
+                        }
+                    }
+                    None => "reset time is unknown".to_string(),
+                };
+                write!(
+                    formatter,
+                    "ChatGPT subscription usage allowance has been exhausted (HTTP {}; {reset_desc}){detail_suffix}. Switch to another provider with /provider <name>.",
+                    self.status
+                )
+            } else {
+                write!(
+                    formatter,
+                    "ChatGPT subscription hit a rate limit (HTTP {}); wait a moment before retrying{detail_suffix}",
+                    self.status
+                )
+            }
         } else {
             write!(
                 formatter,
@@ -279,6 +320,85 @@ fn extract_error_detail(body: &[u8], live_secret: &str) -> Option<String> {
         &redacted,
         MAX_ERROR_DETAIL_DISPLAY_BYTES,
     ))
+}
+
+fn is_usage_limit_error(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    if let Some(err_type) = error.get("type").and_then(|t| t.as_str()) {
+        let lower = err_type.to_ascii_lowercase();
+        if lower.contains("usage_limit") || lower.contains("quota") {
+            return true;
+        }
+    }
+    if let Some(code) = error.get("code").and_then(|c| c.as_str()) {
+        let lower = code.to_ascii_lowercase();
+        if lower.contains("usage_limit") || lower.contains("quota") {
+            return true;
+        }
+    }
+    if let Some(msg) = error.get("message").and_then(|m| m.as_str()) {
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("usage limit")
+            || lower.contains("usage allowance")
+            || lower.contains("allowance has been exhausted")
+            || lower.contains("quota")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_reset_time(
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    live_secret: &str,
+) -> Option<String> {
+    if let Some(retry_after) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let redacted = redact_known_secret(retry_after, live_secret);
+        let bounded = bounded_display_text(&redacted, 128);
+        if let Ok(secs) = bounded.parse::<i64>() {
+            if secs >= 1_000_000_000 {
+                if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+                    return Some(dt.to_rfc3339());
+                }
+            } else {
+                return Some(format!("{secs}s"));
+            }
+        }
+        return Some(bounded);
+    }
+
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    for key in &["resets_at", "reset_time", "resets_in"] {
+        if let Some(val) = error.get(*key) {
+            if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                let redacted = redact_known_secret(s, live_secret);
+                return Some(bounded_display_text(&redacted, 128));
+            }
+            if let Some(n) = val.as_i64() {
+                if *key == "resets_in" || n < 1_000_000_000 {
+                    return Some(format!("{n}s"));
+                } else if let Some(dt) = chrono::DateTime::from_timestamp(n, 0) {
+                    return Some(dt.to_rfc3339());
+                } else {
+                    return Some(n.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Strip a known live secret out of otherwise-safe display text. Defends
@@ -809,10 +929,15 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
+                let headers = response.headers().clone();
                 let body = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                return Err(
-                    SubscriptionResponseRejected::new(status, &body, &lease.access_token).into(),
-                );
+                return Err(SubscriptionResponseRejected::new(
+                    status,
+                    &headers,
+                    &body,
+                    &lease.access_token,
+                )
+                .into());
             }
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?;
