@@ -159,7 +159,10 @@ path; the dialog-option `markdown` preview keeps its own rendering.
   do the same whatever row has focus, and a wheel over the bottom chrome is
   claimed by nobody. `ToolViewportState` holds only the hit regions, rebuilt
   from physical-row geometry after every frame and resize, mirroring the
-  accordion; they serve click-to-expand and hover.
+  accordion; they serve click-to-expand and hover. When the pointer is over the
+  control's cells, `HoverTarget::ToolOutput` highlights the compact block with the
+  active theme scheme's hover background (#1679), showing it can be clicked to open,
+  while leaving the surrounding conversation and disclosure headers untouched.
 - Click on the control's cells, or Enter/Space once the `> ` focus marker is on
   the result's `Output (N)` header (F6 moves it one expandable on-screen row per
   press, so it usually takes several), opens a focused expanded surface (title bar, scrolled body, plain-text
