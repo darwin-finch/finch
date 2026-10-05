@@ -10630,3 +10630,49 @@ fn test_enter_on_empty_model_shows_missing_model_message_and_hint() {
         "controls hint must say 'Enter chooses model'; screen:\n{rendered_after}"
     );
 }
+
+#[test]
+fn test_openai_compatible_primary_renders_credential_and_avoids_anthropic_hint() {
+    let compatible = ProviderEntry::OpenAiCompatible {
+        name: "loopback".into(),
+        base_url: "http://127.0.0.1:9/v1".into(),
+        chat_path: None,
+        models_path: None,
+        model: "main".into(),
+        credential: crate::config::CredentialBinding {
+            credential_ref: "loop-key".into(),
+            audience: None,
+            tenant: None,
+            project: None,
+            account: None,
+            required_scopes: Default::default(),
+        },
+        capabilities: Default::default(),
+        tool_choice: Default::default(),
+        strict_tool_schemas: None,
+    };
+    let config = crate::config::Config::with_providers_and_paths(
+        vec![compatible],
+        std::path::PathBuf::from("unused-test-metrics"),
+    );
+    let mut state = WizardState::new(Some(&config));
+    state.current_section = WizardSection::Models;
+    let rendered = render_wizard_text(&state);
+
+    assert!(
+        !rendered.contains("[Not configured]"),
+        "primary openai_compatible with credential must not show [Not configured]; screen:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[credential: loop-key]"),
+        "primary openai_compatible must show its credential binding; screen:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("console.anthropic.com"),
+        "hint must not point at Anthropic for a non-Anthropic primary; screen:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Primary provider configured"),
+        "hint must confirm primary provider is configured; screen:\n{rendered}"
+    );
+}
