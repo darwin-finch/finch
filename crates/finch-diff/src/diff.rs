@@ -131,41 +131,119 @@ impl FileDiff {
                 file_count_exact: true,
             };
         }
-        if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
-            return Self {
-                old_path,
-                new_path,
-                binary: false,
-                elided: Some(format!(
+        if old == new {
+            let elided = if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
+                Some(format!(
                     "change omitted ({} bytes exceeds display limit)",
                     old.len().saturating_add(new.len())
-                )),
+                ))
+            } else {
+                None
+            };
+            return Self {
+                old_path,
+                new_path,
+                binary: false,
+                elided,
                 hunks: vec![],
                 total_added: 0,
                 total_removed: 0,
-                totals_exact: false,
+                totals_exact: true,
                 file_count_exact: true,
             };
         }
-        let input_lines = old.lines().count().saturating_add(new.lines().count());
-        if input_lines > MAX_DIFF_COMPUTE_LINES {
+
+        let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+        let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+
+        let mut prefix = 0;
+        while prefix < old_lines.len()
+            && prefix < new_lines.len()
+            && old_lines[prefix] == new_lines[prefix]
+        {
+            prefix += 1;
+        }
+
+        let mut suffix = 0;
+        while suffix < (old_lines.len() - prefix)
+            && suffix < (new_lines.len() - prefix)
+            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let old_changed_lines = old_lines.len() - prefix - suffix;
+        let new_changed_lines = new_lines.len() - prefix - suffix;
+        let old_changed_bytes: usize = old_lines[prefix..old_lines.len() - suffix]
+            .iter()
+            .map(|l| l.len())
+            .sum();
+        let new_changed_bytes: usize = new_lines[prefix..new_lines.len() - suffix]
+            .iter()
+            .map(|l| l.len())
+            .sum();
+        let changed_bytes = old_changed_bytes.saturating_add(new_changed_bytes);
+        let changed_lines = old_changed_lines.saturating_add(new_changed_lines);
+
+        if changed_bytes > MAX_DIFF_INPUT_BYTES {
             return Self {
                 old_path,
                 new_path,
                 binary: false,
                 elided: Some(format!(
-                    "change omitted ({input_lines} lines exceeds diff computation limit)"
+                    "change omitted ({changed_bytes} bytes exceeds display limit)"
                 )),
                 hunks: vec![],
-                total_added: 0,
-                total_removed: 0,
+                total_added: new_changed_lines,
+                total_removed: old_changed_lines,
                 totals_exact: false,
                 file_count_exact: true,
             };
         }
+        if changed_lines > MAX_DIFF_COMPUTE_LINES {
+            return Self {
+                old_path,
+                new_path,
+                binary: false,
+                elided: Some(format!(
+                    "change omitted ({changed_lines} lines exceeds diff computation limit)"
+                )),
+                hunks: vec![],
+                total_added: new_changed_lines,
+                total_removed: old_changed_lines,
+                totals_exact: false,
+                file_count_exact: true,
+            };
+        }
+
+        const CONTEXT: usize = 3;
+        let start_idx = prefix.saturating_sub(CONTEXT);
+        let old_end_idx = (old_lines.len() - suffix + CONTEXT).min(old_lines.len());
+        let new_end_idx = (new_lines.len() - suffix + CONTEXT).min(new_lines.len());
+
+        let old_slice = if start_idx < old_end_idx {
+            let start = old_lines[start_idx].as_ptr() as usize - old.as_ptr() as usize;
+            let end = (old_lines[old_end_idx - 1].as_ptr() as usize
+                + old_lines[old_end_idx - 1].len())
+                - old.as_ptr() as usize;
+            &old[start..end]
+        } else {
+            ""
+        };
+
+        let new_slice = if start_idx < new_end_idx {
+            let start = new_lines[start_idx].as_ptr() as usize - new.as_ptr() as usize;
+            let end = (new_lines[new_end_idx - 1].as_ptr() as usize
+                + new_lines[new_end_idx - 1].len())
+                - new.as_ptr() as usize;
+            &new[start..end]
+        } else {
+            ""
+        };
+
         let text_diff = TextDiff::configure()
             .timeout(Duration::from_millis(50))
-            .diff_lines(old, new);
+            .diff_lines(old_slice, new_slice);
         let mut file = Self {
             old_path,
             new_path,
@@ -177,7 +255,7 @@ impl FileDiff {
             totals_exact: true,
             file_count_exact: true,
         };
-        file.ingest_similar(&text_diff);
+        file.ingest_similar_with_offset(&text_diff, start_idx, start_idx);
         let old_ending = line_ending(old);
         let new_ending = line_ending(new);
         if old_ending != new_ending && old_ending.is_some() && new_ending.is_some() {
@@ -553,7 +631,17 @@ impl FileDiff {
         }
     }
 
+    #[allow(dead_code)]
     fn ingest_similar(&mut self, text_diff: &TextDiff<'_, '_, '_, str>) {
+        self.ingest_similar_with_offset(text_diff, 0, 0);
+    }
+
+    fn ingest_similar_with_offset(
+        &mut self,
+        text_diff: &TextDiff<'_, '_, '_, str>,
+        old_line_offset: usize,
+        new_line_offset: usize,
+    ) {
         let mut accepted_lines = 0usize;
         for ops in text_diff.grouped_ops(3) {
             if ops.is_empty() {
@@ -565,6 +653,8 @@ impl FileDiff {
                 break;
             }
             let mut hunk = hunk_from_ops(&ops);
+            hunk.old_start = hunk.old_start.saturating_add(old_line_offset);
+            hunk.new_start = hunk.new_start.saturating_add(new_line_offset);
             for op in &ops {
                 for change in text_diff.iter_changes(op) {
                     let kind = match change.tag() {
@@ -1856,6 +1946,53 @@ mod tests {
             diff.counts_are_exact() && diff.is_complete(),
             "an informational line-ending note is not content omission; elided={:?}",
             diff.elided
+        );
+    }
+
+    #[test]
+    fn test_small_edit_to_large_file_shows_hunk() {
+        let mut old = String::with_capacity(1_300_000);
+        for i in 0..15_000 {
+            old.push_str(&format!("fn test_case_{i}() {{ assert!(true); }}\n"));
+        }
+        let mut new = old.clone();
+        new.push_str("fn test_new_case() { assert_eq!(1, 1); }\n");
+
+        let diff = FileDiff::from_texts("src/cli/repl_event/event_loop/tests.rs", &old, &new);
+        assert!(
+            diff.elided.is_none(),
+            "small edit to large file must not be elided; elided={:?}",
+            diff.elided
+        );
+        assert_eq!(diff.hunks.len(), 1, "expected 1 hunk for small edit");
+        let rendered = diff.render(&ColorScheme::default(), DiffColorMode::NoColor);
+        assert!(
+            rendered.contains("+ fn test_new_case()"),
+            "rendered diff must contain the added hunk line; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("+1 -0"),
+            "rendered diff must report +1 -0; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_oversized_change_reports_lines_added_and_removed() {
+        let old = "old line to be removed\n".repeat(30_000);
+        let new = "new replacement line\n".repeat(40_000);
+
+        let diff = FileDiff::from_texts("large.txt", &old, &new);
+        assert!(diff.elided.is_some(), "oversized change must be elided");
+        assert_eq!(diff.added(), 40_000);
+        assert_eq!(diff.removed(), 30_000);
+        let rendered = diff.render(&ColorScheme::default(), DiffColorMode::NoColor);
+        assert!(
+            rendered.contains("+40000 -30000") || rendered.contains("+≥40000 -≥30000"),
+            "rendered diff must state added and removed counts; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("+≥0 -≥0"),
+            "rendered diff must not report false zero counts; got:\n{rendered}"
         );
     }
 }
