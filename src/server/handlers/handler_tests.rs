@@ -2273,7 +2273,11 @@ fn brain_history_remains_conversation_data_not_system_text() {
     snapshot.events[3].run_id = Some(run_id);
 
     let messages = named_brain_provider_messages(&snapshot);
-    assert_eq!(messages.len(), 3, "internal checkpoint events stay hidden");
+    assert_eq!(
+        messages.len(),
+        2,
+        "internal checkpoint events stay hidden and successful results are not echoed"
+    );
     assert_eq!(messages[0].role, "user");
     assert!(messages[0].text_content().contains("[driver]"));
     assert_eq!(messages[1].role, "assistant");
@@ -2285,8 +2289,6 @@ fn brain_history_remains_conversation_data_not_system_text() {
             crate::providers::ContentBlock::Text { text },
         ] if encrypted_content == "opaque-restart-token" && text == "(say \"answer\")"
     ));
-    assert_eq!(messages[2].role, "user");
-    assert!(messages[2].text_content().contains("program event #2"));
 }
 
 #[test]
@@ -2425,7 +2427,7 @@ fn brain_history_reconstructs_provider_tool_protocol() {
     }
 
     let messages = named_brain_provider_messages(&snapshot);
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 4);
     assert!(matches!(
         &messages[1].content[..],
         [
@@ -7143,5 +7145,89 @@ async fn test_task_list_replaced_mid_turn_survives_restart_and_does_not_leak_int
         !rebuilt_text.contains("step kept"),
         "the turn's rebuilt context must use the task list from its own request (seq \
          {request_seq}), not a replacement journaled after it: {rebuilt_text}"
+    );
+}
+
+#[tokio::test]
+async fn test_named_brain_provider_messages_omits_successful_program_result_and_retains_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::brain::BrainStore::with_root("box.local", Some(dir.path().into()));
+
+    // 1. Initial prompt
+    let _prompt_seq = store
+        .push(
+            "test-brain",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "say hello".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
+        .unwrap()
+        .seq;
+
+    // 2. Program submission from provider
+    let program_seq = store
+        .push(
+            "test-brain",
+            "provider",
+            BrainEventKind::Program {
+                language: crate::brain::ProgramLanguage::Lisp,
+                source: "(say \"hello world\")".into(),
+            },
+        )
+        .unwrap()
+        .seq;
+
+    // 3. Successful program result
+    let success_result_seq = store
+        .push(
+            "test-brain",
+            "runtime",
+            BrainEventKind::Result {
+                request_seq: program_seq,
+                output: "hello world".into(),
+                error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        )
+        .unwrap()
+        .seq;
+
+    let snapshot = store.snapshot("test-brain").unwrap();
+    let messages = named_brain_provider_messages_at(&snapshot, success_result_seq);
+    let messages_debug = format!("{messages:?}");
+    assert!(
+        !messages_debug.contains("Finch VM result"),
+        "successful program result must NOT be replayed as a synthetic user message: {messages_debug}"
+    );
+
+    // 4. Failed program result with error
+    let fail_result_seq = store
+        .push(
+            "test-brain",
+            "runtime",
+            BrainEventKind::Result {
+                request_seq: program_seq,
+                output: String::new(),
+                error: Some("syntax error: unexpected token".into()),
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        )
+        .unwrap()
+        .seq;
+
+    let snapshot_fail = store.snapshot("test-brain").unwrap();
+    let messages_fail = named_brain_provider_messages_at(&snapshot_fail, fail_result_seq);
+    let fail_debug = format!("{messages_fail:?}");
+    assert!(
+        fail_debug.contains("[Finch VM execution error for program event"),
+        "failed program result must be surfaced with diagnostic error: {fail_debug}"
+    );
+    assert!(
+        fail_debug.contains("syntax error: unexpected token"),
+        "error text must be included: {fail_debug}"
     );
 }
