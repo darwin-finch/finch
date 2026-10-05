@@ -14482,3 +14482,216 @@ async fn test_bash_approval_dialog_shows_escape_sequences_as_text_and_keeps_its_
         })
         .await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_named_brain_cancel_then_submit_with_bridge_backed_provider() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let bin = temp.path().join("fake-claude");
+            let script = r#"#!/bin/bash
+SID=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session-id" ] || [ "$prev" = "--resume" ]; then SID="$a"; fi
+  prev="$a"
+done
+INPUT=$(cat)
+if echo "$INPUT" | grep -q "first prompt"; then
+  printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-sonnet-5"}\n' "$SID"
+  printf '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_1","role":"assistant","content":[{"type":"text","text":"thinking..."}]}}\n'
+  while true; do
+    sleep 1
+  done
+else
+  printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-sonnet-5"}\n' "$SID"
+  printf '{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_2","role":"assistant","content":[{"type":"text","text":"(say \\"second prompt reply\\")"}]},"usage":{"input_tokens":2,"output_tokens":4}}\n'
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"(say \\"second prompt reply\\")","stop_reason":"end_turn"}\n'
+fi
+"#;
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let provider = Arc::new(finch_providers::ClaudeCliProvider::with_binary(bin, None));
+            let client = Arc::new(crate::claude::ClaudeClient::with_shared_provider(provider));
+            let generator: Arc<dyn crate::generators::Generator> =
+                Arc::new(crate::generators::ClaudeGenerator::new(client));
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("construct tool executor");
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                runtime,
+            );
+            event_loop.output_manager.disable_stdout();
+            event_loop.streaming_enabled = true;
+            event_loop.runner_brain = Some("home".into());
+            event_loop.home_runner_lease_active = true;
+            event_loop.start_llm_worker();
+
+            // Set up home_brain so selected_brain() is Some
+            let target =
+                crate::brain::RemoteBrainTarget::local("home", "http://127.0.0.1:0").unwrap();
+            let mut brain_client = crate::brain::AttachedBrainClient::local(
+                target,
+                StaleCursorTransport {
+                    acknowledged_seq: 1,
+                },
+            );
+            brain_client
+                .attach("test-runner", crate::brain::AttachmentRole::Driver, None)
+                .await
+                .expect("fake attach must succeed");
+            event_loop.home_brain = Some(brain_client);
+
+            // 1. Dispatch first named Brain turn
+            let run_id_1 = crate::brain::RunId(Uuid::new_v4());
+            let (response_tx_1, mut response_rx_1) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(
+                    crate::server::RunnerTurnRequest {
+                        brain: "home".into(),
+                        run_id: run_id_1,
+                        request_seq: 1,
+                        prompt: "first prompt".into(),
+                        context: vec![crate::providers::Message::user("first prompt")],
+                        approval_audience: crate::brain::BrainApprovalAudience {
+                            brain_id: crate::brain::BrainId(Uuid::new_v4()),
+                            brain: "home".into(),
+                            attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
+                            subject: "runner".into(),
+                            role: crate::brain::AttachmentRole::Runner,
+                            environment_generation: 1,
+                        },
+                        approval_connection_id: None,
+                        grant_ceiling: crate::vm::TypedRuntime::intrinsic_grants(),
+                        approval_tx: None,
+                        effect_audit: None,
+                        response_tx: response_tx_1,
+                    },
+                ))
+                .await
+                .expect("first turn must dispatch");
+
+            // Wait until active query is set
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if event_loop.active_query_id.read().await.is_some() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("first turn never became active");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // Submitting a new prompt while the turn is active must be rejected with informative warning
+            event_loop
+                .execute_query_inner("interleaved prompt".into(), true, false)
+                .await
+                .expect("execute_query_inner must return Ok");
+            let rows = scrollback(&event_loop);
+            assert!(
+                rows.iter().any(|row| {
+                    row.contains("Cannot submit a new prompt while the current turn is still running")
+                }),
+                "must inform user that new prompt cannot be submitted while running; rows={rows:?}"
+            );
+
+            // Give the child process a moment to be running in drive()
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // 2. Cancel the query (user pressed Esc)
+            event_loop
+                .handle_event(super::ReplEvent::CancelQuery)
+                .await
+                .expect("CancelQuery must dispatch");
+
+            // Invariant: exactly one terminal state for the cancelled turn
+            let turn_1_result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut response_rx_1)
+                    .await
+                    .expect("cancelled turn must resolve")
+                    .expect("response channel must deliver terminal state");
+            assert!(
+                turn_1_result.is_err(),
+                "cancelled turn must report error terminal state; got {turn_1_result:?}"
+            );
+            assert_eq!(
+                turn_1_result.unwrap_err().message,
+                "named Brain run cancelled"
+            );
+            assert!(
+                event_loop.active_query_id.read().await.is_none(),
+                "active_query_id must be cleared after cancellation"
+            );
+
+            // 3. Submit next prompt (second named Brain turn)
+            let run_id_2 = crate::brain::RunId(Uuid::new_v4());
+            let (response_tx_2, mut response_rx_2) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(
+                    crate::server::RunnerTurnRequest {
+                        brain: "home".into(),
+                        run_id: run_id_2,
+                        request_seq: 2,
+                        prompt: "second prompt".into(),
+                        context: vec![crate::providers::Message::user("second prompt")],
+                        approval_audience: crate::brain::BrainApprovalAudience {
+                            brain_id: crate::brain::BrainId(Uuid::new_v4()),
+                            brain: "home".into(),
+                            attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
+                            subject: "runner".into(),
+                            role: crate::brain::AttachmentRole::Runner,
+                            environment_generation: 1,
+                        },
+                        approval_connection_id: None,
+                        grant_ceiling: crate::vm::TypedRuntime::intrinsic_grants(),
+                        approval_tx: None,
+                        effect_audit: None,
+                        response_tx: response_tx_2,
+                    },
+                ))
+                .await
+                .expect("second turn must dispatch");
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let turn_2_result = loop {
+                tokio::select! {
+                    res = &mut response_rx_2 => {
+                        break res.expect("response channel must deliver terminal result");
+                    }
+                    Some(event) = event_loop.event_rx.recv() => {
+                        event_loop
+                            .handle_event(event)
+                            .await
+                            .expect("event dispatch must succeed");
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        panic!("second turn must complete within timeout");
+                    }
+                }
+            };
+            let result = turn_2_result.expect("second turn must succeed");
+            assert_eq!(result.output, "second prompt reply");
+
+            // Visible row for the next prompt in scrollback
+            let rows = scrollback(&event_loop);
+            assert!(
+                rows.iter().any(|row| row.contains("second prompt reply")),
+                "scrollback must contain a visible row for the next prompt; rows={rows:?}"
+            );
+        })
+        .await;
+}

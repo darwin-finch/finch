@@ -743,6 +743,7 @@ impl ClaudeCliProvider {
         &self,
         request: &ProviderRequest,
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<TurnOutcome> {
         let mut outcome = if let Some((parked, content, is_error, extra_text)) =
             self.take_matching_parked_turn(request).await
@@ -780,7 +781,8 @@ impl ClaudeCliProvider {
             // (see `TurnRecord::newly_streamed_text`, issue #1372).
             let mut running = parked.running;
             running.record.already_streamed_len = running.record.response_text().len();
-            self.pump_until_settled(running, deltas.clone()).await?
+            self.pump_until_settled(running, deltas.clone(), cancel)
+                .await?
         } else {
             let (system, input_lines) = self.split_request(request)?;
             let tool_names = self.supported_tool_names(request);
@@ -792,6 +794,7 @@ impl ClaudeCliProvider {
                     &input_lines,
                     &tool_names,
                     deltas.clone(),
+                    cancel,
                 )
                 .await
             {
@@ -809,6 +812,7 @@ impl ClaudeCliProvider {
                             &input_lines,
                             &tool_names,
                             deltas.clone(),
+                            cancel,
                         )
                         .await?
                     } else {
@@ -860,7 +864,14 @@ impl ClaudeCliProvider {
             // same as any other turn.
             let wire_line = user_input_line(&text)?;
             outcome = self
-                .run_turn_once(true, system.as_deref(), &[wire_line], &[], deltas.clone())
+                .run_turn_once(
+                    true,
+                    system.as_deref(),
+                    &[wire_line],
+                    &[],
+                    deltas.clone(),
+                    cancel,
+                )
                 .await?;
         }
     }
@@ -993,11 +1004,12 @@ impl ClaudeCliProvider {
         input_lines: &[String],
         tool_names: &[String],
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<TurnOutcome> {
         let running = self
             .spawn_running_turn(resumable, system, input_lines, tool_names)
             .await?;
-        self.pump_until_settled(running, deltas).await
+        self.pump_until_settled(running, deltas, cancel).await
     }
 
     /// Drive a (possibly just-resumed) `claude` process until it either
@@ -1009,9 +1021,10 @@ impl ClaudeCliProvider {
         &self,
         mut running: RunningTurn,
         deltas: Option<mpsc::Sender<Result<StreamChunk>>>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<TurnOutcome> {
         loop {
-            match drive(&mut running, deltas.as_ref()).await? {
+            match drive(&mut running, deltas.as_ref(), cancel).await? {
                 DriveOutcome::Exited(status) => {
                     let stderr_text = running.stderr_task.await.unwrap_or_default();
                     if !status.success() {
@@ -1179,11 +1192,21 @@ async fn spawn_retrying_text_file_busy(
 async fn drive(
     turn: &mut RunningTurn,
     deltas: Option<&mpsc::Sender<Result<StreamChunk>>>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<DriveOutcome> {
     let mut line = String::new();
     loop {
         line.clear();
         tokio::select! {
+            _ = async {
+                match cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = turn.child.start_kill();
+                bail!("claude CLI cancelled by user");
+            }
             read_result = turn.reader.read_line(&mut line) => {
                 let read = read_result.context("reading claude CLI stdout")?;
                 if read == 0 {
@@ -1679,7 +1702,10 @@ impl ProviderBackend for ClaudeCliProvider {
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
         let (request, _bindings) = request.into_request_for(self)?;
-        match self.execute_turn(&request, None).await? {
+        match self
+            .execute_turn(&request, None, request.cancellation_token.as_ref())
+            .await?
+        {
             TurnOutcome::Complete(record) => Ok(self.response_from(&record, &request.model)),
             TurnOutcome::Paused => bail!(
                 "claude CLI subscription transport paused mid-turn with no streaming sink; \
@@ -1707,7 +1733,13 @@ impl ProviderBackend for ClaudeCliProvider {
         let (tx, rx) = mpsc::channel::<Result<StreamChunk>>(64);
         let worker = self.clone();
         tokio::spawn(async move {
-            let result = worker.execute_turn(&request, Some(tx.clone())).await;
+            let result = worker
+                .execute_turn(
+                    &request,
+                    Some(tx.clone()),
+                    request.cancellation_token.as_ref(),
+                )
+                .await;
             match result {
                 Ok(TurnOutcome::Complete(record)) => {
                     // `newly_streamed_text`, not `response_text` — this

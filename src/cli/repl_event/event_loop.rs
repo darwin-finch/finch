@@ -3445,6 +3445,13 @@ impl EventLoop {
         chat_only: bool,
     ) -> Result<()> {
         if self.selected_brain().is_some() {
+            if self.active_query_id.read().await.is_some() {
+                self.output_manager.write_info(
+                    "⚠️  Cannot submit a new prompt while the current turn is still running or reaching a safe boundary",
+                );
+                self.render_tui().await?;
+                return Ok(());
+            }
             let mentions = self.mention_port.prepare_submission(&input);
             match mentions {
                 Ok(submission) => {
