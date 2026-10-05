@@ -1348,6 +1348,16 @@ the dropping execution continues. Cleanup that would itself suspend during such 
 specified. `(return value)` in a generator is never a tail call, since the frame belongs to the
 handle.
 
+A fiber, stream, or suspending task frame is lowered as a **stackless state machine activation
+record**. The compiler statically computes the minimal union of live bindings and captures across all
+suspension points; no private execution stack is allocated. Advancing a fiber (`pop-front`, `reply`)
+or driving a task executes directly on the caller's / driving thread's existing execution stack.
+The activation record is an owned resource held exclusively by the handle, allocated via the active
+allocator, and destroyed deterministically upon completion or cancellation without a garbage
+collector. Loans MUST NOT cross suspension points (section 8), ensuring every value preserved across a
+yield or suspension edge is an owned value and preventing dangling stack references without runtime
+pinning.
+
 `option<T>` has the cases `some(T)` and `none`. `some` is a keyword only in type position
 (`some Concept`), so it is free to name the case.
 

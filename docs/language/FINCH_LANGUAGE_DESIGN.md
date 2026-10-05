@@ -1757,25 +1757,32 @@ stream-close-discarding stream : unit ; cancel producer and drop unread values
 The semantic primitive is a **private resumable execution**, not a generator or scheduler policy:
 
 ```text
-ResumableExecution<Y,Resume,R,X> = verified frames + private operand stack + locals/captures + PC
+ResumableExecution<Y,Resume,R,X> = verified frames + activation record (state + live locals/captures)
                                    + transaction/effect prefix + lifecycle state + exception set X
 ```
 
-A coroutine function may create an instance of that state. Suspension propagates normally through
-the entire ordinary call chain until some boundary handles or reifies it. A generator is the
-`Resume = unit` pull contract; a fiber is an owned handle plus explicit call/yield policy; a green
-thread, event-loop task, actor, or compiler semantic job is a scheduling/event policy over the same
-instance. None gets an independently implemented continuation format. Creating an independently
-resumable instance always starts a private stack from explicit arguments and immutable captures;
-normal calls remain the way to operate on the current stack. Shared `cell<T>`, atomics, mutexes, or
-channels are separate explicit memory resources, not implicit fiber communication.
+A coroutine or generator function creates an instance of that state. Crucially, the physical
+lowering is a **stackless state machine activation record**, not a stackful fiber with a dedicated
+memory buffer (such as D's vibe.d or Go's goroutines). The compiler statically calculates the exact
+union of live locals and captures across suspension edges. The resulting activation frame is an
+owned, compact struct owned directly by the `fiber<Y,R,X>` or `task<T,X>` handle.
 
-Ordinary callers do not acquire `async`/`await` coloring merely because a callee can park on I/O.
-For example, a database call may suspend the current ProgramRun internally and later return its
-ordinary value; `MaySuspend` is inferred and verified like the other effects. Explicit concurrency
-syntax appears only where the programmer creates or steals ownership of concurrent work, such as
-`spawn`, `join-all`, `race`, or cancellation. A caller must not need to know whether an ordinary
-callee parked, exhausted a scheduling quantum, or completed without suspension.
+When a fiber is advanced (`pop-front`, `reply`) or a task is polled by a scheduler, it executes
+**directly on the caller's / driving thread's existing stack**. This achieves the critical systems
+performance properties:
+1. **Zero Stack Overhead:** No 4KB–64KB dedicated stack is allocated per fiber; a dormant fiber uses
+   only the few dozen bytes needed for its state tag and live variables.
+2. **Zero GC Dependency (`@nogc`):** Memory is sized deterministically at compile time and reclaimed
+   deterministically upon handle drop or completion.
+3. **Zero Context-Switch Overhead:** Suspending is an enum state return; resuming is a direct function
+   call entering a compiler-generated jump table (no register-file dumping or stack pointer swaps).
+4. **Zero Function Coloring:** Ordinary callers do not acquire `async`/`await` coloring merely because a
+   callee can park on I/O. The compiler infers suspension from the effect row (`suspends`) and generates
+   the state machine transformation automatically. Direct non-suspending calls pay zero continuation or
+   frame-allocation overhead. Explicit concurrency syntax appears only where the programmer creates or
+   steals ownership of concurrent work, such as `spawn`, `join-all`, `race`, or cancellation. A caller
+   must not need to know whether an ordinary callee parked, exhausted a scheduling quantum, or completed
+   without suspension.
 
 The runtime expresses that separation with a private discriminated drive step. It must not encode
 all suspension as an ambiguous `yielded` state, and every nonterminal step carries the sole

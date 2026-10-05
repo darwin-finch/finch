@@ -43,6 +43,7 @@ What is still open after that pass, in one place:
 | 76 | the REPL use: parked turns; the engine axis has no artifact (manifest, admission, turns, compile-time authority, direct binding done) | formalization |
 | 75 | every open question for the owner and every unfinished piece, in one list | index |
 | 74 | target constraints as compiler input: target-sized `int`, per-target specialization | decided in outline |
+| 85 | stackless state machine lowering for fibers, generators, and suspending tasks | decided |
 | 84 | diamond dependency resolution, isolated feature flags, and semantic interface compatibility | decided |
 | 83 | self-contained script manifests, string locator imports, and decentralized dependencies | decided |
 | 82 | method-call syntax (concepts first, then free functions) and destructuring with private fields and drop hooks | decided and specified; not executable |
@@ -2094,6 +2095,36 @@ nominal type identity or concept evidence mismatches. Furthermore, globally addi
    evidence implementations without modifying either upstream library, avoiding Rust's orphan-rule deadlock.
 6. *Public Interface Leak Prevention:* The compiler checks whether a library's public signatures expose
    types from private dependencies, encouraging explicit re-exports or abstract concepts.
+
+### 85. Stackless state machine lowering for fibers, generators, and suspending tasks — DECIDED
+
+**Finding.** Earlier design passages described a resumable execution as allocating a "private operand stack."
+If lowered as a stackful fiber (like D's vibe.d or Go goroutines), every fiber, generator, or task allocates
+a dedicated stack buffer (typically 4KB–64KB). Under high concurrency (tens of thousands of connections),
+this incurs massive memory overhead, cache-line pollution, stack-overflow/growth checks, and context-switching
+register save/restore penalties, which often drives runtimes to rely on garbage collection. Conversely, Rust's
+stackless futures achieve high density and low latency but impose viral `async`/`await` function coloring.
+
+**Decision (owner, 2026-10-04).**
+1. *Stackless State Machine Compilation:* Generators, fibers, and suspending functions compile into compact
+   stackless state machine activation records. The compiler statically computes the minimal live variable
+   set across all yield/suspension points. The activation record contains only an integer state tag and
+   the union of live values across suspension edges.
+2. *Zero Dedicated Stack Allocation:* A fiber or suspending function does not allocate a private execution
+   stack. When advanced via `front`, `pop-front`, `reply`, or a task scheduler drive step, the execution
+   runs directly on the driving thread's existing stack.
+3. *Zero Function Coloring in Source Syntax:* Callers do not write `async` or `await` keywords. The compiler
+   infers the `suspends` effect from call graphs (Spec §7) and automatically generates the state machine
+   transformation. Direct non-suspending calls pay zero continuation or allocation overhead.
+4. *Zero Garbage Collection (`@nogc`):* Sizing of activation frames is deterministic at compile time.
+   Frames are owned linear values held by the fiber (`fiber<Y,R,X>`) or task (`task<T,X>`) handle and are
+   reclaimed deterministically upon completion or cancellation.
+5. *Zero Context-Switch Overhead:* Yielding or suspending updates the state tag and returns to the caller
+   or scheduler loop (identical to returning a status enum); resuming is a direct function call entering
+   a compiler-generated dispatch table. No CPU register-file dumps or stack pointer swaps are performed.
+6. *Soundness Without Pinning:* As mandated by Section 8, loans cannot cross suspension points. Variables
+   surviving suspension must be owned values (`Copy`, `Unique`, `Shared`, or moved data). This eliminates
+   the self-referential pointer problem that forced Rust to introduce `Pin<&mut T>`.
 
 ## Cross-cutting conclusions
 
