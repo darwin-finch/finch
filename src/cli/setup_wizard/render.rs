@@ -1653,11 +1653,18 @@ pub(super) fn add_provider_card(
         } => {
             let remote_idx = (*provider_idx).min(CLOUD_PROVIDERS.len() - 1);
             let provider_name = CLOUD_PROVIDERS[remote_idx].1;
+            let default_model = CLOUD_PROVIDERS[remote_idx].2;
             let key_hint = CLOUD_PROVIDERS[remote_idx].3;
             let editing = editing_idx.is_some();
             let provider_value =
                 format!("{} ({})", provider_name, cloud_provider_id(*provider_idx));
-            let model_display = if model.is_empty() { "(default)" } else { model };
+            let model_display = if !model.is_empty() {
+                model.as_str()
+            } else if !default_model.is_empty() {
+                "(default)"
+            } else {
+                "(choose a model)"
+            };
             let mut body: Vec<WizardLine> = vec![
                 WizardLine::blank(),
                 remote_form_row("Provider", &provider_value, *focused_field == 0, false),
@@ -1696,10 +1703,14 @@ pub(super) fn add_provider_card(
                 Color::Cyan,
             ));
             if let Some(error) = catalog_error {
-                body.push(wizard_line(
-                    &format!("Refresh warning: {error}"),
-                    Color::Yellow,
-                ));
+                let msg = if error.starts_with("Model required:") {
+                    error.to_string()
+                } else if error.contains("required") {
+                    format!("Model required: {error}")
+                } else {
+                    format!("Refresh warning: {error}")
+                };
+                body.push(wizard_line(&msg, Color::Yellow));
             }
             body.extend(model_choice_lines(
                 catalog_models,
@@ -1707,10 +1718,19 @@ pub(super) fn add_provider_card(
                 catalog_source,
                 CLOUD_PROVIDERS[remote_idx].0 == "chatgpt",
             ));
+            let can_save = !model.is_empty() || !default_model.is_empty();
             let controls = if editing {
-                "↑↓ navigate · ←→ pick model · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
+                if can_save {
+                    "↑↓ navigate · ←→ pick model · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
+                } else {
+                    "↑↓ navigate · ←→ pick model · type to edit · Ctrl+R refresh · Enter chooses model · Esc cancels"
+                }
             } else {
-                "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
+                if can_save {
+                    "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
+                } else {
+                    "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter chooses model · Esc back"
+                }
             };
             WizardCard::new(
                 if editing {

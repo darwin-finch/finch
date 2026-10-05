@@ -10560,3 +10560,73 @@ fn test_ctrl_s_does_not_modify_text_fields_in_setup_forms() {
         );
     }
 }
+
+#[test]
+fn test_enter_on_empty_model_shows_missing_model_message_and_hint() {
+    let cache = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::with_providers_and_paths(
+        vec![ProviderEntry::Claude {
+            api_key: String::new(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".to_string()),
+        }],
+        std::path::PathBuf::from("unused-test-metrics"),
+    );
+    let mut state =
+        WizardState::new_with_catalog_cache_dir(Some(&config), Some(cache.path().to_path_buf()));
+    state.current_section = WizardSection::Models;
+    state.auto_catalog_refresh = true;
+
+    // Open Claude provider editor: lands on API Key row (focused_field 3)
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    // Type API key
+    for c in "sk-fake-persona-test-000".chars() {
+        handle_models_input(&mut state, key(KeyCode::Char(c))).unwrap();
+    }
+
+    // Before pressing Enter: Model row must not claim "(default)" when no default model exists
+    let rendered_before = render_wizard_text(&state);
+    assert!(
+        !rendered_before.contains("Model      [ (default)"),
+        "Model row must not show '(default)' when no default model exists; screen:\n{rendered_before}"
+    );
+    assert!(
+        rendered_before.contains("(choose a model)"),
+        "Model row should show '(choose a model)' when empty; screen:\n{rendered_before}"
+    );
+
+    // Press Enter to submit/save
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    // After Enter: Form remains open on Model row (focused_field 2), and explains a model is required
+    let rendered_after = render_wizard_text(&state);
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                focused_field: 2,
+                ref model,
+                ..
+            }) if model.is_empty()
+        ),
+        "focus must move to Model row; step={:?}",
+        get_step(&state)
+    );
+    assert!(
+        rendered_after.contains("Model required:")
+            || rendered_after.contains("A model is required before saving"),
+        "a message naming the missing model and how to pick one must be visible; screen:\n{rendered_after}"
+    );
+    assert!(
+        !rendered_after.contains("Enter saves"),
+        "controls hint must not falsely claim 'Enter saves' when a model is required; screen:\n{rendered_after}"
+    );
+    assert!(
+        rendered_after.contains("Enter chooses model"),
+        "controls hint must say 'Enter chooses model'; screen:\n{rendered_after}"
+    );
+}
