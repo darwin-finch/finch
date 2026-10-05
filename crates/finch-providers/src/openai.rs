@@ -1761,6 +1761,26 @@ impl OpenAIProvider {
         error
     }
 
+    fn format_request_error(&self, error: reqwest::Error) -> anyhow::Error {
+        let message = if error.is_connect() {
+            format!(
+                "Could not reach {} at {} — check that the server is running and the address is correct",
+                self.provider_name, self.endpoints.base_url
+            )
+        } else if error.is_timeout() {
+            format!(
+                "Failed to send request to {} at {}: request timed out — check that the server is responding",
+                self.provider_name, self.endpoints.base_url
+            )
+        } else {
+            format!(
+                "Failed to send request to {}: {}",
+                self.provider_name, error
+            )
+        };
+        self.configured_terminal_error(anyhow::anyhow!(message))
+    }
+
     /// Convert a Finch request according to the explicitly selected wire rule.
     fn to_openai_request(
         &self,
@@ -2217,14 +2237,16 @@ impl OpenAIProvider {
             "sending OpenAI-compatible request"
         );
 
-        let response = self
+        let response = match self
             .authorize(self.client.post(url))
             .header("content-type", "application/json")
             .json(&openai_request)
             .send()
             .await
-            .context("Failed to send request to OpenAI API")
-            .map_err(|error| self.configured_terminal_error(error))?;
+        {
+            Ok(res) => res,
+            Err(err) => return Err(self.format_request_error(err)),
+        };
 
         let status = response.status();
 
@@ -2303,14 +2325,16 @@ impl OpenAIProvider {
 
         tracing::debug!("Sending streaming request to OpenAI API");
 
-        let response = self
+        let response = match self
             .authorize(self.client.post(url))
             .header("content-type", "application/json")
             .json(&openai_request)
             .send()
             .await
-            .context("Failed to send streaming request to OpenAI API")
-            .map_err(|error| self.configured_terminal_error(error))?;
+        {
+            Ok(res) => res,
+            Err(err) => return Err(self.format_request_error(err)),
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -5935,6 +5959,78 @@ mod tests {
             Some(false),
         )
         .expect("configured-compatible test provider must construct")
+    }
+
+    #[tokio::test]
+    async fn test_openai_compatible_unreachable_endpoint_produces_plain_message() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let provider = OpenAIProvider::new_configured_compatible(
+            "configured-secret".into(),
+            base_url.clone(),
+            "/chat/completions",
+            "/models",
+            "test-model".into(),
+            "loopback".into(),
+            ModelCapabilities::configured_openai_compatible(
+                "loopback",
+                "test-model",
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(32_768),
+                Some(4_096),
+            ),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let request = ProviderRequest::new(vec![crate::Message::user("hello")]);
+
+        // Non-streaming
+        let err = provider
+            .send_message(&request)
+            .await
+            .expect_err("unreachable loopback endpoint must fail");
+        let err_msg = err.to_string();
+
+        assert!(
+            err_msg.contains(&format!("Could not reach loopback at {base_url}")),
+            "error should name the entry and base url; got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("OpenAI API"),
+            "error must not name OpenAI API for configured loopback provider; got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("tcp connect error") && !err_msg.contains("os error"),
+            "error must not contain raw nested library error chain; got: {err_msg}"
+        );
+
+        // Streaming
+        let stream_err = provider
+            .dispatch_stream(&request)
+            .await
+            .expect_err("unreachable loopback endpoint stream must fail");
+        let stream_err_msg = stream_err.to_string();
+
+        assert!(
+            stream_err_msg.contains(&format!("Could not reach loopback at {base_url}")),
+            "streaming error should name the entry and base url; got: {stream_err_msg}"
+        );
+        assert!(
+            !stream_err_msg.contains("OpenAI API"),
+            "streaming error must not name OpenAI API; got: {stream_err_msg}"
+        );
+        assert!(
+            !stream_err_msg.contains("tcp connect error") && !stream_err_msg.contains("os error"),
+            "streaming error must not contain raw nested library error chain; got: {stream_err_msg}"
+        );
     }
 
     async fn configured_stream_outcome(
