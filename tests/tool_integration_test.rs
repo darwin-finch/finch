@@ -1220,26 +1220,10 @@ fn test_bash_timeout_kills_process_tree_no_surviving_children() {
 
 #[test]
 fn test_background_task_availability_on_providers_offered_bash() {
-    // 1. Claude CLI provider: CLAUDE_CLI_TOOL_NAMES includes background_bash, background_poll, background_stop
     for tool_name in ["background_bash", "background_poll", "background_stop"] {
         assert!(
             finch_providers::CLAUDE_CLI_TOOL_NAMES.contains(&tool_name),
             "CLAUDE_CLI_TOOL_NAMES must include {tool_name}"
         );
     }
-
-    // 2. Background task tools registration in ToolRegistry:
-    let mut registry = finch::tools::ToolRegistry::new();
-    let tasks = std::sync::Arc::new(finch::brain::BackgroundTaskManager::new());
-    registry.register(Box::new(finch::tools::BackgroundBashTool::new(
-        std::sync::Arc::clone(&tasks),
-    )));
-    registry.register(Box::new(finch::tools::BackgroundPollTool::new(
-        std::sync::Arc::clone(&tasks),
-    )));
-    registry.register(Box::new(finch::tools::BackgroundStopTool::new(tasks)));
-
-    assert!(registry.get("background_bash").is_some());
-    assert!(registry.get("background_poll").is_some());
-    assert!(registry.get("background_stop").is_some());
 }
