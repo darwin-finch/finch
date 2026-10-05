@@ -2014,8 +2014,9 @@ pub(crate) async fn process_query_with_tools(
                 .unwrap_or_else(|_| fallback_vm_manifest()),
             None => fallback_vm_manifest(),
         };
+        let is_local = !Arc::ptr_eq(&generator, &claude_gen);
         inject_persona_system_prompt(&mut msgs, persona_system_prompt);
-        inject_vm_manifest(&mut msgs, &manifest);
+        inject_vm_manifest_for_target(&mut msgs, &manifest, is_local);
         msgs
     };
     let caps = generator.capabilities();
@@ -3140,11 +3141,16 @@ fn inject_persona_system_prompt(
     );
 }
 
-fn inject_vm_manifest(
+fn inject_vm_manifest_for_target(
     messages: &mut Vec<crate::providers::Message>,
     manifest: &finch_programs::VmManifest,
+    is_local: bool,
 ) -> bool {
-    let protocol = manifest.prompt_block();
+    let protocol = if is_local {
+        manifest.prompt_block_for_local()
+    } else {
+        manifest.prompt_block()
+    };
     let section = format!("## Finch VM wire protocol\n{protocol}");
 
     // The response shape is an execution contract, not user-provided context.
@@ -3175,6 +3181,13 @@ fn inject_vm_manifest(
         },
     );
     true
+}
+
+fn inject_vm_manifest(
+    messages: &mut Vec<crate::providers::Message>,
+    manifest: &finch_programs::VmManifest,
+) -> bool {
+    inject_vm_manifest_for_target(messages, manifest, false)
 }
 
 fn fallback_vm_manifest() -> finch_programs::VmManifest {
@@ -4772,6 +4785,27 @@ mod tests {
         assert!(messages[1].content[0]
             .as_text()
             .is_some_and(|text| text == "add two numbers"));
+    }
+
+    #[test]
+    fn test_inject_vm_manifest_local_prescribes_only_lisp_and_no_forth() {
+        let mut messages = vec![crate::providers::Message::user("say hello")];
+        assert!(inject_vm_manifest_for_target(
+            &mut messages,
+            &fallback_vm_manifest(),
+            true
+        ));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        let ContentBlock::Text { text } = &messages[0].content[0] else {
+            panic!("the system message must retain its text block");
+        };
+        assert!(text.contains("Wire language: Standard Lisp"));
+        assert!(text.contains("(say \"Hello\")"));
+        assert!(!text.contains(": square"));
+        assert!(!text.contains("distance2 ( S x:int"));
+        assert!(!text.contains("Co-Forth"));
+        assert!(!text.contains("\"Hello\" say"));
     }
 
     #[test]
