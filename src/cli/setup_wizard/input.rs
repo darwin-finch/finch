@@ -650,7 +650,13 @@ pub(super) fn start_catalog_refresh(
         selection_identity,
         result,
     });
-    *catalog_error = None;
+    if trigger == CatalogRefreshTrigger::Manual
+        || !catalog_error
+            .as_deref()
+            .map_or(false, |e| e.contains("required"))
+    {
+        *catalog_error = None;
+    }
     true
 }
 
@@ -1488,7 +1494,7 @@ fn handle_models_key(state: &mut WizardState, key: crossterm::event::KeyEvent) -
                             };
                             if resolved_model.trim().is_empty() {
                                 *catalog_error = Some(
-                                    "Refresh the authenticated catalogue with Ctrl+R or enter a model ID manually"
+                                    "A model is required before saving: pick one below with ←→ on the Model row, or type a model ID; Ctrl+R refreshes the list"
                                         .to_string(),
                                 );
                                 Some(AddProviderStep::ConfigureRemote {

@@ -126,7 +126,18 @@ pub(super) fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     *catalog_models = catalog.models;
     *catalog_source = catalog.source;
     *catalog_refreshed_at = Some(catalog.refreshed_at);
-    *catalog_error = refresh_error;
+    let model_empty = matches!(
+        adding_provider.as_ref(),
+        Some(AddProviderStep::ConfigureRemote { model, .. }) if model.trim().is_empty()
+    );
+    if refresh_error.is_some()
+        || !model_empty
+        || !catalog_error
+            .as_deref()
+            .map_or(false, |e| e.contains("required"))
+    {
+        *catalog_error = refresh_error;
+    }
 }
 
 /// Returns true if the Models section currently has any overlay open
