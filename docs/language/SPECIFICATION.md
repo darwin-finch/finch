@@ -565,6 +565,22 @@ implicit private entry callable whose contract is inferred and checked against t
 policy. Root kind is part of source identity and cannot be guessed from parse success. Tests remain
 declarations and never module initialization.
 
+In a `script` or `submission` root, dependencies MAY be declared directly without an external manifest:
+- A `module_path` in an import form accepts an `escaped_string` locator (e.g. `"github.com/org/repo#hash"`).
+  An explicit alias (`(:as name)` in CoLisp, `as name` in Co-Forth and C-like) is REQUIRED for string locators.
+- Alternatively, a top-level `script` declaration form MAY declare a `dependencies` block and an optional
+  `capabilities` block. Dependencies declared in a manifest or `script` form MAY configure `features`,
+  `default-features`, and compile-time `flags`.
+- The runner resolves, content-verifies, and caches remote locators in a content-addressed global cache.
+
+Before compilation or lowering, the dependency resolver unifies compatible SemVer ranges across the
+transitive graph into a single compiled module instance. Dependency configurations (`features`, `flags`)
+are isolated per consumer unless unified by the root manifest. When different major versions are required,
+records and variants remain distinct nominal types. If an upgraded major version preserves the exact
+layout, signature, and identity of the subset of declarations consumed by an importer (verified against its
+sealed canonical interface), the compiler MAY unify the dependency. Callers MAY supply explicit concept
+evidence bridging types across incompatible package versions without modifying upstream packages.
+
 There are three lexical namespaces: **module**, **type**, and **value**. Record and variant types,
 type aliases, and concepts occupy the type namespace. Runtime values, functions, constructors, and
 compile-time transformer bindings occupy the value namespace; phases do not create shadow bindings

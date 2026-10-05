@@ -530,6 +530,79 @@ local override recorded in its own manifest (from *its* author's local developme
 override ignored entirely once it is consumed as a library by someone else — only the actual root
 project's own overrides ever take effect, never a transitively inherited one.
 
+### Self-contained scripts and first-class script manifests
+
+While full multi-module packages use manifest/lockfile retrieval to protect against version drift
+and file-touching churn, single-file scripts (`script` and `submission` roots) require zero-ceremony
+execution without an enclosing project directory. Finch resolves this dual requirement without comment-
+scraping or external pre-parsers:
+
+1. **Direct String/Locator Imports:** For rapid prototyping and single-file tools, `module_path`
+   accepts string literals with mandatory aliases, for example `(import "github.com/finch-libs/http#v1.2.0" (:as http))`.
+   This aligns with Finch's convention where string literals denote outside-world boundaries (such as
+   `extern "C"`). The runner caches and verifies content-addressed packages in `~/.cache/finch/`.
+2. **First-Class `script` Manifest Form:** When a script needs granular dependency configuration or
+   explicit capability sandboxing, it declares a native `script` form at the top of the file:
+   - CoLisp:
+     ```lisp
+     (script
+       (dependencies
+         [http "github.com/finch-libs/http#v1.2.0"]
+         [crypto :source "github.com/finch-libs/crypto#a1b2c3d"
+                 :default-features false
+                 :features ["client"]
+                 :flags {:backend "pureFinch"}])
+       (capabilities
+         (net:out "api.example.com")
+         (fs:read "/tmp/*")))
+     ```
+   - C-like:
+     ```typescript
+     script {
+         dependencies {
+             http: "github.com/finch-libs/http#v1.2.0",
+             crypto: {
+                 source: "github.com/finch-libs/crypto#a1b2c3d",
+                 defaultFeatures: false,
+                 features: ["client"],
+                 flags: { backend: "pureFinch" },
+             },
+         }
+         capabilities {
+             netOut: "api.example.com",
+             fsRead: "/tmp/*",
+         }
+     }
+     ```
+   This form is parsed natively by the frontend grammar in one pass, adhering strictly to the
+   "One Parse Boundary" rule rather than scraping TOML blocks out of comments.
+3. **Dependency Flags and Conditional Lowering:** Callers may toggle `features` or set compile-time
+   `flags` to avoid linking unwanted foreign libraries (e.g. C FFI / OpenSSL). Within libraries,
+   conditional code paths use ordinary `if` expressions over compile-time constant flags. As decided
+   in Finding 74, constant-condition branches guarantee that only the selected arm is lowered to IR,
+   while both arms remain type-checked to eliminate code bitrot.
+
+### Diamond dependencies and semantic interface negotiation
+
+A classic failure in nominal type systems occurs when dependency A and dependency B both depend on
+dependency C, but request incompatible versions, resulting in compiler type mismatches when passing
+types or concepts across A and B.
+
+Finch addresses this at three levels:
+1. **Pre-Compilation Graph Unification:** The frontend dependency solver analyzes the complete
+   transitive graph and unifies compatible SemVer ranges into a single concrete dependency instance
+   before type checking begins, eliminating accidental duplication of identical packages.
+2. **Isolated Dependency Configuration:** Dependency features and flags are isolated per consumer
+   unless unified by the root manifest, avoiding Cargo's workspace-wide additive feature contamination.
+3. **Semantic Interface Verification:** Rather than relying solely on human-assigned SemVer numbers,
+   the compiler compares sealed, content-hashed module interfaces (Spec §4). If an upgraded major
+   version of C maintains exact layout and signature identity for the subset of declarations that A
+   actually consumes, the compiler can safely promote A to use the common version without code edits.
+4. **Decoupled Concept Evidence:** When major versions cannot be unified for concrete records, types
+   communicating across concepts (interfaces) can be bridged using Finch's explicit evidence passing
+   and `stable-evidence` (#NN operation keys), allowing downstream code to supply bridge implementations
+   without modifying upstream libraries or violating orphan rules.
+
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
 requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary

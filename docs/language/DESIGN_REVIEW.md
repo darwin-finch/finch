@@ -43,7 +43,8 @@ What is still open after that pass, in one place:
 | 76 | the REPL use: parked turns; the engine axis has no artifact (manifest, admission, turns, compile-time authority, direct binding done) | formalization |
 | 75 | every open question for the owner and every unfinished piece, in one list | index |
 | 74 | target constraints as compiler input: target-sized `int`, per-target specialization | decided in outline |
-| 73 | what a browser target needs: callbacks, integer width, suspension, tail calls | noted |
+| 84 | diamond dependency resolution, isolated feature flags, and semantic interface compatibility | decided |
+| 83 | self-contained script manifests, string locator imports, and decentralized dependencies | decided |
 | 82 | method-call syntax (concepts first, then free functions) and destructuring with private fields and drop hooks | decided and specified; not executable |
 | 81 | generators as ranges with `reply`; cancel on drop; `start`; a running task keeps its own result object alive; unread failures go to the host | core implemented; `defer`/`spawn`/`foreach` open |
 | 80 | local types that can be returned (Voldemort types): wanted, not in the executable core | language decision recorded |
@@ -2033,6 +2034,66 @@ field case; constructors and hooks are not executable yet.
 A separate, later feature: a refutable, user-defined pattern for values whose shape is known only
 at run time (a JSON-like value). That is an extractor that returns an option of the parts, not a
 way of consuming a record, and should get its own name and concept.
+
+### 83. Standalone self-contained scripts, decentralized dependencies, and script manifests — DECIDED
+
+**Finding.** Section 4 states that the package graph and root mapping come strictly from a build
+manifest/lockfile on disk. This created a contradiction with section 3 and the design history's promise
+that Finch scripts are portable, self-contained single-file artifacts: a standalone script importing an
+external library could not execute without an enclosing project directory and manifest file.
+
+**Decision (owner, 2026-10-04).**
+1. *Direct String/Locator Imports:* For `script` and `submission` roots, `module_path` accepts an
+   `escaped_string` in addition to dotted identifiers (for example `(import "github.com/finch-libs/http#v1.2.0" (:as http))`,
+   `import: "github.com/finch-libs/http#v1.2.0" import{ as http } ;`, and in C-like syntax
+   `import "github.com/finch-libs/http#v1.2.0" as http;`). The alias `:as` / `as` is mandatory for string
+   locators because the locator string is not an identifier. The runner verifies and caches immutable
+   content hashes in a global user cache without requiring an on-disk project directory.
+2. *First-Class `script` Manifest Form:* For scripts requiring granular dependency configuration or
+   explicit sandbox capability declarations, a native top-level `script` declaration form is supported
+   across all three frontends:
+   - CoLisp: `(script (dependencies [http "github.com/...#v1.2.0"] [crypto :source "..." :features ["client"] :flags {:backend "pureFinch"}]) (capabilities (net:out "api.example.com") (fs:read "/tmp/*")))`
+   - Co-Forth: `script: dependencies{ http: "github.com/...#v1.2.0" ; crypto: source: "..." features{ "client" } flags{ backend: "pureFinch" } ; } capabilities{ net:out "api.example.com" ; fs:read "/tmp/*" ; } ;`
+   - C-like: `script { dependencies { http: "github.com/...#v1.2.0", crypto: { source: "...", features: ["client"], flags: { backend: "pureFinch" } } } capabilities { netOut: "api.example.com", fsRead: "/tmp/*" } }`
+3. *Dependency Configuration & Feature Flags:* Dependencies in manifests or `script` blocks may specify
+   `features`, `default-features` (or `defaultFeatures`), and compile-time `flags` (e.g. backend selection).
+   This allows callers to prune unwanted transitive dependencies and avoid linking against C libraries
+   or foreign ABIs (e.g., opting into pure-Finch crypto).
+4. *No Comment-Scraping Hacks:* The script manifest is a first-class AST node parsed in the same single
+   parse pass as the rest of the source, strictly satisfying the "One Parse Boundary" rule without
+   out-of-band TOML/comment scraping.
+5. *Conditional Lowering Without `static if`:* Reaffirmed Finding 74: ordinary `if` over compile-time
+   constant conditions (including dependency flags) guarantees that only the selected branch is lowered
+   to IR. Both branches are type-checked to prevent bitrot, and untaken branches contribute zero linked
+   symbols or dead code.
+
+### 84. Diamond dependency resolution and semantic interface compatibility — DECIDED
+
+**Finding.** When dependency A and dependency B both depend on dependency C but specify different
+versions, passing a type or concept originating in C between A and B risks compilation failure due to
+nominal type identity or concept evidence mismatches. Furthermore, globally additive feature unification
+(as in Cargo) can accidentally force unwanted heavy features across unrelated consumers.
+
+**Decision (owner, 2026-10-04).**
+1. *Frontend Pre-Compilation Version Agreement:* Before type checking or lowering begins, the frontend
+   dependency solver walks the transitive dependency graph and unifies compatible SemVer ranges into a
+   single concrete version of C. A and B compile against that single unified instance, preventing
+   duplicate identical types in memory.
+2. *Isolated Dependency Configurations:* Unlike Cargo's workspace-wide additive feature unification,
+   Finch dependency configurations (features and compile-time flags) are isolated per consumer unless
+   explicitly unified by the root manifest, preventing an optional feature requested by A from polluting B.
+3. *Nominal Type Safety Across Major Versions:* Different major versions of records or variants remain
+   distinct nominal types to preserve memory layout and destructor safety. Mismatches produce actionable
+   diagnostics naming the package identity, SemVer version, content hash, and origin of each candidate.
+4. *Semantic Interface Intersection Verification:* Because Finch module interfaces are sealed, content-hashed
+   canonical contracts (Spec §4), the compiler can verify whether an upgraded major version preserves the
+   exact subset of types, layouts, and operations consumed by an older caller. When the consumed subset is
+   identical, promotion is safe without code changes.
+5. *Concept Evidence Bridging:* For types communicating across concepts (interfaces), Finch's decoupled
+   explicit evidence passing and `stable-evidence` (#NN operation keys) allow callers to provide bridging
+   evidence implementations without modifying either upstream library, avoiding Rust's orphan-rule deadlock.
+6. *Public Interface Leak Prevention:* The compiler checks whether a library's public signatures expose
+   types from private dependencies, encouraging explicit re-exports or abstract concepts.
 
 ## Cross-cutting conclusions
 
