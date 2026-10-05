@@ -48,10 +48,13 @@ impl OutputManagerLayer {
             target
         };
 
-        // Skip target for very common modules
-        match clean_target {
-            "tokio" | "reqwest" | "hyper" => message.to_string(),
-            _ => format!("[{}] {}", clean_target, message),
+        // Skip target for very common modules and internal finch crates (issue #1670)
+        if matches!(clean_target, "tokio" | "reqwest" | "hyper")
+            || clean_target.starts_with("finch_")
+        {
+            message.to_string()
+        } else {
+            format!("[{}] {}", clean_target, message)
         }
     }
 }
@@ -280,6 +283,22 @@ mod tests {
         // Other external crates
         let msg = layer.format_message("hf_hub::download", "Downloading file");
         assert_eq!(msg, "[hf_hub] Downloading file");
+
+        // Internal finch crates have no bracketed crate name (issue #1670)
+        let msg = layer.format_message(
+            "finch_tools_api::permissions",
+            "Blocked dangerous bash command: sleep 25; ps -p 97997 > /dev/sda",
+        );
+        assert_eq!(
+            msg,
+            "Blocked dangerous bash command: sleep 25; ps -p 97997 > /dev/sda"
+        );
+
+        let msg = layer.format_message(
+            "finch_tools_api",
+            "Blocked dangerous bash command: rm -rf /",
+        );
+        assert_eq!(msg, "Blocked dangerous bash command: rm -rf /");
     }
 
     // Note: MessageVisitor test removed - creating proper Field instances
