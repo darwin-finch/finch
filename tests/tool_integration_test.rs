@@ -1128,3 +1128,102 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn test_bash_timeout_kills_process_tree_no_surviving_children() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create test runtime");
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let child_marker = temp_dir.path().join("child.pid");
+    let grandchild_marker = temp_dir.path().join("grandchild.pid");
+
+    // Bash spawns a child subshell, which spawns a grandchild sleep process.
+    // Both write their PIDs to marker files before waiting.
+    let script = format!(
+        "sh -c 'echo $$ > \"{}\"; (sleep 60 & echo $! > \"{}\"; wait)'",
+        child_marker.display(),
+        grandchild_marker.display()
+    );
+
+    let context = finch::tools::ToolContext {
+        save_models: None,
+        host_mode_state: None,
+        plan_content: None,
+        live_output: None,
+        effect_audit: None,
+        grant_ceiling: None,
+        skip_interactive_review: true,
+    };
+
+    let result = runtime.block_on(BashTool.execute(
+        serde_json::json!({
+            "command": script,
+            "timeout_secs": 1,
+            "description": "Test full process tree termination",
+        }),
+        &context,
+    ));
+
+    assert!(
+        result.is_err(),
+        "bash tool execution must report timeout error"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("timed out after 1 second"),
+        "error message must clearly state the timeout limit: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("background_bash"),
+        "error message must advise using background_bash: {err_msg}"
+    );
+
+    // Read the recorded PIDs
+    assert!(
+        child_marker.exists(),
+        "child pid file must have been written"
+    );
+    assert!(
+        grandchild_marker.exists(),
+        "grandchild pid file must have been written"
+    );
+
+    let child_pid: i32 = std::fs::read_to_string(&child_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("valid child pid");
+    let grandchild_pid: i32 = std::fs::read_to_string(&grandchild_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("valid grandchild pid");
+
+    // Assert neither child nor grandchild survived
+    let child_alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), None).is_ok();
+    let grandchild_alive =
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild_pid), None).is_ok();
+
+    assert!(
+        !child_alive,
+        "child process {child_pid} must be terminated on timeout"
+    );
+    assert!(
+        !grandchild_alive,
+        "grandchild process {grandchild_pid} must be terminated on timeout"
+    );
+}
+
+#[test]
+fn test_background_task_availability_on_providers_offered_bash() {
+    for tool_name in ["background_bash", "background_poll", "background_stop"] {
+        assert!(
+            finch_providers::CLAUDE_CLI_TOOL_NAMES.contains(&tool_name),
+            "CLAUDE_CLI_TOOL_NAMES must include {tool_name}"
+        );
+    }
+}

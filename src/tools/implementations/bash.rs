@@ -30,13 +30,17 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a host shell command when behavior exists only in an external program such as git, cargo, npm, or a build script. Never use bash, finch, target/debug/finch, echo, printf, or cat to execute, test, or display Finch Lisp/Co-Forth source: your final text response is already executed by the active Brain VM."
+        "Execute a host shell command when behavior exists only in an external program such as git, cargo, npm, or a build script. Never use bash, finch, target/debug/finch, echo, printf, or cat to execute, test, or display Finch Lisp/Co-Forth source: your final text response is already executed by the active Brain VM. For long-running commands (such as builds or tests), use `background_bash` or configure `timeout_secs`."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema::simple(vec![
             ("command", "The bash command to execute"),
             ("description", "Brief description of what this command does"),
+            (
+                "timeout_secs",
+                "Optional timeout in seconds (default: 30). For commands taking longer than 30 seconds, specify a higher timeout or use background_bash",
+            ),
         ])
     }
 
@@ -45,6 +49,19 @@ impl Tool for BashTool {
             .as_str()
             .context("Missing command parameter")?;
         let description = input["description"].as_str().unwrap_or("");
+        let timeout_secs = input
+            .get("timeout_secs")
+            .or_else(|| input.get("timeout"))
+            .and_then(|v| {
+                if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else if let Some(s) = v.as_str() {
+                    s.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(30);
 
         // Propose the command in $EDITOR before running it — unless the REPL
         // already granted this call (bash:*, AutoAccept, or Yes).
@@ -73,9 +90,21 @@ impl Tool for BashTool {
             // review. Once a script is accepted, however, the actual process
             // remains bounded and is terminated if this future is dropped.
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
         let mut child = command
             .spawn()
             .with_context(|| format!("Failed to spawn command: {}", script))?;
+
+        #[cfg(unix)]
+        let mut pg_guard = ProcessGroupGuard {
+            pgid: child.id().map(|pid| pid as i32),
+        };
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -83,36 +112,63 @@ impl Tool for BashTool {
         // Clone the live output callback for the stdout reader
         let live_cb = context.live_output.clone();
 
-        let (stdout_buf, stderr_buf, exit_status) =
-            tokio::time::timeout(Duration::from_secs(30), async {
-                // Drain stderr in a background task so it doesn't block stdout reading.
-                let stderr_task = tokio::spawn(async move {
-                    let mut buf = String::new();
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                    buf
-                });
-
-                // Drain stdout on this task, calling the live-output callback per line.
-                let mut stdout_buf = String::new();
-                let mut stdout_lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = stdout_lines.next_line().await {
-                    if let Some(ref cb) = live_cb {
-                        cb.line(line.clone());
-                    }
-                    stdout_buf.push_str(&line);
-                    stdout_buf.push('\n');
+        let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            // Drain stderr in a background task so it doesn't block stdout reading.
+            let stderr_task = tokio::spawn(async move {
+                let mut buf = String::new();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    buf.push_str(&line);
+                    buf.push('\n');
                 }
+                buf
+            });
 
-                let stderr_buf = stderr_task.await.unwrap_or_default();
-                let exit_status = child.wait().await?;
-                Ok::<_, anyhow::Error>((stdout_buf, stderr_buf, exit_status))
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("approved command timed out after 30 seconds"))??;
+            // Drain stdout on this task, calling the live-output callback per line.
+            let mut stdout_buf = String::new();
+            let mut stdout_lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = stdout_lines.next_line().await {
+                if let Some(ref cb) = live_cb {
+                    cb.line(line.clone());
+                }
+                stdout_buf.push_str(&line);
+                stdout_buf.push('\n');
+            }
+
+            let stderr_buf = stderr_task.await.unwrap_or_default();
+            let exit_status = child.wait().await?;
+            Ok::<_, anyhow::Error>((stdout_buf, stderr_buf, exit_status))
+        })
+        .await;
+
+        let (stdout_buf, stderr_buf, exit_status) = match outcome {
+            Ok(res) => {
+                #[cfg(unix)]
+                {
+                    pg_guard.pgid = None;
+                }
+                res?
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    pg_guard.pgid = None;
+                }
+                terminate_process_tree(&mut child).await;
+                let unit = if timeout_secs == 1 {
+                    "second"
+                } else {
+                    "seconds"
+                };
+                anyhow::bail!(
+                    "Command timed out after {timeout_secs} {unit}. The process and all of its \
+                     child processes were terminated. For long-running commands (such as builds \
+                     or tests), use `background_bash` to run them in the background (and monitor \
+                     them with `background_poll` or stop them with `background_stop`), or specify \
+                     a larger `timeout_secs`."
+                );
+            }
+        };
         let exit_code = exit_status.code().unwrap_or(-1);
 
         let mut result = stdout_buf;
@@ -142,6 +198,138 @@ impl Tool for BashTool {
             Ok(result)
         }
     }
+}
+
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn find_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let output = match std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,ppid=,pgid="])
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("/bin/ps")
+                .args(["-ax", "-o", "pid=,ppid=,pgid="])
+                .output()
+        }) {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+    let Ok(text) = String::from_utf8(output) else {
+        return Vec::new();
+    };
+
+    let mut parent_to_children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut pgid_members: Vec<u32> = Vec::new();
+
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(pgid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+
+        if pid == root_pid {
+            continue;
+        }
+
+        if pgid == root_pid {
+            pgid_members.push(pid);
+        }
+        parent_to_children.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = std::collections::HashSet::new();
+    for member in pgid_members {
+        descendants.insert(member);
+    }
+
+    let mut queue = vec![root_pid];
+    while let Some(parent) = queue.pop() {
+        if let Some(children) = parent_to_children.get(&parent) {
+            for &child in children {
+                if descendants.insert(child) {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+
+    descendants.into_iter().collect()
+}
+
+#[cfg(unix)]
+async fn terminate_process_tree(child: &mut tokio::process::Child) {
+    let Some(root_pid) = child.id() else {
+        return;
+    };
+
+    let descendants = find_descendant_pids(root_pid);
+    let pgid = root_pid as i32;
+
+    // Send SIGKILL to the entire process group (-pgid).
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+
+    // Explicitly send SIGKILL to each descendant as well.
+    for pid in &descendants {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(*pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    // Kill the root process and reap it so it is never a zombie.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    // Confirm that all descendants have terminated.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < deadline {
+        let mut any_alive = false;
+        for pid in &descendants {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), None).is_ok() {
+                any_alive = true;
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(*pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        if !any_alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_tree(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -284,5 +472,95 @@ mod tests {
         let input = serde_json::json!({ "command": "echo hello" });
         let result = tool.execute(input, &make_context()).await.unwrap();
         assert!(result.trim().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout_terminates_entire_process_tree() {
+        let tool = BashTool;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_file = temp_dir.path().join("child.pid");
+        let marker_path = marker_file.to_string_lossy().to_string();
+
+        // Spawn a background child process from bash, record its PID, and wait in bash.
+        // On timeout, both bash and the background child process must be terminated.
+        let command_str = format!("sh -c 'sleep 60 & echo $! > \"{marker_path}\"; wait'");
+        let input = serde_json::json!({
+            "command": command_str,
+            "timeout_secs": 1,
+            "description": "Test process tree termination on timeout"
+        });
+
+        let start = std::time::Instant::now();
+        let result = tool.execute(input, &make_context()).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "command must fail on timeout");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("timed out after 1 second"),
+            "error message must state the timeout limit: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("background_bash"),
+            "error message must state what to do instead (background_bash): {err_msg}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout must trigger quickly, took {elapsed:?}"
+        );
+
+        // Read the child PID from the marker file
+        assert!(
+            marker_file.exists(),
+            "child pid file must have been created"
+        );
+        let pid_str = std::fs::read_to_string(&marker_file).unwrap();
+        let child_pid: u32 = pid_str.trim().parse().expect("valid pid");
+
+        // Verify the child process is NOT alive
+        #[cfg(unix)]
+        {
+            let alive =
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid as i32), None).is_ok();
+            assert!(
+                !alive,
+                "child process {child_pid} must be terminated across its tree, but was still alive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bash_configurable_timeout_succeeds() {
+        let tool = BashTool;
+        let input = serde_json::json!({
+            "command": "sleep 1 && echo finished",
+            "timeout_secs": 5,
+            "description": "Test configurable timeout allows command to finish"
+        });
+        let result = tool.execute(input, &make_context()).await;
+        assert!(
+            result.is_ok(),
+            "command must succeed within extended timeout: {:?}",
+            result
+        );
+        assert!(result.unwrap().contains("finished"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_default_timeout_message() {
+        let tool = BashTool;
+        let input = serde_json::json!({
+            "command": "sleep 2",
+            "timeout_secs": 1,
+            "description": "Test timeout message phrasing"
+        });
+        let result = tool.execute(input, &make_context()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Command timed out after 1 second"));
+        assert!(err.contains("background_bash"));
+        assert!(err.contains("background_poll"));
+        assert!(err.contains("background_stop"));
+        assert!(err.contains("timeout_secs"));
     }
 }

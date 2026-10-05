@@ -246,3 +246,17 @@ async fn test_background_tools_fail_closed_on_unknown_or_missing_input() {
         "error chain must name the missing parameter: {error:#}"
     );
 }
+
+#[test]
+fn test_background_tools_registration_in_tool_registry() {
+    use crate::tools::ToolRegistry;
+    let mut registry = ToolRegistry::new();
+    let tasks = Arc::new(BackgroundTaskManager::new());
+    registry.register(Box::new(BackgroundBashTool::new(Arc::clone(&tasks))));
+    registry.register(Box::new(BackgroundPollTool::new(Arc::clone(&tasks))));
+    registry.register(Box::new(BackgroundStopTool::new(tasks)));
+
+    assert!(registry.get("background_bash").is_some());
+    assert!(registry.get("background_poll").is_some());
+    assert!(registry.get("background_stop").is_some());
+}

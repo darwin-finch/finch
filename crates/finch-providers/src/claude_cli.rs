@@ -102,7 +102,17 @@ pub const CLAUDE_CLI_MCP_SERVER_NAME: &str = "finch";
 /// always stays `""`). A tool that exists in Finch but is not in this list is
 /// simply never offered to this provider; the caller sees no tool-call
 /// attempt for it, not a failure.
-pub const CLAUDE_CLI_TOOL_NAMES: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
+pub const CLAUDE_CLI_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "bash",
+    "background_bash",
+    "background_poll",
+    "background_stop",
+];
 
 /// The MCP wire name Claude Code will call for a Finch tool name.
 pub fn claude_cli_mcp_wire_name(finch_tool_name: &str) -> String {
@@ -2659,6 +2669,28 @@ printf '%s\n' \
             vec!["read".to_string(), "bash".to_string()],
             "only tools in CLAUDE_CLI_TOOL_NAMES are exposed, in that fixed order; \
              unsupported tool names are silently dropped, not an error: {names:?}"
+        );
+    }
+
+    #[test]
+    fn supported_tool_names_includes_background_task_tools() {
+        let provider = ClaudeCliProvider::new(None);
+        let mut request = simple_request();
+        request.tools = Some(vec![
+            tool_definition("bash"),
+            tool_definition("background_bash"),
+            tool_definition("background_poll"),
+            tool_definition("background_stop"),
+        ]);
+        let names = provider.supported_tool_names(&request);
+        assert_eq!(
+            names,
+            vec![
+                "bash".to_string(),
+                "background_bash".to_string(),
+                "background_poll".to_string(),
+                "background_stop".to_string()
+            ]
         );
     }
 
