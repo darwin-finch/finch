@@ -6,6 +6,7 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEndpoints {
+    pub base_url: String,
     pub chat_url: String,
     pub models_url: String,
 }
@@ -13,6 +14,7 @@ pub struct ProviderEndpoints {
 impl ProviderEndpoints {
     pub fn new(base_url: &str, chat_path: &str, models_path: &str) -> Self {
         Self {
+            base_url: base_url.to_string(),
             chat_url: resolve_endpoint(base_url, chat_path),
             models_url: resolve_endpoint(base_url, models_path),
         }
