@@ -93,6 +93,7 @@ use command_autocomplete::{CommandRegistry, CommandSpec};
 pub use diagnostic_console::{DiagnosticConsolePort, DiagnosticConsoleSnapshot};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use tabbed_dialog::{QuestionOptionView, QuestionView};
+pub use view_model::HoverTarget;
 
 /// Application-owned status state read and updated by the terminal renderer.
 ///
@@ -1317,7 +1318,11 @@ pub(crate) fn plan_live_frame(
     // SGR here, at paint. The plain text stays what every measurement reads;
     // span-free lines keep their legacy bytes.
     for line in &viewport_content {
-        let hover_bg = if vm.hovered_row.is_some() && line.row_id.as_ref() == vm.hovered_row {
+        let hover_bg = if vm
+            .hover_target
+            .as_ref()
+            .is_some_and(|target| target.is_line_hovered(line))
+        {
             vm.hover_bg.clone()
         } else {
             None
@@ -1572,7 +1577,7 @@ pub struct TuiRenderer {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: Option<String>,
 
-    pub hovered_row: Option<finch_ui_model::RowId>,
+    pub hover_target: Option<HoverTarget>,
 
     // How many rows the live area currently occupies at the bottom of the
     // terminal (WorkUnit + separator + input + status).  Cleared before each
@@ -1800,7 +1805,7 @@ impl TuiRenderer {
             command_history: Vec::new(),
             history_index: None,
             history_draft: None,
-            hovered_row: None,
+            hover_target: None,
             active_rows: 0,
             pending_viewport_size: None,
             last_live_frame_rows: 0,
@@ -1894,7 +1899,7 @@ impl TuiRenderer {
             command_history,
             history_index: None,
             history_draft: None,
-            hovered_row: None,
+            hover_target: None,
 
             active_rows: 0,
             pending_viewport_size: None,
@@ -1959,6 +1964,22 @@ impl TuiRenderer {
     /// Attach a source the live area polls for task rows each time it redraws.
     pub fn set_task_rows(&mut self, rows: activity::SharedActivityRows) {
         self.task_rows = Some(rows);
+    }
+
+    /// The expandable transcript row currently hovered, if any.
+    pub fn hovered_row(&self) -> Option<&finch_ui_model::RowId> {
+        match &self.hover_target {
+            Some(HoverTarget::Row(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The bounded tool result whose compact block is currently hovered, if any.
+    pub fn hovered_tool_output(&self) -> Option<&finch_ui_model::RowId> {
+        match &self.hover_target {
+            Some(HoverTarget::ToolOutput(id)) => Some(id),
+            _ => None,
+        }
     }
 
     /// Attach the application-owned source shown by the diagnostic console.
@@ -2333,7 +2354,7 @@ impl TuiRenderer {
                 active_dialog.as_ref(),
                 expanded_lines.as_deref(),
             );
-            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_target = self.hover_target.as_ref();
             let hover_bg = span_render::component_style_palette(&self.colors).hover_background;
             vm.hover_bg = Some(hover_bg);
             vm.chrome = span_render::ChromeStyle::from_scheme(&self.colors);
@@ -3077,7 +3098,7 @@ fn live_view_model<'a>(
         scroll_hint: sources.scroll_hint.as_deref(),
         dialog,
         expanded_lines,
-        hovered_row: None,
+        hover_target: None,
         hover_bg: None,
         chrome: Default::default(),
         render_error: sources.render_error,
@@ -4013,19 +4034,32 @@ impl TuiRenderer {
     }
 
     fn handle_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
-        let hover_row =
+        if self.active_dialog.is_some()
+            || self.active_tabbed_dialog.is_some()
+            || self.expanded_tool.is_some()
+        {
+            if self.hover_target.is_some() {
+                self.hover_target = None;
+                self.live_area_dirty = true;
+                self.viewport_invalidated = true;
+                return true;
+            }
+            return false;
+        }
+
+        let hover_target =
             if let Some(region) = self.accordion.component_region_at(mouse.column, mouse.row) {
-                Some(region)
+                Some(HoverTarget::Row(region))
             } else if let Some(region) = self.accordion.hit_region_at(mouse.column, mouse.row) {
-                Some(region.row_id.clone())
+                Some(HoverTarget::Row(region.row_id.clone()))
             } else if let Some(region) = self.tool_viewports.region_at(mouse.column, mouse.row) {
-                Some(region.row_id.clone())
+                Some(HoverTarget::ToolOutput(region.row_id.clone()))
             } else {
                 None
             };
 
-        if self.hovered_row != hover_row {
-            self.hovered_row = hover_row;
+        if self.hover_target != hover_target {
+            self.hover_target = hover_target;
             self.live_area_dirty = true;
             self.viewport_invalidated = true; // force full repaint to ensure hover is visible / cleared
             true
@@ -4339,6 +4373,7 @@ impl TuiRenderer {
             scroll: 0,
             body_lines: body.len(),
         });
+        self.hover_target = None;
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
     }
@@ -4350,6 +4385,7 @@ impl TuiRenderer {
         if self.expanded_tool.take().is_none() {
             return;
         }
+        self.hover_target = None;
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
     }
@@ -4533,7 +4569,7 @@ impl TuiRenderer {
             let sources = self.live_frame_sources(draw_width);
             let mut autocomplete = self.autocomplete_state.clone();
             let mut vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
-            vm.hovered_row = self.hovered_row.as_ref();
+            vm.hover_target = self.hover_target.as_ref();
             vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
             let frame = plan_live_frame(&vm, &mut autocomplete);
             return Some((frame.physical_rows(draw_width), frame.cursor_row));
@@ -4564,7 +4600,7 @@ impl TuiRenderer {
             None,
             expanded_lines.as_deref(),
         );
-        vm.hovered_row = self.hovered_row.as_ref();
+        vm.hover_target = self.hover_target.as_ref();
         vm.hover_bg = Some(finch_ui_model::SpanColor::DARK_GREY);
         let frame = plan_live_frame(&vm, &mut autocomplete);
         Some((frame.physical_rows(draw_width), frame.cursor_row))
@@ -4637,7 +4673,10 @@ impl TuiRenderer {
             .map(|l| {
                 let lowered = span_render::lower_rendered_line(
                     l,
-                    if self.hovered_row.is_some() && l.row_id.as_ref() == self.hovered_row.as_ref()
+                    if self
+                        .hover_target
+                        .as_ref()
+                        .is_some_and(|target| target.is_line_hovered(l))
                     {
                         Some(hover_bg.clone())
                     } else {
@@ -6807,7 +6846,7 @@ mod tests {
         let vm = view_model::LiveViewModel {
             hover_bg: None,
             chrome: Default::default(),
-            hovered_row: None,
+            hover_target: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &draft,
@@ -7589,6 +7628,239 @@ mod tests {
              lines",
             &terminal,
         );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT (#1679): moving the pointer over a truncated tool-output block
+    /// highlights that block and nothing else with the theme's hover background.
+    /// Moving the pointer away removes the styling. The highlight never changes
+    /// the block's text or row count, and clicking the highlighted block opens
+    /// the expanded view.
+    #[test]
+    fn test_hover_over_truncated_tool_output_highlights_block_from_theme_and_opens_on_click() {
+        let (mut renderer, mut terminal, output_row) =
+            painted_long_conversation_with_truncated_tool_output();
+        let (first_row, status_row) = compact_block_rows(&terminal);
+        let header_row = usize::from(first_row.checked_sub(1).expect("header above block"));
+        assert_vt(
+            terminal.row(header_row).contains("Output (40)"),
+            "precondition: the header row immediately above the block is Output (40)",
+            &terminal,
+        );
+
+        let expected_hover_bg = match renderer.colors.hover_background() {
+            ratatui::style::Color::Rgb(r, g, b) => VtColor::Rgb(r, g, b),
+            _ => panic!("expected RGB hover background"),
+        };
+
+        let move_to = |row| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Precondition: no cells have hover background styling before pointer movement.
+        let has_hover_bg = |terminal: &VtOracle, row: usize| {
+            (0..LONG_CONVERSATION_WIDTH)
+                .any(|col| terminal.cell(row, col).style.background == expected_hover_bg)
+        };
+        for row in 0..LONG_CONVERSATION_HEIGHT {
+            assert_vt(
+                !has_hover_bg(&terminal, row),
+                &format!("precondition: row {row} has no hover styling before pointer move"),
+                &terminal,
+            );
+        }
+
+        let pre_hover_block_text: Vec<String> = (first_row..=status_row)
+            .map(|r| terminal.row(usize::from(r)))
+            .collect();
+
+        // 1. Move pointer over the first row of the truncated tool-output block.
+        assert!(
+            renderer.handle_mouse(move_to(first_row)),
+            "pointer move onto truncated tool-output block must report change"
+        );
+        assert_eq!(renderer.hovered_tool_output(), Some(&output_row));
+        assert_eq!(renderer.hovered_row(), None);
+        repaint_long_conversation(&mut renderer, &mut terminal);
+
+        // Assert: every row in the block has hover styling applied.
+        for r in first_row..=status_row {
+            let row_idx = usize::from(r);
+            assert_vt(
+                has_hover_bg(&terminal, row_idx),
+                &format!("INVARIANT: row {row_idx} of truncated block must show hover styling"),
+                &terminal,
+            );
+        }
+
+        // Assert: nothing else has hover styling (header row and other rows).
+        assert_vt(
+            !has_hover_bg(&terminal, header_row),
+            "INVARIANT: Output header row must NOT have hover styling when pointer is over the block",
+            &terminal,
+        );
+        for row in 0..LONG_CONVERSATION_HEIGHT {
+            if row < usize::from(first_row) || row > usize::from(status_row) {
+                assert_vt(
+                    !has_hover_bg(&terminal, row),
+                    &format!("INVARIANT: row {row} outside block must NOT show hover styling"),
+                    &terminal,
+                );
+            }
+        }
+
+        // Assert: highlight never changes the block's text or row count.
+        let post_hover_block_text: Vec<String> = (first_row..=status_row)
+            .map(|r| terminal.row(usize::from(r)))
+            .collect();
+        assert_eq!(
+            pre_hover_block_text, post_hover_block_text,
+            "INVARIANT: hover highlight must never change the block's text or row count"
+        );
+
+        // 2. Move pointer within the block (status row): hover stays on the block.
+        assert!(
+            !renderer.handle_mouse(move_to(status_row)),
+            "moving within same tool block is no change"
+        );
+
+        // 3. Move pointer leaves the block (row below status row).
+        let outside_row = status_row + 1;
+        assert!(
+            renderer.handle_mouse(move_to(outside_row)),
+            "pointer move outside block must report change"
+        );
+        assert_eq!(renderer.hovered_tool_output(), None);
+        repaint_long_conversation(&mut renderer, &mut terminal);
+
+        // Assert: hover styling is removed from all rows.
+        for row in 0..LONG_CONVERSATION_HEIGHT {
+            assert_vt(
+                !has_hover_bg(&terminal, row),
+                &format!(
+                    "INVARIANT: row {row} must have hover styling removed when pointer leaves"
+                ),
+                &terminal,
+            );
+        }
+
+        // 4. Move pointer over the Output header row: header row is hovered, block is not.
+        assert!(
+            renderer.handle_mouse(move_to(header_row as u16)),
+            "pointer move over Output header row must report change"
+        );
+        assert_eq!(renderer.hovered_row(), Some(&output_row));
+        assert_eq!(renderer.hovered_tool_output(), None);
+        repaint_long_conversation(&mut renderer, &mut terminal);
+
+        assert_vt(
+            has_hover_bg(&terminal, header_row),
+            "INVARIANT: Output header row shows hover styling when pointer is over it",
+            &terminal,
+        );
+        for r in first_row..=status_row {
+            assert_vt(
+                !has_hover_bg(&terminal, usize::from(r)),
+                "INVARIANT: block rows must NOT show hover styling when pointer is over header",
+                &terminal,
+            );
+        }
+
+        // 5. Move pointer back onto the block and click to open expanded view.
+        assert!(renderer.handle_mouse(move_to(first_row)));
+        repaint_long_conversation(&mut renderer, &mut terminal);
+
+        let click = |kind| MouseEvent {
+            kind,
+            column: 8,
+            row: first_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        renderer.handle_mouse_to(
+            click(event::MouseEventKind::Down(event::MouseButton::Left)),
+            &mut Vec::new(),
+        );
+        assert!(
+            renderer.handle_mouse_to(
+                click(event::MouseEventKind::Up(event::MouseButton::Left)),
+                &mut Vec::new(),
+            ),
+            "a click on the highlighted block is claimed"
+        );
+        repaint_long_conversation(&mut renderer, &mut terminal);
+        assert_vt(
+            renderer
+                .expanded_tool
+                .as_ref()
+                .is_some_and(|view| view.row_id == output_row)
+                && terminal.find_row("lines 1–").is_some()
+                && terminal.find_row("Esc close").is_some(),
+            "INVARIANT: clicking the highlighted block opens the expanded view",
+            &terminal,
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT (#1679): hover styling comes from the active theme scheme, not a fixed colour.
+    #[test]
+    fn test_hover_styling_comes_from_active_theme_scheme() {
+        let colors = finch_theme::ColorTheme::Light.to_scheme();
+        let expected_hover_bg = match colors.hover_background() {
+            ratatui::style::Color::Rgb(r, g, b) => VtColor::Rgb(r, g, b),
+            _ => panic!("expected RGB hover background"),
+        };
+        // Verify light scheme hover background is distinct from default dark scheme.
+        assert_ne!(
+            colors.hover_background(),
+            ColorScheme::default().hover_background(),
+            "light theme must have distinct hover background"
+        );
+
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer =
+            TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors.clone());
+        renderer.is_active = true;
+        renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
+
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(build)");
+        work.complete_row_with_body(
+            call,
+            "",
+            (0..40).map(|n| format!("line {n}")).collect::<Vec<_>>(),
+        );
+        work.set_complete();
+        renderer.add_trait_message(work);
+        for message in renderer.output_manager.get_messages() {
+            renderer.printed_ids.insert(message.id());
+        }
+
+        let mut terminal = VtOracle::new(LONG_CONVERSATION_WIDTH, LONG_CONVERSATION_HEIGHT);
+        repaint_long_conversation(&mut renderer, &mut terminal);
+        let (first_row, status_row) = compact_block_rows(&terminal);
+
+        let move_to = |row| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(renderer.handle_mouse(move_to(first_row)));
+        repaint_long_conversation(&mut renderer, &mut terminal);
+
+        for r in first_row..=status_row {
+            let row_idx = usize::from(r);
+            let has_light_hover = (0..LONG_CONVERSATION_WIDTH)
+                .any(|col| terminal.cell(row_idx, col).style.background == expected_hover_bg);
+            assert_vt(
+                has_light_hover,
+                &format!("INVARIANT: row {row_idx} must show light scheme hover colour {expected_hover_bg:?}"),
+                &terminal,
+            );
+        }
         renderer.is_active = false;
     }
 
@@ -12248,7 +12520,7 @@ mod tests {
         view_model::LiveViewModel {
             hover_bg: None,
             chrome: Default::default(),
-            hovered_row: None,
+            hover_target: None,
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -12330,7 +12602,7 @@ mod tests {
             let vm = view_model::LiveViewModel {
                 hover_bg: None,
                 chrome: Default::default(),
-                hovered_row: None,
+                hover_target: None,
                 terminal_width: width,
                 terminal_height: height,
                 input_lines: &input_lines,
@@ -12508,7 +12780,7 @@ mod tests {
             let vm = view_model::LiveViewModel {
                 hover_bg: None,
                 chrome: Default::default(),
-                hovered_row: None,
+                hover_target: None,
                 terminal_width: w,
                 terminal_height: h,
                 input_lines: &draft,
@@ -12602,7 +12874,7 @@ mod tests {
         let vm = view_model::LiveViewModel {
             hover_bg: None,
             chrome: Default::default(),
-            hovered_row: None,
+            hover_target: None,
             terminal_width: width,
             terminal_height: 24,
             input_lines: &draft,

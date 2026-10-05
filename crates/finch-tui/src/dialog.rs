@@ -2248,7 +2248,7 @@ mod tests {
         let inputs = super::super::view_model::LiveViewModel {
             hover_bg: None,
             chrome: Default::default(),
-            hovered_row: None,
+            hover_target: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &input,
@@ -2286,7 +2286,7 @@ mod tests {
         let inputs = super::super::view_model::LiveViewModel {
             hover_bg: None,
             chrome: Default::default(),
-            hovered_row: None,
+            hover_target: None,
             terminal_width: width,
             terminal_height: height,
             input_lines: &input,

@@ -135,6 +135,27 @@ pub(crate) struct FrameRects {
     pub tracked: Rect,
 }
 
+/// The transcript element currently under the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoverTarget {
+    /// An expandable transcript row (accordion disclosure header or component row).
+    Row(finch_ui_model::RowId),
+    /// A bounded compact tool-result window.
+    ToolOutput(finch_ui_model::RowId),
+}
+
+impl HoverTarget {
+    pub fn is_line_hovered(&self, line: &RenderedTranscriptLine) -> bool {
+        match self {
+            HoverTarget::Row(row_id) => line.row_id.as_ref() == Some(row_id),
+            HoverTarget::ToolOutput(tool_id) => {
+                line.body_of.as_ref() == Some(tool_id)
+                    && line.role == Some(finch_ui_model::NodeRole::ToolOutput)
+            }
+        }
+    }
+}
+
 /// Everything the live-frame planner reads: the blit-time ViewModel snapshot.
 ///
 /// Gathering the renderer's state into one owned struct is the whole point: a
@@ -157,7 +178,7 @@ pub(crate) struct LiveViewModel<'a> {
     /// [`super::scroll_view::TranscriptScrollView::hidden_rows`] and
     /// [`super::scroll_view::scroll_position_hint`]).
     pub scroll_hint: Option<&'a str>,
-    pub hovered_row: Option<&'a finch_ui_model::RowId>,
+    pub hover_target: Option<&'a HoverTarget>,
     pub hover_bg: Option<finch_ui_model::SpanColor>,
     /// Scheme colours for the chrome the planner draws itself.
     pub chrome: super::span_render::ChromeStyle,
