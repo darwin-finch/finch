@@ -88,16 +88,35 @@ impl QwenAdapter {
                 .to_string();
         }
 
-        // The model might echo the system prompt - we need to extract ONLY the actual answer
         let mut cleaned = raw_output;
 
-        // Step 1: Handle special tokens (ChatML format with markers)
+        // Step 1: Remove reasoning blocks (<think>...</think>) if present.
+        // In reasoning models, thoughts precede the final response; keep what follows </think>.
+        let mut without_think = cleaned.to_string();
+        while let Some(think_start) = without_think.find("<think>") {
+            if let Some(think_end) = without_think[think_start..].find("</think>") {
+                let end_pos = think_start + think_end + "</think>".len();
+                without_think = format!(
+                    "{}{}",
+                    &without_think[..think_start],
+                    &without_think[end_pos..]
+                );
+            } else {
+                without_think = without_think.replace("<think>", "");
+                break;
+            }
+        }
+        let without_think_str = without_think;
+        cleaned = &without_think_str;
+
+        // Step 2: Handle special tokens (ChatML format with markers)
         // If the model echoed the template, find the last "assistant" section with markers
         if let Some(last_assistant_start) = cleaned.rfind("<|im_start|>assistant") {
-            cleaned = &cleaned[last_assistant_start + 22..]; // Skip "<|im_start|>assistant\n"
+            let after = &cleaned[last_assistant_start + "<|im_start|>assistant".len()..];
+            cleaned = after.strip_prefix('\n').unwrap_or(after);
         }
 
-        // Remove end markers (ChatML + DeepSeek + reasoning)
+        // Remove end markers (ChatML + DeepSeek)
         cleaned = cleaned
             .split("<|im_end|>")
             .next()
@@ -108,39 +127,48 @@ impl QwenAdapter {
             .split("<｜end▁of▁sentence｜>")
             .next()
             .unwrap_or(cleaned)
-            .split("</think>")
-            .next()
-            .unwrap_or(cleaned)
             .trim();
 
-        // Step 2: Handle role names as plain text (when tokenizer treats them as regular tokens)
-        // Find the LAST occurrence of "assistant\n" or "assistant " (without special tokens)
-        // This handles cases like: "user\nWhat is 2+2?\nassistant\n4"
-        if let Some(last_assistant_pos) = cleaned.rfind("assistant\n") {
-            // Take everything after "assistant\n"
-            cleaned = &cleaned[last_assistant_pos + 10..]; // "assistant\n".len() = 10
-        } else if let Some(last_assistant_pos) = cleaned.rfind("assistant ") {
-            // Handle "assistant " (space instead of newline)
-            cleaned = &cleaned[last_assistant_pos + 10..]; // "assistant ".len() = 10
+        // Step 3: Handle role names as plain text (when tokenizer treats them as regular tokens)
+        // Only strip if the response actually contains role markers (starts with assistant/user/system
+        // or contains user/system turns) to avoid truncating legitimate prose mentioning "assistant".
+        let has_role_markers = cleaned.starts_with("assistant\n")
+            || cleaned.starts_with("assistant ")
+            || cleaned.starts_with("user\n")
+            || cleaned.starts_with("user ")
+            || cleaned.starts_with("system\n")
+            || cleaned.starts_with("system ")
+            || cleaned.contains("\nuser\n")
+            || cleaned.contains("\nuser ")
+            || cleaned.contains("\nsystem\n")
+            || cleaned.contains("\nsystem ");
+
+        if has_role_markers {
+            if let Some(last_pos) = cleaned.rfind("\nassistant\n") {
+                cleaned = &cleaned[last_pos + 1 + 10..];
+            } else if let Some(last_pos) = cleaned.rfind("\nassistant ") {
+                cleaned = &cleaned[last_pos + 1 + 10..];
+            } else if cleaned.starts_with("assistant\n") {
+                cleaned = &cleaned[10..];
+            } else if cleaned.starts_with("assistant ") {
+                cleaned = &cleaned[10..];
+            }
         }
 
-        // Step 3: Remove embedded role patterns and special tokens
-        // Replace patterns like "\nuser\n", "\nsystem\n", "\nassistant\n" with just "\n"
-        // Also remove DeepSeek BOS tokens and ChatML markers
+        // Step 4: Remove embedded role patterns and special tokens
         let mut temp = cleaned.to_string();
         temp = temp.replace("\nuser\n", "\n");
         temp = temp.replace("\nsystem\n", "\n");
         temp = temp.replace("\nassistant\n", "\n");
         temp = temp.replace("<｜begin▁of▁sentence｜>", "");
         temp = temp.replace("<｜end▁of▁sentence｜>", "");
-        temp = temp.replace("<think>", "");
-        temp = temp.replace("</think>", "");
         temp = temp.replace("<|im_start|>user", "");
         temp = temp.replace("<|im_start|>system", "");
         temp = temp.replace("<|im_start|>assistant", "");
-        cleaned = &temp;
+        let temp_str = temp;
+        cleaned = &temp_str;
 
-        // Step 4: Remove leading role names (if any remain after above steps)
+        // Step 5: Remove leading role names (if any remain after above steps)
         cleaned = cleaned
             .trim_start_matches("system")
             .trim_start_matches("user")
@@ -148,17 +176,13 @@ impl QwenAdapter {
             .trim_start_matches('\n')
             .trim();
 
-        // Step 5: Detect question/answer pattern and extract just the answer
+        // Step 6: Detect question/answer pattern and extract just the answer
         // Pattern: "What is X?\nAnswer" → extract "Answer"
-        // IMPORTANT: Only trigger this for SHORT responses (2-3 lines) that look like prompt echoes
-        // Don't truncate normal multi-line responses that happen to contain questions!
+        // IMPORTANT: Only trigger this for SHORT responses (2-3 lines) that look like prompt echoes.
         let lines: Vec<&str> = cleaned.lines().collect();
         if lines.len() == 2 || lines.len() == 3 {
-            // Only for very short responses that look like prompt echoes
             if let Some(first_line) = lines.first() {
-                // First line should end with '?' AND be a reasonable question length (< 100 chars)
                 if first_line.trim().ends_with('?') && first_line.len() < 100 {
-                    // Last line should be short (< 50 chars) like a direct answer
                     if let Some(last_line) = lines.iter().rev().find(|l| !l.trim().is_empty()) {
                         if last_line.len() < 50 {
                             cleaned = last_line.trim();
@@ -168,13 +192,8 @@ impl QwenAdapter {
             }
         }
 
-        // Step 6: AGGRESSIVE: If the output starts with constitution text, skip to the actual answer
-        // Constitution typically starts with "You are Shammah" or "# Shammah Constitution"
+        // Step 7: If the output starts with constitution text, skip to the actual answer
         if cleaned.starts_with("You are Shammah") || cleaned.starts_with("# Shammah Constitution") {
-            // The actual answer is usually at the end after all the instructions
-            // Try multiple strategies:
-
-            // Strategy 1: Look for common question-answer separators
             for separator in &[
                 "\n\n##",
                 "\n\nExamples",
@@ -183,36 +202,19 @@ impl QwenAdapter {
                 "## Examples",
             ] {
                 if let Some(sep_pos) = cleaned.find(separator) {
-                    // Answer is likely after this section, so skip the rest of constitution
                     cleaned = &cleaned[sep_pos..];
                     break;
                 }
             }
-
-            // Strategy 2: If output is very long (>200 chars) and starts with constitution,
-            // the answer is likely the LAST paragraph
-            if cleaned.len() > 200 {
-                // Split by double newline and take the last non-empty paragraph
-                let paragraphs: Vec<&str> = cleaned.split("\n\n").collect();
-                if let Some(last_para) = paragraphs
-                    .iter()
-                    .rev()
-                    .find(|p| !p.trim().is_empty() && p.len() < 100)
-                {
-                    cleaned = last_para.trim();
+            if let Some(q_pos) = cleaned.rfind('?') {
+                if let Some(answer_start) = cleaned[q_pos..].find("\n\n") {
+                    cleaned = &cleaned[q_pos + answer_start + 2..];
                 }
             }
         }
 
-        // Step 7: If still too long (>500 chars), something went wrong - take last line as fallback
-        if cleaned.len() > 500 {
-            if let Some(last_line) = cleaned.lines().last() {
-                if !last_line.trim().is_empty() && last_line.len() < 200 {
-                    cleaned = last_line.trim();
-                }
-            }
-        }
-
+        // Legitimate responses (poems, code, programs, explanations) can be thousands
+        // of characters long. Never truncate based on length.
         cleaned.trim().to_string()
     }
 }
@@ -392,5 +394,97 @@ Based on the file contents..."#;
         assert!(cleaned.contains("toolu_123"));
         assert!(cleaned.contains("File contents here"));
         assert!(cleaned.contains("</tool_result>"));
+    }
+
+    #[test]
+    fn test_clean_preserves_long_output_exceeding_500_chars() {
+        let adapter = QwenAdapter;
+
+        // A poem or document that is well over 500 characters
+        let poem = "\
+In the quiet of the night, I find my heart's desire,
+In the love of my life, my soul's truest guide.
+Through the storms and the sunshine, we've stood together strong,
+In each other's arms, we've found a place to belong.
+Your laughter echoes in the halls of my memory,
+A melody so sweet, it sets my spirit free.
+With every passing day, my affection only grows,
+A river of devotion that endlessly flows.
+Side by side we walk this road hand in gentle hand,
+The greatest journey across all time and land.
+Forever and always, my promise is true,
+In this life and the next, I belong with you.";
+
+        assert!(
+            poem.len() > 500,
+            "Poem must be >500 chars (was {})",
+            poem.len()
+        );
+        let raw = format!("{}<|im_end|>", poem);
+        let cleaned = adapter.clean_output(&raw);
+        assert_eq!(cleaned, poem);
+    }
+
+    #[test]
+    fn test_clean_preserves_long_code_fence_block() {
+        let adapter = QwenAdapter;
+
+        // A long Forth / Lisp program exceeding 500 characters that ends with ```
+        let program = r#"```forth
+(say (write-file "love_poem.txt"
+                 (concatenate 'string
+                   "In the quiet of the night, I find my heart's desire,\n"
+                   "In the love of my life, my soul's truest guide.\n"
+                   "Through the storms and the sunshine, we've stood together strong,\n"
+                   "In each other's arms, we've found a place to belong.\n"
+                   "Your laughter echoes in the silent morning light,\n"
+                   "A warmth that keeps me safe through every winter night.\n")))
+```"#;
+
+        assert!(
+            program.len() > 500,
+            "Program must be >500 chars (was {})",
+            program.len()
+        );
+        let raw = format!("{}<|im_end|>", program);
+        let cleaned = adapter.clean_output(&raw);
+        assert_eq!(cleaned, program);
+        // Ensure it did not get truncated down to 3 chars ("```")
+        assert!(cleaned.len() > 500);
+        assert!(cleaned.starts_with("```forth"));
+        assert!(cleaned.ends_with("```"));
+    }
+
+    #[test]
+    fn test_clean_reasoning_think_tags() {
+        let adapter = QwenAdapter;
+
+        let raw = "<think>\nThinking about the user's poem request...\nLet's write something nice.\n</think>\nHere is your poem:\nRoses are red,\nViolets are blue.<|im_end|>";
+        let cleaned = adapter.clean_output(raw);
+        assert!(!cleaned.contains("<think>"));
+        assert!(!cleaned.contains("Thinking about"));
+        assert!(cleaned.starts_with("Here is your poem:"));
+        assert!(cleaned.contains("Roses are red"));
+    }
+
+    #[test]
+    fn test_clean_preserves_assistant_in_normal_prose() {
+        let adapter = QwenAdapter;
+
+        let raw = "As an AI assistant, I can help you with your question.\nHere is the answer: 42.<|im_end|>";
+        let cleaned = adapter.clean_output(raw);
+        assert_eq!(
+            cleaned,
+            "As an AI assistant, I can help you with your question.\nHere is the answer: 42."
+        );
+    }
+
+    #[test]
+    fn test_clean_assistant_marker_without_newline() {
+        let adapter = QwenAdapter;
+
+        let raw = "<|im_start|>assistantHello world!<|im_end|>";
+        let cleaned = adapter.clean_output(raw);
+        assert_eq!(cleaned, "Hello world!");
     }
 }
