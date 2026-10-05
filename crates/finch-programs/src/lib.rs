@@ -28,6 +28,8 @@ pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;
 
 /// Minimal language/runtime definition supplied to every fresh model context.
 pub const BOOT_CAPSULE: &str = include_str!("../../../vocabulary/BOOT.md");
+/// Minimal language/runtime definition supplied to local models (standard Lisp only).
+pub const BOOT_CAPSULE_LISP: &str = include_str!("../../../vocabulary/BOOT_LISP.md");
 pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../../vocabulary/language/FINCH_VM.md");
 pub const FORTH_LANGUAGE_DEFINITION: &str =
     include_str!("../../../vocabulary/language/FINCH_FORTH.md");
@@ -1012,6 +1014,65 @@ impl VmManifest {
         );
         lines.join("\n")
     }
+
+    /// Format a compact block suitable for prompt injection for local models,
+    /// prescribing standard Lisp without conflicting Forth syntax examples.
+    pub fn prompt_block_for_local(&self) -> String {
+        let mut lines = vec![
+            BOOT_CAPSULE_LISP.trim().to_string(),
+            format!(
+                "Finch VM manifest v{} generation={} environment={}",
+                self.protocol_version, self.registry_generation, self.environment_hash
+            ),
+        ];
+        lines.push("Languages: lisp".to_string());
+        if !self.language_packages.is_empty() {
+            let packages = self
+                .language_packages
+                .iter()
+                .filter(|p| p.name != "forth")
+                .map(|package| {
+                    format!(
+                        "{}@{}#{}",
+                        package.name,
+                        package.version,
+                        &package.sha256[..12]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !packages.is_empty() {
+                lines.push(format!("Language packages: {packages}"));
+            }
+        }
+        lines.push(format!("Effects: {}", self.core_effects.join(", ")));
+        if !self.relevant_programs.is_empty() {
+            let relevant: Vec<_> = self
+                .relevant_programs
+                .iter()
+                .filter(|p| p.language != ProgramLanguage::Forth)
+                .collect();
+            if !relevant.is_empty() {
+                lines.push("Relevant vocabulary:".to_string());
+                for program in relevant {
+                    let signature = program.signature.as_deref().unwrap_or("signature unknown");
+                    lines.push(format!(
+                        "- {} [{} {} effect={}]: {}",
+                        program.name,
+                        program.language.as_str(),
+                        signature,
+                        program.effect.as_str(),
+                        program.documentation
+                    ));
+                }
+            }
+        }
+        lines.push(
+            "Use vocabulary introspection for exact source; never assume a remembered definition."
+                .to_string(),
+        );
+        lines.join("\n")
+    }
 }
 
 /// SHA-256 of canonical source or environment material.
@@ -1410,6 +1471,25 @@ mod tests {
         assert!(prompt.contains("distance2 ( S x:int y:int -- S int ! pure )"));
         assert!(prompt.contains("Language packages: boot@FINCH-VM-TYPED/1#"));
         assert!(!prompt.contains(".\" response\""));
+    }
+
+    #[test]
+    fn test_local_boot_prompt_contains_only_lisp_and_no_forth_syntax_examples() {
+        let manifest = VmManifest {
+            protocol_version: MANIFEST_PROTOCOL_VERSION,
+            registry_generation: 1,
+            environment_hash: "abc".to_string(),
+            languages: vec![ProgramLanguage::Lisp],
+            language_packages: language_package_identities(),
+            core_effects: vec!["say".to_string()],
+            relevant_programs: vec![],
+        };
+        let prompt = manifest.prompt_block_for_local();
+        assert!(prompt.contains("(say \"Hello\")"));
+        assert!(!prompt.contains(": square"));
+        assert!(!prompt.contains("distance2 ( S x:int"));
+        assert!(!prompt.contains("Co-Forth"));
+        assert!(!prompt.contains("\"Hello\" say"));
     }
 
     #[test]
