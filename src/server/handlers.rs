@@ -1679,18 +1679,12 @@ fn named_brain_provider_messages_at(
             ))],
             BrainEventKind::Result {
                 request_seq,
-                output,
-                error,
+                error: Some(error),
                 ..
-            } => {
-                let result = error
-                    .as_ref()
-                    .map(|error| format!("error: {error}"))
-                    .unwrap_or_else(|| output.clone());
-                vec![Message::user(format!(
-                    "[Finch VM result for program event #{request_seq}]\n{result}"
-                ))]
-            }
+            } => vec![Message::user(format!(
+                "[Finch VM execution error for program event #{request_seq}]\nerror: {error}"
+            ))],
+            BrainEventKind::Result { error: None, .. } => Vec::new(),
             BrainEventKind::MutationRecorded { .. }
             | BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::TaskListReplaced { .. }
