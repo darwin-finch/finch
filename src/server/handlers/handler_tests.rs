@@ -5915,6 +5915,73 @@ async fn replay_skips_one_unprojectable_run_and_continues() {
 }
 
 #[tokio::test]
+async fn test_repeated_memory_replay_errors_are_deduplicated() {
+    super::reset_replay_errors_for_test();
+
+    // Verify should_log_replay_error deduplicates
+    assert!(super::should_log_replay_error(
+        "brain-1",
+        "traversal mismatch"
+    ));
+    assert!(!super::should_log_replay_error(
+        "brain-1",
+        "traversal mismatch"
+    ));
+    assert!(super::should_log_replay_error("brain-1", "other cause"));
+    assert!(super::should_log_replay_error(
+        "brain-2",
+        "traversal mismatch"
+    ));
+
+    // Verify clear_replay_error resets deduplication for that brain
+    super::clear_replay_error("brain-1");
+    assert!(super::should_log_replay_error(
+        "brain-1",
+        "traversal mismatch"
+    ));
+
+    // End-to-end replay with repeated rejected runs
+    let store = crate::brain::BrainStore::with_root("box.local", None);
+    let lease = seed_completed_brain_runs(&store, 3);
+    let runners = crate::server::BrainRunnerBroker::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runners.register("shared", lease.lease_id, tx);
+
+    let runner = tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let crate::server::RunnerRequest::ProjectMemory(request) = request else {
+                panic!("expected replayed memory projection");
+            };
+            request
+                .response_tx
+                .send(Err("traversal mismatch leaf 3 != leaf 5".to_string()))
+                .unwrap();
+        }
+    });
+
+    super::reset_replay_errors_for_test();
+    let projected = replay_committed_named_brain_memory(
+        store.clone(),
+        runners.clone(),
+        "shared".into(),
+        lease.lease_id,
+    )
+    .await
+    .expect("declined runs do not fail the replay pass");
+    assert_eq!(projected, 0);
+
+    // After replaying 3 runs with the same error, the error has been logged once.
+    // Re-checking should_log_replay_error confirms subsequent runs were deduplicated.
+    assert!(!super::should_log_replay_error(
+        "shared",
+        "traversal mismatch leaf 3 != leaf 5"
+    ));
+
+    drop(runners);
+    runner.await.unwrap();
+}
+
+#[tokio::test]
 async fn replay_aborts_when_the_runner_is_unavailable() {
     // The opposite error. A runner that is gone fails identically for every
     // remaining run, so continuing costs one full IPC round trip and one log

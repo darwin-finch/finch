@@ -1935,6 +1935,7 @@ dependencies = [
  "anyhow",
  "rusqlite",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

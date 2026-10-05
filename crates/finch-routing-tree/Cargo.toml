@@ -11,6 +11,7 @@ repository = "https://github.com/darwin-finch/finch"
 [dependencies]
 anyhow = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3.8"

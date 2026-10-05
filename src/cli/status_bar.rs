@@ -538,6 +538,38 @@ impl StatusBar {
             ),
         );
     }
+
+    /// Format and update the memory status line, distinguishing whether the
+    /// index is loading or has failed.
+    pub fn update_memory_status(&self, recalled: usize, status: &finch_memory::HydrationStatus) {
+        let content = format_memory_status(recalled, status);
+        self.update_line(StatusLineType::MemoryContext, content);
+    }
+}
+
+/// Format the memory context status line, distinguishing "index loading" from "index failed".
+pub fn format_memory_status(recalled: usize, status: &finch_memory::HydrationStatus) -> String {
+    match status {
+        finch_memory::HydrationStatus::Ready { .. } => format!("🧠 recalled {recalled}"),
+        finch_memory::HydrationStatus::Loading { loaded: 0, total } => {
+            format!("🧠 recalled {recalled} · index loading, {total} entries total")
+        }
+        finch_memory::HydrationStatus::Loading { loaded, total } => {
+            format!("🧠 recalled {recalled} · index loading ({loaded} of {total} entries)")
+        }
+        finch_memory::HydrationStatus::Degraded { loaded, total, .. } => {
+            format!(
+                "🧠 recalled {recalled} · searched at least {loaded} of {total} entries · index stopped short"
+            )
+        }
+        finch_memory::HydrationStatus::Failed { reason } => {
+            if reason.is_empty() {
+                format!("🧠 recalled {recalled} · index failed")
+            } else {
+                format!("🧠 recalled {recalled} · index failed: {reason}")
+            }
+        }
+    }
 }
 
 /// Exponential-moving-average weight applied to each newly observed
@@ -1394,6 +1426,70 @@ mod tests {
         assert_eq!(
             lines[2].line_type,
             StatusLineType::Custom("test2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_status_bar_distinguishes_index_loading_from_index_failed() {
+        let status = StatusBar::new();
+
+        // 1. Loading with 0 loaded
+        status.update_memory_status(
+            0,
+            &finch_memory::HydrationStatus::Loading {
+                loaded: 0,
+                total: 2048,
+            },
+        );
+        let loading_line = status
+            .get_line(&StatusLineType::MemoryContext)
+            .expect("memory context line should exist");
+        assert!(
+            loading_line.contains("index loading"),
+            "loading state must indicate 'index loading': {loading_line}"
+        );
+        assert!(
+            !loading_line.contains("index failed"),
+            "loading state must not indicate 'index failed': {loading_line}"
+        );
+
+        // 2. Loading with partial loaded
+        status.update_memory_status(
+            3,
+            &finch_memory::HydrationStatus::Loading {
+                loaded: 512,
+                total: 2048,
+            },
+        );
+        let partial_line = status
+            .get_line(&StatusLineType::MemoryContext)
+            .expect("memory context line should exist");
+        assert!(
+            partial_line.contains("index loading"),
+            "partial loading state must indicate 'index loading': {partial_line}"
+        );
+        assert!(
+            !partial_line.contains("index failed"),
+            "partial loading state must not indicate 'index failed': {partial_line}"
+        );
+
+        // 3. Failed state
+        status.update_memory_status(
+            0,
+            &finch_memory::HydrationStatus::Failed {
+                reason: "traversal mismatch".into(),
+            },
+        );
+        let failed_line = status
+            .get_line(&StatusLineType::MemoryContext)
+            .expect("memory context line should exist");
+        assert!(
+            failed_line.contains("index failed"),
+            "failed state must indicate 'index failed': {failed_line}"
+        );
+        assert!(
+            !failed_line.contains("index loading"),
+            "failed state must not indicate 'index loading': {failed_line}"
         );
     }
 }
