@@ -10,12 +10,27 @@ pub struct QwenAdapter;
 
 impl LocalModelAdapter for QwenAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // ChatML format used by Qwen models
         // Reference: https://github.com/QwenLM/Qwen/blob/main/README.md
-        format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            system, user_message
-        )
+        let mut prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system);
+        for (role, content) in history {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
+        }
+        prompt.push_str(&format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            user_message
+        ));
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {
@@ -217,6 +232,33 @@ mod tests {
         assert!(prompt.contains("What is 2+2?"));
         assert!(prompt.contains("<|im_start|>assistant"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn test_qwen_format_multi_turn() {
+        let adapter = QwenAdapter;
+        let history = vec![
+            ("user", "Hello!"),
+            ("assistant", "Hi there! How can I help you?"),
+        ];
+        let prompt =
+            adapter.format_chat_history("You are a helpful assistant.", &history, "What is 2+2?");
+
+        let expected = "<|im_start|>system\n\
+                        You are a helpful assistant.<|im_end|>\n\
+                        <|im_start|>user\n\
+                        Hello!<|im_end|>\n\
+                        <|im_start|>assistant\n\
+                        Hi there! How can I help you?<|im_end|>\n\
+                        <|im_start|>user\n\
+                        What is 2+2?<|im_end|>\n\
+                        <|im_start|>assistant\n";
+        assert_eq!(prompt, expected);
+
+        // Also verify format_chat_prompt with serialized query decomposes to the same ChatML
+        let query = "user: Hello!\n\nassistant: Hi there! How can I help you?\n\nWhat is 2+2?";
+        let prompt_from_query = adapter.format_chat_prompt("You are a helpful assistant.", query);
+        assert_eq!(prompt_from_query, expected);
     }
 
     #[test]

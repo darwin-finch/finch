@@ -13,12 +13,27 @@ pub struct PhiAdapter;
 
 impl LocalModelAdapter for PhiAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // Phi-3 uses ChatML-style format with specific tokens
         // Format: <|system|>\n{system}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n
-        format!(
-            "<|system|>\n{}<|end|>\n<|user|>\n{}<|end|>\n<|assistant|>\n",
-            system, user_message
-        )
+        let mut prompt = format!("<|system|>\n{}<|end|>\n", system);
+        for (role, content) in history {
+            prompt.push_str(&format!("<|{}|>\n{}<|end|>\n", role, content));
+        }
+        prompt.push_str(&format!(
+            "<|user|>\n{}<|end|>\n<|assistant|>\n",
+            user_message
+        ));
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {

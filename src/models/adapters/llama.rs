@@ -10,14 +10,33 @@ pub struct LlamaAdapter;
 
 impl LocalModelAdapter for LlamaAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // Llama 3 chat template format
         // Reference: https://llama.meta.com/docs/model-cards-and-prompt-formats/meta-llama-3/
-        format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n",
-            system, user_message
-        )
+        let mut prompt = format!(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
+            system
+        );
+        for (role, content) in history {
+            prompt.push_str(&format!(
+                "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                role, content
+            ));
+        }
+        prompt.push_str(&format!(
+            "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            user_message
+        ));
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {

@@ -20,16 +20,51 @@ pub struct GemmaAdapter;
 
 impl LocalModelAdapter for GemmaAdapter {
     fn format_chat_prompt(&self, system: &str, user_message: &str) -> String {
+        let (history, question) = super::parse_history_from_query(user_message);
+        self.format_chat_history(system, &history, question)
+    }
+
+    fn format_chat_history(
+        &self,
+        system: &str,
+        history: &[(&str, &str)],
+        user_message: &str,
+    ) -> String {
         // Gemma has no dedicated system role in its chat template. Google's
         // documented guidance is to fold any system instructions into the
         // leading user turn.
         // Reference: https://ai.google.dev/gemma/docs/core/prompt-structure
-        let user_turn = if system.is_empty() {
-            user_message.to_string()
+        let mut prompt = String::from("<bos>");
+        let mut system_injected = system.is_empty();
+        for (role, content) in history {
+            let gemma_role = if *role == "assistant" {
+                "model"
+            } else {
+                "user"
+            };
+            if !system_injected && gemma_role == "user" {
+                prompt.push_str(&format!(
+                    "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n",
+                    system, content
+                ));
+                system_injected = true;
+            } else {
+                prompt.push_str(&format!(
+                    "<start_of_turn>{}\n{}<end_of_turn>\n",
+                    gemma_role, content
+                ));
+            }
+        }
+        let final_user = if !system_injected {
+            format!("{}\n\n{}", system, user_message)
         } else {
-            format!("{system}\n\n{user_message}")
+            user_message.to_string()
         };
-        format!("<bos><start_of_turn>user\n{user_turn}<end_of_turn>\n<start_of_turn>model\n")
+        prompt.push_str(&format!(
+            "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+            final_user
+        ));
+        prompt
     }
 
     fn eos_token_id(&self) -> u32 {
