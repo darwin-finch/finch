@@ -93,24 +93,7 @@ commits sticky conversation rows between program source and output (#819). Lefto
 environment mismatch at startup still uses `apply_home_runner_startup` (header plus the detailed
 startup TUI line, #794).
 
-**A self-correcting wire-protocol repair round hides its raw diagnostic from the transcript
-(#1383).** `execute_wire_with_single_repair` (`query_processor.rs`) rejects a provider response
-that is not a valid `ProgramSubmission`, then — when the rejection is repairable — retries once
-with a corrective prompt before showing anything to the user. The raw compiler-style diagnostic
-(`file:line`, an `error[E-...]` code, a `phase:` field) is internal detail with nothing a
-non-technical user can act on; it goes to `tracing::debug!` only, never
-`output_unit.append_response`. If the repair round then fails for any reason (cancelled while
-waiting on it, the corrective generation itself errors or returns no usable program, or the
-repaired program is rejected too), the transcript gets the plain-language
-`WIRE_REPAIR_FAILED_MESSAGE` fallback instead of the raw diagnostic — never nothing, and never the
-compiler-style shape. Only a first-pass rejection classified as non-repairable at all (no retry
-ever attempted) still shows its raw diagnostic, since there is no eventual corrected answer to
-prefer showing instead. `test_repairable_rejection_diagnostic_reaches_debug_log_not_transcript`,
-`failed_wire_turn_stays_expanded_program_output`,
-`named_brain_effect_audit_cancel_before_repair_never_invokes_provider`, and
-`named_brain_effect_audit_cancel_drops_inflight_repair_without_continuation` in
-`query_processor.rs` cover the successful-repair, cancelled-before-repair, and cancelled-during-repair
-cases.
+**A self-correcting wire-protocol repair round hides its raw diagnostic from the transcript on success, but preserves actionable diagnosis on failure (#1383, #1690).** `execute_wire_with_single_repair` (`query_processor.rs`) rejects a provider response that is not a valid `ProgramSubmission`, then — when the rejection is repairable — retries once with a corrective prompt before showing anything to the user. While the corrective generation runs, the raw diagnostic is kept out of the transcript so a self-healed turn shows only the final successful output. If the repair round fails for any reason (cancelled while waiting on it, the corrective generation itself errors or returns no usable program, or the repaired program is rejected or errors too), the transcript retains the diagnostic error explanation alongside `WIRE_REPAIR_FAILED_MESSAGE` (`wire_repair_failed_message`), so the user receives actionable diagnostic information rather than an empty or wiped notice (#1690). Only a first-pass rejection classified as non-repairable at all (no retry ever attempted) shows its raw diagnostic directly without a repair attempt. `test_repairable_rejection_diagnostic_reaches_debug_log_not_transcript`, `failed_wire_repair_preserves_error_diagnosis_in_transcript`, `failed_wire_turn_stays_expanded_program_output`, `named_brain_effect_audit_cancel_before_repair_never_invokes_provider`, and `named_brain_effect_audit_cancel_drops_inflight_repair_without_continuation` in `query_processor.rs` cover the successful-repair, failed-repair, cancelled-before-repair, and cancelled-during-repair cases.
 
 **A deterministic raw-prose fallback must caption unsupported completed filesystem mutation
 claims.** `claims_tool_grounded_fact` (`query_processor.rs`) recognizes a narrow completed-claim
