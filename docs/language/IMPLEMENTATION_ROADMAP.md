@@ -33,6 +33,8 @@ the missing normative contracts in vertical slices while keeping the current cor
 4. The verifier independently derives security- and ownership-relevant facts. It does not trust
    frontend claims.
 5. Only `ModuleVerified` executes. Native code remains a rebuildable cache of verified semantics.
+   Provisional compilation MAY start from `FunctionCertified` and stays quarantined until the
+   module certificate issues.
 6. Every temporary path names its owner, successor, deletion trigger, and deletion proof.
 7. Serialized source, syntax, interfaces, IR, checkpoints, and native caches carry independent
    versions.
@@ -369,10 +371,32 @@ language without changing the contract.
 
 ## M5 — optimizing native backend
 
+The canonical input remains verified typed stack IR. Do not freeze one native strategy before the
+same corpus and worker counts have measured at least these alternatives:
+
+- direct lowering from verified stack IR toward machine operations;
+- a terminating worklist that rewrites verified stack IR to improved stack IR, then lowers it;
+- derivation of a compact private value or SSA form, then optimization and lowering.
+
+Record compile latency, generated-code quality, peak compiler memory, scaling across worker
+counts, and optimizer convergence. The question to answer is how much native-code quality a cheap
+optimizer can obtain while compilation stays low-latency and scales across cores. Several tiers
+MAY remain when the measurements justify them. SSA is permitted and not required. Cranelift
+remains one available implementation strategy and one differential oracle. It is not the
+architectural waist, and this plan states no performance number for any strategy.
+
+Function-level parallelism is the default. A `FunctionCertified` function MAY be optimized or
+lowered while other functions are still lowering, awaiting verification, or parked on `require`.
+The resulting native artifact stays quarantined until `ModuleVerified`. Jobs stay at least as
+coarse as a function. Fine-grained parallel symbolic execution of individual stack instructions is
+an architectural possibility described in the design rationale, not the initial implementation.
+
 Add selective specialization, inlining, representation optimization, and the compact self-hosted
-native tier only behind interpreter differential gates. Algebraic rewrites require certified laws
-and preserve strict numeric/effect behavior. Publish qualified measurements; do not infer
-performance from architecture.
+native tier only behind interpreter differential gates. Algebraic rewrites require a license the
+specification already gives and preserve strict numeric, trap, effect, suspension, and cleanup
+behavior. Optimized stack IR used for execution or for executable native code is reverified by the
+same verifier. It does not replace canonical IR identity, and the optimizer does not mint
+`FunctionCertified` or `ModuleVerified`.
 
 M5 exit: backend selection is unobservable except for resource use and declared implementation
 limits.
@@ -391,7 +415,9 @@ Performance is a cross-milestone acceptance condition, not an M5 cleanup task:
 - M4 measures portable-ABI encoding, calls, callbacks, handles, and release traffic separately from
   internal calls; and
 - M5 measures interpreter and native throughput, allocations, code size, branch/check elimination,
-  and compile-time cost of each optimization.
+  and the compile latency, generated-code quality, peak compiler memory, worker scaling, and
+  worklist convergence of direct stack lowering, stack-to-stack fixed-point optimization, and
+  compact value/SSA lowering.
 
 Every benchmark reports semantic configuration, input scale, warm/cold state, target, toolchain,
 median and tail latency, peak memory, and dated baseline. A regression gate must pair performance

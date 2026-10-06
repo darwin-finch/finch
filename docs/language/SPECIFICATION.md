@@ -2,7 +2,7 @@
 
 Version: 0.1-draft  
 Status: normative closure draft; implementation and corpus-integration gates are tracked in `IMPLEMENTATION_ROADMAP.md`  
-Date: 2026-10-03
+Date: 2026-10-05
 
 ## 1. Scope and conformance
 
@@ -34,7 +34,8 @@ A conforming implementation declares the profiles it supports:
 - **concurrency** — fibers, tasks, streams, cancellation, checkpointable suspension, and safe
   synchronization;
 - **portable-abi** — the versioned host/compiler/runtime ABI and safe foreign adapters;
-- **native** — verified IR to native code with interpreter-equivalent behavior.
+- **native** — native code from verified typed stack IR, with the same observable behavior as
+  the reference interpreter. Section 13.1 states how a backend may consume that IR.
 
 `accelerator` is reserved for a separately versioned future kernel/tensor extension. It is not a
 version 0.1 conformance profile and an implementation MUST NOT claim it as one.
@@ -56,12 +57,18 @@ source bytes
   -> concrete typed stack IR
   -> independent verification
   -> ModuleVerified
-  -> interpreter or verified native lowering
+  -> execution
 ```
 
 Each source byte crosses exactly one reader. Generated code is structured `syntax`; no operation
 converts generated text back into source. A frontend cannot mint resolved symbols, evidence,
-certificates, or verified modules. Execution consumes `ModuleVerified`, never a frontend tree.
+certificates, or verified modules. Execution, publication, and import consume `ModuleVerified`,
+never a frontend tree and never `FunctionCertified` IR by itself. The phase order above is the
+trust order. A compiler MAY overlap work on different symbols. Provisional native compilation
+MAY start from `FunctionCertified` IR. That artifact is a quarantined cache keyed by the
+certified IR, the dependency summaries it used, the compiler and backend versions, the target,
+and the optimization policy. It MUST be discarded when any key input changes or when the module
+certificate does not issue. An implementation MAY defer all native work until `ModuleVerified`.
 
 The event schema defines the logical boundary, not a mandatory JSON serialization in the compiler's
 hot path. A conforming implementation may stream typed in-memory events directly into construction;
@@ -115,7 +122,11 @@ section 11.
 
 `require(identity, state)` either returns the immutable result, suspends the current compiler
 job on that dependency, or reports a deterministic cycle/failure. Scheduling order MUST NOT change
-the sealed interface, verified IR, or primary diagnostic.
+the sealed interface, canonical verified IR, or primary diagnostic. That canonical IR is the
+verified typed stack IR associated with `FunctionCertified`. Optimized stack IR, a private value
+or SSA form, and machine code are rebuildable caches. They MUST NOT replace the canonical IR
+identity. Compiler parallelism is this symbol scheduler. Stack shape does not grant automatic
+concurrent execution of user code. Explicit program concurrency remains the concurrency profile.
 
 [`compile-scheduler.json`](semantics/compile-scheduler.json) fixes what each operation requires and
 what it records:
@@ -468,6 +479,10 @@ reference and every paired execution vector checks them.
 - Building the tree requires each applied word's stack signature, so Co-Forth semantic construction
   runs with the signatures of the names in scope already resolved. It needs no types beyond those
   signatures.
+
+The resulting tree is the common semantic program. Co-Forth tokens are not copied into typed stack
+IR. The shared lowering in section 2 produces that IR after construction, and section 13.1 says
+how a backend may consume it.
 
 ### 3.6 C-like reader
 
@@ -846,8 +861,23 @@ its explicit inputs and immutable dependencies. Reads of clocks, randomness, sch
 shared mutable state, host state, or unstable identity are effects and therefore not pure. Purity is
 orthogonal to exceptions and suspension. `nothrow` means the escaping exception antichain is empty.
 `non-suspending` means no reachable semantic or host suspension edge exists. A pure function may
-throw. Optimizations MUST preserve evaluation order, exceptions, ownership, destruction,
-suspension, and externally observable effects.
+throw. Optimizations MUST preserve eager left-to-right evaluation, exceptional control, traps
+(including checked integer overflow and the floating-point rules in section 5), observable
+suspension and cancellation behavior, the order of capability and other effects, state effects,
+the ownership and lifetime decisions fixed before IR, deterministic cleanup, externally
+observable events, and required control flow. A narrower license stated elsewhere still applies,
+including elimination of a check whose predicate is proved by verified IR and the
+cancellation-poll rule in section 12. An algebraically similar regrouping is illegal when it
+could change which operation traps, which effect or suspension is observed, or how a strict
+floating-point result is rounded. Section 5 already forbids reassociating `f32` and `f64`
+arithmetic unless the operation's contract requests that policy. Referential transparency
+licenses removal of an unused result, and sharing of a repeated computation, only when that
+transformation also preserves exceptions, traps, and the number and order of observable
+effects. `pure`, `nothrow`, and `non-suspending`
+are separate verifier-derived facts. A range fact the verifier established, or a law this
+specification already treats as trusted, MAY license a transformation only for the behavior that
+law is specified to affect. A claim made by a frontend does not license a transformation. The
+language defines no optimizer cost function.
 
 A non-suspending direct call requires no continuation object, scheduler registration, journal entry,
 or heap allocation merely because the language also supports resumable code. Suspension machinery
@@ -1622,6 +1652,38 @@ structural verifier does not yet check operand types, effect containment, or exc
 Only the verifier mints `FunctionCertified`; only a sealed module containing certified functions may
 become `ModuleVerified`. Decoding serialized IR re-runs verification. Native code is a rebuildable
 cache and never substitutes for verified IR.
+
+### 13.1 How a backend may consume verified IR
+
+Typed stack IR is the canonical verified executable representation. The reference behavior is
+concrete interpretation of the canonical IR. A conforming implementation MAY also consume that IR
+in any of these ways:
+
+- direct lowering toward machine operations;
+- a backend-private value, dataflow, or SSA form derived from the verified IR, then optimization
+  and instruction selection;
+- a rewrite to semantically equivalent typed stack IR, which MAY then be interpreted or lowered
+  by either native strategy above.
+
+An implementation of the native profile MUST produce native code with the reference observable
+behavior. It MAY use one strategy or several as tiers. It is not required to construct SSA, to
+rewrite stack IR, or to use any particular backend IR. Symbolic execution is permitted and not
+required.
+
+Stack IR keeps data dependencies in a compact form. An implementation MAY recover them by
+abstract execution: a stack entry holds a symbolic fact, an instruction consumes symbolic operands
+and produces a symbolic result, and a verified stack merge says which entries correspond at a
+join. Differing symbolic values at a join MAY become parameters of a private value representation.
+That recovery is not a required pass and is not a second semantic IR.
+
+Every transformation MUST meet section 7. Certification remains the independent verifier specified
+above. A backend MAY walk the same IR over a richer symbolic domain, carrying facts such as a
+constant, a range, or a value identity, and those facts license a transformation only under
+section 7. Rewritten stack IR MUST be accepted by the same independent verifier before it is
+executed, serialized as executable IR, or lowered to executable native code.
+An optimizer MUST NOT mint `FunctionCertified` or `ModuleVerified`. A private form cannot stand in
+for verified stack IR and does not change the canonical IR identity fixed in section 2. A rewrite
+system MUST terminate.
 
 ## 14. Capabilities and selector grammar
 

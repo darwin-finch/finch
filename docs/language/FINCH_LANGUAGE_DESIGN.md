@@ -16,16 +16,28 @@ gates live in the separate [language implementation plan](IMPLEMENTATION_ROADMAP
 
 ```text
 typed Lisp source ────┐
-                      ├──> Finch typed stack IR ──> verifier ──> interpreter
-Co-Forth source text ─┘                                      └──> CLIF ──> native code (later)
+                      ├──> semantic program ──> typed stack IR ──> verifier
+Co-Forth source text ─┘                                              │
+                                                                     ├─ concrete interpreter
+                                                                     ├─ optional optimized stack IR
+                                                                     ├─ optional private value/SSA form
+                                                                     └─ machine code, directly or through a private backend IR
 ```
 
 It refines `SHARED_PROGRAM_RUNTIME_PLAN.md` and `VM_NATIVE_AGENT_RUNTIME_PLAN.md`. Where the
 older shared-runtime plan says that Lisp must not be implemented by generating Forth text, this
 plan makes the boundary precise: Lisp must not generate textual Forth and then be reparsed.
-Both frontends compile directly to the same internal typed stack IR. Co-Forth remains a source
-language with its own text syntax; it is not the IR. The shared vocabulary supplies the callable
-semantics used by both frontends.
+Both frontends construct the same semantic program and lower it to the same internal typed stack
+IR. Co-Forth remains a source language. Its construction uses known word stack signatures to
+rebuild that shared program; it does not copy tokens into the IR, and the IR is not Co-Forth text.
+The shared vocabulary supplies the callable semantics used by both frontends.
+
+The verified stack IR is the executable waist. A backend may interpret it, rewrite it to improved
+stack IR, recover a private value or SSA form, or lower it toward machine operations. Cranelift IR
+(CLIF) is one possible private form behind one native backend. It is not the canonical IR, and the
+architecture does not require it. The normative consumption contract is
+[`SPECIFICATION.md`](SPECIFICATION.md) sections 2, 7, and 13.1. The rationale is under
+[Common typed IR](#common-typed-ir).
 
 ### Progressive output templates
 
@@ -183,29 +195,31 @@ This is the SDC lesson: parse AST is frontend-private; the compiler scheduler ru
 
 **2. Compiler → execute: typed stack IR, not AST.**
 
-`finch-language` (the compiler door) is the only place that lowers. `finch-vm` (interpreter, fibers, checkpoints), later Cranelift, `programs`, and `src/runtime` consume **`ModuleVerified` IR**. They do not take frontend trees, builder traces, or compiler-private HIR. Application composition submits either source plus a language tag to `finch-language`, or an already-verified module to `finch-vm`. It never compiles by importing `finch-colisp` or `finch-coforth`.
+`finch-language` (the compiler door) is the only place that lowers. `finch-vm` (interpreter, fibers, checkpoints), native backends, `programs`, and `src/runtime` consume verified typed stack IR. They do not take frontend trees, builder traces, or compiler-private HIR. Application composition submits either source plus a language tag to `finch-language`, or an already-verified module to `finch-vm`. It never compiles by importing `finch-colisp` or `finch-coforth`.
 
 The VM fiber scheduler is a **different** machine from the compiler job scheduler. Compiler jobs may eventually be self-hosted as CoLisp fibers that yield `CompilerNeed`; they still lower to IR before anything executes.
 
-**3. Interpreter and Cranelift: the same IR waist.**
+**3. Interpreter and native backends: the same IR waist.**
 
-The interpreter and the later Cranelift handoff consume the **same** Finch typed stack IR. They do not take AST, builder traces, or `require(symbol, stage)`. CLIF is a hidden, rebuildable backend IR behind Cranelift; it is not the program-exchange format and is not a second language.
+The interpreter and every native backend consume the **same** verified Finch typed stack IR. They do not take AST, builder traces, or `require(symbol, stage)`. A private form — CLIF, a value graph, SSA, or machine operations — is rebuildable and backend-local. It is not the program-exchange format and is not a second language. Cranelift is one native implementation strategy. [Common typed IR](#common-typed-ir) describes the consumption modes, including direct machine lowering that never builds SSA.
 
 ```text
 finch-language
   await require(...) → lower → FunctionCertified → ModuleVerified
                          │
-                         ├─→ interpreter (tier 0)
-                         └─→ CLIF → native (later)
+                         ├─→ concrete interpreter
+                         ├─→ optimized stack IR (reverified cache)
+                         ├─→ private value/SSA form (optional)
+                         └─→ direct machine lowering, or a derived backend IR such as CLIF
 ```
 
-Shared across both backends: IR types, verifier, source maps, trap/safepoint metadata, capability request sites, and the effect/resume ABI (native shims stay capability-bound). Not shared: the compiler scheduler, frontend trees, or CLIF.
+Shared across backends: IR types, verifier, source maps, trap/safepoint metadata, capability request sites, and the effect/resume ABI (native shims stay capability-bound). Not shared: the compiler scheduler, frontend trees, or any backend-private IR.
 
-The interpreter **runs** only `ModuleVerified`. Native lowering **may start** from `FunctionCertified` as a quarantined cache, discarded if the module certificate never issues. An first implementation may wait for `ModuleVerified` for both.
+The interpreter **runs** only `ModuleVerified`. Native lowering **may start** from `FunctionCertified` as a quarantined cache, discarded if the module certificate never issues. A first implementation may wait for `ModuleVerified` for both.
 
-**Crate split that keeps the scheduler shareable.** `require` only works if the elaboratable tree, the symbol/phase table, and lowering live together (`finch-language`, with types in `finch-vm-core`). Frontends do not own that scheduler; they publish builder submissions. `finch-vm` does not own it either: it is an IR backend, like Cranelift. Splitting at IR is the intended waist. Splitting with AST inside `finch-vm`, or with frontends emitting IR, makes `require` impossible or forces every execution change to load the compiler.
+**Crate split that keeps the scheduler shareable.** `require` only works if the elaboratable tree, the symbol/phase table, and lowering live together (`finch-language`, with types in `finch-vm-core`). Frontends do not own that scheduler; they publish builder submissions. `finch-vm` does not own it either: it is an IR consumer, as a native backend is. Splitting at IR is the intended waist. Splitting with AST inside `finch-vm`, or with frontends emitting IR, makes `require` impossible or forces every execution change to load the compiler.
 
-**Why not “shared AST into the VM instead of IR”.** Putting the elaboratable tree in `finch-vm` makes the interpreter a compiler, forces every Brain/runtime change to load elaborator state, and gives native lowering a second source of truth. The shared tree belongs to `finch-language`. The shared **executable** waist is typed stack IR. Today’s tree is inverted: frontends still lower privately and the VM still re-exports `compile_forth` / `compile_lisp`. That inversion is debt, not the target.
+**Why not “shared AST into the VM instead of IR”.** Putting the elaboratable tree in `finch-vm` makes the interpreter a compiler, forces every Brain/runtime change to load elaborator state, and gives native lowering a second source of truth. The shared tree belongs to `finch-language`. The shared **executable** waist is typed stack IR. A later value or SSA form is a cache derived from that IR. Today’s tree is inverted: frontends still lower privately and the VM still re-exports `compile_forth` / `compile_lisp`. That inversion is debt, not the target.
 
 Shared lowering helpers enforce Lisp/Co-Forth parity without requiring an intermediate tree for its
 own sake. Source-defined generics and compile-time templates are the concrete feature that can
@@ -447,6 +461,18 @@ Jobs should be coarse enough to amortize scheduling cost, queues must apply boun
 and a small module may run serially. This preserves the speed goal without turning individual AST
 nodes into synchronization-heavy actors.
 
+Once a function is `FunctionCertified`, native-backend work on it is another job of that same
+grain. It may run while other functions are still parsing, elaborating, lowering, or parked on
+`require`, using the dependency and ABI summaries the scheduler already recorded. The native
+artifact stays quarantined until `ModuleVerified`. Function-level jobs are the default
+native-backend parallelism. Independent stack-IR fragments can be summarized — input and output
+stack contracts, a symbolic value graph, effect and control constraints, and fixups — and those
+summaries could compose in parallel. Executing one instruction is cheap enough that a task would
+cost more than the walk, so that composition stays an architectural possibility. It is not the
+strategy to build first, and it does not change the coarse-job rule. Compiler parallelism is also
+separate from program parallelism: this scheduler does not run a user's straight-line code
+concurrently. [Common typed IR](#common-typed-ir) is the consumption model.
+
 Package retrieval is a separate later layer over modules. Dependency declarations identify a
 source locator and exact version or immutable content hash, and a checked-in lockfile fixes the
 complete transitive graph. Resolvers must support local paths and decentralized Git, HTTPS, and
@@ -641,7 +667,8 @@ and JIT execution the same verified IR, transaction, and error behavior.
    originating Lisp form to the model submission and visible user turn.
 6. Every provider receives a compact, versioned language definition plus on-demand vocabulary
    introspection, so it can write programs without relying on remembered words.
-7. A later Cranelift backend lowers proven hot code through Cranelift IR (CLIF) without becoming a
+7. A later native backend lowers proven hot code from verified typed stack IR. A private
+   representation such as Cranelift IR (CLIF) may sit behind that backend and does not become a
    second semantic VM.
 8. There is no process-wide GIL. Executions own their stacks and frames; shared state uses immutable
    versions, explicit transactions, concurrent handles, or narrowly scoped synchronization.
@@ -723,7 +750,9 @@ instruction stream with constants, typed stack operations, locals, lexical envir
 branches, structured values, capability requests, suspension points, and returns. It is not a
 third user-facing language and is not simply tokenized Forth text.
 
-Co-Forth source compiles almost directly to the IR. Lisp is parsed, macro-expanded, type-checked,
+Co-Forth is not a token translation into the IR. Semantic construction uses each applied word's
+stack signature to rebuild the same semantic program CoLisp constructs directly; both then lower
+through one stage to typed stack IR. Lisp is parsed, macro-expanded, type-checked,
 closure-converted, and lowered by post-order traversal. Each resulting Lisp instruction currently
 carries the exact span of its enclosing top-level source form (including source identity and
 line/column coordinates); macro-expanded instructions retain that caller-form provenance. Precise
@@ -744,10 +773,12 @@ and capability requests explicit enough to verify and later lower to native code
 The stack form is also a compiler-pipeline boundary, not merely an accommodation for Co-Forth. Each
 instruction compactly states its input/output rows, ownership transition, effect contribution,
 control successors, and source origin. Once a function's resolved syntax has been linearized into
-those transformations, local verification, serialization, interpretation, and SSA lowering no
-longer need its unrelated frontend tree. This makes functions natural bounded producer/consumer
-units for dependency-driven and parallel compilation while preserving deterministic evaluation
-order.
+those transformations, local verification, serialization, interpretation, and later backend
+consumption no longer need its unrelated frontend tree. The stack discipline does not erase data
+dependencies. A later walk can recover them by popping symbolic operands and pushing a symbolic
+result. Functions remain the bounded producer/consumer units for dependency-driven and parallel
+compilation while preserving deterministic evaluation order. The consumption modes and the
+optional stack-to-stack optimizer are under [Common typed IR](#common-typed-ir).
 
 The runtime retains canonical source in the authored language. Compiled IR, verifier summaries,
 and native code are rebuildable caches keyed by source, compiler, vocabulary, dependency, target,
@@ -3702,7 +3733,7 @@ unsafe boundaries, variant construction/destructuring, `throw`, handler regions,
 `nothrow` guarantees, record layout declarations, safe receiver projection, and inferred/move/exact
 closure capture policies. Co-Forth stack effects record whether an input is borrowed or consumed,
 and its handler and closure syntax lower to the same exceptional edges, match decision trees,
-capture records, and ownership transitions, so its direct operation mapping to typed IR loses no
+capture records, and ownership transitions, so the shared lowering to typed IR loses no
 source-level guarantee. CoLisp lowers the same semantics rather than routing through Co-Forth text.
 
 **Frozen 2026-10-01: CoLisp per-parameter ownership spelling.** CoLisp uses an unannotated binding
@@ -3790,8 +3821,8 @@ elsewhere. This closes #674's fourth item.
 
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
-borrows, mutable aliasing, and borrows live across suspension. The interpreter and future Cranelift
-backend consume those already-verified decisions; native lowering never reruns source inference or
+borrows, mutable aliasing, and borrows live across suspension. The interpreter and a native backend
+consume those already-verified decisions; native lowering never reruns source inference or
 invents a different lifetime model. A shared conformance corpus must express each ownership behavior
 in both syntaxes and compare accepted IR, diagnostics, traps, drops, and observable results.
 
@@ -5369,6 +5400,149 @@ The verifier proves:
 Verifier output is a reusable certificate summary keyed to the exact module hash. Remote peers may
 send summaries for caching, but each receiver verifies the module independently.
 
+The instruction list above is the design-era sketch. The normative instruction set and verifier
+contract are [`SPECIFICATION.md`](SPECIFICATION.md) section 13 and
+[`semantics/ir.json`](semantics/ir.json). What follows is why that stack IR is the waist a backend
+should consume, and which private forms it may build afterward.
+
+### One verified stack program, several abstract machines
+
+The same verified typed stack program can be consumed by different abstract machines:
+
+```text
+concrete interpreter:    StackIR -> runtime values
+optimizer:               StackIR -> improved StackIR
+value/SSA builder:       StackIR -> symbolic values
+direct native backend:   StackIR -> machine-oriented locations and operations
+```
+
+That is an observation about the IR. It does not ask for one generic interpreter parameterized by
+an abstract domain. Each consumer may be its own walk over the same instruction stream. Native and
+value lowering are abstract execution of the verified stack program over a symbolic value domain.
+
+Where a concrete interpreter pushes a runtime value, a symbolic walk pushes a fact. Useful facts
+are the value's producer, its type, a known constant, a numeric range or other refinement the
+verifier already established, equality or value-number identity, a source or dependency identity
+when it matters, and the verified effect and control facts the instruction carries.
+
+A straight-line fragment such as `a b * c d * +` is consumed by popping symbolic operands and
+pushing a symbolic result. The recovered dependence is the same one an explicit form would write
+as the product of `a` and `b`, the product of `c` and `d`, and the sum of those products. The
+syntax of that private graph is the backend's choice. Stack IR does not delete data dependencies.
+The stack discipline stores them so a linear walk can recover them: each instruction names its
+inputs by consuming them and names its output by producing a result.
+
+At a control-flow join, corresponding stack slots that carry different symbolic values become
+block parameters in the private value representation, the role phi nodes play in SSA. The typed
+stack merge the verifier already requires says which slots correspond and that their types agree.
+The backend does not invent a second merge rule.
+
+The specification's verifier walks the stack for certification: heights, types, regions, effects,
+and merges. The backend walk is a later consumer over a richer value domain. It does not replace
+verification and it does not mint `FunctionCertified` or `ModuleVerified`.
+
+### Permitted consumption strategies
+
+A native implementation may use any of these, or more than one as tiers. The core profile's
+reference remains concrete interpretation. Native conformance is observable behavior against that
+reference. None of the native strategies is mandatory. SSA is a private derived form, used when
+its optimizations pay for constructing it.
+
+1. Concrete interpretation. Verified stack IR produces runtime values.
+2. Direct native lowering. The backend evaluates verified stack IR against symbolic machine
+   locations, selects instructions, allocates registers, and emits machine operations. This path
+   does not build SSA.
+3. Derived value or SSA lowering. Abstract execution builds a compact private value or SSA form.
+   Optimization, instruction selection, register allocation, and emission follow. Build that form
+   when the code-quality return justifies it.
+4. Stack-IR optimization. Abstract execution rewrites the function to semantically equivalent
+   typed stack IR. The result is interpreted, lowered directly, or sent through a value or SSA
+   path.
+
+Canonical IR identity stays the verified lowering accepted at `FunctionCertified`. Optimized stack
+IR and every private form are caches keyed by that IR, the dependency summaries, the target, and
+the optimization policy. Scheduling order does not change the canonical IR. Before rewritten stack
+IR is executed or lowered to executable native code, the same independent verifier accepts it.
+`ModuleVerified` remains the publication and execution boundary. Provisional native work may start
+at `FunctionCertified` and stays quarantined until that certificate exists, as the compilation
+states above already require. A backend consumes checked IR.
+
+### Stack-to-stack fixed point
+
+A lightweight optimizer may abstractly execute typed stack IR and emit typed stack IR. Where the
+legality rules below allow it, the facts it can use include constants, ranges, value identities,
+and verified effect and control facts. The reductions those facts can justify include constant
+folding and propagation, folding a branch whose condition is known, elimination of a dead stack
+value, copy and value forwarding, local value numbering, peephole canonicalization, and removal of
+a conversion or check that a verified fact already proves redundant.
+
+The engine is a worklist. Rewrite a block or region, record which facts, instructions, or edges
+changed, and revisit the affected blocks and their dependencies. Stop when the worklist is empty.
+The design to avoid is a blind rescan of the whole function, repeated until its bytes stop
+changing, with no account of which region a rewrite affected.
+
+The rewrite system has to terminate. Rules that turn two equivalent forms into each other are
+rejected. Canonical forms, separate bounded phases, or a well-founded improvement order are how an
+implementation gets termination. There is no language-level optimizer cost function. A private
+cost order, if one is used, is only a termination device. It does not decide which programs are
+legal or what they mean.
+
+Conceptually the pipeline is `IR0`, then a rewrite to `IR1`, and so on until a fixed point `IRn`.
+The worklist is that pipeline with the unaffected blocks left alone.
+
+### What a rewrite is allowed to change
+
+Every rewrite preserves the observable semantics the specification already requires. That includes
+eager left-to-right evaluation, traps and checked integer overflow, exceptions, suspension points,
+capability and effect order, state effects, the ownership and lifetime decisions lowering already
+recorded, deterministic cleanup, externally observable events, and required control flow.
+
+Checked arithmetic is the standard limit. The fragment `a b * c d * +` stays in that association
+when a different grouping could trap on overflow or, for strict floating point, round differently.
+A named wrapping or saturating operation has its own contract and may be rewritten only within
+that contract. `pure`, `nothrow`, and `non-suspending` license a transformation only as the
+verifier derived them, and they are separate facts: a pure callable may still throw, so sharing a
+repeated pure call is legal only when the sharing also preserves exceptions, traps, and observable
+effects. A certified law or a range proof licenses a rewrite only for the behavior the
+specification already attaches to that law or proof. A frontend annotation is not a license. The
+optimizer does not get a weaker verifier in order to make a rewrite easier.
+
+Ownership in the version 6 model is decided before IR. The IR records the decision as explicit
+drops, cleanup regions, and slot borrows, and the executor carries no second ownership state. A
+rewrite preserves those instructions and regions. It does not run source lifetime inference again.
+
+### Compiler parallelism is not program parallelism
+
+Function-level backend jobs, quarantine until `ModuleVerified`, and the decision to keep symbolic
+execution of single instructions off the initial scheduler are already stated with the dependency
+scheduler above. This section does not add a second scheduling design.
+
+Typed stack shape, recovered value dependencies, ownership, effects, and purity may eventually be
+evidence that some computations can run concurrently. That is a separate optimization question.
+Stack IR does not remove dependencies, and Forth-shaped source does not make independent-looking
+words concurrent. Version 0.1 execution remains the observable trace the specification defines,
+including where the source itself uses tasks.
+
+### Where Co-Forth sits relative to the IR
+
+Co-Forth semantic construction uses each word's stack signature to rebuild the common semantic
+program, the same expression structure CoLisp writes directly. That program lowers to typed stack
+IR. A later abstract execution may recover a value graph or machine operations:
+
+```text
+Co-Forth source
+  -> signature-guided semantic construction
+  -> common semantic program
+  -> typed stack IR
+  -> verifier
+  -> concrete interpretation, stack-to-stack rewrite, or abstract execution
+  -> optional private value/SSA form, or machine operations
+```
+
+The stack IR earns its place because it is the compact verified waist for interpretation,
+verification, serialization and caching, frontend equivalence, and native lowering. It is not a
+copy of Co-Forth source, and it need not be the only private representation a backend builds.
+
 ## Runtime, memory, and concurrency
 
 ### Concurrency memory model
@@ -5961,32 +6135,38 @@ The language definitions must be concise, literal, and executable:
 Generate provider prompt fragments and schemas from the canonical vocabulary registry so prose,
 tool schemas, verifier signatures, and runtime words cannot silently drift.
 
-## Cranelift JIT plan (deliberately later)
+## Native backends, with Cranelift as one later strategy
 
 ### IR layering
 
-Cranelift IR is conventionally called CLIF. It is a distinct, lower representation from Finch's
-typed stack IR:
+[Common typed IR](#common-typed-ir) is the architectural choice: verified typed stack IR stays the
+waist, and a backend may interpret it, rewrite it, recover a private value form, or lower it
+directly to machine operations. Cranelift is one candidate implementation of the private-value
+path. Its IR, conventionally called CLIF, is a distinct, lower, backend-private representation:
 
 ```text
 Finch typed stack IR
   semantic types, stack effects, capability requirements, suspension, source origins
-        ↓ verified lowering
+        ↓ verified abstract execution, when this strategy is the one in use
 CLIF
   SSA values, blocks, calls, guards, loads/stores, target-independent machine operations
         ↓ Cranelift code generation
 native code
 ```
 
-The interpreter and Cranelift are two backends of this same Finch IR, not two languages.
+A direct stack-to-machine backend skips CLIF. A stack-to-stack optimizer may sit in front of
+either path and still produces typed stack IR that the Finch verifier accepts. The interpreter and
+a Cranelift backend would be two consumers of the same Finch IR, not two languages.
 See [Abstraction boundaries](#abstraction-boundaries-do-not-collapse). CLIF never becomes
-the handoff from `finch-language`.
+the handoff from `finch-language`, and choosing Cranelift first does not retire the other
+consumption strategies.
 
 Finch IR is the durable semantic and verification boundary. CLIF is target/backend-oriented and
-normally a rebuildable compilation artifact. Do not serialize CLIF as the program-exchange ABI or
-ask models to generate it. Cranelift consumes only verified concrete typed IR or verified shared
-typed IR with explicit evidence parameters; it does not infer source types, resolve concepts, choose
-evidence, or repair an invalid generic instantiation. Capability authority is already validated
+normally a rebuildable compilation artifact. Do not serialize CLIF, or any other private backend
+IR, as the program-exchange ABI or ask models to generate it. A Cranelift backend consumes only
+verified concrete typed IR or verified shared typed IR with explicit evidence parameters; it does
+not infer source types, resolve concepts, choose evidence, or repair an invalid generic
+instantiation. Capability authority is already validated
 before lowering, but every runtime shim call remains capability-bound so malformed or stale native
 artifacts cannot bypass the broker.
 
@@ -6007,11 +6187,15 @@ Do not begin native code generation until:
 
 ### Tiering
 
-Use three tiers:
+Runtime tiering is independent of which consumption strategy a tier uses. Tier 0 interprets
+verified stack IR. A fast native tier may be direct lowering or another baseline compilation. An
+optimizing tier may run the stack-to-stack worklist, build a private value form, or both, when
+measurement says the code quality pays for the compile time. One Cranelift-shaped version of that
+policy is:
 
 ```text
 tier 0: verified IR interpreter
-tier 1: cached baseline Cranelift compilation for hot functions
+tier 1: cached baseline native compilation for hot functions
 tier 2: optional optimized recompilation using profiles and proven specialization
 ```
 
@@ -6030,12 +6214,16 @@ code into native code without requiring the host application to embed the Rust t
 Rust implementation. This is a distribution and latency goal, not a claim that Finch will reproduce
 LuaJIT's tracing architecture or current performance.
 
-Cranelift is a practical first native backend and can itself be embedded. It remains the reference
+Cranelift is a practical first native backend and can itself be embedded. It remains an available
 baseline while language semantics, runtime shims, native metadata, and differential tests stabilize.
-After self-hosting, Finch may add a compact baseline machine-code generator written in CoLisp or
+It is not the only architecture the IR allows. After self-hosting, Finch may add a compact baseline
+machine-code generator written in CoLisp or
 Co-Forth. Verified typed stack IR, resolved layouts, explicit control edges, and certified ownership
 and effects let that backend encode a deliberately small instruction-selection and register-allocation
-surface instead of rebuilding frontend semantics. The initial target should support one architecture
+surface instead of rebuilding frontend semantics. That surface may be direct stack-to-machine
+lowering or a compact private value form. The measurements under
+[Performance and expressiveness targets](#performance-and-expressiveness-targets) choose; the IR
+does not require SSA. The initial target should support one architecture
 and ABI well, fall back to the interpreter for unsupported operations, and expand only from measured
 embedding workloads.
 
@@ -6056,9 +6244,19 @@ embedding contract.
 
 ### Native ABI and lowering
 
-- Lower verified Finch IR blocks into CLIF blocks and map virtual stack slots to CLIF SSA values.
+Every native backend preserves the semantic obligations below. Mapping blocks onto CLIF SSA values
+is one way to meet them, used when the private form is CLIF. A direct stack-to-machine backend
+meets them without constructing SSA.
+
+When the private form is CLIF or another SSA form:
+
+- Lower verified Finch IR blocks into blocks of that form and map virtual stack slots to its SSA
+  values.
 - Spill only across calls, control-flow merges, suspension points, and register pressure.
 - Eliminate `dup`, `swap`, `over`, and local stack shuffles in SSA when possible.
+
+For every native backend:
+
 - Lower verified move/borrow state directly; do not rerun source lifetime inference in the backend.
 - Emit cleanup blocks and stable borrow/drop/retain/release runtime hooks for owner carriers whose
   operations cannot be inlined, preserving exactly-once destruction across return and unwind.
@@ -6117,7 +6315,7 @@ compiler version. Dynamic inputs use guards and safe fallback rather than compil
 specialization set.
 
 Initial backends should reuse an established GPU toolchain or portable device format and retain a
-CPU interpreter/Cranelift oracle. A compact self-hosted backend may later emit one GPU instruction
+CPU interpreter and native-backend oracle. A compact self-hosted backend may later emit one GPU instruction
 set directly, but backend replacement must not change kernel semantics or capability enforcement.
 Claiming parity with or replacement of a mature tiled-kernel system requires differential numerical
 tests, race/bounds diagnostics, profiler/source mapping, representative model kernels, competitive
@@ -6143,7 +6341,7 @@ Native artifacts are keyed by:
 
 ```text
 IR hash
-compiler and Cranelift versions
+compiler and backend versions
 target triple and CPU feature set
 runtime ABI version
 dependency ProgramRefs
@@ -6171,14 +6369,25 @@ verifies and compiles it locally.
 
 ### Performance and expressiveness targets
 
-Native-code generation is not itself the performance goal. Cranelift is a low-latency baseline JIT;
-it does not by itself supply the loop optimization, vectorization, and alias analysis behind
-optimized Rust/C++ results. Track wall time, allocations, peak resident memory, code size, compile
-latency, and dispatch/host-boundary overhead against checked-in interpreter, Cranelift, optimized
-Rust, and C++ baselines. The product roadmap requires meaningful wins on measured hot Finch
+Native-code generation is not itself the performance goal. A low-latency baseline JIT, Cranelift
+included, does not by itself supply the loop optimization, vectorization, and alias analysis behind
+optimized Rust/C++ results. Before a deployment freezes its native strategy, measure three
+consumers of the same verified stack IR: direct machine lowering, a worklist stack-to-stack
+optimizer followed by native lowering, and a compact private value or SSA form followed by
+optimized native lowering. Record compile latency, generated-code quality, peak compiler memory,
+scaling across worker counts, and worklist convergence, each with the semantic configuration and
+dated manifest the implementation plan requires. The question is how much native-code quality a
+very cheap optimizer can obtain while compilation stays low-latency and scales across cores.
+Reproducing a large optimizing compiler is a different and later question. Several tiers may
+remain when those measurements justify them. This section states no performance number.
+
+Track wall time, allocations, peak resident memory, code size, compile
+latency, and dispatch/host-boundary overhead against the checked-in interpreter, the native
+strategies under measurement, and optimized
+Rust and C++ baselines. The product roadmap requires meaningful wins on measured hot Finch
 programs without harming startup or agent latency. Rust/C++-class output remains a separate
 language/compiler research target that requires an appropriate optimizing backend or substantial
-optimizer work; it is not a Finch Runtime, Brain, or initial Cranelift acceptance gate. Publish
+optimizer work; it is not a Finch Runtime, Brain, or initial native-backend acceptance gate. Publish
 distributions over representative programs and never claim parity from one arithmetic benchmark.
 
 The source-language expressiveness target is comparable to TypeScript for ordinary application
@@ -6299,7 +6508,7 @@ standalone executables. Programs with host effects instead link the portable
 `VmSideEffect`/`VmResume` ABI and require a capability-providing embedder. Both modes consume the
 same span-preserving AST/parametric HIR, dependency scheduler, CTFE/evidence/specialization cache,
 verified stack IR, and source maps; there is no AOT-only source language or trusted model-authored
-CLIF.
+backend IR.
 Host selection is explicit. A `none` profile rejects any inferred effect it cannot satisfy; a small
 terminal wrapper may project `session.emit` to stdout/stderr and implement a declared bounded host
 surface; portable or object/library output exposes or leaves unresolved the effect/resume shims for
@@ -6330,7 +6539,7 @@ effects; they never expose a raw owning pointer, and opaque C pointers remain ge
 resources or explicit foreign ownership carriers. Calling an unverified symbol,
 passing a raw pointer/integer descriptor, variadic calls, and unchecked shared-memory access require
 an explicit unsafe boundary admitted only by an unhosted profile. The same declarations feed
-interpreter bindings and Cranelift AOT lowering so FFI does not become a second language semantic
+interpreter bindings and native AOT lowering so FFI does not become a second language semantic
 path. Hosted profiles may call only safe host wrappers whose implementation is outside the language
 sandbox and whose typed effect contract remains independently authorized.
 
@@ -6467,6 +6676,11 @@ Exit: production Lisp and Co-Forth share one verified execution engine and capab
 Exit: independent tasks scale across worker threads and state conflicts are explicit outcomes.
 
 ### Phase 10: JIT instrumentation and Cranelift prototype
+
+This prototype is one native strategy. It does not make CLIF the canonical IR, and it leaves
+direct machine lowering and stack-to-stack optimization open until the measurements in
+[Performance and expressiveness targets](#performance-and-expressiveness-targets) exist.
+[`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) M5 is the gate that compares them.
 
 - Add stable runtime shim ABI, hotness counters, native cache keys, and source-map storage.
 - Implement typed-stack-IR-to-CLIF lowering for a pure arithmetic/control-flow subset.
@@ -6808,8 +7022,8 @@ provenance set with shared loans until the returned view's last use.
 
 The project reaches the intended architecture when:
 
-- one typed IR and verifier define runtime semantics;
-- both Lisp and Co-Forth compile directly to it;
+- one typed stack IR and verifier define runtime semantics, and backend-private forms stay caches;
+- both Lisp and Co-Forth reach that IR through shared semantic construction, with no Forth-text detour;
 - the native Lisp fallback is gone;
 - public words expose checked typed stack/effect signatures;
 - capability selectors are structured, scoped, attenuable, persistable, revocable, and audited;
@@ -6818,8 +7032,9 @@ The project reaches the intended architecture when:
 - model language packages are generated, versioned, discoverable, and pass provider conformance tests;
 - independent executions and agents do not require a process-wide GIL;
 - the interpreter remains the reference implementation;
-- the optional Cranelift tier passes differential, security, cancellation, transaction, and
-  performance gates without changing observable language behavior;
+- an optional native tier passes differential, security, cancellation, transaction, and
+  performance gates without changing observable language behavior, whichever consumption strategy
+  it uses;
 - the comptime-hook catalog (`members-of`, `fields-of`, `modules-of`, `FunctionSpec`, and any later
   addition) carries conformance fixtures — fixed input, exact expected output — checked against every
   implementation that claims to speak the language/ABI, not documented only as one reference
