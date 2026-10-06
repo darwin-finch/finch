@@ -249,6 +249,7 @@ pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
     let status = match view.vm.status {
         SayTurnStatus::Running => "running",
         SayTurnStatus::Completed => "completed",
+        SayTurnStatus::Failed => "failed",
     };
     let program = |id: String| {
         DynamicUiNode::leaf("ProgramSource", id)
@@ -265,7 +266,7 @@ pub fn say_card_manifest(view: &SayTurnView) -> DynamicUiNode {
         .with_prop("elapsedMs", view.elapsed.as_millis() as u64)
         .with_prop("showProgram", view.vm.show_program);
 
-    if view.vm.status == SayTurnStatus::Running {
+    if view.vm.status == SayTurnStatus::Running || view.vm.status == SayTurnStatus::Failed {
         card = card.with_child(program(String::new()));
         if let Some(output) = output(String::new()) {
             card = card.with_child(output);

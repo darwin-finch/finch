@@ -98,7 +98,12 @@ impl ProgramLanguage {
     /// leaving it in the compiled source silently turns a real definition
     /// into quoted, never-executed data instead.
     pub fn infer_source(source: &str) -> Self {
-        if source.trim_start().starts_with('(') {
+        let trimmed = source.trim_start();
+        if trimmed.starts_with("```lisp") || trimmed.starts_with("```scheme") {
+            Self::Lisp
+        } else if trimmed.starts_with("```forth") {
+            Self::Forth
+        } else if trimmed.starts_with('(') {
             Self::Lisp
         } else {
             Self::Forth

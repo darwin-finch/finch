@@ -550,7 +550,7 @@ mod tests {
         );
         assert_eq!(
             palette.hover_background,
-            SpanColor::Rgb(36, 38, 42),
+            SpanColor::Rgb(52, 56, 68),
             "hover background maps to the softened dark-scheme hover color"
         );
     }

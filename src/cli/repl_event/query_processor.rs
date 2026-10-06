@@ -765,46 +765,6 @@ async fn execute_wire_with_single_repair(
     metric.failure_class = Some(finch_programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = finch_programs::wire_diagnostic_code(&diagnostic);
 
-    if repairable {
-        // A self-correcting repair round is about to fire: keep the raw
-        // compiler-style diagnostic out of the user-facing transcript and
-        // show only the eventual outcome (the successfully repaired
-        // response, or a plain-language fallback if repair itself fails
-        // below). The diagnostic is still fully available for debugging.
-        // #1383.
-        tracing::debug!(
-            diagnostic = %diagnostic,
-            "VM wire error triggering a repair round (not shown in transcript)"
-        );
-    } else {
-        output_unit.append_response(&format!("VM wire error: {diagnostic}"));
-    }
-    if !repairable {
-        metric.terminal_failure = true;
-        record_wire_metric(metrics_logger, &metric);
-        let _ = event_tx.send(ReplEvent::VmOutputComplete {
-            output_unit: Arc::clone(&output_unit),
-        });
-        return WireExecution {
-            source_for_history: source,
-            response: diagnostic,
-            effect_journal,
-            output_unit,
-        };
-    }
-    if cancel.is_cancelled() {
-        metric.terminal_failure = true;
-        record_wire_metric(metrics_logger, &metric);
-        let message = wire_repair_failed_message(&diagnostic);
-        output_unit.append_response(&message);
-        output_unit.set_complete();
-        return WireExecution {
-            source_for_history: source,
-            response: message,
-            effect_journal,
-            output_unit,
-        };
-    }
     if finch_programs::is_unattempted_prose(&source) {
         // The model never attempted a program -- plain prose, not a
         // near-miss. Asking the same model to "repair" it just compounds
@@ -911,6 +871,51 @@ async fn execute_wire_with_single_repair(
             }
         };
     }
+
+    if repairable {
+        // A self-correcting repair round is about to fire: keep the raw
+        // compiler-style diagnostic out of the user-facing transcript and
+        // show only the eventual outcome (the successfully repaired
+        // response, or a plain-language fallback if repair itself fails
+        // below). The diagnostic is still fully available for debugging.
+        // #1383.
+        tracing::debug!(
+            diagnostic = %diagnostic,
+            "VM wire error triggering a repair round (not shown in transcript)"
+        );
+    } else {
+        output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+        output_unit.set_say_turn_failed();
+    }
+
+    if !repairable {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        output_unit.set_complete();
+        let _ = event_tx.send(ReplEvent::VmOutputComplete {
+            output_unit: Arc::clone(&output_unit),
+        });
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+            effect_journal,
+            output_unit,
+        };
+    }
+    if cancel.is_cancelled() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        let message = wire_repair_failed_message(&diagnostic);
+        output_unit.append_response(&format!("VM wire error: {diagnostic}\n{message}"));
+        output_unit.set_say_turn_failed();
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: message,
+            effect_journal,
+            output_unit,
+        };
+    }
     metric.repair_attempted = true;
 
     // Keep the rejected result visibly live while the bounded corrective
@@ -928,7 +933,8 @@ async fn execute_wire_with_single_repair(
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             let message = wire_repair_failed_message(&diagnostic);
-            output_unit.append_response(&message);
+            output_unit.append_response(&format!("VM wire error: {diagnostic}\n{message}"));
+            output_unit.set_say_turn_failed();
             output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
@@ -944,7 +950,8 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         let message = wire_repair_failed_message(&diagnostic);
-        output_unit.append_response(&message);
+        output_unit.append_response(&format!("VM wire error: {diagnostic}\n{message}"));
+        output_unit.set_say_turn_failed();
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
@@ -957,7 +964,8 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         let message = wire_repair_failed_message(&diagnostic);
-        output_unit.append_response(&message);
+        output_unit.append_response(&format!("VM wire error: {diagnostic}\n{message}"));
+        output_unit.set_say_turn_failed();
         output_unit.set_complete();
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
@@ -973,7 +981,8 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         let message = wire_repair_failed_message(&diagnostic);
-        output_unit.append_response(&message);
+        output_unit.append_response(&format!("VM wire error: {diagnostic}\n{message}"));
+        output_unit.set_say_turn_failed();
         output_unit.set_complete();
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
@@ -1056,6 +1065,7 @@ async fn execute_wire_with_single_repair(
             );
             let message = wire_repair_failed_message(&detail);
             repair_output_unit.append_response(&message);
+            repair_output_unit.set_say_turn_failed();
             repair_output_unit.set_complete();
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
@@ -1077,6 +1087,7 @@ async fn execute_wire_with_single_repair(
             );
             let message = wire_repair_failed_message(&detail);
             repair_output_unit.append_response(&message);
+            repair_output_unit.set_say_turn_failed();
             repair_output_unit.set_complete();
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
@@ -4801,14 +4812,14 @@ mod tests {
         assert!(text.contains("complete body of every text response is one"));
         assert!(text.contains("`ProgramSubmission`"));
         assert!(text.contains("Default to Lisp"));
-        assert!(text.contains("every other valid submission is Co-Forth"));
+        assert!(text.contains("is a Co-Forth definition"));
         assert!(text.contains("already writing the active Brain's VM input"));
         assert!(text.contains("A nested CLI"));
         assert!(text.contains("process is a different runtime"));
         assert!(text.contains("submit_program` tool only when this same inference"));
         assert!(text.contains("search_word(query)"));
         assert!(text.contains("inspect_word(name)"));
-        assert!(text.contains("\"Hello\" say"));
+        assert!(text.contains(": run s\"Hello\" say ; run"));
         assert!(text.contains("`s\"text\"` is equivalent"));
         assert!(messages[1].content[0]
             .as_text()

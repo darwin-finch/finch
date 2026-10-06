@@ -524,6 +524,11 @@ impl WorkUnit {
         let Some(vm) = &mut inner.say_vm else {
             return false;
         };
+        if vm.status == SayTurnStatus::Failed {
+            // Failed turns keep both broken program and error diagnostic visible.
+            // Do not toggle away either.
+            return false;
+        }
         vm.show_program = !vm.show_program;
         true
     }
@@ -946,6 +951,20 @@ impl WorkUnit {
         }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
+        if let Some(vm) = &mut inner.say_vm {
+            if vm.status == SayTurnStatus::Running {
+                vm.status = SayTurnStatus::Failed;
+            }
+        }
+    }
+
+    /// Mark the say-turn view model failed so broken source and diagnostic error
+    /// are rendered together without toggling away on click.
+    pub fn set_say_turn_failed(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(vm) = &mut inner.say_vm {
+            vm.status = SayTurnStatus::Failed;
+        }
     }
 
     /// Give a unit that is still in progress its terminal state because its
@@ -991,6 +1010,14 @@ fn finish_requested_terminal(inner: &mut WorkUnitInner, elapsed: std::time::Dura
     };
     inner.elapsed_at_finish = Some(elapsed);
     inner.status = status;
+    if let Some(vm) = &mut inner.say_vm {
+        if vm.status == SayTurnStatus::Running {
+            vm.status = match status {
+                MessageStatus::Failed => SayTurnStatus::Failed,
+                _ => SayTurnStatus::Completed,
+            };
+        }
+    }
 }
 
 // ============================================================================
