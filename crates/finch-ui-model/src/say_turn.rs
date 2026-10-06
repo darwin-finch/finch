@@ -39,6 +39,7 @@ pub enum SayTurnStatus {
     #[default]
     Running,
     Completed,
+    Failed,
 }
 
 /// The program-source part of a say turn's ViewModel: the exact wire text the
@@ -97,10 +98,13 @@ enum SayTurnState {
     Generating,
     Running,
     Completed,
+    Failed,
 }
 
 fn say_state(vm: &WorkUnitViewModel) -> SayTurnState {
-    if vm.status == SayTurnStatus::Completed {
+    if vm.status == SayTurnStatus::Failed {
+        SayTurnState::Failed
+    } else if vm.status == SayTurnStatus::Completed {
         // Status transitions win: a completed turn renders its output
         // (however empty, #1185) and can never wear the spinner again.
         SayTurnState::Completed
@@ -270,6 +274,38 @@ fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     lines
 }
 
+/// Failed: both broken program source and diagnostic error remain visible.
+/// Neither collapses to empty output nor vanishes on interaction.
+fn failed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
+    let target = content_toggle(view);
+    let program = ProgramSource::from_vm(&view.vm);
+    let mut lines: Vec<RenderedTranscriptLine> = program
+        .render_inline()
+        .into_iter()
+        .map(|text| toggle_content_line(text, &target, true, NodeRole::Program))
+        .collect();
+    if let Some(output) = &view.vm.output {
+        lines.extend(
+            Output::from_vm(output)
+                .render()
+                .into_iter()
+                .map(|text| toggle_content_line(text, &target, false, NodeRole::Output)),
+        );
+    }
+    let elapsed = format!("(ran {})", fmt_elapsed(view.elapsed.as_secs()));
+    if lines.is_empty() {
+        lines.push(toggle_content_line(
+            elapsed,
+            &target,
+            false,
+            NodeRole::Output,
+        ));
+    } else {
+        lines.push(body_line(elapsed));
+    }
+    lines
+}
+
 /// Render the say turn's lines for one frame: exactly one representation for
 /// the turn's current state. The transcript viewport's claiming pass turns
 /// the completed displayed content into one stable toggle target.
@@ -278,6 +314,7 @@ pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
         SayTurnState::Generating => generating_lines(view),
         SayTurnState::Running => running_lines(view),
         SayTurnState::Completed => completed_lines(view),
+        SayTurnState::Failed => failed_lines(view),
     }
 }
 
@@ -768,5 +805,26 @@ mod tests {
             rect.height, 2,
             "prose + elapsed metadata claim two rows; got {rect:?}"
         );
+    }
+
+    #[test]
+    fn failed_say_turn_renders_both_broken_source_and_error_diagnostic() {
+        let vm = WorkUnitViewModel {
+            status: SayTurnStatus::Failed,
+            program: ProgramSourceVm {
+                language: "lisp".to_string(),
+                lines: vec!["(say (fib \"broken\"))".to_string()],
+            },
+            output: Some(OutputVm {
+                lines: vec!["VM wire error: E-LINK-002: unknown function".to_string()],
+            }),
+            show_program: false,
+        };
+        let view = say_view(vm);
+        let lines = say_turn_lines(&view);
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"(say (fib \"broken\"))"));
+        assert!(texts.contains(&"VM wire error: E-LINK-002: unknown function"));
+        assert!(texts.iter().any(|t| t.starts_with("(ran ")));
     }
 }

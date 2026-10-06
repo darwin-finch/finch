@@ -219,6 +219,27 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
 /// mandatory discriminator for this to hold -- see `BOOT_CAPSULE`
 /// (`vocabulary/BOOT.md`), which today still advertises a bare
 /// string-literal-and-`say` form as valid Forth with no leading `:`.
+/// Strip an outer Markdown code fence enclosing `source`, if present.
+///
+/// If `source` starts with ```` ``` ````, strips the opening fence header (e.g. ```` ```lisp\n ````)
+/// and any trailing ```` ``` ```` fence line, returning the inner content.
+pub fn strip_outer_markdown_fence(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let newline_idx = rest.find('\n')?;
+    let content_start = 3 + newline_idx + 1;
+    let content = &trimmed[content_start..];
+    let content_trimmed_end = content.trim_end();
+    if let Some(inner) = content_trimmed_end.strip_suffix("```") {
+        Some(inner.trim().to_string())
+    } else {
+        Some(content_trimmed_end.trim().to_string())
+    }
+}
+
 pub fn is_unattempted_prose(source: &str) -> bool {
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -1258,6 +1279,27 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_outer_markdown_fence() {
+        assert_eq!(
+            strip_outer_markdown_fence("```lisp\n(say \"hello\")\n```"),
+            Some("(say \"hello\")".to_string())
+        );
+        assert_eq!(
+            strip_outer_markdown_fence("```forth\n: greet s\"hi\" say ; greet\n```"),
+            Some(": greet s\"hi\" say ; greet".to_string())
+        );
+        assert_eq!(
+            strip_outer_markdown_fence("```\njust plain text\n```"),
+            Some("just plain text".to_string())
+        );
+        assert_eq!(strip_outer_markdown_fence("(say \"hello\")"), None);
+        assert_eq!(
+            strip_outer_markdown_fence("```lisp\n(say \"truncated\""),
+            Some("(say \"truncated\"".to_string())
+        );
+    }
+
+    #[test]
     fn test_a_bare_string_literal_near_miss_is_now_treated_as_unattempted_prose() {
         // The accepted tradeoff of simplifying to the `(`/`:` discriminator
         // (matching ProgramLanguage::infer_source exactly): a real, if
@@ -1462,9 +1504,9 @@ mod tests {
         let prompt = manifest.prompt_block();
         assert!(prompt.contains("secret-helper"));
         assert!(!prompt.contains("12345"));
-        assert!(prompt.contains("every other valid submission is Co-Forth"));
+        assert!(prompt.contains("is a Co-Forth definition"));
         assert!(prompt.contains("get_language_definition"));
-        assert!(prompt.contains("\"Hello\" say"));
+        assert!(prompt.contains(": run s\"Hello\" say ; run"));
         assert!(prompt.contains("search_word(query)"));
         assert!(prompt.contains("inspect_word(name)"));
         assert!(prompt.contains(": square ( S int -- S int ! pure )"));

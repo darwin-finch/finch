@@ -375,7 +375,7 @@ impl ColorScheme {
     /// Return the subtle background used to identify interactive rows on hover.
     pub fn hover_background(&self) -> Color {
         if self.is_dark() {
-            Color::Rgb(36, 38, 42)
+            Color::Rgb(52, 56, 68)
         } else {
             Color::Rgb(240, 240, 243)
         }
@@ -939,7 +939,7 @@ mod tests {
         );
         assert_eq!(
             dark.hover_background(),
-            Color::Rgb(36, 38, 42),
+            Color::Rgb(52, 56, 68),
             "dark hover should remain visible without overpowering row text"
         );
         assert_eq!(
